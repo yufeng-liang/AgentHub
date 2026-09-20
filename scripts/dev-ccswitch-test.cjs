@@ -1,5 +1,5 @@
-// 生态接入 · CC Switch 假库自测：造一个临时 cc-switch.db（官方 14 列 schema），
-// 用 CCSWITCH_DB_PATH 把模块指到它上面，验证 status / register 幂等 / 备份 / 条目内容。
+// 生态接入 · CC Switch 假库自测：造临时库（对齐真实 schema：BOOLEAN 标志列 + 复合主键 (id, app_type)），
+// 用 CCSWITCH_DB_PATH 把模块指到它上面，验证 status / register 幂等 / 备份与轮换 / 条目内容 / 校验报错 / 版本不兼容。
 // 用法：node scripts/dev-ccswitch-test.cjs
 "use strict";
 const fs = require("node:fs");
@@ -11,43 +11,51 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ccswitch-test-"));
 const dbFile = path.join(tmp, "cc-switch.db");
 process.env.CCSWITCH_DB_PATH = dbFile;
 
-// 建库（对齐 CC Switch database/schema.rs 的 providers 表）
 let Database = null;
 try {
   Database = require("node:sqlite").DatabaseSync;
 } catch {
   Database = require("better-sqlite3");
 }
-const db = new Database(dbFile);
-db.exec(`
+
+// 真实 providers 表结构（CC Switch database/schema.rs：BOOLEAN 标志列默认 '0'，复合主键）
+const PROVIDERS_SQL = `
 CREATE TABLE providers (
-  id TEXT NOT NULL PRIMARY KEY,
+  id TEXT NOT NULL,
   app_type TEXT NOT NULL,
   name TEXT NOT NULL,
-  settings_config TEXT,
+  settings_config TEXT NOT NULL,
   website_url TEXT,
   category TEXT NOT NULL DEFAULT 'default',
-  created_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL DEFAULT 0,
   sort_index INTEGER NOT NULL DEFAULT 0,
   notes TEXT,
   icon TEXT,
   icon_color TEXT,
-  meta TEXT,
-  is_current TEXT NOT NULL DEFAULT '0',
-  in_failover_queue TEXT NOT NULL DEFAULT '0'
+  meta TEXT NOT NULL DEFAULT '{}',
+  is_current BOOLEAN NOT NULL DEFAULT '0',
+  in_failover_queue BOOLEAN NOT NULL DEFAULT '0',
+  PRIMARY KEY (id, app_type)
 );
-`);
+`;
+
+/** 重建指定库文件（可自定义建表 SQL；不传则建空库） */
+function makeDb(file, tableSql) {
+  fs.rmSync(file, { force: true });
+  const db = new Database(file);
+  if (tableSql) db.exec(tableSql);
+  db.close();
+  return file;
+}
+
+makeDb(dbFile, PROVIDERS_SQL);
+const db = new Database(dbFile);
 // 塞一条用户自己的 provider，验证绝不被改动
-db.prepare(`INSERT INTO providers (id, app_type, name, settings_config, category, created_at, sort_index, is_current, in_failover_queue)
-  VALUES ('user-claude-main', 'claude', '我的主力', '{"env":{"X":"1"}}', 'custom', 1, 5, '1', '0')`).run();
+db.prepare(`INSERT INTO providers (id, app_type, name, settings_config, website_url, category, created_at, sort_index, is_current, in_failover_queue)
+  VALUES ('user-claude-main', 'claude', '我的主力', '{"env":{"X":"1"}}', null, 'custom', 1, 5, '1', '0')`).run();
 db.close();
 
 const ccswitch = require("../electron/backend/proxy/ccswitch.cjs");
-
-function fail(msg) {
-  console.error("✗ " + msg);
-  process.exit(1);
-}
 
 (async () => {
   // 1) 初始 status：未注册
@@ -70,7 +78,7 @@ function fail(msg) {
 
   // 4) 注册 codex
   r = ccswitch.register({ appType: "codex", apiKey: "sk-test-123", model: "deepseek-v4-flash", port: 9527 });
-  assert.strictEqual(r.clone, undefined); // 防呆：无 clone 字段由 schema 保证
+  assert.strictEqual(r.clone, undefined); // 防呆：register 不返回无关字段
   assert.strictEqual(r.ok, true, "register codex 应 ok");
   assert.strictEqual(r.action, "inserted", "codex 首次应为 inserted");
   console.log("✓ register codex inserted");
@@ -108,17 +116,56 @@ function fail(msg) {
   console.log("✓ claude 条目 env 嵌套 + apiFormat=openai_chat");
   console.log("✓ codex 条目 auth + 指定 toml");
 
-  // 6) 备份：应存在备份目录与至少 3 份备份文件（两次 claude + 一次 codex）
-  const backups = fs.readdirSync(path.join(tmp, "backups"));
+  // 6) 校验报错分支：未知 appType / 空 key / 空 model（不落库）
+  assert.strictEqual(ccswitch.register({ appType: "foo", apiKey: "k", model: "m" }).ok, false, "未知 appType 应失败");
+  assert.ok(/未知应用类型/.test(ccswitch.register({ appType: "foo", apiKey: "k", model: "m" }).message), "未知 appType 报错文案");
+  assert.ok(/API Key/.test(ccswitch.register({ appType: "claude", apiKey: "  ", model: "m" }).message), "空 key 报错文案");
+  assert.ok(/默认模型/.test(ccswitch.register({ appType: "claude", apiKey: "k", model: "" }).message), "空 model 报错文案");
+  console.log("✓ 参数校验报错分支");
+
+  // 7) 备份：至少 3 份（两次 claude + 一次 codex）
+  let backups = fs.readdirSync(path.join(tmp, "backups"));
   assert.ok(backups.length >= 3, "备份数量应 >=3，实际 " + backups.length + " -> " + backups.join(","));
   console.log("✓ 备份目录文件 =", backups.join(", "));
 
-  // 7) status 终态：都 registered
+  // 8) 备份轮换：连续注册足够多次后，本应用前缀备份不超过保留上限（BACKUP_KEEP=10），
+  //    且不误删非本应用文件（预先放一个别的备份文件当哨兵）
+  fs.writeFileSync(path.join(tmp, "backups", "cc-switch.db.bak_user_manual"), "user sentinel");
+  for (let i = 0; i < 12; i++) {
+    ccswitch.register({ appType: "claude", apiKey: "sk-rotate", model: "m", port: 9527 });
+  }
+  backups = fs.readdirSync(path.join(tmp, "backups"));
+  const mine = backups.filter((n) => n.startsWith("cc-switch.db.bak_agenthub_"));
+  assert.ok(mine.length <= 10, "轮换后本应用备份应 <=10，实际 " + mine.length + " -> " + mine.join(","));
+  assert.ok(backups.includes("cc-switch.db.bak_user_manual"), "哨兵备份不得被删");
+  console.log("✓ 备份轮换保留 <=10 且不动其它备份");
+
+  // 9) status 终态：都 registered
   s = ccswitch.status();
   assert.deepStrictEqual(s.entries.map((e) => [e.appType, e.registered]), [["claude", true], ["codex", true]]);
   console.log("✓ status 终态全部已注册");
 
-  // 8) 异常分支：缺库
+  // 10) 版本不兼容：providers 缺列 → status.incompatible + register 报版本不兼容
+  const badCols = path.join(tmp, "bad-cols.db");
+  makeDb(badCols, `CREATE TABLE providers (id TEXT, app_type TEXT, name TEXT)`);
+  process.env.CCSWITCH_DB_PATH = badCols;
+  assert.strictEqual(ccswitch.status().incompatible, true, "缺列库 incompatible 应为 true");
+  const rBad = ccswitch.register({ appType: "claude", apiKey: "k", model: "m" });
+  assert.strictEqual(rBad.ok, false, "缺列库 register 应失败");
+  assert.ok(/版本不兼容/.test(rBad.message), "应报版本不兼容: " + rBad.message);
+  console.log("✓ 缺列库：incompatible + 「版本不兼容」报错");
+
+  // 11) 无 providers 表 → status.incompatible + register 报表不存在
+  const empty = path.join(tmp, "empty.db");
+  makeDb(empty, null);
+  process.env.CCSWITCH_DB_PATH = empty;
+  assert.strictEqual(ccswitch.status().incompatible, true, "空库 incompatible 应为 true");
+  const rEmpty = ccswitch.register({ appType: "claude", apiKey: "k", model: "m" });
+  assert.strictEqual(rEmpty.ok, false, "空库 register 应失败");
+  assert.ok(/providers 表不存在/.test(rEmpty.message), "应报表不存在: " + rEmpty.message);
+  console.log("✓ 无 providers 表：incompatible + 表不存在报错");
+
+  // 12) 缺库：整库不存在 → installed=false + register 失败
   delete process.env.CCSWITCH_DB_PATH;
   assert.strictEqual(ccswitch.status().installed, false, "无库时 installed=false");
   const rNoDb = ccswitch.register({ appType: "claude", apiKey: "k", model: "m" });
