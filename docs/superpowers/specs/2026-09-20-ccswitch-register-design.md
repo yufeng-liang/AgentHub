@@ -14,14 +14,14 @@ CC Switch（farion1231/cc-switch）管理 Claude Code / Codex 的应用配置并
 
 ## 方案选择
 
-- **方案 A（采用）**：新建独立后端模块 `electron/backend/proxy/ccswitch.cjs`，复用 store.cjs 的 SQLite 驱动加载方式（node:sqlite 优先、better-sqlite3 回退），只读写 CC Switch 库；IPC 两条、前端新增子板块。
+- **方案 A（采用）**：新建独立后端模块 `electron/backend/proxy/ccswitch.cjs`，复用 store.cjs 的 SQLite 驱动加载方式（node:sqlite 优先、better-sqlite3 回退），只读写 CC Switch 库；IPC 两条、前端新增「生态接入」顶栏页。
 - 方案 B：并入 store.cjs —— 破坏其"只管 AgentHub stats 库"的单职，不采用。
 - 方案 C：不写库、让用户手动粘贴 —— UX 差，不采用。
 
 ## 架构
 
 ```
-前端 ConfigProxySection.vue（新子板块「生态接入」）
+前端 ProxyCcSwitchView.vue（反代网关顶栏新增「生态接入」页）
   → src/api/ipc.ts（proxyCcSwitchStatus / proxyCcSwitchRegister）
   → src/api/mock.ts（dev:web 预览 mock）
   → IPC: proxy_ccswitch_status / proxy_ccswitch_register
@@ -106,19 +106,28 @@ CC Switch（farion1231/cc-switch）管理 Claude Code / Codex 的应用配置并
 
 `{ ok: true, action: "inserted" | "updated", backupPath, dbPath, appType }`；失败 `{ ok: false, message }`。
 
+### 关键默认值
+
+- **端口**：`register` 的 port 参数缺省取 `config.proxy.port`（默认 9527），与网关实际端口一致；条目 base URL 由该 port 拼出 `http://127.0.0.1:{port}`（claude 不带 /v1、codex 带 /v1，按各自协议约定）。
+- **模型**：前端「默认模型」输入，存 `config.proxy.ccSwitchModel`，缺省取 `config.proxy.fallbackModel`。
+- **API Key**：前端下拉选已有 Key（复用 `proxyKeysList()`）；无 Key 时引导到 API Keys 页生成。
+
 ## IPC 接入
 
 - 在 `electron/backend/proxy/index.cjs` 的 `register(ipcMain)` 挂两条（沿用现有 `handle()` 包装）：`proxy_ccswitch_status` / `proxy_ccswitch_register`。模块顶部 `require("./ccswitch.cjs")`。
 
 ## 前端
 
-- `src/types/index.ts`：`CcSwitchStatus`、`CcSwitchRegisterResult` 类型。
+- `src/types/index.ts`：
+  - `CcSwitchStatus`、`CcSwitchRegisterResult` 类型；
+  - `ProxyConfig` 增加 `ccSwitchModel: string`（生态接入页的默认模型，持久化随整体配置）。
+- `electron/backend/config.cjs`：`defaultConfig().proxy` 增加 `ccSwitchModel: ""`。
 - `src/api/ipc.ts`：`proxyCcSwitchStatus()` / `proxyCcSwitchRegister({ appType, apiKey, model, port })`。
 - `src/api/mock.ts`：两条 mock（installed=true、已注册/未注册 示例）。
-- `src/components/config/ConfigProxySection.vue`：
-  - 新增第三个子板块 tab「生态接入」（icon `ph-plugs`）；
-  - 内容：安装状态徽标（未安装 → 提示去装 CC Switch）；Claude Code / Codex 两个注册按钮（注册中 busy 态、成功后显示"已入门 + 备份路径 + 重启 CC Switch 生效"文案）；Key 下拉（复用 `proxyKeysList()`，无 Key 时引导去 Api Keys 页生成）；模型输入（默认 `app.config.proxy.fallbackModel`）。
-- 端口取 `app.config.proxy.port`（默认 9527），与网关实际端口一致。
+- **页面导航**：`src/types/index.ts` 的 `MODULES` 中 proxy 模块 `pages` 新增 `{ id: "ccswitch", name: "生态接入" }` —— 顶栏（PageTabs 遍历 `app.pagesOf`）自动出现该 tab，与 总览 / API Keys / 号池 / 模型目录 / 用量统计 / 号池同步 平级。
+- **新页面** `src/views/proxy/ProxyCcSwitchView.vue`，在 `src/App.vue` proxy 区块挂载（`v-if/v-show` 懒挂载，同其它页）：
+  - 内容：CC Switch 安装状态徽标（未安装 → 提示去装 CC Switch）；Claude Code / Codex 两个注册按钮（busy 态）；API Key 下拉（复用 `proxyKeysList()`，无 Key 时引导去 API Keys 页生成）；**默认模型输入**（存 `app.config.proxy.ccSwitchModel`，缺省取 `fallbackModel`，注册时传入 register 的 model 参数，即 CC Switch Codex 配置的 model 字段）；
+  - 成功文案：注册结果 + 备份路径 + 「重启 CC Switch 生效」。
 
 ## 安全与错误处理
 
