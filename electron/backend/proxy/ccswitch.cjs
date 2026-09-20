@@ -37,6 +37,17 @@ const ICONS = {
   codex: { icon: "openai", iconColor: "#10A37F" },
 };
 
+/** 只保留最近 N 份本应用生成的写前备份：备份含明文密钥，无限累积是一种安全负担 */
+const BACKUP_KEEP = 10;
+
+/** INSERT 用到的全部列（自检与写入共用，单一事实源）：
+ *  schema 漂移时按这份清单把写入错误归类为「CC Switch 版本不兼容」 */
+const INSERT_COLS = [
+  "id", "app_type", "name", "settings_config", "website_url", "category",
+  "created_at", "sort_index", "notes", "icon", "icon_color", "meta",
+  "is_current", "in_failover_queue",
+];
+
 function ccDir() {
   return process.env.CCSWITCH_DB_PATH ? path.dirname(process.env.CCSWITCH_DB_PATH) : path.join(os.homedir(), ".cc-switch");
 }
@@ -49,16 +60,18 @@ function dbPath() {
 function openDb() {
   if (!Database) throw new Error("SQLite 驱动不可用（node:sqlite / better-sqlite3 均加载失败）");
   const db = driver === "better-sqlite3" ? new Database(dbPath(), { timeout: 3000 }) : new Database(dbPath());
-  db.exec("PRAGMA busy_timeout = 3000"); // CC Switch 可能正开着（WAL），等待而非直接失败
+  db.exec("PRAGMA busy_timeout = 3000"); // CC Switch 应用可能正持着库连接，等待锁释放而非直接失败（WAL 与回滚日志模式均适用）
   return db;
 }
 
 function formatTimestamp(d = new Date()) {
   const p = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}${p(d.getMilliseconds())}`;
+  const p3 = (n) => String(n).padStart(3, "0");
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}${p3(d.getMilliseconds())}`;
 }
 
-/** 写前备份：VACUUM INTO 产出单一一致性快照（含 WAL 未合并帧），避免复制 .db/-wal 三件套的撕裂风险；
+/** 写前备份：主路径 VACUUM INTO 产出单一一致性快照（含 WAL 未合并帧），无需复制 .db/-wal/-shm 三件套即可避免撕裂；
+ *  不支持 VACUUM INTO 的老 SQLite 才退化为三件套文件拷贝（见下方兜底分支，尽力而为）；
  *  目标已存在时按 .1/.2 后缀递增，保证每次注册的备份独立落盘；返回实际写入的路径 */
 function backupTo(backupPath) {
   fs.mkdirSync(path.dirname(backupPath), { recursive: true });
@@ -83,6 +96,41 @@ function backupTo(backupPath) {
   }
   if (!fs.existsSync(target)) throw new Error("备份失败：未生成备份文件");
   return target;
+}
+
+/** 备份轮换：仅清理本应用前缀（cc-switch.db.bak_agenthub_*）的旧备份，保留最近 keep 份；
+ *  其它任何文件（含用户自己的备份）一概不动；按修改时间倒序计数，失败静默跳过 */
+function rotateBackups(dir, keep) {
+  let names;
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return 0;
+  }
+  const prefix = "cc-switch.db.bak_agenthub_";
+  const mine = names
+    .filter((n) => n.startsWith(prefix))
+    .map((n) => {
+      const full = path.join(dir, n);
+      let mtime = 0;
+      try {
+        mtime = fs.statSync(full).mtimeMs;
+      } catch {
+        mtime = 0;
+      }
+      return { name: n, full, mtime };
+    })
+    .sort((a, b) => b.mtime - a.mtime);
+  let removed = 0;
+  for (const f of mine.slice(keep)) {
+    try {
+      fs.unlinkSync(f.full);
+      removed++;
+    } catch {
+      /* 删除失败不影响本次注册 */
+    }
+  }
+  return removed;
 }
 
 /** 组装条目的 settings_config / meta（字符串化后入库） */
@@ -142,9 +190,14 @@ function status() {
     let rows = [];
     let incompatible = false;
     try {
+      // 与 register 同源校验：providers 表存在且具备 INSERT 所需的全部列
+      const hasTable = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='providers'`).get();
+      if (!hasTable) throw new Error("no providers table");
+      const cols = new Set(db.prepare(`PRAGMA table_info(providers)`).all().map((c) => c.name));
+      if (INSERT_COLS.some((c) => !cols.has(c))) throw new Error("missing providers columns");
       rows = db.prepare(`SELECT id, name FROM providers WHERE id IN (?, ?)`).all(FIXED.claude, FIXED.codex);
     } catch {
-      incompatible = true; // 库在但 providers 表缺失等，按未注册展示
+      incompatible = true; // 库在但表/列缺失等，按未注册展示并提示库异常
     }
     return {
       installed: true,
@@ -184,15 +237,17 @@ function register({ appType, apiKey, model, port } = {}) {
   } catch (e) {
     return { ok: false, message: `备份失败，已中止：${(e && e.message) || e}` };
   }
+  rotateBackups(path.dirname(backupPath), BACKUP_KEEP); // 轮换失败不影响本次注册
 
-  // 2) 表结构自检：providers 表与其必需列
+  // 2) 表结构自检：providers 表与其 INSERT 所需的全部列
   const db = openDb();
   try {
     const hasTable = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='providers'`).get();
     if (!hasTable) return { ok: false, message: "CC Switch 数据库版本不兼容（providers 表不存在）" };
     const cols = new Set(db.prepare(`PRAGMA table_info(providers)`).all().map((c) => c.name));
-    for (const need of ["id", "app_type", "name", "settings_config", "meta"]) {
-      if (!cols.has(need)) return { ok: false, message: `CC Switch 数据库版本不兼容（providers 缺列 ${need}）` };
+    const missing = INSERT_COLS.filter((c) => !cols.has(c));
+    if (missing.length) {
+      return { ok: false, message: `CC Switch 数据库版本不兼容（providers 缺列：${missing.join("、")}），请升级 CC Switch 后重试` };
     }
 
     // 3) 组装并 upsert
@@ -213,9 +268,8 @@ function register({ appType, apiKey, model, port } = {}) {
       ).get(t, FIXED.claude, FIXED.codex);
       const sortIndex = Number((maxRow && maxRow.m) || 0) + 1;
       db.prepare(
-        `INSERT INTO providers
-           (id, app_type, name, settings_config, website_url, category, created_at, sort_index, notes, icon, icon_color, meta, is_current, in_failover_queue)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO providers (${INSERT_COLS.join(", ")})
+         VALUES (${INSERT_COLS.map(() => "?").join(", ")})`
       ).run(
         FIXED[t], t, name, settings, "https://github.com/HUIdada1/AgentHub", "custom",
         now, sortIndex, notes, ICONS[t].icon, ICONS[t].iconColor, meta, "0", "0"
