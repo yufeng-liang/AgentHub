@@ -279,6 +279,8 @@ export interface ProxyConfig {
   checkinAuto: boolean;
   /** 每日自动签到时间（HH:mm） */
   checkinAutoTime: string;
+  /** 生态接入默认模型（注册进 CC Switch 时使用，缺省取 fallbackModel） */
+  ccSwitchModel: string;
 }
 
 // ===== 反代网关：数据结构（跟 electron/backend/proxy/* 返回一一对应） =====
@@ -302,6 +304,28 @@ export interface ProxyKeyRow {
   todayTokens: number;
   /** 完整 Key（后端 DPAPI 解密后随列表返回，供随时查看 / 复制；旧版本创建的 Key 无存档则为空） */
   secret?: string;
+}
+
+// ===== 反代网关：生态接入（CC Switch） =====
+export interface CcSwitchEntry {
+  appType: "claude" | "codex";
+  registered: boolean;
+  name?: string;
+}
+export interface CcSwitchStatus {
+  installed: boolean;
+  /** 库在但 providers 表缺失等异常（按未注册展示，注册时会被更准确的报错拦截） */
+  incompatible?: boolean;
+  dbPath?: string;
+  entries?: CcSwitchEntry[];
+}
+export interface CcSwitchRegisterResult {
+  ok?: boolean;
+  action?: "inserted" | "updated";
+  backupPath?: string;
+  dbPath?: string;
+  appType?: "claude" | "codex";
+  message?: string;
 }
 
 export interface ProxyAccount {
@@ -531,6 +555,7 @@ export const MODULES: ModuleDef[] = [
       { id: "models", name: "模型目录" },
       { id: "stats", name: "用量统计" },
       { id: "poolsync", name: "号池同步" },
+      { id: "ccswitch", name: "生态接入" },
     ],
   },
 ];
