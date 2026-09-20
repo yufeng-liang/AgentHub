@@ -129,6 +129,12 @@ CC Switch（farion1231/cc-switch）管理 Claude Code / Codex 的应用配置并
   - 内容：CC Switch 安装状态徽标（未安装 → 提示去装 CC Switch）；Claude Code / Codex 两个注册按钮（busy 态）；API Key 下拉（复用 `proxyKeysList()`，无 Key 时引导去 API Keys 页生成）；**默认模型输入**（存 `app.config.proxy.ccSwitchModel`，缺省取 `fallbackModel`，注册时传入 register 的 model 参数，即 CC Switch Codex 配置的 model 字段）；
   - 成功文案：注册结果 + 备份路径 + 「重启 CC Switch 生效」。
 
+### UI 风格（与现有页一致）
+
+- 页面骨架按号池同步页（`src/views/proxy/ProxyPoolSyncView.vue`）同款约定：`<section class="page">` → `.page-head`（`.page-title` + `.page-sub` + `.page-actions`）→ `.page-body`；
+- 内容区用 `.card` 卡片（`.card-title` 标题、`.set-desc` 描述），状态用 `.tag` / `.tag-ok` / `.tag-warn`，按钮用 `.btn` / `.btn-primary`（注册按钮），次级信息用 `.kpis` / `.kpi` 或 `.mono`；
+- 全部走全局 CSS 变量（`var(--text-*)` / `var(--accent-*)` / `var(--line)` / `var(--r-*)`）与现有颜色语义，双主题（深/浅）跟随自动生效，不新造色值与布局；表单控件沿用系统既有风格（如 Key 下拉与 Api Keys 页一致）。
+
 ## 安全与错误处理
 
 - Key 只写入 CC Switch 自己库的 settings_config，不进 AgentHub 日志 / 前端不回显（注册后不返回 Key）；
