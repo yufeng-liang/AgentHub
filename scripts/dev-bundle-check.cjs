@@ -33,6 +33,17 @@ if (/seriesType:\s*"line"/.test(entryText)) fails.push("echarts 疑似仍在 ent
 // ===== 覆盖层级联顺序 =====
 // element.css 打进入口样式表，EP 组件样式一旦被挪进懒加载 chunk，就是运行时才注入 <head>：
 // 同特异性下后到者赢，覆盖层被静默反超（Task 3+4 之后真实发生过，字节位置检查看不见）。
+//
+// 判据是「特异性 + 注入顺序」，不是文件名启发式也不是选择器字面相等：
+//   1) 只认**同一主体**的选择器：懒块选择器的复合单元序列以我们的选择器结尾（可带额外祖先上下文）。
+//      字面「包含」但不等主体的（如 .el-dialog__header .el-icon 之于 .el-icon）作用在不同元素上，不比。
+//      单元键不区分后代 / 子代组合符（.a .b 与 .a > .b 视作同主体），这种成对的判定交给下面的特异性闸门。
+//   2) 违规要求懒块特异性 **<= 我们**：等特异性才是「后到者赢」的危险区；更低说明我们已经赢，
+//      报出来只会逼人去加重选择器（假阳性）；更高那是特异性问题，得靠 element.css 自己压过，不是顺序问题。
+//   3) 特异性按 CSS 计算规则算：#id / .class / [属性]（含 Vue 的 [data-v-*]）/ :伪类 记 b，类型与 ::伪元素
+//      记 c，:where() 整段记 0，:is() / :not() / :has() 取参数列表最大值，* 记 0。
+// 于是 .el-select-dropdown__item.is-selected 不会被 :where(.foo) .el-select-dropdown__item.is-selected
+// （0,3,0 > 0,2,0）或 [data-v-fake] .el-select-dropdown__item.is-selected（0,3,0）误判为被反超。
 function stripComments(css) {
   return css.replace(/\/\*[\s\S]*?\*\//g, "");
 }
@@ -40,6 +51,164 @@ function stripComments(css) {
 /** 选择器文本归一化：折叠空白、去掉逗号两侧空格，便于逐字比较 */
 function normSel(s) {
   return s.replace(/\s+/g, " ").replace(/\s*,\s*/g, ",").trim();
+}
+
+/** 选择器 → 复合单元序列：按顶层空白与 > + ~ 切开，括号/方括号/引号内的不切 */
+function unitsOf(sel) {
+  const units = [];
+  let cur = "";
+  let depth = 0;
+  let quote = "";
+  const flush = () => {
+    const t = cur.trim();
+    if (t) units.push(t);
+    cur = "";
+  };
+  for (let i = 0; i < sel.length; i++) {
+    const ch = sel[i];
+    if (quote) {
+      cur += ch;
+      if (ch === "\\") cur += sel[++i] || "";
+      else if (ch === quote) quote = "";
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      cur += ch;
+      continue;
+    }
+    if (ch === "(" || ch === "[") depth++;
+    else if (ch === ")" || ch === "]") depth--;
+    if (depth === 0 && (ch === " " || ch === ">" || ch === "+" || ch === "~")) {
+      flush();
+      continue;
+    }
+    cur += ch;
+  }
+  flush();
+  return units;
+}
+
+/** 单元序列的规范键：单元文本各自折叠空白后按空格拼回 */
+function unitKey(units) {
+  return units.map((u) => u.replace(/\s+/g, "")).join(" ");
+}
+
+/** 特异性三元组 [id, 类/属性/伪类, 类型/伪元素] */
+function specificity(sel) {
+  const total = [0, 0, 0];
+  for (const u of unitsOf(normSel(sel))) {
+    const p = unitSpec(u);
+    total[0] += p[0];
+    total[1] += p[1];
+    total[2] += p[2];
+  }
+  return total;
+}
+
+function cmpSpec(a, b) {
+  return a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
+}
+
+const fmtSpec = (s) => `(${s.join(",")})`;
+
+/** 单个复合单元的特异性 */
+function unitSpec(u) {
+  const out = [0, 0, 0];
+  const n = u.length;
+  let i = 0;
+  const isNameCh = (c) => /[\w\-\\]|[\u00a0-\uffff]/.test(c);
+  const readIdent = () => {
+    const s = i;
+    while (i < n && isNameCh(u[i])) i++;
+    return u.slice(s, i);
+  };
+  // u[i] 处是 '(' ：返回括号内文本（嵌套与引号感知），i 停在右括号上交给主循环前移
+  const readArgs = () => {
+    let depth = 0;
+    let q = "";
+    const start = i + 1;
+    for (; i < n; i++) {
+      const c = u[i];
+      if (q) {
+        if (c === "\\") i++;
+        else if (c === q) q = "";
+        continue;
+      }
+      if (c === '"' || c === "'") q = c;
+      else if (c === "(") depth++;
+      else if (c === ")") {
+        depth--;
+        if (!depth) return u.slice(start, i);
+      }
+    }
+    return u.slice(start);
+  };
+  const skipBracket = () => {
+    let q = "";
+    for (; i < n; i++) {
+      const c = u[i];
+      if (q) {
+        if (c === "\\") i++;
+        else if (c === q) q = "";
+        continue;
+      }
+      if (c === '"' || c === "'") q = c;
+      else if (c === "]") return;
+    }
+  };
+  while (i < n) {
+    const ch = u[i];
+    if (ch === "#") {
+      i++;
+      readIdent();
+      out[0]++;
+    } else if (ch === ".") {
+      i++;
+      readIdent();
+      out[1]++;
+    } else if (ch === "[") {
+      i++;
+      skipBracket();
+      i++; // 跳过 ']'
+      out[1]++; // 属性选择器（含 Vue 的 [data-v-*]）记 1 个 b
+    } else if (ch === ":") {
+      if (u[i + 1] === ":") {
+        i += 2;
+        readIdent();
+        out[2]++; // 伪元素与类型选择器同档
+        continue;
+      }
+      i++;
+      const name = readIdent().toLowerCase();
+      if (u[i] === "(") {
+        const arg = readArgs();
+        if (name === "where") continue; // :where() 特异性 0
+        if (name === "is" || name === "not" || name === "has") {
+          let best = [0, 0, 0];
+          for (const inner of splitSelectors(arg)) {
+            const t = specificity(inner);
+            if (cmpSpec(t, best) > 0) best = t;
+          }
+          out[0] += best[0];
+          out[1] += best[1];
+          out[2] += best[2];
+        } else {
+          out[1]++; // :nth-child(2n) / :lang() 等按一个伪类计
+        }
+      } else if (name !== "where") {
+        out[1]++;
+      }
+    } else if (ch === "*") {
+      i++; // 通用选择器不贡献特异性
+    } else if (/[A-Za-z_]|[\u00a0-\uffff]/.test(ch)) {
+      readIdent();
+      out[2]++; // 类型选择器
+    } else {
+      i++; // ',' '|' 等
+    }
+  }
+  return out;
 }
 
 /** 逗号拆分选择器组：括号内的逗号（:is(a,b)）不拆 */
@@ -111,26 +280,53 @@ function leafRules(css) {
 }
 
 // 我方覆盖层：src/styles/element.css 顶层规则（@ 块内语境外不同，不参与）
+// bySuffix 按「复合单元序列键」索引，懒块写法可能给我们的选择器加祖先上下文
 const overrides = new Map();
+const bySuffix = new Map();
+
+/** 累积某选择器在我们覆盖层里声明的属性，并登记它的特异性与单元键 */
+function addOverride(sel, props) {
+  let e = overrides.get(sel);
+  if (!e) {
+    e = { sel, props: new Set(), spec: specificity(sel), key: unitKey(unitsOf(sel)) };
+    overrides.set(sel, e);
+    if (!bySuffix.has(e.key)) bySuffix.set(e.key, []);
+    bySuffix.get(e.key).push(e);
+  }
+  for (const p of props) e.props.add(p);
+}
+
 for (const r of leafRules(stripComments(fs.readFileSync(path.join(ROOT, "src", "styles", "element.css"), "utf8")))) {
   if (r.sel.startsWith("@") || r.atContext.includes("@")) continue;
   const props = declProps(r.body);
-  for (const sel of splitSelectors(r.sel)) {
-    if (!overrides.has(sel)) overrides.set(sel, new Set());
-    for (const p of props) overrides.get(sel).add(p);
-  }
+  for (const sel of splitSelectors(r.sel)) addOverride(sel, props);
 }
 
 const collisions = [];
+const reported = new Set();
 for (const f of css) {
   if (f === entrySheet || "assets/" + f === entrySheet) continue; // 入口表在 element.css 之前，本来就该赢
   for (const r of leafRules(stripComments(fs.readFileSync(path.join(assets, f), "utf8")))) {
     if (r.sel.startsWith("@") || /keyframes/i.test(r.atContext)) continue;
+    const props = declProps(r.body);
     for (const sel of splitSelectors(r.sel)) {
-      const mine = overrides.get(sel);
-      if (!mine) continue;
-      const stolen = [...declProps(r.body)].filter((p) => mine.has(p)).sort();
-      if (stolen.length) collisions.push(`覆盖层 ${sel} 被 ${f} 重申，抢回 ${stolen.join(", ")}`);
+      const units = unitsOf(sel);
+      const lateSpec = specificity(sel);
+      // 只比同一主体：懒块选择器的单元序列以我们的选择器结尾（前缀是额外的祖先上下文）
+      for (let cut = 0; cut < units.length; cut++) {
+        const list = bySuffix.get(unitKey(units.slice(cut)));
+        if (!list) continue;
+        for (const ours of list) {
+          if (cmpSpec(lateSpec, ours.spec) > 0) continue; // 更高特异性是特异性问题，不是注入顺序被反超
+          const stolen = [...props].filter((p) => ours.props.has(p)).sort();
+          if (!stolen.length) continue;
+          const dedupe = ours.sel + "|" + f + "|" + sel + "|" + stolen.join(",");
+          if (reported.has(dedupe)) continue;
+          reported.add(dedupe);
+          const note = sel === ours.sel ? "" : `（懒块写法 ${sel} ${fmtSpec(lateSpec)}，我们 ${fmtSpec(ours.spec)}）`;
+          collisions.push(`覆盖层 ${ours.sel} 被 ${f} 重申${note}，抢回 ${stolen.join(", ")}`);
+        }
+      }
     }
   }
 }
