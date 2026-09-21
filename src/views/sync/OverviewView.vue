@@ -211,18 +211,20 @@ function showSettings() {
 </template>
 
 <style scoped>
-/* 图表块异步后，pending 期不渲染任何有高度的节点，而这张卡的高度全长在组件内部
-   （卡体的 padding/border 在 sync.css，图高在 TrendChart 自己的 scoped CSS，两者都随块晚到）。
+/* 图表块异步后，pending 期整个 TrendChart 模板（连卡体节点一起）不渲染，这里只剩零高度的注释节点，
+   不预留就会先塌陷再回填一次，把下方「各电脑用量构成」顶回去。卡体样式（.sync-scope .card 的
+   padding/border/margin）在 sync.css、随 entry 立即注入；只有图高 .trend-chart{height:320px} 在
+   TrendChart 自己的 scoped CSS、随该异步块晚到——预留补的是「组件整体尚未挂载」这段，不是补 CSS。
    预留值按组件挂载后真实占据的 border-box 高度算（全局 * { box-sizing: border-box }）：
      18   卡上内边距      sync.css:1154
-     34   卡头            sync.css:1182 flex 不换行，最高子项是 .tabs：
-                          24(.tab 高 --ctl-h-sm，sync.css:1217) + 3×2 内边距 + 1×2 边框
+     32   卡头            sync.css:1182 flex 不换行，最高子项是 .tabs（.tabs 自身不声明 height）：
+                          24(.tab 高 --ctl-h-sm，sync.css:1217) + 3×2 内边距 + 1×2 边框 = 32
      16   卡头下边距      sync.css:1185
     320   图高            TrendChart.vue:306 的 scoped .trend-chart 覆盖 sync.css:1298 的 300
                           （特异性同为 (0,2,0)，它的样式表随块更晚注入，故后者胜出）
      18   卡下内边距      sync.css:1154
       2   上下各 1px 边框  sync.css:1152
-   = 408px。不含卡片自身的 margin-bottom:18：按 CSS 2.1 §8.3.1，父层无下内边距、无下边框且
+   = 406px（min-height 取 408 = 406 + 2 余量）。不含卡片自身的 margin-bottom:18：按 CSS 2.1 §8.3.1，父层无下内边距、无下边框且
    height 仍为 auto 时子元素下边距穿透塌陷（min-height 不阻断塌陷），它会与相邻
    .device-breakdowns 的 margin-top:18 折叠成同一个 18，于是预留后的排布与「未异步」时一致。
    用 min-height 而非 height：真实渲染更高（卡头文案换行等）时只撑开、不裁切。 */

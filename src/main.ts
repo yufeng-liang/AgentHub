@@ -5,7 +5,7 @@ import "element-plus/es/components/message-box/style/css";
 // dark css-vars 绑定 html.dark，须在 element.css 之前引入，让项目主题变量赢
 import "element-plus/theme-chalk/dark/css-vars.css";
 import App from "./App.vue";
-import "./assets/phosphor/style.css";
+import "./assets/phosphor/phosphor-used.css";
 import "./styles/global.css";
 import "./styles/skills.css";
 import "./styles/sync.css";

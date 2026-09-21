@@ -317,43 +317,6 @@ html[data-theme="light"] .el-select__wrapper:hover {
   font-family: var(--font-ui);
 }
 
-/* ---------- 表格：透明底 + 发丝线，密度对齐 .tbl ---------- */
-.el-table {
-  --el-table-bg-color: transparent;
-  --el-table-tr-bg-color: transparent;
-  --el-table-header-bg-color: transparent;
-  --el-table-border-color: var(--line);
-  --el-table-header-text-color: var(--text-3);
-  --el-table-text-color: var(--text);
-  --el-table-row-hover-bg-color: rgba(255, 255, 255, 0.025);
-  font-size: 11.5px;
-}
-html[data-theme="light"] .el-table {
-  --el-table-row-hover-bg-color: rgba(15, 23, 42, 0.025);
-}
-/* 表格自带的外框线会跟容器边框打架 */
-.el-table__inner-wrapper::before,
-.el-table::before {
-  display: none;
-}
-.el-table th.el-table__cell {
-  font-size: 10.5px;
-  font-weight: 600;
-  padding: 8px 0;
-  border-bottom: 1px solid var(--line-strong);
-}
-.el-table td.el-table__cell {
-  padding: 8px 0;
-  border-bottom: 1px solid var(--line);
-}
-.el-table .cell {
-  padding: 0 10px;
-  line-height: 1.5;
-}
-.el-table tr:last-child td.el-table__cell {
-  border-bottom: none;
-}
-
 /* ---------- 标签：胶囊 + 五档语义色（对齐 tag-ok / warn / err / info / dim） ---------- */
 .el-tag {
   height: auto;
