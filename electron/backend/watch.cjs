@@ -4,6 +4,7 @@
 // 有冲突绝不替人裁决，只托盘提醒
 "use strict";
 const fs = require("node:fs");
+const fsp = require("node:fs/promises");
 const path = require("node:path");
 const config = require("./config.cjs");
 const adapter = require("./adapter.cjs");
@@ -17,22 +18,23 @@ let baseline = ""; // 已对过账的快照
 let pending = "";  // 刚变化、还没确认稳定的快照
 let lastScanAt = 0;
 let busy = false;
+let ticking = false; // 重入闸：fingerprint 异步化后跨拍可能重叠，两个 handle 并发会重复收纳
 let onEvent = null; // main.cjs 挂的桌面通知回调
 
-function fingerprint(cfg) {
+async function fingerprint(cfg) {
   const parts = [];
   for (const t of adapter.resolveScanTargets(cfg)) {
     const list = [];
     let entries;
     try {
-      entries = fs.readdirSync(t.dir, { withFileTypes: true });
+      entries = await fsp.readdir(t.dir, { withFileTypes: true });
     } catch {
       continue;
     }
     for (const e of entries) {
       let st;
       try {
-        st = fs.lstatSync(path.join(t.dir, e.name));
+        st = await fsp.lstat(path.join(t.dir, e.name));
       } catch {
         continue;
       }
@@ -42,7 +44,7 @@ function fingerprint(cfg) {
       let extra = "";
       if (kind === "d") {
         try {
-          const sm = fs.statSync(path.join(t.dir, e.name, "SKILL.md"));
+          const sm = await fsp.stat(path.join(t.dir, e.name, "SKILL.md"));
           extra = `${Math.round(sm.mtimeMs)}:${sm.size}`;
         } catch { /* 无 SKILL.md 或读不到 */ }
       }
@@ -87,17 +89,18 @@ function handle(cfg, fp) {
   }
 }
 
-function tick() {
+async function tick() {
   lastScanAt = Date.now();
+  if (ticking || busy) return; // await 引入后可能跨拍重叠，必须闸住
+  ticking = true;
   try {
-    if (busy) return;
     const cfg = config.loadConfig();
     if (!(cfg.watch && cfg.watch.enabled)) {
       baseline = "";
       pending = "";
       return;
     }
-    const fp = fingerprint(cfg);
+    const fp = await fingerprint(cfg);
     if (!baseline) {
       baseline = fp; // 启动留基线，不立刻把历史存货收走
       return;
@@ -113,6 +116,8 @@ function tick() {
     pending = fp;
   } catch {
     /* 感知异常静默，下一拍重试 */
+  } finally {
+    ticking = false;
   }
 }
 
