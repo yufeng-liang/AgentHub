@@ -25,6 +25,9 @@ app.setName("AgentHub");
 let mainWindow = null;
 let tray = null;
 let quitting = false;
+// 「跳到软件更新卡片」是一次性待办：窗口销毁态下 send 过去没有监听者（App.vue 的 app:event
+// 监听在渲染层挂载后才注册），所以先记账，等那个窗口的 did-finish-load 补投，投完即清
+let pendingFocusUpdate = false;
 
 /** 资源目录：打包后为 process.resourcesPath 的相邻 build，开发时为项目 build/ */
 function buildDir() {
@@ -97,7 +100,10 @@ function createWindow() {
     mainWindow.show();
   };
   mainWindow.once("ready-to-show", reveal);
-  mainWindow.webContents.once("did-finish-load", reveal);
+  mainWindow.webContents.once("did-finish-load", () => {
+    reveal();
+    deliverFocusUpdate(true); // 页面已解析完，监听者就位，补投待办
+  });
 
   // 窗口尺寸变化 / 页面（重）载入后按当前宽度重算缩放
   applyViewportZoom();
@@ -218,7 +224,7 @@ function buildTrayMenu() {
   ];
   const st = updater.getStatus();
   if (st.status === "available" || st.status === "downloaded") {
-    items.push({ label: `发现新版本 v${st.latestVersion} →`, click: () => { showWindow(); focusSettingsUpdate(); } });
+    items.push({ label: `发现新版本 v${st.latestVersion} →`, click: focusSettingsUpdate });
     items.push({ type: "separator" });
   }
   items.push(
@@ -240,13 +246,29 @@ function buildTrayMenu() {
   return Menu.buildFromTemplate(items);
 }
 
-/** 新版本提示点击 → 打开配置中心 · 通用并定位到「软件更新」卡片 */
+/** 新版本提示点击（托盘条目与桌面通知共用）→ 打开主界面并定位到「软件更新」卡片 */
 function focusSettingsUpdate() {
+  pendingFocusUpdate = true;
+  showWindow();
+  deliverFocusUpdate();
+}
+
+/**
+ * 销账式投递：投成功才清待办。
+ * fromLoadFinished 是由那一次 did-finish-load 触发的补投——此刻渲染层监听者已就位；
+ * 别用 isLoadingMainFrame() 当就绪判据，它在 did-finish-load 之后仍为 true（本机探针实测：
+ * 用它做闸，补投这一路永远 return，销毁态点通知就是 0 次送达）。
+ */
+function deliverFocusUpdate(fromLoadFinished) {
+  if (!pendingFocusUpdate) return;
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (!fromLoadFinished && mainWindow.webContents.isLoadingMainFrame()) return;
   try {
-    for (const win of BrowserWindow.getAllWindows()) {
-      if (!win.isDestroyed()) win.webContents.send("app:event", { event: "focus-update" });
-    }
-  } catch { /* 无窗口就算了 */ }
+    mainWindow.webContents.send("app:event", { event: "focus-update" });
+    pendingFocusUpdate = false;
+  } catch {
+    /* 窗口刚好没了：待办留着，下次载入完成再补 */
+  }
 }
 
 function refreshTrayMenu() {
@@ -362,7 +384,7 @@ if (!gotLock) {
     scheduler.start();
     usageScheduler.start();
     watch.start();
-    updater.init({ onShowWindow: showWindow, onTrayRefresh: refreshTrayMenu });
+    updater.init({ onShowWindow: showWindow, onTrayRefresh: refreshTrayMenu, onFocusUpdate: focusSettingsUpdate });
 
     // 依据配置启用开机自启（便携版不支持：注册的会是临时解压副本路径，退出即失效）。
     // 开关唯一来源是框架配置（设置 · 通用 · 应用行为），用量模块旧配置字段不再参与
