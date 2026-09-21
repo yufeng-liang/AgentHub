@@ -19,7 +19,7 @@
 - 类型检查与构建的唯一入口是 `npm run build`（= `vue-tsc --noEmit && vite build`）。**每个任务改完必跑**；体积结论一律从 `dist/assets/` 实际文件量出来，不看构建退出码。
 - 框架配置新增字段必须同步四处，缺一处就静默不一致：`electron/backend/config.cjs:122-129` 的 `defaultConfig().schedule`、`src/types/index.ts:232-239`、`src/stores/app.ts:20`、`src/api/mock.ts:37`。`src/types/sync.ts:192` 与 `src/stores/sync.ts:50` 是**用量模块自己的 schedule**，与框架配置无关，不要动。
 - CSS 引入顺序约束（`src/main.ts:6` 注释）：EP 基础样式 → `theme-chalk/dark/css-vars.css` → 项目 `styles/element.css`。`element.css` 靠 `html.dark` 变量块盖住 EP，顺序颠倒深色主题整体跑偏。
-- 打包前先杀运行中的 AgentHub（含 `%TEMP%` 便携版解出的子进程），否则 electron-builder 卡文件锁。
+- 打包前杀掉**会锁住 `release\win-unpacked` 的实例**（含 `%TEMP%` 便携版解出的子进程），否则 electron-builder 卡文件锁。注意用户日常使用的那份装在 `H:\AgentHub`，不占仓库产物，**不要杀它**；真撞上报文件锁就停下报告，别用终止用户进程的方式绕过。
 - 临时/探针文件只写在 `tmp/` 下（`.gitignore:41` 已排除）。**不得**把 `%APPDATA%\AgentHub` 的真实库文件拷进仓库。
 - PowerShell 脚本落 `.ps1` 用 `-File` 跑，内容保持纯 ASCII（PS 5.1 按 GBK 解无 BOM 的 UTF-8，中文注释会吞掉后面的换行）。
 
@@ -46,9 +46,9 @@ Expected: 打印 ws 版本号（Vite 4 的 HMR 依赖它，通常已在 `node_mo
 ```bash
 npm run electron:pack
 ```
-Expected: 产出 `release/win-unpacked/AgentHub.exe`。**打包前务必先杀掉运行中的 AgentHub**（含 `%TEMP%` 便携版子进程），否则 electron-builder 会卡在文件锁上。
+Expected: 产出 `release/win-unpacked/AgentHub.exe`。**打包会锁文件的只是 `release\win-unpacked` 下自己跑起来的实例**——用户日常使用的那份装在 `H:\AgentHub`，不占仓库产物，**不要去杀它**；只清理本仓库 `release\` 下残留的进程，真的撞上报文件锁就停下报告。
 
-`scripts/dev-first-paint-check.cjs`：用 `--remote-debugging-port` 起打包版、把 userData 指到临时目录（绕开单实例锁，不动真实配置），连 CDP 读页面计时。三个数都取自 Navigation Timing / Paint Timing，**加载完成后一次性读取，不需要在加载前注入**，因此没有竞态：
+`scripts/dev-first-paint-check.cjs`：用 `--remote-debugging-port` 起打包版、把 userData 指到临时目录（绕开单实例锁，不动真实配置），连 CDP 读页面计时。**注意：下面这段是立项初稿，已提交版本经评审修了四处**（调试端口改 `0` 并只读本 run 的 `DevToolsActivePort`；`evaluate` 补 close/超时/parse 保护；空导航或 `load===0` 的样本一律拒收；产物轴 `dist/assets/*.js` 计数与首屏 DOM 轴分开打印）。**以仓库里的文件为准，不要照抄本段重新生成**——照抄会把两条"打印一个像样的数然后退出码 0"的静默失效路径装回去。这段留着只说明测量口径：三个数取自 Navigation Timing / Paint Timing，加载完成后读取、无需加载前注入；FCP 因窗口 `show:false` 会晚于 `load` 才出现，实现里轮询到可用样本为止。
 
 ```js
 // 首屏耗时基线/回归测量：起打包版 Electron（userData 重定向，不碰真实实例），
@@ -914,14 +914,14 @@ Expected: 打印 `OK entry … KB · CSS … KB · … 个 JS chunk`。**把三�
 - [ ] **Step 2: 首屏耗时复测（对比 Task 0 基线）**
 
 ```bash
-npm run electron:pack   # 先杀运行中的 AgentHub
+npm run electron:pack   # 只清理 release\win-unpacked 下自己起的实例；用户装在 H:\AgentHub 的那份不要动
 node scripts/dev-first-paint-check.cjs
 ```
-Expected: 同一脚本、同一测量口径下，`DOMContentLoaded` 与 `load` 两个数**都要低于 Task 0 记录的基线**，且脚本打印的 **`dist JS 文件` 计数从 1 变成 15+**。后者是产物轴——打包版走 `file://`，Resource Timing 结构性为空，运行时 DOM 里的 `script` 数只数初始文档、数不到按需 chunk，所以 chunk 数只能从 `dist/assets` 数出来。FCP 受机器抖动影响最大，单次差值不作为判据；若 FCP 反而变高，多跑三次取中位再下结论。把这一行输出与基线并排记进执行报告——规格 §4.1 的「销毁窗口不掉体验」全靠这两个数的对比撑住，没有它就是口头承诺。
+Expected: 同一脚本、同一测量口径下，`DOMContentLoaded` 与 `load` 两个数**都要低于 Task 0 记录的基线**，且脚本打印的 **`dist JS 文件` 计数从 1 变成 15+**。后者是产物轴——打包版走 `file://`，Resource Timing 结构性为空，运行时 DOM 里的 `script` 数只数初始文档、数不到按需 chunk，所以 chunk 数只能从 `dist/assets` 数出来。FCP 受机器抖动影响最大——Task 0 的修复轮实测同日串行样本跨 1404–2888 ms（并发跑更高到 3650 ms），**它只能当参考量，判据用 DCL / load 与产物计数**；每次测都严格串行、≥3 次取中位，与 Task 0 的采样方式对齐，否则任何结论都是噪声。把这一行输出与基线并排记进执行报告——规格 §4.1 的「销毁窗口不掉体验」全靠这两个数的对比撑住，没有它就是口头承诺。
 
 - [ ] **Step 3: 关窗内存实测**
 
-先 `npm run electron:pack` 出 `release/win-unpacked`（**打包前杀掉运行中的 AgentHub**，含 `%TEMP%` 里的便携版子进程）。启动它，打开一次「用量统计 · 总览」让重页面挂载过，点关闭按钮，然后采私有内存：
+先 `npm run electron:pack` 出 `release/win-unpacked`（只清理 `release\win-unpacked` 下自己起过的实例；用户装在 `H:\AgentHub` 的那份不要动）。启动它，打开一次「用量统计 · 总览」让重页面挂载过，点关闭按钮，然后采私有内存：
 
 ```bash
 powershell -NoProfile -ExecutionPolicy Bypass -File tmp/gateway-probe/memtree.ps1
