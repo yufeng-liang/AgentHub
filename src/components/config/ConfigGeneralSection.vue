@@ -313,7 +313,7 @@ onUnmounted(() => {
       <div class="set-row">
         <div class="set-info">
           <div class="set-name">启动不打开主界面</div>
-          <div class="set-desc">开机后直接缩在托盘，需要时点托盘图标或菜单「显示主界面」再打开</div>
+          <div class="set-desc">开机后直接缩在托盘，需要时点托盘图标或菜单「显示主界面」再打开（下次启动生效）</div>
         </div>
         <el-switch v-model="app.config.schedule.launchHidden" :disabled="!app.config.schedule.minimizeToTray" @change="toggleAppBehavior" />
       </div>

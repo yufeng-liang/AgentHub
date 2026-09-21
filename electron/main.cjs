@@ -120,7 +120,9 @@ function createWindow() {
 }
 
 function showWindow() {
-  if (!mainWindow) {
+  // destroy() 与 closed（置 null）不在同一个消息循环批次里：这中间的托盘双击 / second-instance
+  // 会拿到「非 null 但已销毁」的窗口，show() 直接抛 Object has been destroyed（主进程未捕获 → 进程退出）
+  if (!mainWindow || mainWindow.isDestroyed()) {
     createWindow();
   } else {
     mainWindow.show();
