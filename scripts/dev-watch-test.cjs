@@ -78,15 +78,19 @@ function legacyFingerprint() {
 }
 
 (async () => {
-  // 1) 形态：改造后必须返回 Promise（改造前这一条就该红）
-  assert.ok(types.isPromise(watch.fingerprint({})), "fingerprint 应已改为返回 Promise");
-  // 2) 逐字节等价于旧同步实现
-  const fp = await watch.fingerprint({});
-  assert.strictEqual(fp, legacyFingerprint());
-  // 3) 读不到的目标目录整块跳过
-  assert.ok(!fp.includes("gone"), "不存在的目标目录不应进入快照");
-  // 4) 纯内容编辑可感知：SKILL.md 变长后快照必须变
-  fs.writeFileSync(path.join(trae, "skill-a", "SKILL.md"), "# a longer");
-  assert.notStrictEqual(await watch.fingerprint({}), fp, "SKILL.md 内容变化必须反映到快照");
-  console.log("OK watch fingerprint 异步化断言全通过");
+  try {
+    // 1) 形态：改造后必须返回 Promise（改造前这一条就该红）
+    assert.ok(types.isPromise(watch.fingerprint({})), "fingerprint 应已改为返回 Promise");
+    // 2) 逐字节等价于旧同步实现
+    const fp = await watch.fingerprint({});
+    assert.strictEqual(fp, legacyFingerprint());
+    // 3) 读不到的目标目录整块跳过
+    assert.ok(!fp.includes("gone"), "不存在的目标目录不应进入快照");
+    // 4) 纯内容编辑可感知：SKILL.md 变长后快照必须变
+    fs.writeFileSync(path.join(trae, "skill-a", "SKILL.md"), "# a longer");
+    assert.notStrictEqual(await watch.fingerprint({}), fp, "SKILL.md 内容变化必须反映到快照");
+    console.log("OK watch fingerprint 异步化断言全通过");
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true }); // 与 dev-ccswitch-test.cjs 同口径，别在 %TEMP% 堆夹具
+  }
 })().catch((e) => { console.error(e); process.exit(1); });
