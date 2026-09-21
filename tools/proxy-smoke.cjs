@@ -22,7 +22,7 @@ async function main() {
   // 1. 数据库 + 种子
   store.open();
   console.log("db driver:", store.driver());
-  assert(store.listAgents().length === 3, "三渠道种子");
+  assert(store.listAgents().length === store.CHANNELS.length, "渠道种子数 = CHANNELS 数（4：trae/workbuddy/workbuddy_ai/raccoon）");
 
   // 2. Key 全链路
   const k = store.createKey({ name: "自测", route: "auto", dailyQuota: 10, rateLimit: 0 });
@@ -139,6 +139,28 @@ async function main() {
   assert(adapters.modelOwners("gpt-5").length === 1 && adapters.modelOwners("gpt-5")[0] === "workbuddy", "gpt-5 归属 CN workbuddy（AI 区目录已无此型号）");
   assert(adapters.modelOwners("deepseek-v4.1-flash").length === 1 && adapters.modelOwners("deepseek-v4.1-flash")[0] === "workbuddy_ai", "deepseek-v4.1-flash 归属国际版 workbuddy_ai");
   assert(adapters.modelOwners("deepseek-v4-flash")[0] === "trae", "单源模型归属");
+
+  // ===== 商汤小浣熊（raccoon 渠道）离线断言 =====
+  const rc = adapters.get("raccoon");
+  assert(rc && rc.id === "raccoon", "raccoon 适配器注册");
+  assert(store.CHANNELS.some((c) => c.id === "raccoon"), "store.CHANNELS 含 raccoon");
+  assert(adapters.modelOwners("raccoon-chat-ml-5-5")[0] === "raccoon", "raccoon-chat-ml-5-5 归属 raccoon");
+  assert(rc.mapModel("raccoon-chat") === "raccoon-chat-ml-5-5" && rc.mapModel("raccoon-chat-ml") === "raccoon-chat-ml-5-5", "raccoon 模型别名归一");
+  const rbody = rc.rewriteBody("raccoon-chat", { model: "raccoon-chat", conversation_id: "x", prompt_cache_key: "y", messages: [{ role: "user", content: "hi" }], temperature: 0.7 });
+  assert(rbody.model === "raccoon-chat-ml-5-5" && rbody.stream === true && rbody.stream_options.include_usage === true, "raccoon rewriteBody 强制流式+include_usage");
+  assert(!("conversation_id" in rbody) && !("prompt_cache_key" in rbody) && rbody.temperature === 0.7, "raccoon rewriteBody 剥内部字段、标准字段透传");
+  // 与桌面端共用 auth.json 的双向同步（掉登录根因修复）：
+  // ① refresh 端点专用头组不带 authorization（只凭 refresh_token，会话1 §1.3）；
+  // ② fetchModels 对 401 返回 authError 交由上层刷新重试，而非直接判失败；
+  // ③ 预刷新窗口贴官方 300s，避免每轮额度刷新都抢刷同一个 refresh_token
+  assert(rc.refreshWindowSec === 300, "raccoon 预刷新窗口 = 300s");
+  const raccoonAuth = require(path.join(__dirname, "..", "electron", "backend", "proxy", "raccoonAuth.cjs"));
+  assert(raccoonAuth.AUTH_KEYS.length === 3 && raccoonAuth.AUTH_KEYS.includes("refresh_token"), "raccoonAuth 凭据三键");
+  assert(typeof raccoonAuth.ownedTokens === "function" && typeof raccoonAuth.tokenUid === "function", "raccoonAuth 归属校验接口");
+  assert(raccoonAuth.ownedTokens("someone", "") === null || raccoonAuth.ownedTokens("someone", "") === undefined, "无本地文件时 ownedTokens 不认领");
+  const rcUid = raccoonAuth.tokenUid("x." + Buffer.from(JSON.stringify({ iss: "6f66ba", sid: "9a" })).toString("base64url") + ".y");
+  assert(rcUid === "6f66ba", "raccoonAuth.tokenUid 认 iss（与 scanRaccoon 同口径）");
+  console.log("raccoon adapter ok");
 
   // 6. 统计链路
   store.insertUsage({ reqId: "r1", keyId: k.id, keyName: "自测", channel: "trae", accountId: aid, accountName: "测试号", model: "deepseek-v4-flash", promptTokens: 10, completionTokens: 20, ttftMs: 100, latencyMs: 500, status: 200 });
