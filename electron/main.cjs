@@ -104,29 +104,32 @@ function createWindow() {
   mainWindow.on("resize", applyViewportZoom);
   mainWindow.webContents.on("did-finish-load", applyViewportZoom);
 
-  // 关闭 → 缩到托盘：liteOnClose 开时销毁窗口，连渲染进程与合成表面一起回收（实测省 261 MB），
-  // 关掉则只 hide()（重开更快）；托盘菜单「退出」才是真正退出，后台才能持续跑网关与定时同步
-  mainWindow.on("close", (e) => {
+  const thisWindow = mainWindow;
+
+  // 关闭 → 缩到托盘：liteOnClose 开时销毁窗口，连渲染进程与合成表面一起回收
+  // （一期打包版实测：同一次运行 424.86 → 215.47 MB 私有，−49.3%，4 进程降到 3），
+  // 关掉则只 hide()（重开更快）；托盘菜单「退出」才是真正退出，后台才能持续跑网关与定时同步。
+  // 两个处理器都只用 thisWindow：destroy() 不会再触发 close，无递归。
+  thisWindow.on("close", (e) => {
     const cfg = config.loadConfig();
     if (quitting || !cfg.schedule || !cfg.schedule.minimizeToTray) return;
     e.preventDefault();
-    if (cfg.schedule.liteOnClose) mainWindow.destroy();
-    else mainWindow.hide();
+    if (cfg.schedule.liteOnClose) thisWindow.destroy();
+    else thisWindow.hide();
   });
 
-  // 身份校验：destroy() 是否同步派发 closed 未经实测，两种可能的结论相反，所以按「两种都对」写——
-  // 迟到的 closed 只能抹掉它自己那个窗口。无条件置 null 时，A 的 closed 若晚于 B 创建，
-  // 指向存活 B 的 mainWindow 会被抹成 null，下次 showWindow 判「无窗口」再开一个 C：
-  // 界面叠两个窗口、UI 内存不降反升，托盘「显示主界面」每点一次多一个窗口。
-  const thisWindow = mainWindow;
+  // 身份校验：destroy() 是否同步派发 closed 本机实测判别不了（竞态探针在无校验版本上同样通过），
+  // 两种时序的结论相反，所以按「两种都对」写——迟到的 closed 只能抹掉它自己那个窗口。
   thisWindow.on("closed", () => {
     if (mainWindow === thisWindow) mainWindow = null;
   });
 }
 
 function showWindow() {
-  // destroy() 与 closed（置 null）不在同一个消息循环批次里：这中间的托盘双击 / second-instance
-  // 会拿到「非 null 但已销毁」的窗口，show() 直接抛 Object has been destroyed（主进程未捕获 → 进程退出）
+  // 两种派发时序下都安全：本机判别不了 destroy() 与 closed（置 null）是否同批
+  // （Task 7 §0c 的竞态探针在无身份校验的版本上同样通过），所以不主张任一时序为事实，
+  // 而是同时挡「null」与「非 null 但已销毁」两种落点——只挡 null 时，若 closed 还没跑，
+  // show() 会抛 Object has been destroyed（主进程未捕获 → 进程退出）。
   if (!mainWindow || mainWindow.isDestroyed()) {
     createWindow();
   } else {
@@ -351,7 +354,8 @@ if (!gotLock) {
     usagesync.setOnFinish(notifyUsageSync);
     // 反代网关：规则热加载 + 额度定时刷新 + 按配置自启网关服务（服务独立于窗口存续）
     proxy.boot();
-    // 启动即进托盘：首帧不建窗，GPU 侧连建窗残留都不产生（实测比"建过再销毁"再省约 39 MB）。
+    // 启动即进托盘：首帧不建窗，GPU 侧连建窗残留都不产生（一期打包版实测私有 166.05 MB / GPU 32.2，
+    // 对比「建过再销毁」的 215.47 MB，再省 49.42 MB）。
     // minimizeToTray 关时不生效 —— 那种配置下关窗就是退出，不该留一个没有界面的进程
     if (!(boot.schedule.launchHidden && boot.schedule.minimizeToTray)) createWindow();
     createTray();
