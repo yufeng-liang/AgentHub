@@ -1,6 +1,7 @@
 // 特征测试一：fingerprint 异步化后输出必须与旧同步实现逐字节一致 —— 快照差集决定自动
 // 收纳，语义变一个字符就会误收纳或漏收纳。
 // 特征测试二：tick 的重入闸确实拦住跨拍重叠（异步化新引入的风险，见断言 5）。
+// 特征测试三：stop() 作废"已经 await 出去、正挂着的那一拍"，start() 再放开（断言 6/7）。
 // 其余 require 全打桩，不碰真实配置目录。
 "use strict";
 const assert = require("node:assert");
@@ -36,8 +37,9 @@ function stub(name, exports) {
   m.exports = exports;
   require.cache[file] = m;
 }
-// 调用计数：断言 5 靠"扫描/规划/执行各被进入几次"观测重入闸的行为，
-// 这是本文件唯一一处耦合内部实现的地方，专为钉住闸门存在而写。
+// 调用计数：断言 5 靠"扫描/规划/执行各被进入几次"观测重入闸的行为，断言 6/7 靠 execs
+// 观测 stop() 之后挂起那一拍有没有真的走进 handle。
+// 这是本文件唯一一处耦合内部实现的地方，专为钉住闸门与停机作废而写。
 let scans = 0;
 let plans = 0;
 let execs = 0;
@@ -129,6 +131,40 @@ function legacyFingerprint() {
     await watch.tick(); // 闸门必须在上一拍结束后放开
     assert.strictEqual(scans, scansAfterGate + 1, "下一拍应照常扫描，否则感知被永久锁死");
     assert.strictEqual(execs, 1, "收敛拍不应再执行收纳");
+
+    // 6) stop() 必须作废"已经 await 出去、正挂着的那一拍"。异步化前一拍必然跑完，
+    //    before-quit 结构上碰不到在飞的扫描；现在 stop() 只清 timer，而 main.cjs:364-372
+    //    的 pendingInstall 分支 preventDefault 之后还会继续 pump 事件循环，resume 的这拍
+    //    照样能走到 handle() → executeSync 真搬文件 + onEvent 发桌面通知。
+    //    拦的是 stop() 置的标志，不是"timer 为空"——本文件的 tick() 全是直连调用、
+    //    从不 start()，`!timer` 恒为真会把每一拍都作废，断言 5 当场红（实测见报告）。
+    fs.mkdirSync(path.join(trae, "skill-d"), { recursive: true });
+    fs.writeFileSync(path.join(trae, "skill-d", "SKILL.md"), "# d");
+    await watch.tick(); // 前置拍：只记 pending（baseline 还是 skill-c 那一版）
+    assert.strictEqual(plans, 1, "前置拍只应记 pending，不应规划");
+    const execsBeforeStop = execs;
+    const suspended = watch.tick(); // 同步跑进 fingerprint，在第一个 await 处挂住
+    watch.stop();                   // 就在它挂着的时候停机
+    await suspended;
+    assert.strictEqual(
+      execs - execsBeforeStop,
+      0,
+      "stop() 后挂起中的那一拍必须作废，实到 " + (execs - execsBeforeStop) + " 次收纳"
+    );
+
+    // 7) start() 要清掉停机标志，否则重启感知后永远不干活；同时反证断言 6 的提前 return
+    //    没把 ticking 焊死（焊死了这拍进不去 fingerprint，增量会是 0 而不是 1）。
+    //    两拍之间磁盘不再变化，pending 仍等于当前快照，所以这一拍本来就该动作。
+    const execsBeforeStart = execs;
+    watch.start();
+    await watch.tick();
+    assert.strictEqual(
+      execs - execsBeforeStart,
+      1,
+      "start() 后应恢复动作，实到 " + (execs - execsBeforeStart) + " 次收纳"
+    );
+    watch.stop(); // 别把 15 秒的 timer 留在事件循环里
+
     console.log("OK watch fingerprint 异步化断言全通过");
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true }); // 与 dev-ccswitch-test.cjs 同口径，别在 %TEMP% 堆夹具
