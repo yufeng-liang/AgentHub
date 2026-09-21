@@ -78,7 +78,7 @@
 - 关窗后进程数 4 → 3（renderer 消失），且**同一次运行内**相对开着窗的私有内存降幅 **≥45%**（实测 424.86 → 215.47 MB，−49.3%；工作集 618.95 → 348.37，−43.7%）。
 - 无窗三进程合计 **≤220 MB，且 main 单列 ≤130 MB**（实测 215.47 / main 126.84）。拆出 main 这一条是刻意的：main 里驻着网关与两个 SQLite，与窗口无关，关窗路径回收不动它——它是二期的靶子，不该让一期的门为它失败或为它放行。
 - 原「150–200 MB」绝对区间**不由关窗路径达成，移交二期**：`launchHidden` 实测 166.05 MB 已在区间内，剩下那 49 MB 要靠把网关搬出 main（§五）才拿得到。
-- 托盘双击 / `second-instance` 都能重开，重开后各页正常；重开的首帧实测（同一实例内、缓存热）FCP 504 / 1880 ms、DCL 362–433 ms，优于冷启动，规格「销毁窗口不掉体验」由此撑住。
+- 重开路径：**`second-instance` 已实测通过**（3 次，同实例重开首帧 FCP 504/1880 ms、DCL 362–433 ms，均优于冷启动）；**托盘双击重开仍未验**——原生托盘在 CDP 之外，按 AGENTS.md 第三节也不许用合成鼠标点击，一期把它列为**待人工确认项**（`main.cjs` 里 `showWindow()` 六个调用点只实跑过 `:339` 那一个）。规格「销毁窗口不掉体验」目前只由 DCL/load 撑住，不含冷启动 FCP（实测 +19.6%，见 §4.3 注）。
 
 ### 4.2 后台扫描异步化（不改任何行为）
 
@@ -117,7 +117,7 @@
 **不需要** `HeatmapChart`——`Heatmap.vue` 是纯 DOM 格子（`:157-202`），完全不碰 echarts。`TooltipComponent` 内部已 `use(installAxisPointer)`，不必显式注册。全库无 `registerTheme`。
 `TrendChart.vue:15`/`CostTrendChart.vue:14` 的 `echarts.ECharts` 类型引用要转 `import type`，否则 `npm run build` 的 vue-tsc 会把整包重新拉回。
 
-**(d) Phosphor 子集。** `src/assets/phosphor/style.css`（82,758 B）定义 **1530** 个 `.ph.ph-*:before`，src 实际用到 **82** 个类名，加后端 `toolIcon()` 下发的 8 个（`electron/backend/*.cjs`：`ph-brain ph-code ph-command ph-folder-open ph-package ph-robot ph-sparkle ph-terminal-window`）共 **88** 个，CSS 侧做规则子集约 5 KB。`Phosphor.woff2` 147,380 B 的字形子集**推迟**：需要 `fontTools/pyftsubset`（本机有 Python 无 fontTools，不擅自装系统依赖），且字体文件是按需缓存的静态资源、不参与解析，收益只在安装体积上。
+**(d) Phosphor 子集。** `src/assets/phosphor/style.full.css`（82,758 B，Task 5 起从 `style.css` 改名以标清「全量参照表，不入库引用」）定义 **1530** 个 `.ph.ph-*:before`。实际用到多少：**Task 5 的实测并集是 83 个**，不是本节早先写的「82 个 src + 8 个后端 = 88」——那个 88 是我拍脑袋加出来的（src 静态扫描本身已含 82 个，后端 9 个字面量里除 `ph-airplane-tilt` 外全与 src 重合，并集只有 83）。生成器 `tools/gen-phosphor-subset.cjs` 现扫两个根（`src/` + `electron/backend/`）并在类名不在字体表时硬失败，`BACKEND_ICONS` 只作「扫描看不见的计算式图标名」的兜底。CSS 侧规则子集约 3.7 KB（压缩后实测净省 57 KB，见 §4.3 D1 归因）。`Phosphor.woff2` 147,380 B 的字形子集**推迟**：需要 `fontTools/pyftsubset`（本机有 Python 无 fontTools，不擅自装系统依赖），且字体文件是按需缓存的静态资源、不参与解析，收益只在安装体积上。
 
 **(e) 死重清理。** `src/api/ipc.ts:21` 无条件引 `mock.ts`(32.6 KB)、`src/api/sync.ts:7` 引 `sync-mock.ts`(26.4 KB)，仅 `dev:web` 浏览器预览用（`ipc.ts:49-50`）→ 约 58 KB 移出生产构建（改成浏览器回退分支里的动态 `import`）。`src/styles/element.css:320-355` 的 `.el-table` 整块删除（`<el-table` 全库零使用）。**`.el-textarea__inner` 不删**：它在 `:292`、`:301`、`:310` 是逗号选择器组的成员，删要拆组、收益不足 1 KB，风险与收益不成比例；`ProxyAgentsView.vue:885` 用的是原生 `<textarea>`，与 EP 那个类名无关，既不构成保留理由也不构成删除依据。
 
@@ -239,9 +239,9 @@
 只限于本次改动确实经过的文件：
 
 - `ph-radar`（`ConfigSkillsSection.vue:266`）、`ph-packages`（`SkillsHelpDialog.vue:56`）在字体表里不存在，现状即空白图标。子集化会让人误判为分包引起，一并纠正为已存在字形。
-- `src/assets/phosphor/style.css:4-7` 的 `@font-face` 声明了 `.woff`/`.ttf`/`.svg` 三个不存在于目录的文件，产物里仍留着这三条死 URL。子集重写时清掉。`font-display: block`（`:10`）改 `swap` 与否按首帧表现定，不作为本期目标。
+- `src/assets/phosphor/style.full.css:4-7` 的 `@font-face` 声明了 `.woff`/`.ttf`/`.svg` 三个不存在于目录的文件，产物里曾留着这三条死 URL —— Task 5 子集重写时已清掉。`font-display: block`（`:10`）**一期定案：不改 `swap`**，理由记录在此而非静默漂移：字体是本地产物（`file://` 读取，无网络往返），换 `swap` 只会让图标先空白再跳现、比现状更差；首帧实测 FCP +19.6% 由懒 chunk 的读盘+parse 解释（§4.1 注），与 `font-display` 无关，所以那条「按首帧表现定」的悬置条件已经用上并给出了结论。
 - `store.cjs:13-25` 的 `better-sqlite3` 回退分支是死代码（不在 `package.json` 依赖里）。二期中改 `store.cjs` 时顺手删。
-- `echarts` 在 `devDependencies` 且声明 `^5.4.3` 而实装 5.6.0；`Heatmap` 相关的历史注释若与实际不符一并订正。
+- `echarts` 在 `devDependencies` 且声明 `^5.4.3` 而实装 5.6.0 —— **一期定案：不动声明**。理由：实装版本由 lock 固定，改下限只影响将来的重装解析，且它不属于本期任何任务的改动面；本期已经实测过「`^5.4.3` 与 5.6.0 的按需安装集完全相同」（Task 2/3 用 `npm pack` 核对），所以这行既不是 bug 也没有回归风险，留给二期一并处理。`Heatmap` 的历史注释本期核实过：它不用 echarts，未动。
 - `main.cjs:328` 的 `second-instance` 忽略 argv，无法区分「点图标」与「重复启动带参数」，二期认领逻辑需要参数区分时补。
 
 ## 十、非目标

@@ -715,7 +715,7 @@ git commit -m "perf: 图标 CSS 子集化、mock 移出首屏、删 el-table 死
 - Create: `scripts/dev-config-lite-defaults-test.cjs`
 
 **Interfaces:**
-- Consumes: Task 4 之后重开窗口只解析首屏 chunk，销毁的代价已被压小；`showWindow()`（`main.cjs:121-128`）的 `if (!mainWindow) createWindow()` 重建路径**必须补 `isDestroyed()` 闸**——`destroy()`（close 处理器内）与置空 `mainWindow` 的 `closed` 不在同一轮消息循环，该窗口内落地的托盘点击/`second-instance` 会对已销毁实例 `show()` 抛 `Object has been destroyed`，主进程事件处理器内未捕获即整个进程退出（Task 6 round 1 修；同文件 `:56`/`:95` 早已带同款闸）
+- Consumes: Task 4 之后重开窗口只解析首屏 chunk，销毁的代价已被压小；`showWindow()`（`main.cjs:121-128`）的 `if (!mainWindow) createWindow()` 重建路径**必须补 `isDestroyed()` 闸**。`destroy()`（close 处理器内）与置空 `mainWindow` 的 `closed` 是否同轮派发，本机实测判别不了（Task 7 的竞态探针在无闸版本上同样通过）；但只要存在哪怕一瞬「非 null 而已销毁」，落在那一瞬的托盘点击/`second-instance` 就会对已销毁实例 `show()` 抛 `Object has been destroyed`，主进程事件处理器内未捕获即整个进程退出。所以闸按「两种时序都安全」写，不把任一种当结论（Task 6 round 1 落闸；同文件 `:56`/`:95` 早已带同款闸）
 - Produces: `config.schedule.liteOnClose: boolean`、`config.schedule.launchHidden: boolean`，主进程与渲染层同名同语义；网关代码零改动（`proxy/events.cjs:11-15` 无窗口时零次广播，`main.cjs:381` 的 `window-all-closed` 本就空实现）
 
 - [ ] **Step 1: 写失败的测试（存量配置补齐默认值）**
@@ -1004,4 +1004,4 @@ git commit -m "test: 固化首屏产物体积门槛与关窗内存验收"
 
 ## 完成定义
 
-一期算完成：Task 0-7 全部提交；Task 0 的基线与 Task 7 Step 1/2 的复测数字（体积门槛三数 + FCP/DCL/load）并排进过一次执行报告；关窗后按 **D7 更正后的判据**（4→3 进程、同一次运行相对降幅 ≥45%、无窗合计 ≤220 MB 且 main ≤130 MB）达成，且网关在无窗期仍应答；`launchHidden` 开与关两种启动方式都走过一遍，重开的**托盘双击**与 `second-instance` 两条路径都验过。**另有两条只能由用户本人跑的收尾**（要真实号池与凭据，子代理不得动用）：无窗期一次真补全 200 + 该请求重开后在「反代网关 · 用量统计」入库；`node tools/proxy-regress.cjs` 非隔离跑（覆盖 CN/AI 适配器余额聚合）。达成后再为规格 §五 出第二份实现计划。
+一期算完成：Task 0-7 全部提交；Task 0 的基线与 Task 7 Step 1/2 的复测数字（体积门槛三数 + FCP/DCL/load）并排进过一次执行报告；关窗后按 **D7 更正后的判据**（4→3 进程、同一次运行相对降幅 ≥45%、无窗合计 ≤220 MB 且 main ≤130 MB）达成，且网关在无窗期仍应答；`launchHidden` 开与关两种启动方式都走过一遍，重开的 `second-instance` 路径已实测；**托盘双击仍待人工**（原生托盘在 CDP 之外，合成鼠标点击被 AGENTS.md §三 禁过）——连同「无窗期一次真补全 + 入库」与 `proxy-regress` 非隔离跑一起，是本期明确交回用户的三项，未默默吞掉。达成后再为规格 §五 出第二份实现计划。
