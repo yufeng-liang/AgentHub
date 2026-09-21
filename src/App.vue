@@ -1,5 +1,7 @@
 <!-- 沐辉制作：AgentHub Agent中控台入口 -->
 <script setup lang="ts">
+import zhCn from "element-plus/es/locale/lang/zh-cn";
+import { ElConfigProvider } from "element-plus";
 import { onMounted, onUnmounted, ref, watch } from "vue";
 import { animate, stagger } from "motion-v";
 import { usePreferredReducedMotion } from "@vueuse/core";
@@ -539,6 +541,11 @@ const seen = (mod: string, page: string) => !!visited.value[`${mod}/${page}`];
 </script>
 
 <template>
+  <el-config-provider :locale="zhCn">
+  <!-- 全库唯一的 locale 注入点：按需注册后没有 app.use(ElementPlus, { locale }) 了，
+       el-date-picker 面板的月份/星期等内置文案全靠这里，删掉会静默回退英文。
+       provider 自身不渲染 DOM 节点（config-provider.mjs 直接 renderSlot default），
+       包一层不改变结构与 .app 的背景层叠。 -->
   <!-- 最底层：粒子尘场（z-index: -2）→ 随机涌动的液态色块 + 两团跟着光标游走的光池（z-index: -1），
        都在玻璃壳之下被折射出来；3D 球体作为氛围浮在主区右上的玻璃之下；
        最上面一层是颗粒质感。都不吃鼠标事件 -->
@@ -594,4 +601,5 @@ const seen = (mod: string, page: string) => !!visited.value[`${mod}/${page}`];
     <SkillsHelpDialog />
     <SettingsDialog />
   </div>
+  </el-config-provider>
 </template>
