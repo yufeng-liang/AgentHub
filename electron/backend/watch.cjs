@@ -3,7 +3,6 @@
 // 设计：零冲突零 error 的新收纳/挂载自动执行（覆盖删除全进回收站可还原）；
 // 有冲突绝不替人裁决，只托盘提醒
 "use strict";
-const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
 const config = require("./config.cjs");
