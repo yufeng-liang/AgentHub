@@ -63,14 +63,31 @@ function registeredName(r: CcSwitchRegisterResult) {
   return r.name || entry(r.appType as CcSwitchAppType)?.name || "AgentHub 网关";
 }
 
-async function refresh() {
+const refreshing = ref(false);
+const refreshTip = ref<"" | "ok" | "fail">("");
+
+async function refresh(): Promise<boolean> {
+  refreshing.value = true;
   try {
     st.value = await api.proxyCcSwitchStatus();
+    return true;
   } catch (e) {
     err.value = String((e as Error).message || e);
     // 失败也要结束「检测中」态：否则 st 恒为 null，卡片会永远停在检测中
     st.value = { installed: false };
+    return false;
+  } finally {
+    refreshing.value = false;
   }
+}
+
+/** 手动刷新的行内反馈：结果在按钮上短暂提示（进页/注册后的自动刷新不提示） */
+let refreshTipTimer: ReturnType<typeof setTimeout> | undefined;
+async function manualRefresh() {
+  const ok = await refresh();
+  refreshTip.value = ok ? "ok" : "fail";
+  clearTimeout(refreshTipTimer);
+  refreshTipTimer = setTimeout(() => (refreshTip.value = ""), 2000);
 }
 
 async function loadKeys() {
@@ -184,11 +201,19 @@ onMounted(() => {
       <div class="card">
         <div class="card-title">
           CC Switch 接入状态
-          <span class="right">
+          <span class="right" style="display: inline-flex; align-items: center; gap: 8px">
             <span v-if="!st" class="tag tag-dim">检测中…</span>
             <span v-else-if="!installed" class="tag tag-warn">未安装</span>
             <span v-else-if="incompatible" class="tag tag-warn">库异常</span>
             <span v-else class="tag tag-ok">已就绪</span>
+            <button
+              class="btn btn-sm"
+              :disabled="refreshing || !installed"
+              :title="installed ? '' : '未检测到 CC Switch，无状态可刷新'"
+              @click="manualRefresh"
+            >
+              {{ refreshing ? "刷新中…" : refreshTip === "ok" ? "已刷新" : refreshTip === "fail" ? "刷新失败" : "刷新状态" }}
+            </button>
           </span>
         </div>
         <div v-if="!st" class="set-desc">正在检测本机 CC Switch…</div>
