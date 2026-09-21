@@ -28,7 +28,7 @@ let currentCheckIsManual = false; // 手动检查时用户正看着页面，不�
 let timer = null;
 let showWindow = null;
 let onTrayRefresh = null; // 状态一变就刷新托盘菜单（更新提示条目随之出现/消失）
-let onFocusUpdate = null; // 通知点击的跳转交回主进程投递（窗口可能是新建的，这里 broadcast 会落空）
+let onFocusUpdate = null; // 通知点击的跳转交回主进程投递（销毁态下 getAllWindows() 是空的，自己 broadcast 投给空气）
 
 function isPortable() {
   if (process.env.PORTABLE_EXECUTABLE_DIR) return true;
