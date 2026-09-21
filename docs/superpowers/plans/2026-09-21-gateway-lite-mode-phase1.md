@@ -917,7 +917,7 @@ Expected: 打印 `OK entry … KB · CSS … KB · … 个 JS chunk`。**把三�
 npm run electron:pack   # 先杀运行中的 AgentHub
 node scripts/dev-first-paint-check.cjs
 ```
-Expected: 同一脚本、同一测量口径下，`DOMContentLoaded` 与 `load` 两个数**都要低于 Task 0 记录的基线**，且 `JS chunk` 计数从 1 变成 15+。FCP 受机器抖动影响最大，单次差值不作为判据；若 FCP 反而变高，多跑三次取中位再下结论。把这一行输出与基线并排记进执行报告——规格 §4.1 的「销毁窗口不掉体验」全靠这两个数的对比撑住，没有它就是口头承诺。
+Expected: 同一脚本、同一测量口径下，`DOMContentLoaded` 与 `load` 两个数**都要低于 Task 0 记录的基线**，且脚本打印的 **`dist JS 文件` 计数从 1 变成 15+**。后者是产物轴——打包版走 `file://`，Resource Timing 结构性为空，运行时 DOM 里的 `script` 数只数初始文档、数不到按需 chunk，所以 chunk 数只能从 `dist/assets` 数出来。FCP 受机器抖动影响最大，单次差值不作为判据；若 FCP 反而变高，多跑三次取中位再下结论。把这一行输出与基线并排记进执行报告——规格 §4.1 的「销毁窗口不掉体验」全靠这两个数的对比撑住，没有它就是口头承诺。
 
 - [ ] **Step 3: 关窗内存实测**
 
