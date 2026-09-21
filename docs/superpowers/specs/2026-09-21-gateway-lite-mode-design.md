@@ -110,14 +110,14 @@
 **不需要** `HeatmapChart`——`Heatmap.vue` 是纯 DOM 格子（`:157-202`），完全不碰 echarts。`TooltipComponent` 内部已 `use(installAxisPointer)`，不必显式注册。全库无 `registerTheme`。
 `TrendChart.vue:15`/`CostTrendChart.vue:14` 的 `echarts.ECharts` 类型引用要转 `import type`，否则 `npm run build` 的 vue-tsc 会把整包重新拉回。
 
-**(d) Phosphor 子集。** `src/assets/phosphor/style.css`（82,758 B）定义 **1530** 个 `.ph.ph-*:before`，src 实际用到 **82** 个类名，加后端 `toolIcon()` 下发的 8 个（`electron/backend/*.cjs`：`ph-brain ph-code ph-command ph-folder-open ph-package ph-robot ph-sparkle ph-terminal-window`）共 **88** 个子集。`Phosphor.woff2` 147,380 B 同步做字形子集。
+**(d) Phosphor 子集。** `src/assets/phosphor/style.css`（82,758 B）定义 **1530** 个 `.ph.ph-*:before`，src 实际用到 **82** 个类名，加后端 `toolIcon()` 下发的 8 个（`electron/backend/*.cjs`：`ph-brain ph-code ph-command ph-folder-open ph-package ph-robot ph-sparkle ph-terminal-window`）共 **88** 个，CSS 侧做规则子集约 5 KB。`Phosphor.woff2` 147,380 B 的字形子集**推迟**：需要 `fontTools/pyftsubset`（本机有 Python 无 fontTools，不擅自装系统依赖），且字体文件是按需缓存的静态资源、不参与解析，收益只在安装体积上。
 
-**(e) 死重清理。** `src/api/ipc.ts:21` 无条件引 `mock.ts`(32.6 KB)、`src/api/sync.ts:7` 引 `sync-mock.ts`(26.4 KB)，仅 `dev:web` 浏览器预览用（`ipc.ts:49-50`）→ 约 58 KB 移出生产构建。`src/styles/element.css:321-355` 的 `.el-table` 与 `.el-textarea` 规则对应的组件全库未使用，删。
+**(e) 死重清理。** `src/api/ipc.ts:21` 无条件引 `mock.ts`(32.6 KB)、`src/api/sync.ts:7` 引 `sync-mock.ts`(26.4 KB)，仅 `dev:web` 浏览器预览用（`ipc.ts:49-50`）→ 约 58 KB 移出生产构建（改成浏览器回退分支里的动态 `import`）。`src/styles/element.css:320-355` 的 `.el-table` 整块删除（`<el-table` 全库零使用）。**`.el-textarea__inner` 不删**：它在 `:292`、`:301`、`:310` 是逗号选择器组的成员，删要拆组、收益不足 1 KB，风险与收益不成比例；`ProxyAgentsView.vue:885` 用的是原生 `<textarea>`，与 EP 那个类名无关，既不构成保留理由也不构成删除依据。
 
 **(f) CSS 不能整文件延后的三处。** `sync.css`(72.3 KB) 与 `skills.css`(18.5 KB) 被常驻组件依赖：`SyncDialog.vue:51`、`ConfigDataSection.vue:146`、`ConfigUsageSection.vue:228`、`ConfigWebdavSection.vue:182,228` 根节点都带 `sync-scope`；`SkillsHelpDialog.vue` 全用 `sk-*`。`Heatmap.vue:190` 的 `.heat-tip` Teleport 到 body 且不受 scope 约束（`sync.css:3187`），`@keyframes` 也是全局规则。`element.css:526` 的 `.el-popper.glass-popper` 被壳用（`Sidebar.vue:285`）。→ 这两份 CSS 留在 entry，只按规则块瘦身，不做整文件懒加载。
 `main.ts:5-13` 的引入顺序约束（EP index.css → dark css-vars → phosphor → global → skills → sync → element，注释在 `:6`）**保持不动**：分包只影响 JS 与异步 chunk 自带 CSS，entry CSS 内部相对顺序不变。
 
-**验收**：首屏 JS ≤700 KB（现 2445 KB）、首屏 CSS ≤250 KB（现 584 KB）、echarts 不进 entry chunk。构建产物用 `dist/assets/` 文件名与字节数直接核，不看构建退出码。
+**验收**：首屏 entry JS 目标 ≤700 KB（现 2445 KB），回归门槛按 **800 KB** 硬失败（留机器与 tree-shaking 抖动余量）；entry CSS **≤320 KB**（现 584 KB）——250 KB 这个初值与本节自己的约束矛盾：`sync.css` 72 KB 与 `skills.css` 18 KB 必须留 entry（见下条 (f)），加按需 EP 约 140 KB、`global.css` 66 KB，地板价就在 310 KB 上下。echarts 不进 entry chunk。构建产物用 `dist/assets/` 文件名与字节数直接核，不看构建退出码。
 
 ## 五、二期设计：网关下沉独立进程
 
