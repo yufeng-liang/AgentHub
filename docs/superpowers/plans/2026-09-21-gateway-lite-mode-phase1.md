@@ -715,7 +715,7 @@ git commit -m "perf: 图标 CSS 子集化、mock 移出首屏、删 el-table 死
 - Create: `scripts/dev-config-lite-defaults-test.cjs`
 
 **Interfaces:**
-- Consumes: Task 4 之后重开窗口只解析首屏 chunk，销毁的代价已被压小；`showWindow()`（`main.cjs:121-128`）已有的 `if (!mainWindow) createWindow()` 重建路径不改
+- Consumes: Task 4 之后重开窗口只解析首屏 chunk，销毁的代价已被压小；`showWindow()`（`main.cjs:121-128`）的 `if (!mainWindow) createWindow()` 重建路径**必须补 `isDestroyed()` 闸**——`destroy()`（close 处理器内）与置空 `mainWindow` 的 `closed` 不在同一轮消息循环，该窗口内落地的托盘点击/`second-instance` 会对已销毁实例 `show()` 抛 `Object has been destroyed`，主进程事件处理器内未捕获即整个进程退出（Task 6 round 1 修；同文件 `:56`/`:95` 早已带同款闸）
 - Produces: `config.schedule.liteOnClose: boolean`、`config.schedule.launchHidden: boolean`，主进程与渲染层同名同语义；网关代码零改动（`proxy/events.cjs:11-15` 无窗口时零次广播，`main.cjs:381` 的 `window-all-closed` 本就空实现）
 
 - [ ] **Step 1: 写失败的测试（存量配置补齐默认值）**
@@ -738,11 +738,13 @@ const config = require(path.join(__dirname, "..", "electron", "backend", "config
 
 const dir = path.join(tmp, "AgentHub"); // dataDir() 的纯 Node 回退：APPDATA/AgentHub
 fs.mkdirSync(dir, { recursive: true });
+// 夹具刻意用「与默认值相反」的 theme / minimizeToTray：若写默认值，后两条断言在
+// mergeConfig 回归（默认盖掉磁盘值）下也照样通过，等于空断言。
 fs.writeFileSync(
   path.join(dir, "config.json"),
   JSON.stringify({
-    theme: "dark",
-    schedule: { minimizeToTray: true, autoStart: false, hourly: false, daily: false, dailyTime: "09:00", notifyOnSuccess: false },
+    theme: "light",
+    schedule: { minimizeToTray: false, autoStart: false, hourly: false, daily: false, dailyTime: "09:00", notifyOnSuccess: false },
   }),
   "utf8"
 );
@@ -750,8 +752,8 @@ fs.writeFileSync(
 const cfg = config.loadConfig();
 assert.strictEqual(cfg.schedule.liteOnClose, true, "老配置应补出 liteOnClose 默认 true");
 assert.strictEqual(cfg.schedule.launchHidden, false, "launchHidden 默认应为 false");
-assert.strictEqual(cfg.schedule.minimizeToTray, true, "用户已有值不能被默认值盖掉");
-assert.strictEqual(cfg.theme, "dark", "同层其它字段不受影响");
+assert.strictEqual(cfg.schedule.minimizeToTray, false, "用户已有值不能被默认值盖掉");
+assert.strictEqual(cfg.theme, "light", "同层其它字段不受影响");
 console.log("OK 配置深合并补齐新字段");
 ```
 
@@ -859,7 +861,7 @@ Expected: `OK 配置深合并补齐新字段`
       <div class="set-row">
         <div class="set-info">
           <div class="set-name">启动不打开主界面</div>
-          <div class="set-desc">开机后直接缩在托盘，需要时点托盘图标或菜单「显示主界面」再打开</div>
+          <div class="set-desc">开机后直接缩在托盘，需要时点托盘图标或菜单「显示主界面」再打开（下次启动生效）</div>
         </div>
         <el-switch v-model="app.config.schedule.launchHidden" :disabled="!app.config.schedule.minimizeToTray" @change="toggleAppBehavior" />
       </div>
