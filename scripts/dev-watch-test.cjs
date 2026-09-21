@@ -136,8 +136,8 @@ function legacyFingerprint() {
     //    before-quit 结构上碰不到在飞的扫描；现在 stop() 只清 timer，而 main.cjs:364-372
     //    的 pendingInstall 分支 preventDefault 之后还会继续 pump 事件循环，resume 的这拍
     //    照样能走到 handle() → executeSync 真搬文件 + onEvent 发桌面通知。
-    //    拦的是 stop() 置的标志，不是"timer 为空"——本文件的 tick() 全是直连调用、
-    //    从不 start()，`!timer` 恒为真会把每一拍都作废，断言 5 当场红（实测见报告）。
+    //    拦的是 stop() 置的标志，不是"timer 为空"——本文件断言 6/7 会真的 start()/stop()，
+    //    若以 `!timer` 作判据，stop 之后每一拍都作废，恢复拍（断言 6）当场红。
     fs.mkdirSync(path.join(trae, "skill-d"), { recursive: true });
     fs.writeFileSync(path.join(trae, "skill-d", "SKILL.md"), "# d");
     await watch.tick(); // 前置拍：只记 pending（baseline 还是 skill-c 那一版）
