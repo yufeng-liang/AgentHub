@@ -1,5 +1,5 @@
 // 扫 src/ 与 electron/backend/ 实际用到的 Phosphor 类名，生成只含这些字形
-// 规则的 CSS（全量 1530 条 / 82 KB，实际用 88 条）。用法：
+// 规则的 CSS（全量 1530 条 / 82 KB，实际用 83 条）。用法：
 //   node tools/gen-phosphor-subset.cjs        # 生成 phosphor-used.css
 // 图标集合变化后重跑即可；扫到字体表里不存在的类名会直接失败退出，不静默丢。
 "use strict";

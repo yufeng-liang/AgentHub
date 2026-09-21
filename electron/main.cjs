@@ -114,8 +114,13 @@ function createWindow() {
     else mainWindow.hide();
   });
 
-  mainWindow.on("closed", () => {
-    mainWindow = null;
+  // 身份校验：destroy() 是否同步派发 closed 未经实测，两种可能的结论相反，所以按「两种都对」写——
+  // 迟到的 closed 只能抹掉它自己那个窗口。无条件置 null 时，A 的 closed 若晚于 B 创建，
+  // 指向存活 B 的 mainWindow 会被抹成 null，下次 showWindow 判「无窗口」再开一个 C：
+  // 界面叠两个窗口、UI 内存不降反升，托盘「显示主界面」每点一次多一个窗口。
+  const thisWindow = mainWindow;
+  thisWindow.on("closed", () => {
+    if (mainWindow === thisWindow) mainWindow = null;
   });
 }
 
