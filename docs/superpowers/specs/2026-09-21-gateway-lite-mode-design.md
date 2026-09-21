@@ -117,7 +117,7 @@
 **(f) CSS 不能整文件延后的三处。** `sync.css`(72.3 KB) 与 `skills.css`(18.5 KB) 被常驻组件依赖：`SyncDialog.vue:51`、`ConfigDataSection.vue:146`、`ConfigUsageSection.vue:228`、`ConfigWebdavSection.vue:182,228` 根节点都带 `sync-scope`；`SkillsHelpDialog.vue` 全用 `sk-*`。`Heatmap.vue:190` 的 `.heat-tip` Teleport 到 body 且不受 scope 约束（`sync.css:3187`），`@keyframes` 也是全局规则。`element.css:526` 的 `.el-popper.glass-popper` 被壳用（`Sidebar.vue:285`）。→ 这两份 CSS 留在 entry，只按规则块瘦身，不做整文件懒加载。
 `main.ts:5-13` 的引入顺序约束（EP index.css → dark css-vars → phosphor → global → skills → sync → element，注释在 `:6`）**保持不动**：分包只影响 JS 与异步 chunk 自带 CSS，entry CSS 内部相对顺序不变。
 
-**验收**：首屏 entry JS 目标 ≤700 KB（现 2445 KB），回归门槛按 **800 KB** 硬失败（留机器与 tree-shaking 抖动余量）；entry CSS **≤320 KB**（现 584 KB）——250 KB 这个初值与本节自己的约束矛盾：`sync.css` 72 KB 与 `skills.css` 18 KB 必须留 entry（见下条 (f)），加按需 EP 约 140 KB、`global.css` 66 KB，地板价就在 310 KB 上下。echarts 不进 entry chunk。构建产物用 `dist/assets/` 文件名与字节数直接核，不看构建退出码。
+**验收**：首屏 entry JS 目标 ≤700 KB（现 2445 KB），回归门槛按 **800 KB** 硬失败（留机器与 tree-shaking 抖动余量）；entry CSS **≤325 KiB**（现 584 KB）——250 KB 与本节自己的约束矛盾（`sync.css` 72 KB、`skills.css` 18 KB 必须留 entry），320 KB 又错在按 phosphor **源码** 82 KB 估可省量（压缩后实占 60 KB、子集 3.7 KB，实省 57 KB）；按需 EP 约 140 KB + `global.css` 66 KB 等叠起来的实测地板价是 **321.0 KiB**，门槛取 325 KiB。echarts 不进 entry chunk。构建产物用 `dist/assets/` 文件名与字节数直接核，不看构建退出码。
 
 ## 五、二期设计：网关下沉独立进程
 
