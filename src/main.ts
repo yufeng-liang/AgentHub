@@ -2,6 +2,9 @@ import { createApp } from "vue";
 import { createPinia } from "pinia";
 // ElMessageBox 是显式 import 的服务式组件（Sidebar.vue:7 等三处），插件不接管它的样式
 import "element-plus/es/components/message-box/style/css";
+// select 只在懒加载视图里出现，它的样式会跟着 JS chunk 在 element.css 之后注入并反超覆盖层
+// （同特异性后到者赢）；显式静态引入，让它回到入口图里、排在 element.css 之前，顺带去重
+import "element-plus/es/components/select/style/css";
 // dark css-vars 绑定 html.dark，须在 element.css 之前引入，让项目主题变量赢
 import "element-plus/theme-chalk/dark/css-vars.css";
 import App from "./App.vue";
