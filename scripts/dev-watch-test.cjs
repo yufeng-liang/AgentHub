@@ -1,5 +1,7 @@
-// 特征测试：fingerprint 异步化后输出必须与旧同步实现逐字节一致 —— 快照差集决定自动
-// 收纳，语义变一个字符就会误收纳或漏收纳。其余 require 全打桩，不碰真实配置目录。
+// 特征测试一：fingerprint 异步化后输出必须与旧同步实现逐字节一致 —— 快照差集决定自动
+// 收纳，语义变一个字符就会误收纳或漏收纳。
+// 特征测试二：tick 的重入闸确实拦住跨拍重叠（异步化新引入的风险，见断言 5）。
+// 其余 require 全打桩，不碰真实配置目录。
 "use strict";
 const assert = require("node:assert");
 const fs = require("node:fs");
@@ -34,9 +36,21 @@ function stub(name, exports) {
   m.exports = exports;
   require.cache[file] = m;
 }
-stub("adapter.cjs", { resolveScanTargets: () => TARGETS });
+// 调用计数：断言 5 靠"扫描/规划/执行各被进入几次"观测重入闸的行为，
+// 这是本文件唯一一处耦合内部实现的地方，专为钉住闸门存在而写。
+let scans = 0;
+let plans = 0;
+let execs = 0;
+stub("adapter.cjs", { resolveScanTargets: () => { scans++; return TARGETS; } });
 stub("config.cjs", { loadConfig: () => ({ watch: { enabled: true } }) });
-stub("syncer.cjs", { planSync: () => ({ actions: [], conflicts: [] }), executeSync: () => ({}) });
+// planSync 给一个 import 动作：让 handle 真的走到 executeSync，断言 5 才测得到"重复收纳"
+stub("syncer.cjs", {
+  planSync: () => {
+    plans++;
+    return { actions: [{ type: "import", name: "skill-a" }], conflicts: [] };
+  },
+  executeSync: () => { execs++; return { summary: { imported: 1 } }; },
+});
 stub("remotesync.cjs", { isRunning: () => false });
 const watch = require(path.join(BACKEND, "watch.cjs"));
 
@@ -89,6 +103,32 @@ function legacyFingerprint() {
     // 4) 纯内容编辑可感知：SKILL.md 变长后快照必须变
     fs.writeFileSync(path.join(trae, "skill-a", "SKILL.md"), "# a longer");
     assert.notStrictEqual(await watch.fingerprint({}), fp, "SKILL.md 内容变化必须反映到快照");
+    // 5) tick 重入闸：fingerprint 里一旦有 await，上一拍没跑完下一拍就能插进来，
+    //    两个 handle 并发会重复收纳。旧同步版结构上不可能重叠，所以这条断言钉的是
+    //    本次改动新引入的风险——把 watch.cjs 闸门从 `if (ticking || busy)` 退回
+    //    `if (busy)` 后，本文件必红（实到 2 次扫描）。
+    //    闸门判断在 tick 的同步前段、await 之前，两拍必然一前一后进入，不靠时序运气。
+    await watch.tick(); // 第 1 拍：只落基线
+    assert.strictEqual(plans, 0, "首拍不应动作");
+    fs.mkdirSync(path.join(trae, "skill-c"), { recursive: true });
+    fs.writeFileSync(path.join(trae, "skill-c", "SKILL.md"), "# c");
+    await watch.tick(); // 第 2 拍：快照变了但只一拍，记 pending 不动作
+    assert.strictEqual(plans, 0, "只变一拍不应动作（连续两拍一致才算）");
+
+    const scansBeforeOverlap = scans;
+    await Promise.all([watch.tick(), watch.tick()]); // 连发两拍，不等第一拍
+    assert.strictEqual(
+      scans - scansBeforeOverlap,
+      1,
+      "并发两拍只应扫描一次，实到 " + (scans - scansBeforeOverlap)
+    );
+    assert.strictEqual(plans, 1, "planSync 只应跑一次");
+    assert.strictEqual(execs, 1, "executeSync 只应跑一次（闸门要防的就是重复收纳）");
+
+    const scansAfterGate = scans;
+    await watch.tick(); // 闸门必须在上一拍结束后放开
+    assert.strictEqual(scans, scansAfterGate + 1, "下一拍应照常扫描，否则感知被永久锁死");
+    assert.strictEqual(execs, 1, "收敛拍不应再执行收纳");
     console.log("OK watch fingerprint 异步化断言全通过");
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true }); // 与 dev-ccswitch-test.cjs 同口径，别在 %TEMP% 堆夹具
