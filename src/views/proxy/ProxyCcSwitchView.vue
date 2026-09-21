@@ -4,12 +4,13 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import * as api from "../../api/ipc";
-import type { CcSwitchStatus, CcSwitchRegisterResult, ProxyKeyRow } from "../../types";
+import type { CcSwitchStatus, CcSwitchRegisterResult, ProxyKeyRow, ProxyModel } from "../../types";
 import { useAppStore } from "../../stores/app";
 
 const app = useAppStore();
 const st = ref<CcSwitchStatus | null>(null);
 const keys = ref<ProxyKeyRow[]>([]);
+const models = ref<ProxyModel[]>([]);
 const keyId = ref("");
 const model = ref("");
 const busy = ref<"claude" | "codex" | "">("");
@@ -19,13 +20,34 @@ const saved = ref(false); // 默认模型已写回配置
 
 const installed = computed(() => !!st.value?.installed);
 const incompatible = computed(() => !!st.value?.incompatible);
+/** CC Switch 的「本地路由」未开启时不会做协议转换，直连网关必 404（Claude /v1/messages、Codex /v1/responses） */
+const needsTakeover = computed(() =>
+  (["claude", "codex"] as const).filter((t) => entry(t)?.registered && !st.value?.takeover?.[t]),
+);
 const port = computed(() => app.config?.proxy?.port ?? 9527);
 const keyOpts = computed(() => keys.value.filter((k) => k.enabled));
-/** 模型占位：未填时用全局回退模型 */
+/** 模型占位：未选时用全局回退模型 */
 const fallback = computed(() => app.config?.proxy?.fallbackModel || "");
+
+/** 内部条目：模型目录里不对外的子代理 / 占位模板（归组置底，仍可选） */
+const INTERNAL_MODEL_RE = /sub_?agent|^summary$|^file_search|^computer_use|^browser_use|^custom_model_/i;
+const normalModels = computed(() => models.value.filter((m) => !INTERNAL_MODEL_RE.test(m.id)));
+const internalModels = computed(() => models.value.filter((m) => INTERNAL_MODEL_RE.test(m.id)));
+/** 当前值已失效（目录里没有）时补一个占位项，避免下拉显示空白让人误以为没配置 */
+const staleModel = computed(() => {
+  const v = model.value.trim();
+  if (!v || models.value.some((m) => m.id === v)) return "";
+  return v;
+});
 
 function entry(appType: "claude" | "codex") {
   return (st.value?.entries || []).find((x) => x.appType === appType);
+}
+
+/** 提示语里的条目名：用后端回传的真实名（与 CC Switch 列表一致），
+ *  拿不到时退回注册后刷新到的状态，避免前端另拼一套名字造成对不上 */
+function registeredName(r: CcSwitchRegisterResult) {
+  return r.name || entry(r.appType as "claude" | "codex")?.name || "AgentHub 网关";
 }
 
 async function refresh() {
@@ -33,6 +55,8 @@ async function refresh() {
     st.value = await api.proxyCcSwitchStatus();
   } catch (e) {
     err.value = String((e as Error).message || e);
+    // 失败也要结束「检测中」态：否则 st 恒为 null，卡片会永远停在检测中
+    st.value = { installed: false };
   }
 }
 
@@ -42,6 +66,14 @@ async function loadKeys() {
     if (!keyId.value && keyOpts.value.length) keyId.value = keyOpts.value[0].id;
   } catch {
     /* Key 列表失败不阻断页面（空态提示去 API Keys 页） */
+  }
+}
+
+async function loadModels() {
+  try {
+    models.value = (await api.proxyModels()) || [];
+  } catch {
+    /* 模型目录失败不阻断页面（下拉退化为仅当前值） */
   }
 }
 
@@ -75,18 +107,29 @@ async function register(appType: "claude" | "codex") {
   }
 }
 
-/** 默认模型写回配置（缺省用 fallbackModel），下次注册生效 */
-function onModelChange() {
+/** 默认模型写回配置（缺省用 fallbackModel），下次注册生效。
+ *  提示语在保存完成后保留 2 秒：落盘是本地 IPC，几乎瞬间返回，若在保存前置位会一闪而过 */
+let savedTimer: ReturnType<typeof setTimeout> | undefined;
+async function onModelChange() {
   if (!app.config?.proxy) return;
   app.config.proxy.ccSwitchModel = model.value.trim();
+  saved.value = false;
+  const r = await app.save();
+  if (r && r.ok === false) {
+    err.value = r.message || "默认模型保存失败";
+    return;
+  }
+  err.value = "";
   saved.value = true;
-  app.save().then(() => (saved.value = false)).catch(() => (saved.value = false));
+  clearTimeout(savedTimer);
+  savedTimer = setTimeout(() => (saved.value = false), 2000);
 }
 
 onMounted(() => {
   model.value = ((app.config?.proxy?.ccSwitchModel || app.config?.proxy?.fallbackModel || "") as string).trim();
   refresh();
   loadKeys();
+  loadModels();
 });
 </script>
 
@@ -111,12 +154,14 @@ onMounted(() => {
 
       <div v-if="result && result.ok" class="card ok-card">
         <div class="set-desc">
-          {{ result.action === "updated" ? "已更新已有条目" : "已注册新条目" }}：{{ result.appType === "claude" ? "Claude Code" : "Codex" }}
+          {{ result.action === "updated" ? "已更新已有条目（配置已同步）" : "已注册新条目" }}：<b>{{ registeredName(result) }}</b>
         </div>
         <div class="set-desc" style="margin-top: 6px">
           数据库：<span class="mono">{{ result.dbPath }}</span> · 写前备份：<span class="mono">{{ result.backupPath }}</span>
         </div>
-        <div class="set-desc" style="margin-top: 6px">重启 CC Switch（或在其界面重新加载）使配置生效</div>
+        <div class="set-desc" style="margin-top: 6px">
+          注册已写入，无需重启 CC Switch。还需在其「设置 → 本地路由」为该应用开启<b>本地路由</b>开关，并切换到该条目。
+        </div>
       </div>
 
       <!-- 接入状态与说明 -->
@@ -136,13 +181,21 @@ onMounted(() => {
         </div>
         <div v-else-if="incompatible" class="set-desc">检测到 CC Switch 数据库但结构不符，可能版本过旧；注册时会有更具体的报错。</div>
         <div v-else class="set-desc">
-          网关协议为 OpenAI Chat Completions（<span class="mono">http://127.0.0.1:{{ port }}/v1</span>）。Claude Code 与 Codex 的原生协议由
+          网关协议为 OpenAI Chat Completions。Claude Code 与 Codex 的原生协议由
           CC Switch 翻译成 Chat Completions 再打到网关；每次注册前自动备份 CC Switch 数据库，且不修改其它 provider。
+        </div>
+        <div v-if="installed && !incompatible && needsTakeover.length" class="set-desc err-text" style="margin-top: 8px">
+          检测到 {{ needsTakeover.map((t) => t === "claude" ? "Claude Code" : "Codex").join(" / ") }}
+          已注册但未开启本地路由。CC Switch 只在本地路由开启时做协议转换，直接「打开终端」或普通切换会把原生请求打到网关而报 404。
+        </div>
+        <div v-else-if="installed && !incompatible" class="set-desc" style="margin-top: 8px">
+          本地路由已开启；请勿使用条目的「打开终端」直连，那条路径不经过 CC Switch 协议转换。
         </div>
         <div class="kpis" style="margin-top: 12px">
           <div class="kpi"><span>网关地址</span><b class="mono">127.0.0.1:{{ port }}/v1</b></div>
-          <div class="kpi"><span>Claude Code</span><b>{{ entry("claude")?.registered ? "已注册" : "未注册" }}</b></div>
-          <div class="kpi"><span>Codex</span><b>{{ entry("codex")?.registered ? "已注册" : "未注册" }}</b></div>
+          <div class="kpi"><span>Claude Code</span><b :class="entry('claude')?.registered ? 'acc' : ''">{{ entry("claude")?.registered ? "已注册" : "未注册" }}</b></div>
+          <div class="kpi"><span>Codex</span><b :class="entry('codex')?.registered ? 'acc' : ''">{{ entry("codex")?.registered ? "已注册" : "未注册" }}</b></div>
+          <div class="kpi"><span>CC Switch 本地路由</span><b :class="(st?.takeover?.claude || st?.takeover?.codex) ? 'acc' : 'err'">{{ st?.takeover?.claude || st?.takeover?.codex ? "已开启" : "未开启" }}</b></div>
           <div class="kpi"><span>数据库</span><b class="mono">{{ st?.dbPath || "-" }}</b></div>
         </div>
       </div>
@@ -152,19 +205,37 @@ onMounted(() => {
         <div class="card-title">注册参数</div>
         <div class="set-desc" style="margin-bottom: 10px">
           网关 Key 与默认模型会写入条目配置（Claude 条目同时覆盖 Sonnet / Opus / Haiku / 子代理等模型字段）；
-          默认模型写回配置，对下次注册生效
+          参数在点击注册时写入 CC Switch，修改后请重新注册以同步。注册后需在 CC Switch 为该应用开启本地路由，
+          再切换到该条目；无需重启 CC Switch。
         </div>
         <div v-if="keyOpts.length" class="co-row">
           <span class="co-label">网关 API Key</span>
-          <select class="f-select" style="min-width: 300px" v-model="keyId">
-            <option v-for="k in keyOpts" :key="k.id" :value="k.id">{{ k.name }} · {{ k.mask }}</option>
-          </select>
+          <el-select v-model="keyId" popper-class="glass-popper" style="width: 300px">
+            <el-option v-for="k in keyOpts" :key="k.id" :value="k.id" :label="`${k.name} · ${k.mask}`" />
+          </el-select>
         </div>
         <div v-else class="set-desc err-text">还没有可用的网关 Key，请先到「API Keys」页生成</div>
         <div class="co-row" style="margin-top: 10px">
           <span class="co-label">默认模型</span>
-          <input v-model="model" class="input mono" style="width: 300px" placeholder="留空使用 fallbackModel：{{ fallback || '—' }}" @change="onModelChange" />
-          <span v-if="saved" class="tag tag-ok">已保存</span>
+          <el-select
+            v-model="model"
+            popper-class="glass-popper"
+            filterable
+            clearable
+            style="width: 300px"
+            :placeholder="`跟随全局回退模型：${fallback || '—'}`"
+            @change="onModelChange"
+          >
+            <!-- 当前值已不在目录：补项显示，避免下拉空白让人误以为没配置 -->
+            <el-option v-if="staleModel" :key="staleModel" :value="staleModel" :label="`${staleModel}（已不在模型目录）`" />
+            <el-option-group v-if="normalModels.length" label="对话模型">
+              <el-option v-for="m in normalModels" :key="m.id" :value="m.id" :label="m.enabled ? m.id : `${m.id}（已禁用）`" />
+            </el-option-group>
+            <el-option-group v-if="internalModels.length" label="内部条目">
+              <el-option v-for="m in internalModels" :key="m.id" :value="m.id" :label="m.id" />
+            </el-option-group>
+          </el-select>
+          <span v-if="saved" class="tag tag-ok">已保存 · 重新注册后同步</span>
         </div>
       </div>
     </div>

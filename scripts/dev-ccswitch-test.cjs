@@ -39,6 +39,14 @@ CREATE TABLE providers (
 );
 `;
 
+// 真实库另有 proxy_config 表：enabled 决定该应用是否处于代理接管（= 是否需要协议转换）
+const PROXY_CONFIG_SQL = `
+CREATE TABLE proxy_config (
+  app_type TEXT NOT NULL PRIMARY KEY,
+  enabled BOOLEAN NOT NULL DEFAULT '0'
+);
+`;
+
 /** 重建指定库文件（可自定义建表 SQL；不传则建空库） */
 function makeDb(file, tableSql) {
   fs.rmSync(file, { force: true });
@@ -48,11 +56,12 @@ function makeDb(file, tableSql) {
   return file;
 }
 
-makeDb(dbFile, PROVIDERS_SQL);
+makeDb(dbFile, PROVIDERS_SQL + PROXY_CONFIG_SQL);
 const db = new Database(dbFile);
 // 塞一条用户自己的 provider，验证绝不被改动
 db.prepare(`INSERT INTO providers (id, app_type, name, settings_config, website_url, category, created_at, sort_index, is_current, in_failover_queue)
   VALUES ('user-claude-main', 'claude', '我的主力', '{"env":{"X":"1"}}', null, 'custom', 1, 5, '1', '0')`).run();
+db.prepare(`INSERT INTO proxy_config (app_type, enabled) VALUES ('claude', '1'), ('codex', '0')`).run();
 db.close();
 
 const ccswitch = require("../electron/backend/proxy/ccswitch.cjs");
@@ -81,6 +90,7 @@ const ccswitch = require("../electron/backend/proxy/ccswitch.cjs");
   assert.strictEqual(r.clone, undefined); // 防呆：register 不返回无关字段
   assert.strictEqual(r.ok, true, "register codex 应 ok");
   assert.strictEqual(r.action, "inserted", "codex 首次应为 inserted");
+  assert.strictEqual(r.name, "AgentHub 网关（Codex）", "register 应回传真实条目名，供提示语直接使用");
   console.log("✓ register codex inserted");
 
   // 5) 校验最终库内容
@@ -97,15 +107,36 @@ const ccswitch = require("../electron/backend/proxy/ccswitch.cjs");
   assert.strictEqual(userRow.sort_index, 5, "用户 provider 的 sort_index 不得被改动");
   console.log("✓ 用户 provider 未被触碰");
 
+  // 接管状态：proxy_config.enabled 决定 CC Switch 是否会做协议转换
+  const stTakeover = ccswitch.status();
+  assert.strictEqual(stTakeover.takeover.claude, true, "claude 接管状态应可读取");
+  assert.strictEqual(stTakeover.takeover.codex, false, "codex 未开启接管时应为 false");
+  console.log("✓ 代理接管状态读取");
+
   // 条目内容
   const cs = JSON.parse(claudeRow.settings_config);
   assert.strictEqual(cs.env.ANTHROPIC_BASE_URL, "http://127.0.0.1:9527", "claude base url");
   assert.strictEqual(cs.env.ANTHROPIC_AUTH_TOKEN, "sk-test-456", "重复注册后 key 应更新为最新");
+  assert.strictEqual(cs.env.ANTHROPIC_API_KEY, undefined, "claude 只写 AUTH_TOKEN，避免双变量鉴权告警");
+  // *_MODEL 是接管后 model_mapper 的上游真值；*_MODEL_NAME 只是展示名，不能写角色别名。
+  assert.strictEqual(cs.env.ANTHROPIC_MODEL, "deepseek-v4-flash", "默认模型为真实上游模型");
+  assert.strictEqual(cs.env.ANTHROPIC_DEFAULT_SONNET_MODEL, "deepseek-v4-flash", "Sonnet 映射目标须为真实模型");
+  assert.strictEqual(cs.env.ANTHROPIC_DEFAULT_SONNET_MODEL_NAME, "deepseek-v4-flash", "Sonnet 显示名");
+  assert.strictEqual(cs.env.ANTHROPIC_DEFAULT_OPUS_MODEL, "deepseek-v4-flash", "Opus 映射目标须为真实模型");
+  assert.strictEqual(cs.env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME, "deepseek-v4-flash", "Opus 显示名");
+  assert.strictEqual(cs.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, "deepseek-v4-flash", "Haiku 映射目标须为真实模型");
+  assert.strictEqual(cs.env.ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME, "deepseek-v4-flash", "Haiku 显示名");
   assert.strictEqual(cs.env.CLAUDE_CODE_SUBAGENT_MODEL, "deepseek-v4-flash", "子代理模型");
   const metaC = JSON.parse(claudeRow.meta);
   assert.strictEqual(metaC.apiFormat, "openai_chat", "claude 上游格式须为 openai_chat");
+  assert.strictEqual(metaC.commonConfigEnabled, true, "claude 须并入用户通用配置，否则切换后全局配置丢失");
+  assert.strictEqual(metaC.apiKeyField, "ANTHROPIC_AUTH_TOKEN", "claude 须声明鉴权字段，避免表单回写 API_KEY");
   const cdx = JSON.parse(codexRow.settings_config);
   assert.strictEqual(cdx.auth.OPENAI_API_KEY, "sk-test-123", "codex auth");
+  assert.strictEqual(cdx.modelCatalog.models[0].model, "deepseek-v4-flash", "codex 模型目录应含网关模型");
+  assert.strictEqual(cdx.modelCatalog.models[0].contextWindow, 300000, "codex 模型目录上下文窗口");
+  assert.deepStrictEqual(cdx.modelCatalog.models[0].reasoningLevels, ["low", "high", "max"], "codex 模型目录可选推理档位");
+  assert.strictEqual(cdx.modelCatalog.models[0].defaultReasoningLevel, "high", "codex 模型目录默认推理档位");
   assert.ok(cdx.config.includes('model_provider = "custom"'), "codex toml: model_provider");
   assert.ok(cdx.config.includes('model = "deepseek-v4-flash"'), "codex toml: model");
   assert.ok(cdx.config.includes('[model_providers.custom]'), "codex toml: custom 段");
@@ -113,8 +144,13 @@ const ccswitch = require("../electron/backend/proxy/ccswitch.cjs");
   assert.ok(cdx.config.includes('wire_api = "responses"'), "codex toml: wire_api");
   assert.ok(cdx.config.includes("requires_openai_auth = true"), "codex toml: requires_openai_auth");
   assert.strictEqual(cdx.app_name, undefined, "无多余字段");
+  // codex 的 meta 必须同时带这两项，见 ccswitch.cjs 顶部注释：
+  // apiFormat 触发 Responses→Chat 翻译（缺了会 404），commonConfigEnabled 保住用户全局配置。
+  const metaX = JSON.parse(codexRow.meta);
+  assert.strictEqual(metaX.apiFormat, "openai_chat", "codex 必须显式声明上游为 chat，否则 CC Switch 不转换");
+  assert.strictEqual(metaX.commonConfigEnabled, true, "codex 须并入用户通用配置，否则切换后全局配置丢失");
   console.log("✓ claude 条目 env 嵌套 + apiFormat=openai_chat");
-  console.log("✓ codex 条目 auth + 指定 toml");
+  console.log("✓ codex 条目 auth + 指定 toml + apiFormat=openai_chat");
 
   // 6) 校验报错分支：未知 appType / 空 key / 空 model（不落库）
   assert.strictEqual(ccswitch.register({ appType: "foo", apiKey: "k", model: "m" }).ok, false, "未知 appType 应失败");
@@ -166,7 +202,9 @@ const ccswitch = require("../electron/backend/proxy/ccswitch.cjs");
   console.log("✓ 无 providers 表：incompatible + 表不存在报错");
 
   // 12) 缺库：整库不存在 → installed=false + register 失败
-  delete process.env.CCSWITCH_DB_PATH;
+  // 注意：这里不能 delete 环境变量——那样会回退到真实 ~/.cc-switch/cc-switch.db，
+  // 本机装有 CC Switch 时该库存在，断言就会假失败；指向临时目录下的确定不存在路径才隔离。
+  process.env.CCSWITCH_DB_PATH = path.join(tmp, "missing", "cc-switch.db");
   assert.strictEqual(ccswitch.status().installed, false, "无库时 installed=false");
   const rNoDb = ccswitch.register({ appType: "claude", apiKey: "k", model: "m" });
   assert.strictEqual(rNoDb.ok, false, "无库时 register 应失败");

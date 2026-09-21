@@ -317,6 +317,8 @@ export interface CcSwitchStatus {
   /** 库在但 providers 表缺失等异常（按未注册展示，注册时会被更准确的报错拦截） */
   incompatible?: boolean;
   dbPath?: string;
+  /** 各应用的本地代理接管状态：只有开启接管，OpenAI Chat 上游才会被 CC Switch 转换协议 */
+  takeover?: { claude: boolean; codex: boolean };
   entries?: CcSwitchEntry[];
 }
 export interface CcSwitchRegisterResult {
@@ -325,6 +327,8 @@ export interface CcSwitchRegisterResult {
   backupPath?: string;
   dbPath?: string;
   appType?: "claude" | "codex";
+  /** 写入 CC Switch 的真实条目名（与列表里显示的一致，如「AgentHub 网关（Claude Code）」） */
+  name?: string;
   message?: string;
 }
 

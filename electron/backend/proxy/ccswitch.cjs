@@ -1,6 +1,24 @@
 // 生态接入 · CC Switch：把 AgentHub 反代网关注册（upsert）为 CC Switch 的 provider 条目
-// 只读写 ~/.cc-switch/cc-switch.db 的 providers 表（固定 id），绝不动其它 provider；
-// 上游格式 = OpenAI Chat Completions（Claude 条目 meta.apiFormat = "openai_chat"，协议翻译由 CC Switch 承担）
+// 只读写 ~/.cc-switch/cc-switch.db 的 providers 表（固定 id），绝不动其它 provider。
+//
+// meta 里的字段语义见 CC Switch 源码：
+// 1) apiFormat = "openai_chat"：网关只提供 Chat Completions，需要 CC Switch 做协议翻译。
+//    必须显式写 meta.apiFormat，不能只靠 base_url 兜底——CC Switch 的
+//    codex_provider_uses_chat_completions() 在读到 config 里的 wire_api 后**提前 return**，
+//    base_url 那层永远轮不到；而 Codex 的 wire_api 按 Codex 侧语义必须是 "responses"，
+//    于是判定为「非 chat」→ 不转换 → Codex 的 /v1/responses 直接打到网关 → 404。
+//    （Claude 侧同理走 meta.apiFormat，见 get_claude_api_format()。）
+// 2) commonConfigEnabled = true：切换条目时 CC Switch 会用条目内容**整体覆写** live 配置，
+//    只有 true 才会把用户的「通用配置片段」合并进来。设 false 等于每次切到本条目就丢掉
+//    用户全局配置里的插件 / 状态栏 / 项目信任 / desktop 偏好等。置 true 不会污染网关路由：
+//    片段提取时已剥掉 model、model_provider、整个 [model_providers] 表与 model_catalog_json。
+// 3) Claude 条目只写 ANTHROPIC_AUTH_TOKEN（Authorization: Bearer）：AgentHub 网关只认该
+//    请求头，实测只发 x-api-key 会 401；同时写两个变量还会触发 Claude Code
+//    「AUTH_TOKEN 与 API_KEY 并存」鉴权告警。meta.apiKeyField 同步声明，避免表单回写。
+// 4) Claude 条目的 *_MODEL 存真实上游模型（接管时 CC Switch 的 model_mapper 会据此把
+//    Claude 角色别名映射回真实模型），*_MODEL_NAME 只作展示名，不得写入别名。
+//    非接管路径（如 CC Switch 的「打开终端」）不经过转换，直连网关必然 404，
+//    因此 UI 必须引导用户开启代理接管后正常启动 claude，而不是用「打开终端」。
 // 测试可用 CCSWITCH_DB_PATH 环境变量把库位置指到临时目录（备份目录跟随其父目录）
 "use strict";
 const fs = require("node:fs");
@@ -136,26 +154,35 @@ function rotateBackups(dir, keep) {
 /** 组装条目的 settings_config / meta（字符串化后入库） */
 function buildEntry(appType, { base, apiKey, model }) {
   if (appType === "claude") {
+    // 真实上游模型必须留在 *_MODEL：CC Switch 接管时会把 live 里的角色字段改写成
+    // claude-sonnet-5 等别名，再由 model_mapper 用这里的 *_MODEL 映射回真实模型。
+    // *_MODEL_NAME 仅供展示，写别名会导致接管后上游收到错误模型名。
+    const upstream = String(model);
     return {
       settings_config: {
         env: {
           ANTHROPIC_BASE_URL: base,
           ANTHROPIC_AUTH_TOKEN: apiKey,
-          ANTHROPIC_API_KEY: apiKey,
-          ANTHROPIC_MODEL: model,
-          ANTHROPIC_DEFAULT_SONNET_MODEL: model,
-          ANTHROPIC_DEFAULT_SONNET_MODEL_NAME: model,
-          ANTHROPIC_DEFAULT_OPUS_MODEL: model,
-          ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: model,
-          ANTHROPIC_DEFAULT_HAIKU_MODEL: model,
-          ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME: model,
-          CLAUDE_CODE_SUBAGENT_MODEL: model,
+          ANTHROPIC_MODEL: upstream,
+          ANTHROPIC_DEFAULT_SONNET_MODEL: upstream,
+          ANTHROPIC_DEFAULT_SONNET_MODEL_NAME: upstream,
+          ANTHROPIC_DEFAULT_OPUS_MODEL: upstream,
+          ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: upstream,
+          ANTHROPIC_DEFAULT_HAIKU_MODEL: upstream,
+          ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME: upstream,
+          CLAUDE_CODE_SUBAGENT_MODEL: upstream,
         },
       },
-      meta: { apiFormat: "openai_chat", commonConfigEnabled: false },
+      meta: {
+        apiFormat: "openai_chat",
+        commonConfigEnabled: true,
+        apiKeyField: "ANTHROPIC_AUTH_TOKEN",
+      },
     };
   }
-  // codex：CC Switch 依此写 ~/.codex/config.toml + auth.json；上游 chat 格式由 CC Switch 翻译
+  // codex：CC Switch 依此写 ~/.codex/config.toml + auth.json
+  // wire_api 保持 "responses"（Codex 客户端侧语义），真正的 Chat 翻译由 meta.apiFormat 触发；
+  // 这两者不矛盾——上游 Chat、客户端 Responses，正是 CC Switch 转换层存在的意义。
   const esc = String(model).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
   const toml = [
     'model_provider = "custom"',
@@ -171,24 +198,51 @@ function buildEntry(appType, { base, apiKey, model }) {
     "",
   ].join("\n");
   return {
-    settings_config: { auth: { OPENAI_API_KEY: apiKey }, config: toml },
-    meta: { commonConfigEnabled: false },
+    settings_config: {
+      auth: { OPENAI_API_KEY: apiKey },
+      config: toml,
+      // 模型目录：CC Switch 接管后会投影成 ~/.codex/cc-switch-model-catalog.json，
+      // Codex 的 /model 才能列出网关模型；缺这项时只能用内置模型名。
+      // 字段形态对照本机已跑通的 Buddy 条目（codex_config.rs 的 codex_catalog_model_specs）：
+      // reasoningLevels 决定可选档位，defaultReasoningLevel 只在同时给了 reasoningLevels 时生效，
+      // 否则回落「模板默认档仍在列表里则用模板默认，否则取最高档」。
+      modelCatalog: {
+        models: [
+          {
+            model,
+            displayName: model,
+            contextWindow: 300000,
+            reasoningLevels: ["low", "high", "max"],
+            defaultReasoningLevel: "high",
+          },
+        ],
+      },
+    },
+    meta: { apiFormat: "openai_chat", commonConfigEnabled: true },
   };
 }
 
-/** 只读视图：CC Switch 是否已安装 + 两个固定条目是否已注册 */
+/** 只读视图：CC Switch 是否已安装 + 两个固定条目是否已注册 + 代理接管是否已开启 */
 function status() {
   const p = dbPath();
   if (!fs.existsSync(p)) {
-    return { installed: false, dbPath: p, entries: [
-      { appType: "claude", registered: false },
-      { appType: "codex", registered: false },
-    ] };
+    return {
+      installed: false,
+      dbPath: p,
+      takeover: { claude: false, codex: false },
+      entries: [
+        { appType: "claude", registered: false },
+        { appType: "codex", registered: false },
+      ],
+    };
   }
   const db = openDb();
   try {
     let rows = [];
     let incompatible = false;
+    // 代理接管状态：proxy_config.enabled 为该应用是否已接管（等价于 require routing）。
+    // 读取失败按未接管处理，只在 UI 上提示，不影响注册本身。
+    let takeover = { claude: false, codex: false };
     try {
       // 与 register 同源校验：providers 表存在且具备 INSERT 所需的全部列
       const hasTable = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='providers'`).get();
@@ -196,6 +250,15 @@ function status() {
       const cols = new Set(db.prepare(`PRAGMA table_info(providers)`).all().map((c) => c.name));
       if (INSERT_COLS.some((c) => !cols.has(c))) throw new Error("missing providers columns");
       rows = db.prepare(`SELECT id, name FROM providers WHERE id IN (?, ?)`).all(FIXED.claude, FIXED.codex);
+      try {
+        const ps = db.prepare(`SELECT app_type, enabled FROM proxy_config WHERE app_type IN ('claude','codex')`).all();
+        takeover = {
+          claude: !!ps.find((r) => r.app_type === "claude")?.enabled,
+          codex: !!ps.find((r) => r.app_type === "codex")?.enabled,
+        };
+      } catch {
+        /* proxy_config 缺失/结构不同：按未接管展示 */
+      }
     } catch {
       incompatible = true; // 库在但表/列缺失等，按未注册展示并提示库异常
     }
@@ -203,6 +266,7 @@ function status() {
       installed: true,
       incompatible,
       dbPath: p,
+      takeover,
       entries: ["claude", "codex"].map((t) => {
         const row = rows.find((r) => r.id === FIXED[t]);
         return { appType: t, registered: !!row, name: row ? row.name : undefined };
@@ -276,7 +340,8 @@ function register({ appType, apiKey, model, port } = {}) {
       );
       action = "inserted";
     }
-    return { ok: true, action, backupPath, dbPath: p, appType: t };
+    // 回传真实条目名：提示语直接用它，避免前端另行拼一套名字而与 CC Switch 里显示的不一致
+    return { ok: true, action, backupPath, dbPath: p, appType: t, name };
   } finally {
     db.close();
   }
