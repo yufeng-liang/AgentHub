@@ -324,9 +324,11 @@ git commit -m "refactor: 自动感知指纹扫描改异步，消主进程每 15 
 ```ts
 // echarts 按需注册入口：全库只用折线图 + 网格 / 提示框 / 图例（含滚动图例）+ canvas 渲染器。
 // 所有图表一律从本文件 import，禁止再 import "echarts" —— 那会把 1009 KB 的全量包拉回首屏。
-// 两个坑：legend.type 为 "scroll" 时 LegendScrollComponent 要单独注册（它与 LegendComponent
-// 是两个独立 install），漏了图例直接不渲染且没有任何报错；Heatmap.vue 是纯 DOM 格子，不碰
-// echarts，因此不需要 HeatmapChart。全库无 registerTheme、无 graphic option、无 mark*。
+// 两个坑：Heatmap.vue 是纯 DOM 格子，不碰 echarts，因此不需要 HeatmapChart；全库无
+// registerTheme、无 graphic option、无 mark*。LegendScrollComponent 在实装 5.6.0 里其实是
+// 冗余的（legend/install.js 已自带 use(installLegendScroll)，Task 2 实测：只注册
+// LegendComponent 也能解析出 legend.scroll），但 package.json 声明的下限是 ^5.4.3，
+// 显式注册是防御性的、且两种写法的注册集完全相同 —— 保留，别当冗余删掉。
 import * as echarts from "echarts/core";
 import { LineChart } from "echarts/charts";
 import { GridComponent, LegendComponent, LegendScrollComponent, TooltipComponent } from "echarts/components";
@@ -362,7 +364,9 @@ export type ECharts = echarts.ECharts;
 npm run build
 node -e "const fs=require('fs');for(const f of fs.readdirSync('dist/assets'))if(f.endsWith('.js'))console.log(f,(fs.statSync('dist/assets/'+f).size/1024|0)+' KB')"
 ```
-Expected: 此时仍是单 chunk，但体积应从上一步基线的 2445 KB 降到 **≤1600 KB**（echarts 全量 min 版 1009 KB，按需后约剩 300 KB）。若几乎没降，先查是不是哪处还在 `from "echarts"`：`grep -rn '"echarts"' src/` 应只剩 `src/utils/echarts.ts` 里的三行子路径导入。
+Expected: 此时仍是单 chunk，体积从基线 2445 KB 降到 **≤1950 KB**。
+
+> **门槛算术更正（Task 2 执行时实测得出）**：1009 KB 那个「echarts 全量 min 版」里**含 zrender**，按需后留下来的不是 echarts 一项而是 echarts 308.7 KiB + zrender 166.9 KiB = **475.6 KiB**。所以图表仍在首屏时的地板价约 1912 KB（实测 1899 KB），原先写的「2445 − 1009 + 300 ≈ 1600」漏算 zrender，是错的。**≤1600 KB 这条门槛挪到 Task 4 之后的首屏 chunk**（那时 echarts 随异步视图离开 entry）。若几乎没降，先查是不是哪处还在 `from "echarts"`：`grep -rn '"echarts"' src/` 应只剩 `src/utils/echarts.ts` 里的三行子路径导入。
 
 - [ ] **Step 4: 图能画出来的功能验证（不能只看体积）**
 
