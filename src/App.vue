@@ -13,8 +13,10 @@ import Sidebar from "./components/Sidebar.vue";
 import PageTabs from "./components/PageTabs.vue";
 import SettingsDialog from "./components/config/SettingsDialog.vue";
 import SkillsHelpDialog from "./components/SkillsHelpDialog.vue";
+// 用量统计模块（原「用量记录同步」）：数据源顶栏 + 五个页面 + 同步进度弹窗
 import SyncTopBar from "./components/sync/SyncTopBar.vue";
 import SyncDialog from "./components/sync/SyncDialog.vue";
+// 三大模块的页面视图：各自独立目录，分别开发互不干扰
 // 首屏落点三选一（moduleOrder 可被用户自定义排序覆盖，见 stores/app.ts:102-106）：留静态进 entry
 import SkillsDashboardView from "./views/skills/SkillsDashboardView.vue";
 import SyncOverviewView from "./views/sync/OverviewView.vue";

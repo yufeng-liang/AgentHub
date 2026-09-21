@@ -1,14 +1,17 @@
 <script setup lang="ts">
-import { onMounted, ref, watch, computed } from "vue";
+import { onMounted, ref, watch, computed, defineAsyncComponent } from "vue";
 import { useSyncStore } from "../../stores/sync";
 import { useAppStore } from "../../stores/app";
 import { useUsageStore } from "../../stores/usage";
 import { formatToken } from "../../composables/useFormat";
-import TrendChart from "../../components/sync/TrendChart.vue";
 import Heatmap from "../../components/sync/Heatmap.vue";
 import UsageBreakdown from "../../components/sync/UsageBreakdown.vue";
 import DayModal from "../../components/sync/DayModal.vue";
 import EmptyState from "../../components/sync/EmptyState.vue";
+
+// 本页是首屏落点、整体保持静态，唯独图表按需加载：TrendChart -> utils/echarts 会把
+// echarts+zrender（约 473 KiB）拽进 entry，异步化后它才与 CostsView 的 CostTrendChart 共享同一个懒块
+const TrendChart = defineAsyncComponent(() => import("../../components/sync/TrendChart.vue"));
 
 const app = useSyncStore();
 const framework = useAppStore();
