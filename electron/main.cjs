@@ -93,11 +93,13 @@ function createWindow() {
   }
 
   // 首帧就绪后显示窗口（did-finish-load 兜底：HMR 重载等场景 ready-to-show 可能不触发）
+  // 与 close/closed 同一口径：闭包捕获 thisWindow，不再回读可能被别的窗口改写的全局
+  const thisWindow = mainWindow;
   let revealed = false;
   const reveal = () => {
-    if (revealed || !mainWindow || mainWindow.isDestroyed()) return;
+    if (revealed || thisWindow.isDestroyed()) return;
     revealed = true;
-    mainWindow.show();
+    thisWindow.show();
   };
   mainWindow.once("ready-to-show", reveal);
   mainWindow.webContents.once("did-finish-load", () => {
@@ -109,8 +111,6 @@ function createWindow() {
   applyViewportZoom();
   mainWindow.on("resize", applyViewportZoom);
   mainWindow.webContents.on("did-finish-load", applyViewportZoom);
-
-  const thisWindow = mainWindow;
 
   // 关闭 → 缩到托盘：liteOnClose 开时销毁窗口，连渲染进程与合成表面一起回收
   // （一期打包版实测：同一次运行 424.86 → 215.47 MB 私有，−49.3%，4 进程降到 3），

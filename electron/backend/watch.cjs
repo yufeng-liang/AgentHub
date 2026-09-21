@@ -132,8 +132,8 @@ function start() {
 // resume 并走到 handle()（真搬文件）+ onEvent（桌面通知）。旧同步版一拍跑完，before-quit
 // 结构上看不到在飞扫描；现在必须留标志让那拍自己作废——尤其 main.cjs 的 pendingInstall
 // 分支会 preventDefault 后继续 pump 事件循环，stop() 之后循环还长着。
-// 判据用 stopped 而不是"timer 为空"：后者把"没排班"和"停机"混成一件事，而 tick 是导出给
-// 自测直连调用的（dev-watch-test.cjs 从不调 start()），那样每拍都会被作废。
+// 判据用 stopped 而不是"timer 为空"：后者把"没排班"和"停机"混成一件事，而自测是直连 await
+// tick() 的（只有断言 7 前后各 start()/stop() 一次），按 timer 判空会把那些拍全作废。
 function stop() {
   stopped = true;
   if (timer) {
