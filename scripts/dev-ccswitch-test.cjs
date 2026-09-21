@@ -39,10 +39,12 @@ CREATE TABLE providers (
 );
 `;
 
-// 真实库另有 proxy_config 表：enabled 决定该应用是否处于代理接管（= 是否需要协议转换）
+// 真实库另有 proxy_config 表：enabled 为该应用是否接管，proxy_enabled 为全局代理网关在线
+// （Claude Desktop 映射模式无独立行，借 claude 行 proxy_enabled 判断）
 const PROXY_CONFIG_SQL = `
 CREATE TABLE proxy_config (
   app_type TEXT NOT NULL PRIMARY KEY,
+  proxy_enabled BOOLEAN NOT NULL DEFAULT '0',
   enabled BOOLEAN NOT NULL DEFAULT '0'
 );
 `;
@@ -61,7 +63,7 @@ const db = new Database(dbFile);
 // 塞一条用户自己的 provider，验证绝不被改动
 db.prepare(`INSERT INTO providers (id, app_type, name, settings_config, website_url, category, created_at, sort_index, is_current, in_failover_queue)
   VALUES ('user-claude-main', 'claude', '我的主力', '{"env":{"X":"1"}}', null, 'custom', 1, 5, '1', '0')`).run();
-db.prepare(`INSERT INTO proxy_config (app_type, enabled) VALUES ('claude', '1'), ('codex', '0')`).run();
+db.prepare(`INSERT INTO proxy_config (app_type, proxy_enabled, enabled) VALUES ('claude', '1', '1'), ('codex', '0', '0')`).run();
 db.close();
 
 const ccswitch = require("../electron/backend/proxy/ccswitch.cjs");
@@ -71,7 +73,7 @@ const ccswitch = require("../electron/backend/proxy/ccswitch.cjs");
   let s = ccswitch.status();
   assert.strictEqual(s.installed, true, "installed 应为 true");
   assert.strictEqual(s.incompatible, false, "schema 正常不应 incompatible");
-  assert.deepStrictEqual(s.entries.map((e) => e.registered), [false, false], "初始应都未注册");
+  assert.deepStrictEqual(s.entries.map((e) => e.registered), [false, false, false], "初始应都未注册");
   console.log("✓ status 初始未注册");
 
   // 2) 注册 claude
@@ -93,24 +95,36 @@ const ccswitch = require("../electron/backend/proxy/ccswitch.cjs");
   assert.strictEqual(r.name, "AgentHub 网关（Codex）", "register 应回传真实条目名，供提示语直接使用");
   console.log("✓ register codex inserted");
 
+  // 4.5) 注册 claude-desktop：proxy 模型映射模式（meta.claudeDesktopModelRoutes 四角色全映射同一上游模型）
+  r = ccswitch.register({ appType: "claude-desktop", apiKey: "sk-test-123", model: "deepseek-v4-flash", port: 9527 });
+  assert.strictEqual(r.ok, true, "register claude-desktop 应 ok: " + JSON.stringify(r));
+  assert.strictEqual(r.action, "inserted", "claude-desktop 首次应为 inserted");
+  assert.strictEqual(r.name, "AgentHub 网关（Claude Desktop）", "claude-desktop 应回传真实条目名");
+  console.log("✓ register claude-desktop inserted");
+
   // 5) 校验最终库内容
   const db2 = new Database(dbFile);
   const rows = db2.prepare("SELECT * FROM providers ORDER BY sort_index").all();
   db2.close();
   const claudeRow = rows.find((x) => x.id === "agenthub-gateway-claude");
   const codexRow = rows.find((x) => x.id === "agenthub-gateway-codex");
+  const desktopRow = rows.find((x) => x.id === "agenthub-gateway-claude-desktop");
   assert.ok(claudeRow, "应有 claude 固定条目");
   assert.ok(codexRow, "应有 codex 固定条目");
+  assert.ok(desktopRow, "应有 claude-desktop 固定条目");
+  assert.strictEqual(desktopRow.app_type, "claude-desktop", "claude-desktop 条目应落独立 app_type");
   // 用户 provider 未被动过
   const userRow = rows.find((x) => x.id === "user-claude-main");
   assert.strictEqual(userRow.settings_config, '{"env":{"X":"1"}}', "用户 provider 不得被改动");
   assert.strictEqual(userRow.sort_index, 5, "用户 provider 的 sort_index 不得被改动");
   console.log("✓ 用户 provider 未被触碰");
 
-  // 接管状态：proxy_config.enabled 决定 CC Switch 是否会做协议转换
+  // 接管状态：proxy_config.enabled 决定 CC Switch 是否会做协议转换；
+  // claudeDesktop 无独立行，跟 claude 行 proxy_enabled（全局代理网关在线）
   const stTakeover = ccswitch.status();
   assert.strictEqual(stTakeover.takeover.claude, true, "claude 接管状态应可读取");
   assert.strictEqual(stTakeover.takeover.codex, false, "codex 未开启接管时应为 false");
+  assert.strictEqual(stTakeover.takeover.claudeDesktop, true, "claudeDesktop 应跟随全局代理（claude 行 proxy_enabled=1）");
   console.log("✓ 代理接管状态读取");
 
   // 条目内容
@@ -144,13 +158,41 @@ const ccswitch = require("../electron/backend/proxy/ccswitch.cjs");
   assert.ok(cdx.config.includes('wire_api = "responses"'), "codex toml: wire_api");
   assert.ok(cdx.config.includes("requires_openai_auth = true"), "codex toml: requires_openai_auth");
   assert.strictEqual(cdx.app_name, undefined, "无多余字段");
-  // codex 的 meta 必须同时带这两项，见 ccswitch.cjs 顶部注释：
-  // apiFormat 触发 Responses→Chat 翻译（缺了会 404），commonConfigEnabled 保住用户全局配置。
+  // codex 的 meta 必须同时带这几项，见 ccswitch.cjs 顶部注释：
+  // apiFormat 触发 Responses→Chat 翻译（缺了会 404），commonConfigEnabled 保住用户全局配置，
+  // codexChatReasoning 声明网关支持思考模式/思考等级（否则 Codex 的 reasoning.effort 不转成上游参数）。
   const metaX = JSON.parse(codexRow.meta);
   assert.strictEqual(metaX.apiFormat, "openai_chat", "codex 必须显式声明上游为 chat，否则 CC Switch 不转换");
   assert.strictEqual(metaX.commonConfigEnabled, true, "codex 须并入用户通用配置，否则切换后全局配置丢失");
+  assert.strictEqual(metaX.codexChatReasoning.supportsThinking, true, "codex 须开启支持思考模式");
+  assert.strictEqual(metaX.codexChatReasoning.supportsEffort, true, "codex 须开启支持思考等级");
+  assert.strictEqual(metaX.codexChatReasoning.thinkingParam, "thinking", "thinking 参数名为上游默认");
+  assert.strictEqual(metaX.codexChatReasoning.effortParam, "reasoning_effort", "effort 参数名为顶层 OpenAI 风格字段");
+  assert.strictEqual(metaX.codexChatReasoning.effortValueMode, "passthrough", "effort 档位按原值透传网关");
   console.log("✓ claude 条目 env 嵌套 + apiFormat=openai_chat");
-  console.log("✓ codex 条目 auth + 指定 toml + apiFormat=openai_chat");
+  console.log("✓ codex 条目 auth + 指定 toml + apiFormat=openai_chat + 思考能力已开启");
+
+  // claude-desktop 条目内容：proxy 模型映射模式
+  // 模型不写 env（Desktop 只认 CC Switch 网关里的角色路由），全放 meta.claudeDesktopModelRoutes；
+  // Desktop 3P 不走通用配置同步，故无 commonConfigEnabled。
+  const cdd = JSON.parse(desktopRow.settings_config);
+  assert.strictEqual(cdd.env.ANTHROPIC_BASE_URL, "http://127.0.0.1:9527", "claude-desktop base url");
+  assert.strictEqual(cdd.env.ANTHROPIC_AUTH_TOKEN, "sk-test-123", "claude-desktop token");
+  assert.strictEqual(cdd.env.ANTHROPIC_API_KEY, undefined, "claude-desktop 只写 AUTH_TOKEN，避免双变量鉴权告警");
+  assert.strictEqual(cdd.env.ANTHROPIC_MODEL, undefined, "claude-desktop 模型不写 env，走 meta 角色路由映射");
+  const metaD = JSON.parse(desktopRow.meta);
+  assert.strictEqual(metaD.apiFormat, "openai_chat", "claude-desktop 上游格式须为 openai_chat");
+  assert.strictEqual(metaD.claudeDesktopMode, "proxy", "claude-desktop 须为 proxy 模型映射模式");
+  assert.strictEqual(metaD.commonConfigEnabled, undefined, "Desktop 3P 不走通用配置同步，不得写 commonConfigEnabled");
+  assert.deepStrictEqual(
+    Object.keys(metaD.claudeDesktopModelRoutes).sort(),
+    ["claude-fable-5", "claude-haiku-4-5", "claude-opus-5", "claude-sonnet-5"],
+    "四角色 routeId 应全映射",
+  );
+  for (const [rid, route] of Object.entries(metaD.claudeDesktopModelRoutes)) {
+    assert.strictEqual(route.model, "deepseek-v4-flash", `角色 ${rid} 应映射到同一上游模型`);
+  }
+  console.log("✓ claude-desktop 条目 env 形态 + proxy 模式 + 四角色路由映射");
 
   // 6) 校验报错分支：未知 appType / 空 key / 空 model（不落库）
   assert.strictEqual(ccswitch.register({ appType: "foo", apiKey: "k", model: "m" }).ok, false, "未知 appType 应失败");
@@ -159,9 +201,9 @@ const ccswitch = require("../electron/backend/proxy/ccswitch.cjs");
   assert.ok(/默认模型/.test(ccswitch.register({ appType: "claude", apiKey: "k", model: "" }).message), "空 model 报错文案");
   console.log("✓ 参数校验报错分支");
 
-  // 7) 备份：至少 3 份（两次 claude + 一次 codex）
+  // 7) 备份：至少 4 份（两次 claude + 一次 codex + 一次 claude-desktop）
   let backups = fs.readdirSync(path.join(tmp, "backups"));
-  assert.ok(backups.length >= 3, "备份数量应 >=3，实际 " + backups.length + " -> " + backups.join(","));
+  assert.ok(backups.length >= 4, "备份数量应 >=4，实际 " + backups.length + " -> " + backups.join(","));
   console.log("✓ 备份目录文件 =", backups.join(", "));
 
   // 8) 备份轮换：连续注册足够多次后，本应用前缀备份不超过保留上限（BACKUP_KEEP=10），
@@ -178,7 +220,10 @@ const ccswitch = require("../electron/backend/proxy/ccswitch.cjs");
 
   // 9) status 终态：都 registered
   s = ccswitch.status();
-  assert.deepStrictEqual(s.entries.map((e) => [e.appType, e.registered]), [["claude", true], ["codex", true]]);
+  assert.deepStrictEqual(
+    s.entries.map((e) => [e.appType, e.registered]),
+    [["claude", true], ["codex", true], ["claude-desktop", true]],
+  );
   console.log("✓ status 终态全部已注册");
 
   // 10) 版本不兼容：providers 缺列 → status.incompatible + register 报版本不兼容

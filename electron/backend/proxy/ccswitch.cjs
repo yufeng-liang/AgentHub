@@ -45,14 +45,17 @@ try {
 const FIXED = {
   claude: "agenthub-gateway-claude",
   codex: "agenthub-gateway-codex",
+  "claude-desktop": "agenthub-gateway-claude-desktop",
 };
 const APP_NAMES = {
   claude: "AgentHub 网关（Claude Code）",
   codex: "AgentHub 网关（Codex）",
+  "claude-desktop": "AgentHub 网关（Claude Desktop）",
 };
 const ICONS = {
   claude: { icon: "anthropic", iconColor: "#D4915D" },
   codex: { icon: "openai", iconColor: "#10A37F" },
+  "claude-desktop": { icon: "claude", iconColor: "#D4915D" },
 };
 
 /** 只保留最近 N 份本应用生成的写前备份：备份含明文密钥，无限累积是一种安全负担 */
@@ -180,6 +183,34 @@ function buildEntry(appType, { base, apiKey, model }) {
       },
     };
   }
+  if (appType === "claude-desktop") {
+    // Claude Desktop 3P profile 与 Claude Code 是不同入口，只能走 Proxy 模型映射模式：
+    // 网关是 openai_chat 且模型非 Sonnet/Opus/Haiku 三档角色 id，直连模式会被 Desktop 拒绝。
+    // 模型不写 env，统一放 meta.claudeDesktopModelRoutes（routeId → 真实上游模型），
+    // 由 CC Switch 本地网关（127.0.0.1:15721/claude-desktop）做角色映射 + 协议转换。
+    // Desktop 3P 不走 CC Switch 的通用配置 / MCP / Skills 同步，故不写 commonConfigEnabled。
+    const upstream = String(model);
+    return {
+      settings_config: {
+        env: {
+          ANTHROPIC_BASE_URL: base,
+          ANTHROPIC_AUTH_TOKEN: apiKey,
+        },
+      },
+      meta: {
+        apiFormat: "openai_chat",
+        claudeDesktopMode: "proxy",
+        // 四角色 routeId 全映射到同一上游模型（上游 CLAUDE_DESKTOP_ROLE_ROUTE_IDS；
+        // value 形态 { model } 对照上游 ClaudeDesktopProviderForm 的落库样板）
+        claudeDesktopModelRoutes: {
+          "claude-sonnet-5": { model: upstream },
+          "claude-opus-5": { model: upstream },
+          "claude-haiku-4-5": { model: upstream },
+          "claude-fable-5": { model: upstream },
+        },
+      },
+    };
+  }
   // codex：CC Switch 依此写 ~/.codex/config.toml + auth.json
   // wire_api 保持 "responses"（Codex 客户端侧语义），真正的 Chat 翻译由 meta.apiFormat 触发；
   // 这两者不矛盾——上游 Chat、客户端 Responses，正是 CC Switch 转换层存在的意义。
@@ -218,21 +249,39 @@ function buildEntry(appType, { base, apiKey, model }) {
         ],
       },
     },
-    meta: { apiFormat: "openai_chat", commonConfigEnabled: true },
+    meta: {
+      apiFormat: "openai_chat",
+      commonConfigEnabled: true,
+      // 思考能力：Codex 客户端经 CC Switch 转 Chat 时，声明上游网关支持思考模式与思考深度档位。
+      // supportsThinking / supportsEffort 即 CC Switch「支持思考模式 / 支持思考等级」开关
+      // （effort 开启会自动带起 thinking，见 transform_codex_chat.rs 的 supports_thinking 推断）；
+      // 网关为通用 Chat 层，effort 档位按 passthrough 原样透传（modelCatalog.reasoningLevels 已背书 low/high/max），
+      // thinking/effort 参数名取上游默认值（thinking / reasoning_effort，顶层 OpenAI 风格字段，
+      // 与本机跑通的「赔钱国模」等 Chat 上游条目一致）。
+      codexChatReasoning: {
+        supportsThinking: true,
+        supportsEffort: true,
+        thinkingParam: "thinking",
+        effortParam: "reasoning_effort",
+        effortValueMode: "passthrough",
+        outputFormat: "auto",
+      },
+    },
   };
 }
 
-/** 只读视图：CC Switch 是否已安装 + 两个固定条目是否已注册 + 代理接管是否已开启 */
+/** 只读视图：CC Switch 是否已安装 + 三个固定条目是否已注册 + 各应用代理接管是否已开启 */
 function status() {
   const p = dbPath();
   if (!fs.existsSync(p)) {
     return {
       installed: false,
       dbPath: p,
-      takeover: { claude: false, codex: false },
+      takeover: { claude: false, codex: false, claudeDesktop: false },
       entries: [
         { appType: "claude", registered: false },
         { appType: "codex", registered: false },
+        { appType: "claude-desktop", registered: false },
       ],
     };
   }
@@ -242,19 +291,23 @@ function status() {
     let incompatible = false;
     // 代理接管状态：proxy_config.enabled 为该应用是否已接管（等价于 require routing）。
     // 读取失败按未接管处理，只在 UI 上提示，不影响注册本身。
-    let takeover = { claude: false, codex: false };
+    let takeover = { claude: false, codex: false, claudeDesktop: false };
     try {
       // 与 register 同源校验：providers 表存在且具备 INSERT 所需的全部列
       const hasTable = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='providers'`).get();
       if (!hasTable) throw new Error("no providers table");
       const cols = new Set(db.prepare(`PRAGMA table_info(providers)`).all().map((c) => c.name));
       if (INSERT_COLS.some((c) => !cols.has(c))) throw new Error("missing providers columns");
-      rows = db.prepare(`SELECT id, name FROM providers WHERE id IN (?, ?)`).all(FIXED.claude, FIXED.codex);
+      rows = db.prepare(`SELECT id, name FROM providers WHERE id IN (?, ?, ?)`)
+        .all(FIXED.claude, FIXED.codex, FIXED["claude-desktop"]);
       try {
-        const ps = db.prepare(`SELECT app_type, enabled FROM proxy_config WHERE app_type IN ('claude','codex')`).all();
+        // Claude Desktop 的映射模式依赖 CC Switch 本地网关常驻：本机 proxy_config 无
+        // claude-desktop 行，借 claude 行的 proxy_enabled 判断全局代理网关是否在线。
+        const ps = db.prepare(`SELECT app_type, proxy_enabled, enabled FROM proxy_config WHERE app_type IN ('claude','codex')`).all();
         takeover = {
           claude: !!ps.find((r) => r.app_type === "claude")?.enabled,
           codex: !!ps.find((r) => r.app_type === "codex")?.enabled,
+          claudeDesktop: !!ps.find((r) => r.app_type === "claude")?.proxy_enabled,
         };
       } catch {
         /* proxy_config 缺失/结构不同：按未接管展示 */
@@ -267,7 +320,7 @@ function status() {
       incompatible,
       dbPath: p,
       takeover,
-      entries: ["claude", "codex"].map((t) => {
+      entries: ["claude", "codex", "claude-desktop"].map((t) => {
         const row = rows.find((r) => r.id === FIXED[t]);
         return { appType: t, registered: !!row, name: row ? row.name : undefined };
       }),
@@ -280,7 +333,7 @@ function status() {
 /** 注册（upsert）固定 id 条目：备份 → 表自检 → UPDATE 优先，0 行则 INSERT */
 function register({ appType, apiKey, model, port } = {}) {
   const t = String(appType || "");
-  if (t !== "claude" && t !== "codex") return { ok: false, message: `未知应用类型 "${t}"` };
+  if (t !== "claude" && t !== "codex" && t !== "claude-desktop") return { ok: false, message: `未知应用类型 "${t}"` };
   const key = String(apiKey || "").trim();
   const mdl = String(model || "").trim();
   if (!key) return { ok: false, message: "请先选择网关 API Key" };
@@ -328,8 +381,8 @@ function register({ appType, apiKey, model, port } = {}) {
     if (!upd.changes) {
       // 排在同 app 分组其它条目末尾；固定 id 本身不参与计 max（避免覆盖已有条目顺序）
       const maxRow = db.prepare(
-        `SELECT COALESCE(MAX(sort_index), 0) AS m FROM providers WHERE app_type = ? AND id NOT IN (?, ?)`
-      ).get(t, FIXED.claude, FIXED.codex);
+        `SELECT COALESCE(MAX(sort_index), 0) AS m FROM providers WHERE app_type = ? AND id NOT IN (?, ?, ?)`
+      ).get(t, FIXED.claude, FIXED.codex, FIXED["claude-desktop"]);
       const sortIndex = Number((maxRow && maxRow.m) || 0) + 1;
       db.prepare(
         `INSERT INTO providers (${INSERT_COLS.join(", ")})

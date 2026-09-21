@@ -307,8 +307,10 @@ export interface ProxyKeyRow {
 }
 
 // ===== 反代网关：生态接入（CC Switch） =====
+/** CC Switch 里的应用入口：claude / codex（Claude Code / Codex CLI）与 claude-desktop（Claude Desktop 3P，独立入口） */
+export type CcSwitchAppType = "claude" | "codex" | "claude-desktop";
 export interface CcSwitchEntry {
-  appType: "claude" | "codex";
+  appType: CcSwitchAppType;
   registered: boolean;
   name?: string;
 }
@@ -317,8 +319,9 @@ export interface CcSwitchStatus {
   /** 库在但 providers 表缺失等异常（按未注册展示，注册时会被更准确的报错拦截） */
   incompatible?: boolean;
   dbPath?: string;
-  /** 各应用的本地代理接管状态：只有开启接管，OpenAI Chat 上游才会被 CC Switch 转换协议 */
-  takeover?: { claude: boolean; codex: boolean };
+  /** 各应用的本地代理接管状态：只有开启接管，OpenAI Chat 上游才会被 CC Switch 转换协议；
+   *  claudeDesktop 表示 CC Switch 全局代理网关在线（Desktop 映射模式依赖它常驻，借 claude 行 proxy_enabled 判断） */
+  takeover?: { claude: boolean; codex: boolean; claudeDesktop: boolean };
   entries?: CcSwitchEntry[];
 }
 export interface CcSwitchRegisterResult {
@@ -326,7 +329,7 @@ export interface CcSwitchRegisterResult {
   action?: "inserted" | "updated";
   backupPath?: string;
   dbPath?: string;
-  appType?: "claude" | "codex";
+  appType?: CcSwitchAppType;
   /** 写入 CC Switch 的真实条目名（与列表里显示的一致，如「AgentHub 网关（Claude Code）」） */
   name?: string;
   message?: string;

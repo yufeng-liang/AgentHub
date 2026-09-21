@@ -1,10 +1,10 @@
 <!-- 反代网关 · 生态接入（CC Switch）：把 AgentHub 网关注册为 CC Switch 的 provider 条目，
-     上游格式 = OpenAI Chat Completions（http://127.0.0.1:{port}/v1），Claude Code / Codex 的原生协议
+     上游格式 = OpenAI Chat Completions（http://127.0.0.1:{port}/v1），Claude Code / Codex / Claude Desktop 的原生协议
      由 CC Switch 翻译后再打到网关；注册前自动备份 CC Switch 数据库，且只 upsert 固定 id 条目 -->
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import * as api from "../../api/ipc";
-import type { CcSwitchStatus, CcSwitchRegisterResult, ProxyKeyRow, ProxyModel } from "../../types";
+import type { CcSwitchStatus, CcSwitchRegisterResult, CcSwitchAppType, ProxyKeyRow, ProxyModel } from "../../types";
 import { useAppStore } from "../../stores/app";
 
 const app = useAppStore();
@@ -13,16 +13,22 @@ const keys = ref<ProxyKeyRow[]>([]);
 const models = ref<ProxyModel[]>([]);
 const keyId = ref("");
 const model = ref("");
-const busy = ref<"claude" | "codex" | "">("");
+const busy = ref<CcSwitchAppType | "">("");
 const result = ref<CcSwitchRegisterResult | null>(null);
 const err = ref("");
 const saved = ref(false); // 默认模型已写回配置
 
+const APP_LABELS: Record<CcSwitchAppType, string> = {
+  claude: "Claude Code",
+  codex: "Codex",
+  "claude-desktop": "Claude Desktop",
+};
+
 const installed = computed(() => !!st.value?.installed);
 const incompatible = computed(() => !!st.value?.incompatible);
-/** CC Switch 的「本地路由」未开启时不会做协议转换，直连网关必 404（Claude /v1/messages、Codex /v1/responses） */
+/** CC Switch 的「本地路由」未开启时不会做协议转换，直连网关必 404（Claude /v1/messages、Codex /v1/responses、Desktop 映射模式失联） */
 const needsTakeover = computed(() =>
-  (["claude", "codex"] as const).filter((t) => entry(t)?.registered && !st.value?.takeover?.[t]),
+  (["claude", "codex", "claude-desktop"] as const).filter((t) => entry(t)?.registered && !takeoverOf(t)),
 );
 const port = computed(() => app.config?.proxy?.port ?? 9527);
 const keyOpts = computed(() => keys.value.filter((k) => k.enabled));
@@ -40,14 +46,21 @@ const staleModel = computed(() => {
   return v;
 });
 
-function entry(appType: "claude" | "codex") {
+function entry(appType: CcSwitchAppType) {
   return (st.value?.entries || []).find((x) => x.appType === appType);
+}
+
+/** 各应用的本地路由接管状态：claude-desktop 无独立行，读全局代理网关在线状态（takeover.claudeDesktop） */
+function takeoverOf(appType: CcSwitchAppType) {
+  const tk = st.value?.takeover;
+  if (!tk) return false;
+  return appType === "claude-desktop" ? !!tk.claudeDesktop : !!tk[appType];
 }
 
 /** 提示语里的条目名：用后端回传的真实名（与 CC Switch 列表一致），
  *  拿不到时退回注册后刷新到的状态，避免前端另拼一套名字造成对不上 */
 function registeredName(r: CcSwitchRegisterResult) {
-  return r.name || entry(r.appType as "claude" | "codex")?.name || "AgentHub 网关";
+  return r.name || entry(r.appType as CcSwitchAppType)?.name || "AgentHub 网关";
 }
 
 async function refresh() {
@@ -77,7 +90,7 @@ async function loadModels() {
   }
 }
 
-async function register(appType: "claude" | "codex") {
+async function register(appType: CcSwitchAppType) {
   if (busy.value) return;
   busy.value = appType;
   err.value = "";
@@ -138,7 +151,7 @@ onMounted(() => {
     <div class="page-head">
       <div>
         <div class="page-title">生态接入</div>
-        <div class="page-sub">把 AgentHub 网关注册为 CC Switch 的 provider，Claude Code / Codex 的协议翻译由 CC Switch 完成</div>
+        <div class="page-sub">把 AgentHub 网关注册为 CC Switch 的 provider，Claude Code / Codex / Claude Desktop 的协议翻译由 CC Switch 完成</div>
       </div>
       <div class="page-actions">
         <button class="btn btn-primary" :disabled="!installed || incompatible || busy === 'claude'" @click="register('claude')">
@@ -146,6 +159,9 @@ onMounted(() => {
         </button>
         <button class="btn btn-primary" :disabled="!installed || incompatible || busy === 'codex'" @click="register('codex')">
           {{ busy === "codex" ? "注册中…" : "注册 Codex" }}
+        </button>
+        <button class="btn btn-primary" :disabled="!installed || incompatible || busy === 'claude-desktop'" @click="register('claude-desktop')">
+          {{ busy === "claude-desktop" ? "注册中…" : "注册 Claude Desktop" }}
         </button>
       </div>
     </div>
@@ -160,7 +176,7 @@ onMounted(() => {
           数据库：<span class="mono">{{ result.dbPath }}</span> · 写前备份：<span class="mono">{{ result.backupPath }}</span>
         </div>
         <div class="set-desc" style="margin-top: 6px">
-          注册已写入，无需重启 CC Switch。还需在其「设置 → 本地路由」为该应用开启<b>本地路由</b>开关，并切换到该条目。
+          注册已写入，无需重启 CC Switch。还需在其「设置 → 本地路由」为该应用开启<b>本地路由</b>开关，并切换到该条目。<template v-if="result.appType === 'claude-desktop'">切换后需<b>完全退出并重启 Claude Desktop</b>（Desktop 不热加载配置，且使用期间 CC Switch 需保持运行）。</template>
         </div>
       </div>
 
@@ -181,11 +197,11 @@ onMounted(() => {
         </div>
         <div v-else-if="incompatible" class="set-desc">检测到 CC Switch 数据库但结构不符，可能版本过旧；注册时会有更具体的报错。</div>
         <div v-else class="set-desc">
-          网关协议为 OpenAI Chat Completions。Claude Code 与 Codex 的原生协议由
+          网关协议为 OpenAI Chat Completions。Claude Code、Codex 与 Claude Desktop 的原生协议由
           CC Switch 翻译成 Chat Completions 再打到网关；每次注册前自动备份 CC Switch 数据库，且不修改其它 provider。
         </div>
         <div v-if="installed && !incompatible && needsTakeover.length" class="set-desc err-text" style="margin-top: 8px">
-          检测到 {{ needsTakeover.map((t) => t === "claude" ? "Claude Code" : "Codex").join(" / ") }}
+          检测到 {{ needsTakeover.map((t) => APP_LABELS[t]).join(" / ") }}
           已注册但未开启本地路由。CC Switch 只在本地路由开启时做协议转换，直接「打开终端」或普通切换会把原生请求打到网关而报 404。
         </div>
         <div v-else-if="installed && !incompatible" class="set-desc" style="margin-top: 8px">
@@ -194,8 +210,11 @@ onMounted(() => {
         <div class="kpis" style="margin-top: 12px">
           <div class="kpi"><span>网关地址</span><b class="mono">127.0.0.1:{{ port }}/v1</b></div>
           <div class="kpi"><span>Claude Code</span><b :class="entry('claude')?.registered ? 'acc' : ''">{{ entry("claude")?.registered ? "已注册" : "未注册" }}</b></div>
+          <div class="kpi"><span>路由 · Claude Code</span><b :class="takeoverOf('claude') ? 'acc' : 'err'">{{ takeoverOf("claude") ? "已开启" : "未开启" }}</b></div>
           <div class="kpi"><span>Codex</span><b :class="entry('codex')?.registered ? 'acc' : ''">{{ entry("codex")?.registered ? "已注册" : "未注册" }}</b></div>
-          <div class="kpi"><span>CC Switch 本地路由</span><b :class="(st?.takeover?.claude || st?.takeover?.codex) ? 'acc' : 'err'">{{ st?.takeover?.claude || st?.takeover?.codex ? "已开启" : "未开启" }}</b></div>
+          <div class="kpi"><span>路由 · Codex</span><b :class="takeoverOf('codex') ? 'acc' : 'err'">{{ takeoverOf("codex") ? "已开启" : "未开启" }}</b></div>
+          <div class="kpi"><span>Claude Desktop</span><b :class="entry('claude-desktop')?.registered ? 'acc' : ''">{{ entry("claude-desktop")?.registered ? "已注册" : "未注册" }}</b></div>
+          <div class="kpi"><span>路由 · Claude Desktop</span><b :class="takeoverOf('claude-desktop') ? 'acc' : 'err'">{{ takeoverOf("claude-desktop") ? "已开启" : "未开启" }}</b></div>
           <div class="kpi"><span>数据库</span><b class="mono">{{ st?.dbPath || "-" }}</b></div>
         </div>
       </div>
@@ -204,7 +223,7 @@ onMounted(() => {
       <div class="card" style="margin-top: 12px">
         <div class="card-title">注册参数</div>
         <div class="set-desc" style="margin-bottom: 10px">
-          网关 Key 与默认模型会写入条目配置（Claude 条目同时覆盖 Sonnet / Opus / Haiku / 子代理等模型字段）；
+          网关 Key 与默认模型会写入条目配置（Claude 条目同时覆盖 Sonnet / Opus / Haiku / 子代理等模型字段；Claude Desktop 条目将四档角色路由全映射到该模型）；
           参数在点击注册时写入 CC Switch，修改后请重新注册以同步。注册后需在 CC Switch 为该应用开启本地路由，
           再切换到该条目；无需重启 CC Switch。
         </div>
