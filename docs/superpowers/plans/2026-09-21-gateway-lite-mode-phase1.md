@@ -784,17 +784,27 @@ Expected: `OK 配置深合并补齐新字段`
 
 - [ ] **Step 3: 主进程 close 分支与启动建窗**
 
-`main.cjs:107-114` 整段替换。`destroy()` 不会再触发 `close`，无递归；`closed` 已有 `mainWindow = null`（`:116-118`）：
+`main.cjs` 的 `close` / `closed` 两个处理器整段替换为**同一个捕获引用的两条**（Task 7 的评审更正：原写法一处引用可变全局 `mainWindow`、一处引用捕获的 `thisWindow`，是对称性缺陷——迟到的 `close` 会 `destroy()` 掉活着的新窗口，后果比 `closed` 误置 null 更重）：
 
 ```js
-  // 关闭 → 缩到托盘：liteOnClose 开时销毁窗口，连渲染进程与合成表面一起回收（实测省 261 MB），
-  // 关掉则只 hide()（重开更快）；托盘菜单「退出」才是真正退出，后台才能持续跑网关与定时同步
-  mainWindow.on("close", (e) => {
+  const thisWindow = mainWindow;
+
+  // 关闭 → 缩到托盘：liteOnClose 开时销毁窗口，连渲染进程与合成表面一起回收
+  // （一期打包版实测：同一次运行 424.86 → 215.47 MB 私有，−49.3%，4 进程降到 3），
+  // 关掉则只 hide()（重开更快）；托盘菜单「退出」才是真正退出，后台才能持续跑网关与定时同步。
+  // 两个处理器都只用 thisWindow：destroy() 不会再触发 close，无递归。
+  thisWindow.on("close", (e) => {
     const cfg = config.loadConfig();
     if (quitting || !cfg.schedule || !cfg.schedule.minimizeToTray) return;
     e.preventDefault();
-    if (cfg.schedule.liteOnClose) mainWindow.destroy();
-    else mainWindow.hide();
+    if (cfg.schedule.liteOnClose) thisWindow.destroy();
+    else thisWindow.hide();
+  });
+
+  // 身份校验：destroy() 是否同步派发 closed 本机实测判别不了（竞态探针在无校验版本上同样通过），
+  // 两种时序的结论相反，所以按「两种都对」写——迟到的 closed 只能抹掉它自己那个窗口。
+  thisWindow.on("closed", () => {
+    if (mainWindow === thisWindow) mainWindow = null;
   });
 ```
 
@@ -810,13 +820,14 @@ Expected: `OK 配置深合并补齐新字段`
 
 ```js
     proxy.boot();
-    // 启动即进托盘：首帧不建窗，GPU 侧连建窗残留都不产生（实测比"建过再销毁"再省约 39 MB）。
+    // 启动即进托盘：首帧不建窗，GPU 侧连建窗残留都不产生（打包版实测无窗 166.05 MB，
+    // 比「建过窗再销毁」的 215.47 MB 再省 49.4 MB，GPU 只占 32.2）。
     // minimizeToTray 关时不生效 —— 那种配置下关窗就是退出，不该留一个没有界面的进程
     if (!(boot.schedule.launchHidden && boot.schedule.minimizeToTray)) createWindow();
     createTray();
 ```
 
-`second-instance`（`:328`）与托盘菜单「显示主界面」（`:214`）都走 `showWindow()`，无需改动。
+`second-instance`（`:328`）与托盘菜单「显示主界面」（`:214`）都走 `showWindow()`；`showWindow()` **本身要改**（见上方 Interfaces 与 Task 6 Step 3 评审 I1）：判据从 `if (!mainWindow)` 改为 `if (!mainWindow || mainWindow.isDestroyed())`，注释按「`closed` 派发时序本机判别不了，按两种时序都安全写」的口径落，不要写成已证实的时序结论。
 
 - [ ] **Step 4: 无窗口时的 dialog 兜底**
 
@@ -942,7 +953,9 @@ Expected: 同一脚本、同一测量口径下，`DOMContentLoaded` 与 `load` �
 ```bash
 powershell -NoProfile -ExecutionPolicy Bypass -File tmp/gateway-probe/memtree.ps1
 ```
-Expected: 进程数从 4 降到 3（renderer 消失），三进程私有内存合计落在 **150–200 MB**（探针基线 175.4 MB；GPU 回落幅度有抖动，取多次采样）。同时验证托盘双击可重开、重开后各页正常。若仍是 4 个进程，说明 `close` 没走到 `destroy()`，查 `minimizeToTray` 与 `quitting` 判断分支。
+Expected: 进程数从 4 降到 3（renderer 消失）；**同一次运行内**关窗后私有内存相对开着窗降幅 **≥45%**，且无窗三进程合计 **≤220 MB、main 单列 ≤130 MB**（Task 7 实测：424.86 → 215.47 MB，−49.3%，main 126.84 / gpu 75.77 / network utility 12.86，40 s 落定 5 次采样一字不差）；同时验证**托盘双击**与 `second-instance` 两条路径都能重开、重开后各页正常（同实例重开首帧实测 FCP 504/1880 ms、DCL 362–433 ms）。若仍是 4 个进程，说明 `close` 没走到 `destroy()`，查 `minimizeToTray` 与 `quitting` 判断分支。
+
+> **判据更正（D7）**：本节原文写的是「三进程落在 **150–200 MB**（探针基线 175.4 MB）」。实测 215.47 MB 未落进这条绝对区间，**处置是报告未达标 + 归因，不放宽、不改探针**（见 §偏差 D7）：175.37 从来不是本应用的地板价，它是 §三那支只建一个 `BrowserWindow` 的**裸 Electron 合成探针**的关窗后两次采样（176.94 / 173.79）的均值；真实打包版比它高 38.5 MB，其中 +27.7 MB 在 main（网关 express、两个 SQLite、watch 快照器、两个调度器常驻），旁证是对用户自己那份实例只读枚举得 `main:125.98`，与本构建无窗的 `main:126.84` 同值 —— 这块驻留与窗口无关，关窗路径回收不动。故绝对区间改为「相对降幅 + main 单列」两条，150–200 MB 移交二期（`launchHidden` 实测 166.05 MB 已在区间内）。
 
 - [ ] **Step 4: 常驻期功能不回退**
 
@@ -979,14 +992,16 @@ git commit -m "test: 固化首屏产物体积门槛与关窗内存验收"
 
 ---
 
-## 与规格的五处偏差（执行前请确认）
+## 与规格的八处偏差（D1-D5 执行前确认，D7-D8 由执行中的实测新增）
 
 - **D1 CSS 门槛 ≤250 KB → 320 KB → 325 KB。** 250 与规格自己的约束矛盾（`sync.css` 72 KB、`skills.css` 18 KB 必须留 entry）；320 又错在按源码体积估 phosphor 可省量，压缩后实省 57 KB 而非 78 KB，实测地板价 321.0 KiB。最终 325 KB = 实测 + 约 4 KB 漂移余量。两次都改门槛数字而非硬凑产物，且各自带实测归因。
 - **D2 视图不合并成 8 块，按视图各成一块（约 18 块）。** 规格 §4.3(a) 的合并理由是"别碎成十几个请求"，那是 Web 口径；本项目走 `file://` 加载本地产物，多几个 chunk 没有网络代价，还省掉 `manualChunks` 路径正则的维护。若实测发现碎片化拖慢重开，再加 `manualChunks` 合并。
 - **D3 `unplugin-vue-components` 取 0.27 线。** Vite 4 不在其 peerDependencies 约束里，取与本仓库 Vite 4.5.14 同期的大版本。若 Step 1 冒烟就报 hook 不兼容，退路不是"手写 19 个组件注册"，而是回到规格重议按需方案。
 - **D4 `.el-textarea__inner` 死规则不删。** 它出现在 `element.css:292/301/310` 的逗号选择器组里，删要拆组、收益不足 1 KB，风险收益不成比例。规格 §九 据此把这条从"顺手修"降为"不做"。
 - **D5 Phosphor 的 `woff2` 字形子集本计划不做。** 需要 `fontTools/pyftsubset`，本机有 Python 3.14 但没装 fontTools，不擅自装系统依赖。Task 5 只做 CSS 规则子集（82 KB → 约 5 KB，这才是解析成本的来源）。字体文件要不要裁，等一期实测数字出来单独决定。
+- **D7（Task 7 执行中新增）关窗内存的绝对区间判据被探针数字污染，已就地更正为「相对降幅 + main 单列」。** 原「150–200 MB（基线 175.4）」引自 §三只建一个 `BrowserWindow` 的合成探针，不是本应用的地板价；真实打包版无窗 215.47 MB（main 占 126.84，其中网关/SQLite/watch/调度器与窗口无关）。处置顺序是「报告未达标 → 归因 → 换判据」，不是放宽数字。规格 §一 表、§4.1 验收、D5 的收益数字同步更正。**这条更正改变了对外承诺的数字，需要用户签字。**
+- **D8（Task 7 执行中新增）`ws` 补为 devDependency。** `scripts/dev-first-paint-check.cjs:9` 需要 `ws`，而 `package.json` / `package-lock.json` 里从来没有它（Task 0 当时靠 `node_modules` 里一个无关的既存副本，装 `unplugin-vue-components` 时被裁掉，Task 7 又用 `npm pack` 手工解包救回）——即整条首屏测量链在新克隆/新装机器上跑不起来，而「Task 0 与 Task 7 同一支脚本同一口径」这个可比性前提正是 §4.1 判据的地基。裁决：`npm i -D ws@8.21.3`（该包无 install 脚本，不触发本机 npm 11 的 postinstall 拦截），不改写脚本去用 Node 全局 `WebSocket`（非 EventEmitter、无 `terminate()`，等于在验收中途换测量仪器）。
 
 ## 完成定义
 
-一期算完成：Task 0-7 全部提交；Task 0 的基线与 Task 7 Step 1/2 的复测数字（体积门槛三数 + FCP/DCL/load）并排进过一次执行报告；关窗后私有内存落在 Task 7 Step 3 的区间且网关转发与记账不受影响；`launchHidden` 开与关两种启动方式都手动走过一遍。达成后再为规格 §五 出第二份实现计划。
+一期算完成：Task 0-7 全部提交；Task 0 的基线与 Task 7 Step 1/2 的复测数字（体积门槛三数 + FCP/DCL/load）并排进过一次执行报告；关窗后按 **D7 更正后的判据**（4→3 进程、同一次运行相对降幅 ≥45%、无窗合计 ≤220 MB 且 main ≤130 MB）达成，且网关在无窗期仍应答；`launchHidden` 开与关两种启动方式都走过一遍，重开的**托盘双击**与 `second-instance` 两条路径都验过。**另有两条只能由用户本人跑的收尾**（要真实号池与凭据，子代理不得动用）：无窗期一次真补全 200 + 该请求重开后在「反代网关 · 用量统计」入库；`node tools/proxy-regress.cjs` 非隔离跑（覆盖 CN/AI 适配器余额聚合）。达成后再为规格 §五 出第二份实现计划。
