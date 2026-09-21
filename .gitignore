@@ -31,6 +31,8 @@ npm-debug.log*
 # 助手工作区（本地记忆/缓存，不入库）
 .workbuddy/
 .zcode/
+# 项目级 agent 指南（含本机环境/验证方法，约定不入库）
+AGENTS.md
 
 # vite 构建中断时残留的临时配置
 vite.config.ts.timestamp-*.mjs

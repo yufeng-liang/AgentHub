@@ -106,5 +106,11 @@
     "portable": {
       "artifactName": "AgentHub-${version}-portable.exe"
     }
+  },
+  "allowScripts": {
+    "electron@35.7.5": true,
+    "esbuild@0.18.20": true,
+    "koffi@3.3.0": true,
+    "vue-demi@0.14.10": true
   }
 }
