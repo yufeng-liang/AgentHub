@@ -226,7 +226,7 @@
 | 一期体积 | 核 `dist/assets/` 分块字节数（不用构建退出码代替产物检查）；目标见 §4.3 |
 | 一期耗时 | CDP 实测「建窗 → 可交互」（AGENTS.md 第三节流程）；探针 `tmp/gateway-probe/memtree.ps1` 可复用 |
 | 一期内存 | 关窗前后采 `PrivateMemorySize64`，对齐 **§4.1 更正后的判据**（相对降幅 + main 单列）。**不要**对齐 §三——那张表是合成探针，量的是 Electron 不是本应用（教训见 §一 表下说明） |
-| 探针卫生（一期 Task 7 暴露，二期必须遵守） | 用临时 userData 起打包版实例**并不等于隔离**：`hubDir()` 按 `os.homedir()` 解析，仍会读写共享中央仓库 `~/.agent_skills`；packaged 且非便携的实例每次启动都调 `applyAutoStart`，`autoStart` 默认 false 时会把**用户自己的**开机自启 Run 项删掉。故探针三件套：`AGENT_SKILLS_HOME=<临时目录>`（或临时 config 里 `watch.enabled:false`）+ 网关端口改到非 9527（9527 归用户实例，拿它的应答当本构建的证据是错的）+ 收尾核对 HKCU Run 值列表未变。一期四个探针脚本在 gitignored 的 `tmp/gateway-probe/`，二期复用时**四个一起**提到 `tools/`，别只提 `.cjs`（会留下对 `memtree.ps1` 的悬空引用） |
+| 探针卫生（一期 Task 7 暴露，二期必须遵守） | 用临时 userData 起打包版实例**并不等于隔离**：`hubDir()` 按 `os.homedir()` 解析，仍会读写共享中央仓库 `~/.agent_skills`；packaged 且非便携的实例每次启动都调 `applyAutoStart`，`autoStart` 默认 false 时会把**用户自己的**开机自启 Run 项删掉。故探针三件套：`AGENT_SKILLS_HOME=<临时目录>`（或临时 config 里 `watch.enabled:false`）+ 网关端口改到非 9527（9527 归用户实例，拿它的应答当本构建的证据是错的）+ 收尾核对 HKCU Run 值列表未变。一期四个探针脚本在 gitignored 的 `tmp/gateway-probe/`，二期复用时**四个一起**提到 `tools/`，别只提 `.cjs`（会留下对 `memtree.ps1` 的悬空引用）。另注意 `proxy.boot()` 里的 `discovery.cjs:34,37,347` 会读**真实本机登录文件**（CodeBuddy/Trae 的本地 auth），临时 userData 挡不住它——一期那次隔离实例 `/v1/models` 能列出 `trae` 的模型就是这个原因（只读，discovery/adapter 侧无写入调用；但报告写「号池为空」时必须同时说明这点），二期把 discovery 下沉到子进程时要一并处理 |
 | 按需注册静默坏掉 | 新增 CDP 冒烟：6 个 chunk 落点页各截一次 DOM，断言图表 canvas 存在、`el-date-picker` 面板月份为中文、图例已渲染 |
 | 图标子集 | 纯静态比对：`src` 用到的类名 ∪ 后端 `toolIcon()` 下发集合 ⊆ 生成的子集 CSS |
 | 二期 | 矩阵：安装版/便携版 × 常驻开关 × 升级装更。验「主 App 退出后 9527 仍通」「重开认领不起第二个进程」「WAL 不再单调增长」「装更前子进程已停」 |
