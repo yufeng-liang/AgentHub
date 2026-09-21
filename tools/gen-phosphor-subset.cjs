@@ -1,4 +1,4 @@
-// 扫 src/ 实际用到的 Phosphor 类名，连同后端 toolIcon() 下发的图标，生成只含这些字形
+// 扫 src/ 与 electron/backend/ 实际用到的 Phosphor 类名，生成只含这些字形
 // 规则的 CSS（全量 1530 条 / 82 KB，实际用 88 条）。用法：
 //   node tools/gen-phosphor-subset.cjs        # 生成 phosphor-used.css
 // 图标集合变化后重跑即可；扫到字体表里不存在的类名会直接失败退出，不静默丢。
@@ -7,11 +7,13 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const SRC = path.join(__dirname, "..", "src");
+const BACKEND = path.join(__dirname, "..", "electron", "backend");
 const FULL = path.join(SRC, "assets", "phosphor", "style.full.css");
 const OUT = path.join(SRC, "assets", "phosphor", "phosphor-used.css");
 
-// 后端数据下发的图标（stores/app.ts:241 toolIcon 的返回来自 electron/backend 的适配器），
-// 静态扫 src/ 扫不到，手工列全，新增工具适配器时要同步这里
+// 手工兜底清单：electron/backend/ 已并入扫描根（适配器下发的图标是源码里的字面量，扫得到，
+// 含 ph-airplane-tilt），所以这里只需要列静态扫描看不到的名字——例如计算拼出来的 "ph-" + x。
+// 下面 8 项已被扫描覆盖、保留只为防适配器重构时漏扫，新增动态拼名时才往这里加
 const BACKEND_ICONS = [
   "ph-brain", "ph-code", "ph-command", "ph-folder-open",
   "ph-package", "ph-robot", "ph-sparkle", "ph-terminal-window",
@@ -27,7 +29,7 @@ function walk(dir, files = []) {
 }
 
 const used = new Set(BACKEND_ICONS);
-for (const f of walk(SRC)) {
+for (const f of [...walk(SRC), ...walk(BACKEND)]) {
   // 只认 "ph-xxx" 形式的类名片段；CSS 自定义属性 --ph- 会被这个正则自然排除
   for (const m of fs.readFileSync(f, "utf8").matchAll(/\bph-[a-z0-9]+(?:-[a-z0-9]+)*/g)) used.add(m[0]);
 }
