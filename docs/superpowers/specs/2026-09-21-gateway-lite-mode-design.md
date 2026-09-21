@@ -106,7 +106,7 @@
 
 > **必须同批改的高危点**：`main.ts:21` 的 `{ locale: zhCn }` 是全库唯一 locale 注入点。按需注册后没有全局配置，`el-date-picker` 面板的月份/星期会**静默回退英文**（用在 `TrendChart.vue:286`、`DetailView.vue:178`）。改用 `<el-config-provider :locale="zhCn">` 包住根节点。`ElMessageBox` 需手动引样式（`el-message-box.css` + overlay/input/button）。
 
-**(c) echarts 按需。** `TrendChart.vue:3` 与 `CostTrendChart.vue:3` 的 `import * as echarts`（全量 min 版 1,034,102 B）。实测只用到：series `LineChart`；组件 `GridComponent`/`TooltipComponent`/`LegendComponent` + **`LegendScrollComponent`**（`TrendChart.vue:223` 的 `legend.type:"scroll"`。实装 5.6.0 上这条**冗余**——`legend/install.js` 已自带 `use(installLegendScroll)`，Task 2 实测只注册 `LegendComponent` 也能解析 `legend.scroll`；因 `package.json` 声明下限 `^5.4.3`，显式注册保留作防御，两种写法注册集完全相同）；`CanvasRenderer`；`graphic.LinearGradient`（`echarts/core` 已导出，无需注册）。
+**(c) echarts 按需。** `TrendChart.vue:3` 与 `CostTrendChart.vue:3` 的 `import * as echarts`（全量 min 版 1,034,102 B）。实测只用到：series `LineChart`；组件 `GridComponent`/`TooltipComponent`/`LegendComponent` + `LegendScrollComponent`（`TrendChart.vue:223` 的 `legend.type:"scroll"`。这条**从来不是必需**——Task 3 用 `npm pack` 核对了 5.4.3 与 5.6.0，两者 `legend/install.js` 都自带 `use(installLegendScroll)`，只注册 `LegendComponent` 也能解析 `legend.scroll`；显式注册零成本，保留但别当必需、也别当冗余删）；`CanvasRenderer`；`graphic.LinearGradient`（`echarts/core` 已导出，无需注册）。
 **不需要** `HeatmapChart`——`Heatmap.vue` 是纯 DOM 格子（`:157-202`），完全不碰 echarts。`TooltipComponent` 内部已 `use(installAxisPointer)`，不必显式注册。全库无 `registerTheme`。
 `TrendChart.vue:15`/`CostTrendChart.vue:14` 的 `echarts.ECharts` 类型引用要转 `import type`，否则 `npm run build` 的 vue-tsc 会把整包重新拉回。
 

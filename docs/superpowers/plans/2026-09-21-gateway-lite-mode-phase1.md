@@ -325,10 +325,10 @@ git commit -m "refactor: 自动感知指纹扫描改异步，消主进程每 15 
 // echarts 按需注册入口：全库只用折线图 + 网格 / 提示框 / 图例（含滚动图例）+ canvas 渲染器。
 // 所有图表一律从本文件 import，禁止再 import "echarts" —— 那会把 1009 KB 的全量包拉回首屏。
 // 两个坑：Heatmap.vue 是纯 DOM 格子，不碰 echarts，因此不需要 HeatmapChart；全库无
-// registerTheme、无 graphic option、无 mark*。LegendScrollComponent 在实装 5.6.0 里其实是
-// 冗余的（legend/install.js 已自带 use(installLegendScroll)，Task 2 实测：只注册
-// LegendComponent 也能解析出 legend.scroll），但 package.json 声明的下限是 ^5.4.3，
-// 显式注册是防御性的、且两种写法的注册集完全相同 —— 保留，别当冗余删掉。
+// registerTheme、无 graphic option、无 mark*。LegendScrollComponent **从来不是必需项**：
+// 5.6.0 与 5.4.3（npm pack 核对）的 legend/install.js 都已自带 use(installLegendScroll)，
+// 只注册 LegendComponent 也能解析 legend.scroll。留着它只是零成本的显式声明，
+// 既不必当成"漏了图例就不渲染"，也别当冗余删掉。
 import * as echarts from "echarts/core";
 import { LineChart } from "echarts/charts";
 import { GridComponent, LegendComponent, LegendScrollComponent, TooltipComponent } from "echarts/components";
