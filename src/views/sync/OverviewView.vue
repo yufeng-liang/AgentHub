@@ -227,7 +227,15 @@ function showSettings() {
    = 406px（min-height 取 408 = 406 + 2 余量）。不含卡片自身的 margin-bottom:18：按 CSS 2.1 §8.3.1，父层无下内边距、无下边框且
    height 仍为 auto 时子元素下边距穿透塌陷（min-height 不阻断塌陷），它会与相邻
    .device-breakdowns 的 margin-top:18 折叠成同一个 18，于是预留后的排布与「未异步」时一致。
-   用 min-height 而非 height：真实渲染更高（卡头文案换行等）时只撑开、不裁切。 */
+   用 min-height 而非 height：真实渲染更高（卡头文案换行等）时只撑开、不裁切。
+
+   2026-09-22 CDP 实测复核（headless Chrome 1384×779，dev 与打包产物 dist/ 两份数字一致）：
+   .trend-slot offsetHeight 408 = scrollHeight 408，其唯一子 .card offsetHeight 406 → 图下常驻空档
+   只有 2px（不是 46px）；.card-head 实高 32（.tabs = 24 的 .tab + 上下 3 内边距 + 1 边框 ×2），
+   逐帧采样显示占位期 408 → 到位后 408，无塌陷回弹。把 .pages 压到 960 仍是 406/408；压到 760
+   卡头换行，.card 自然长到 414，min-height 是地板不是天花板，容器照样撑开（所以「窄窗缺 106px」
+   的说法不成立）。别把 408 往小改：地板 362 时占位期 362、到位后 406，凭空多一次 44px 回弹，
+   正是这块占位要防的事（关掉地板实测：0 → 406，下方 .device-breakdowns 从 443 跳到 865）。 */
 .trend-slot {
   min-height: 408px;
 }
