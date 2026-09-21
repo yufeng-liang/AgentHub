@@ -137,9 +137,17 @@ const PROBE = `(() => {
 ```bash
 node scripts/dev-first-paint-check.cjs
 ```
-Expected: 一行 FCP/DCL/load 数字 + 三个最大产物文件（未优化时应为 `index-*.js ≈ 2445 KB`、`index-*.css ≈ 584 KB`）。**把这两个输出原样抄进执行报告的「基线」行** —— 后面所有"省了多少"都以此为参照，没有这行数字 Task 7 的对比就无从成立。脚本本身不在 HEAD 改动范围内，先不提交（Task 7 与门槛脚本一起提交）。
+Expected: 一行 FCP/DCL/load 数字 + 三个最大产物文件（未优化时应为 `index-*.js ≈ 2445 KB`、`index-*.css ≈ 584 KB`）。**把这两个输出原样抄进执行报告的「基线」行** —— 后面所有"省了多少"都以此为参照，没有这行数字 Task 7 的对比就无从成立。
 
-- [ ] **Step 4: 收尾**
+- [ ] **Step 4: 提交测量脚本**
+
+```bash
+git add scripts/dev-first-paint-check.cjs
+git commit -m "test: 首屏耗时测量脚本（CDP 读 Paint/Navigation Timing）"
+```
+若 Step 1 触发了 `npm i -D ws`，`package.json` / `package-lock.json` 一并进这条提交。脚本先入库再动别的代码——基线数字一旦记进报告，工具本身必须能被后续任务复跑。
+
+- [ ] **Step 5: 确认没污染真实环境**
 
 关掉这个测量用的 Electron 实例（`finally` 里已 `taskkill /T /F`），确认真实使用中的 AgentHub 没被误杀、`%APPDATA%\AgentHub` 未被写入：
 
@@ -949,10 +957,9 @@ Expected: 全部通过。`dev-ccswitch-test.cjs` 靠 `CCSWITCH_DB_PATH` 做隔�
 - [ ] **Step 6: 提交**
 
 ```bash
-git add scripts/dev-bundle-check.cjs scripts/dev-first-paint-check.cjs
+git add scripts/dev-bundle-check.cjs
 git commit -m "test: 固化首屏产物体积门槛与关窗内存验收"
 ```
-`dev-first-paint-check.cjs` 一并入库（Task 0 起时就该提交，但它参与本次验收，放在这里避免前面的任务带着一个还没用过第二遍的工具）。若 Step 1 起装了 `ws`，`package.json` / `package-lock.json` 也要进这条提交。
 
 ---
 
