@@ -547,6 +547,14 @@ const ConfigUsageSection = defineAsyncComponent(() => import("./components/confi
 const ConfigProxySection = defineAsyncComponent(() => import("./components/config/ConfigProxySection.vue"));
 ```
 
+- [ ] **Step 1b: 把落点视图里的图表组件也异步化（执行期新增，见文末 D6）**
+
+三个落点视图留静态是为了不白屏，但 `sync/OverviewView.vue` 静态引了 `TrendChart.vue`，而 `TrendChart` 又引 `src/utils/echarts.ts` —— 于是 echarts+zrender **473 KB（占 entry 44%）**被拖回首屏，entry 卡在 1079 KB，≤800 KB 门槛按原计划永远达不到（Task 4 实测，非推测）。
+
+修法只动一处：在 `src/views/sync/OverviewView.vue` 里把 `TrendChart` 的静态 import 换成 `defineAsyncComponent(() => import(...))`。**落点页的壳（标题、KPI、日期区）仍是静态**，图表本来就等 IPC 回数据才画，晚一帧挂载用户看不出；实测 entry 降到 ~606 KB、最大 chunk ~476 KB（echarts 自己那块）。
+
+`src/views/sync/CostsView.vue` 已在异步 chunk 里，不需要这步；`SyncTopBar` 不引 echarts（已核）。做完把 `TrendChart` 出现在哪些 chunk 报出来，确认它不再在 entry。
+
 - [ ] **Step 2: 构建并核 chunk 切分结果**
 
 ```bash
