@@ -551,7 +551,7 @@ const ConfigProxySection = defineAsyncComponent(() => import("./components/confi
 
 三个落点视图留静态是为了不白屏，但 `sync/OverviewView.vue` 静态引了 `TrendChart.vue`，而 `TrendChart` 又引 `src/utils/echarts.ts` —— 于是 echarts+zrender **473 KB（占 entry 44%）**被拖回首屏，entry 卡在 1079 KB，≤800 KB 门槛按原计划永远达不到（Task 4 实测，非推测）。
 
-修法只动一处：在 `src/views/sync/OverviewView.vue` 里把 `TrendChart` 的静态 import 换成 `defineAsyncComponent(() => import(...))`。**落点页的壳（标题、KPI、日期区）仍是静态**，图表本来就等 IPC 回数据才画，晚一帧挂载用户看不出；实测 entry 降到 ~606 KB、最大 chunk ~476 KB（echarts 自己那块）。
+修法只动一处：在 `src/views/sync/OverviewView.vue` 里把 `TrendChart` 的静态 import 换成 `defineAsyncComponent(() => import(...))`。**落点页的壳（标题、KPI、日期区）仍是静态**，图表本来就等 IPC 回数据才画，晚一帧挂载用户看不出；实测结果：entry 降到 **489 KiB**（比当初的 ~606 KB 估算更好——连带 `el-date-picker` 73 KiB 等一起离开首屏），最大 chunk 即 entry 本身，次大 `chart-tooltip` 476 KiB，js 文件 29 个。
 
 `src/views/sync/CostsView.vue` 已在异步 chunk 里，不需要这步；`SyncTopBar` 不引 echarts（已核）。做完把 `TrendChart` 出现在哪些 chunk 报出来，确认它不再在 entry。
 
