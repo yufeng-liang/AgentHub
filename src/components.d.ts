@@ -7,15 +7,6 @@ export {}
 /* prettier-ignore */
 declare module 'vue' {
   export interface GlobalComponents {
-    ConfigDataSection: typeof import('./components/config/ConfigDataSection.vue')['default']
-    ConfigGeneralSection: typeof import('./components/config/ConfigGeneralSection.vue')['default']
-    ConfigProxySection: typeof import('./components/config/ConfigProxySection.vue')['default']
-    ConfigSkillsSection: typeof import('./components/config/ConfigSkillsSection.vue')['default']
-    ConfigUsageSection: typeof import('./components/config/ConfigUsageSection.vue')['default']
-    ConfigWebdavSection: typeof import('./components/config/ConfigWebdavSection.vue')['default']
-    CostTrendChart: typeof import('./components/sync/CostTrendChart.vue')['default']
-    DayModal: typeof import('./components/sync/DayModal.vue')['default']
-    Drawer: typeof import('./components/sync/Drawer.vue')['default']
     ElButton: typeof import('element-plus/es')['ElButton']
     ElDatePicker: typeof import('element-plus/es')['ElDatePicker']
     ElDialog: typeof import('element-plus/es')['ElDialog']
@@ -35,15 +26,5 @@ declare module 'vue' {
     ElTimePicker: typeof import('element-plus/es')['ElTimePicker']
     ElTimeSelect: typeof import('element-plus/es')['ElTimeSelect']
     ElTooltip: typeof import('element-plus/es')['ElTooltip']
-    EmptyState: typeof import('./components/sync/EmptyState.vue')['default']
-    Heatmap: typeof import('./components/sync/Heatmap.vue')['default']
-    PageTabs: typeof import('./components/PageTabs.vue')['default']
-    SettingsDialog: typeof import('./components/config/SettingsDialog.vue')['default']
-    Sidebar: typeof import('./components/Sidebar.vue')['default']
-    SkillsHelpDialog: typeof import('./components/SkillsHelpDialog.vue')['default']
-    SyncDialog: typeof import('./components/sync/SyncDialog.vue')['default']
-    SyncTopBar: typeof import('./components/sync/SyncTopBar.vue')['default']
-    TrendChart: typeof import('./components/sync/TrendChart.vue')['default']
-    UsageBreakdown: typeof import('./components/sync/UsageBreakdown.vue')['default']
   }
 }
