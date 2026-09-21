@@ -201,12 +201,13 @@ function buildEntry(appType, { base, apiKey, model }) {
         apiFormat: "openai_chat",
         claudeDesktopMode: "proxy",
         // 四角色 routeId 全映射到同一上游模型（上游 CLAUDE_DESKTOP_ROLE_ROUTE_IDS；
-        // value 形态 { model } 对照上游 ClaudeDesktopProviderForm 的落库样板）
+        // value 形态 { model, labelOverride } 对照上游 ClaudeDesktopProviderForm 的落库样板）
+        // labelOverride 必须等于 model：留空时 Desktop 菜单显示的是角色名，看不出实际在跑哪个模型
         claudeDesktopModelRoutes: {
-          "claude-sonnet-5": { model: upstream },
-          "claude-opus-5": { model: upstream },
-          "claude-haiku-4-5": { model: upstream },
-          "claude-fable-5": { model: upstream },
+          "claude-sonnet-5": { model: upstream, labelOverride: upstream },
+          "claude-opus-5": { model: upstream, labelOverride: upstream },
+          "claude-haiku-4-5": { model: upstream, labelOverride: upstream },
+          "claude-fable-5": { model: upstream, labelOverride: upstream },
         },
       },
     };

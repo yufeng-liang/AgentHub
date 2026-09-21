@@ -191,8 +191,9 @@ const ccswitch = require("../electron/backend/proxy/ccswitch.cjs");
   );
   for (const [rid, route] of Object.entries(metaD.claudeDesktopModelRoutes)) {
     assert.strictEqual(route.model, "deepseek-v4-flash", `角色 ${rid} 应映射到同一上游模型`);
+    assert.strictEqual(route.labelOverride, "deepseek-v4-flash", `角色 ${rid} 的菜单显示名应与实际请求模型一致`);
   }
-  console.log("✓ claude-desktop 条目 env 形态 + proxy 模式 + 四角色路由映射");
+  console.log("✓ claude-desktop 条目 env 形态 + proxy 模式 + 四角色路由映射（显示名对齐上游模型）");
 
   // 6) 校验报错分支：未知 appType / 空 key / 空 model（不落库）
   assert.strictEqual(ccswitch.register({ appType: "foo", apiKey: "k", model: "m" }).ok, false, "未知 appType 应失败");

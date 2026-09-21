@@ -223,7 +223,8 @@ onMounted(() => {
       <div class="card" style="margin-top: 12px">
         <div class="card-title">注册参数</div>
         <div class="set-desc" style="margin-bottom: 10px">
-          网关 Key 与默认模型会写入条目配置（Claude 条目同时覆盖 Sonnet / Opus / Haiku / 子代理等模型字段；Claude Desktop 条目将四档角色路由全映射到该模型）；
+          网关 Key 与默认模型会写入条目配置（Claude 条目同时覆盖 Sonnet / Opus / Haiku / 子代理等模型字段；Claude Desktop 条目将四档角色路由全映射到该模型，
+          菜单显示名同步为该模型以免与真实请求的模型不一致）；
           参数在点击注册时写入 CC Switch，修改后请重新注册以同步。注册后需在 CC Switch 为该应用开启本地路由，
           再切换到该条目；无需重启 CC Switch。
         </div>
