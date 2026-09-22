@@ -236,6 +236,8 @@ export interface AppConfig {
     /** 启动不建窗，直接进托盘；依赖 minimizeToTray */
     launchHidden: boolean;
     autoStart: boolean;
+    /** 主 App 退出后网关子进程继续常驻（便携版不支持；自启注册目标随它切换） */
+    persistentGateway: boolean;
     hourly: boolean;
     daily: boolean;
     dailyTime: string;

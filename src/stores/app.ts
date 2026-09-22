@@ -17,7 +17,7 @@ const defaultConfig: AppConfig = {
   trashDays: 7,
   update: { channel: "stable", autoCheck: true, notifiedVersion: "" },
   webdav: { endpoint: "", username: "", password: "", root: "/agent-skills", deviceId: "", deviceName: "" },
-  schedule: { minimizeToTray: true, liteOnClose: true, launchHidden: false, autoStart: false, hourly: false, daily: false, dailyTime: "09:00", notifyOnSuccess: false },
+  schedule: { minimizeToTray: true, liteOnClose: true, launchHidden: false, autoStart: false, persistentGateway: false, hourly: false, daily: false, dailyTime: "09:00", notifyOnSuccess: false },
   watch: { enabled: true },
   // 反代网关设置兜底（权威默认值见 electron/backend/config.cjs）
   proxy: {

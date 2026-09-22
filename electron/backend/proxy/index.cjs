@@ -177,11 +177,12 @@ function stopCheckinAuto() {
   checkinTimer = null;
 }
 
-/** 启动装配：规则热加载初始化 + 数据库 + 定时额度刷新 + 按上次的开关状态恢复网关
- *  （restoreOnLaunch 不是「用户偏好」而是「上次退出时网关是开是关」，默认 false → 首次打开是关闭的）
+/** 启动装配：规则热加载初始化 + 数据库 + 定时额度刷新 + 按监听意愿恢复网关
+ *  （restoreOnLaunch 已按 Task 6 重定义：本次启动时是否让（新建或认领来的）子进程进入监听状态，
+ *  不再是「上次退出时网关开没开」；默认 false → 首次打开网关是停的）
  *
- *  二期（Task 3）：attachGatewayMode() 之后这段自启监听**不再生效**——监听决策归主进程
- *  （Task 6 会把 restoreOnLaunch 重定义为「本次启动是否让子进程进入监听」）。
+ *  二期（Task 3）：attachGatewayMode() 之后这段自启监听**不再生效**——监听决策归主进程，
+ *  主进程 start() 成功后按 restoreOnLaunch 发一次 proxy_start 或只发 proxy_status（main.cjs）。
  *  今天子进程走的是 gateway.cjs 自己的装配序（rules.init + store.open + 周期 checkpoint），
  *  不经 boot()，所以这条开关是给「同一个 index.cjs 被子进程 require」留下的边界声明。 */
 async function boot() {

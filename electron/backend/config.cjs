@@ -122,6 +122,7 @@ function defaultConfig() {
       liteOnClose: true,    // 关窗即销毁窗口回收 UI 内存（重开需重新加载首屏）
       launchHidden: false,  // 启动不建窗，直接进托盘
       autoStart: false,     // 开机自启（便携版无效）
+      persistentGateway: false, // 主 App 退出后网关子进程继续常驻（便携版不支持；自启注册目标随它切换）
       hourly: false,        // 每小时自动同步
       daily: false,         // 每天定时同步
       dailyTime: "09:00",
@@ -135,7 +136,10 @@ function defaultConfig() {
     proxy: {
       port: 9527,               // 监听端口（默认 9527）
       bind: "127.0.0.1",        // 绑定地址：127.0.0.1 仅本机 / 0.0.0.0 局域网开放
-      restoreOnLaunch: false,    // 网关开关的上次状态：启动应用时是否随之启动（默认关，由用户自行开启）
+      // 语义（Task 6 重定义，规格 §六）：本次启动时，是否让（新建或认领来的）子进程进入监听状态——
+      // 不再是「上次退出时网关开没开」。常驻（persistentGateway）detach 出去的就是「监听中」这个状态，
+      // 主 App 下次启动认领回来；启动/停止网关仍会同步到这里，作为下次启动的监听意愿。
+      restoreOnLaunch: false,
       routeStrategy: "smart",   // smart=智能路由（健康度×余额打分）/ fixed=指定渠道优先
       fixedChannel: "trae",     // fixed 策略下的优先渠道
       rateLimitPerMin: 120,     // 单 Key 令牌桶限速（次/分钟，Key 可单独覆盖）
@@ -313,7 +317,7 @@ function loadConfig() {
   if (!disk || typeof disk !== "object" || Array.isArray(disk)) disk = {};
   const merged = mergeConfig(defaultConfig(), disk);
   // 迁移：旧版 proxy.autoStart 是「永远自启」的开关且默认 true，不是用户选择；
-  // 新语义是 restoreOnLaunch「记住上次开关」，所以旧值一律丢弃，改完存盘即不再出现
+  // 新语义是 restoreOnLaunch「本次启动是否让子进程进入监听」，所以旧值一律丢弃，改完存盘即不再出现
   if (merged.proxy && "autoStart" in merged.proxy) delete merged.proxy.autoStart;
   if (merged.theme !== "dark" && merged.theme !== "light") merged.theme = "dark";
   merged.moduleOrder = normalizeModuleOrder(merged.moduleOrder);
@@ -398,12 +402,21 @@ function setUpdateNotified(version) {
   }
 }
 
-// 开机自启即时生效；便携版注册的是临时解压路径，开发模式不必注册
+// 开机自启即时生效；便携版注册的是临时解压路径，开发模式不必注册。
+// 注册目标随 schedule.persistentGateway 切换（Task 6）：
+//  · 关（默认）→ 主 App exe：开机拉起完整应用（不传 path，Electron 默认注册 process.execPath）；
+//  · 开 → 安装根目录的 agenthub-gateway.cmd（package.json extraFiles 落位，与主 exe 同目录）：
+//    开机只拉常驻网关子进程（--persistent，不建窗），主 App 由用户手动打开后认领该网关。
+// 打开/关闭都走同一条 setLoginItemSettings：openAtLogin:false 即注销，切目标 = 下次保存时换 path 重注册。
 function applyAutoStart(cfg) {
   if (isPortable() || !electronApp || process.env.VITE_DEV_SERVER_URL) return;
   try {
     if (!electronApp.isPackaged) return;
-    electronApp.setLoginItemSettings({ openAtLogin: !!(cfg.schedule && cfg.schedule.autoStart) });
+    const opts = { openAtLogin: !!(cfg.schedule && cfg.schedule.autoStart) };
+    if (cfg.schedule && cfg.schedule.persistentGateway) {
+      opts.path = path.join(path.dirname(process.execPath), "agenthub-gateway.cmd");
+    }
+    electronApp.setLoginItemSettings(opts);
   } catch { /* 注册失败不拦保存 */ }
 }
 

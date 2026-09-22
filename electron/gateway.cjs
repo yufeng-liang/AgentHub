@@ -7,10 +7,15 @@
 // 职责边界：只做装配与生命周期，**不含业务逻辑**（业务全在 proxy/index.cjs 那张命令表里）。
 // 与一期 boot() 的装配序差别：这里 rules.init + store.open + 周期 checkpoint + 后台作业
 // （Task 5 起：credits 定时刷新与定时签到随命令实现体下沉到这里，startBackgroundJobs），
-// **不 listen**——监听决策归主进程（Task 6），主进程经 proxy_start/proxy_stop 转发体驱动。
+// **不 listen**——监听决策归主进程，主进程经 proxy_start/proxy_stop 转发体驱动。
+// 入口有两种来历（Task 6，共用下面同一个装配，不复制一份）：
+//  · 握手认领：主进程 spawn 并从 stdin 投递握手（token/pipePath 由主进程命名）；
+//  · 自启（--persistent）：启动器 agenthub-gateway.cmd / Run 项直接拉起，token 与 pipePath
+//    由子进程自造、gateway.json 多写 tokenSource:"file"，主 App 之后从文件认领。
 "use strict";
 const fs = require("node:fs");
 const path = require("node:path");
+const crypto = require("node:crypto");
 const gatewayPipe = require("./backend/gateway-pipe.cjs");
 const log = require("./backend/gateway-log.cjs");      // Step 5
 const store = require("./backend/proxy/store.cjs");
@@ -79,7 +84,19 @@ function readHandshake() {
 }
 
 async function main() {
-  const hs = await readHandshake();            // { token, parentPid, persistent, pipePath, exePath? }
+  // 自启路径（--persistent，Task 6）：启动器/Run 项直接拉起本进程，没有父进程投递 stdin 握手——
+  // 照原样 await readHandshake() 会永久挂在读 stdin 上（扫描修正 P4）。这条路径 token 由子进程
+  // 自己生成并写进 gateway.json（§偏差 D4），主 App 之后从文件认领；pipePath 也自造（与
+  // gateway-client.cjs 的命名同款，主进程认领时以盘上那份为准）。两条路径共用下面同一个
+  // srv/看门狗装配，不复制一份。token 走随机生成而不是 argv/env：进程列表看得见，而它能调
+  // 返回明文 Key 的命令（readHandshake 同一条纪律）。
+  const argvPersistent = process.argv.includes("--persistent");
+  const hs = argvPersistent
+    ? { token: crypto.randomBytes(24).toString("hex"), parentPid: 0, persistent: true, pipePath: null, tokenSource: "file" }
+    : await readHandshake();                     // { token, parentPid, persistent, pipePath, exePath? }
+  if (argvPersistent) {
+    hs.pipePath = String.raw`\\.\pipe\agenthub-gw-${process.pid}-${Date.now().toString(36)}`;
+  }
   persistent = !!hs.persistent;                // 看门狗与 gracefulExit 都读它（装配序，见文件头那几个 let）
   watchedExe = String(hs.exePath || process.execPath);
   log.line("boot", { version: util.appVersion(), secretBackend: secretbox.backend(), persistent });
@@ -93,6 +110,9 @@ async function main() {
   gatewayRecord = {
     pid: process.pid, pipe: hs.pipePath, token: hs.token, port: 0,
     version: util.appVersion(), startedAt: Date.now(), secretBackend: secretbox.backend(),
+    // 自启路径多写一个来历标记：握手认领的（stdin 路径）没有这个字段，自启的是 "file"。
+    // Task 8 的验收报告据此区分两种来历，不靠猜。
+    ...(argvPersistent ? { tokenSource: "file" } : {}),
   };
   writeGatewayFile(gatewayRecord);
   const srv = await gatewayPipe.serve({
@@ -168,10 +188,16 @@ function writeGatewayFile(obj) {
 // 第二条的 exe 监视就此永久失效——而 detach 恰恰是唯一需要它的情形（旧代码正是这么错的）。
 // 两条规则的取舍按 reason 走，不按"当前是否在监听"走：见 gracefulExit 的注释。
 function startWatchdog(parentPid) {
+  // parentPid 为 0（--persistent 自启路径）时跳过父进程探测：kill(0,0) 的语义是「当前进程组」，
+  // 拿它当「父进程还活着」的判据结果不定——这条路径没有父进程可盯，只保留 exe-gone 那条线；
+  // detach（父进程退出后的常驻形态）同样只关掉第一条轮询，两条规则的取舍见 gracefulExit 的注释。
+  watchParent = !!parentPid;
   const t = setInterval(() => {
-    let parentAlive = true;
-    try { process.kill(parentPid, 0); } catch (e) { parentAlive = e.code !== "ESRCH"; }
-    if (watchParent && !parentAlive) { gracefulExit("parent-exit"); return; }
+    if (watchParent) {
+      let parentAlive = true;
+      try { process.kill(parentPid, 0); } catch (e) { parentAlive = e.code !== "ESRCH"; }
+      if (!parentAlive) { gracefulExit("parent-exit"); return; }
+    }
     if (!fs.existsSync(watchedExe)) { gracefulExit("exe-gone"); return; }
   }, WATCHDOG_MS);
   watchdogTimer = t;

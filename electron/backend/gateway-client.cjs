@@ -126,6 +126,15 @@ function start(opts) {
  * 启动或认领网关子进程（start() 的本体，单飞保证见上面那层互斥）。返回 { ok, claimed, pid, port, message }。
  */
 async function startOnce({ persistent } = {}) {
+  // 便携版拒常驻（Task 6）：便携版是 %TEMP% 的临时解压副本——detached 出去的子进程会锁住解压目录，
+  // 卸载/清理都删不掉；Run 项指向的路径也在退出即失效的位置。这里对「请求常驻」整体拒绝、不做降级启动：
+  // ok:true（对调用方不算失败，UI 不该吃到红错）+ persistent:false + 人话 message，且不 spawn。
+  // 便携版不落 Run 项由 config.applyAutoStart 的便携版早退保证，两条路径合成零注册。
+  // 正常形态到不了这里：设置页在便携版灰置 persistentGateway 开关（ConfigGeneralSection）。
+  if (persistent && config.isPortable()) {
+    log.line("portable-reject-persistent", {});
+    return { ok: true, persistent: false, message: "便携版不支持后台常驻" };
+  }
   const cur = readGatewayFile();
   if (cur && (await probeAlive(cur))) {
     if (cur.version !== util.appVersion()) {

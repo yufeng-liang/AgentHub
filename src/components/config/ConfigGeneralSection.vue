@@ -317,6 +317,15 @@ onUnmounted(() => {
         </div>
         <el-switch v-model="app.config.schedule.launchHidden" :disabled="!app.config.schedule.minimizeToTray" @change="toggleAppBehavior" />
       </div>
+      <!-- 常驻网关（Task 6）：主 App 退出后子进程继续在后台监听；便携版是临时解压副本，detach 会锁住
+           解压目录，整项灰置。生效时机：退出前已开着网关就原样 detach，下次启动直接认领回来 -->
+      <div class="set-row">
+        <div class="set-info">
+          <div class="set-name">主 App 退出后网关继续常驻</div>
+          <div class="set-desc">{{ isPortable ? "便携版不支持后台常驻（临时解压副本退出即失效）" : "主 App 退出后网关继续常驻（便携版不支持；开机自启需在上方打开）" }}</div>
+        </div>
+        <el-switch v-model="app.config.schedule.persistentGateway" :disabled="isPortable" @change="toggleAppBehavior" />
+      </div>
     </div>
 
     <div ref="updateCard" class="card" :class="{ flash: highlight }">

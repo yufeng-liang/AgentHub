@@ -67,6 +67,12 @@
       "electron/**/*",
       "package.json"
     ],
+    "extraFiles": [
+      {
+        "from": "build/gateway-launcher.cmd",
+        "to": "agenthub-gateway.cmd"
+      }
+    ],
     "extraResources": [
       {
         "from": "build/icon.png",

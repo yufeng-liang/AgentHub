@@ -378,16 +378,19 @@ if (!gotLock) {
     usagesync.setOnFinish(notifyUsageSync);
     // 网关子进程（Task 5 起为正式启动路径，不再是 opt-in）：43 条命令全部在子进程跑，
     // 主进程不再 boot() proxy 域（rules/store/credits/checkin 计时器都随实现体下沉，gateway.cjs）。
-    // 这里先 spawn；网关是否进入监听由配置的 restoreOnLaunch 决定 —— start 成功后转发
-    // proxy_start（与用户点开关同一条路径，claimed 守卫等语义完全一致）。Task 6 会把启动器
-    // 与自启的时机一并复核，本条保持「应用起来 = 子进程在」的最小不变式。
+    // 这里先 spawn；监听决策按 restoreOnLaunch 新语义（Task 6 重定义：本次启动时是否让（新建或
+    // 认领来的）子进程进入监听状态，不再是「上次退出时网关开没开」）在 start() 成功后落地——
+    // true → 转发一次 proxy_start（与用户点开关同一条路径，claimed 守卫等语义完全一致）；
+    // false → 只发一次 proxy_status 同步状态：常驻网关被认领时可能已在监听（detach 出去的就是
+    // 「监听中」这个状态），这里只查询、不强开也不强停。本条保持「应用起来 = 子进程在」的最小不变式。
     // 不 await：whenReady 回调保持同步；成败都由 gateway-client 写进 proxyDir()/logs/gateway.log。
     // 这条裸调与转发侧 ensureStarted 汇入同一条互斥：在飞去重长在 start() 本体（评审 I1），
     // boot-start 在飞期间渲染层首条 proxy 命令只会拿到同一条 promise，不会再 spawn 第二个子进程。
     gatewayClient.start({ persistent: boot.schedule.persistentGateway })
       .then((r) => {
-        if (!r.ok || !boot.proxy || !boot.proxy.restoreOnLaunch) return;
-        return gatewayClient.call("proxy_start", {}).catch(() => {});
+        if (!r.ok) return;
+        return gatewayClient.call(boot.proxy && boot.proxy.restoreOnLaunch ? "proxy_start" : "proxy_status", {})
+          .catch(() => {});
       })
       .catch((e) => {
         console.error("网关子进程启动失败：" + String((e && e.message) || e));
