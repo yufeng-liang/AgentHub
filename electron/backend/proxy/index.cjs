@@ -209,9 +209,17 @@ function shutdown() {
   store.close();
 }
 
-/** 排空在途异步作业的预算上限（ms）。它必须小于 gateway.cjs 那条 Promise.race 的 2 s 上界，
- *  否则「等干净」永远抢在「必须退」前面拿不到决定权。 */
-const DRAIN_BUDGET_MS = 1000;
+/** 排空在途异步作业的预算上限（ms）。它与 server.cjs 的 CLOSE_BUDGET_MS、gateway.cjs 的
+ *  RESPONSE_FLUSH_MS 一起构成「等干净的三段之和 < gateway.cjs 那条 Promise.race 的 EXIT_CEILING_MS」
+ *  这条不变式（评审 I2②：旧值 1000 + stopAsync 的 1000 已经吃掉整个 2 s 上界，"必须退"总是抢在
+ *  "等干净"前面拿到决定权）。四个数字由 scripts/dev-gateway-pipe-test.cjs 的**同一条断言**钉住。 */
+const DRAIN_BUDGET_MS = 800;
+
+/** 「等干净」的预算合计：等监听释放 + 等在途 libuv 作业。store.close() 是同步 fs（内含 checkpoint），
+ *  没法预算，不计入——它只会让总时长变长，不会让 drained/forced 说谎。 */
+function shutdownBudgetMs() {
+  return server.CLOSE_BUDGET_MS + DRAIN_BUDGET_MS;
+}
 
 /** 子进程侧唯一的优雅停机实现（Task 7 的 gateway_shutdown 命令体复用它，不开第二份）。
  *  与一期 shutdown() 的三处差别：① server.stop() 换成 await server.stopAsync()——
@@ -219,16 +227,19 @@ const DRAIN_BUDGET_MS = 1000;
  *  ② store.close() 内含 checkpoint 与周期计时器停止（Task 2 落地了调用点，Task 3 成对收尾计时器）；
  *  ③ 追加 rules.close() + drainLibuvWork()：热重载 watcher 既 ref 着事件循环，它首扫丢到
  *    libuv 线程池的 readdir/stat 作业又会在进程已 exit 时被工作线程回报到已关闭的 uv_async_t 上
- *    （实测 0xC0000409 fastfail，见 rules.close 的注释）。停机的定义因此必须含「在途异步作业落地」。 */
+ *    （实测 0xC0000409 fastfail，见 rules.close 的注释）。停机的定义因此必须含「在途异步作业落地」。
+ *  返回值一路原样交给父进程（gateway.cjs 把它编进 gateway_shutdown 的响应）：
+ *   · drained=false 排空超时、· forced=true 监听没在预算内释放、· port 是刚释放的那个端口。
+ *  这两布尔缺一不可地上报（评审 I2③）：本任务最坏的失败形态「停不干净」过去在代码里是被允许通过的那一支。 */
 async function gracefulShutdown() {
   credits.stopScheduler();
   stopCheckinAuto();
   discovery.cancelOAuth();
-  await server.stopAsync();
+  const st = await server.stopAsync();
   await rules.close();
   store.close();
   const drained = await drainLibuvWork();
-  return { ok: true, drained };
+  return { ok: true, drained, forced: !!st.forced, port: Number(st.port) || 0 };
 }
 
 /** libuv 线程池上还有没有在途作业（fs 异步请求这类）。getActiveResourcesInfo() 是 Node 18+ 的
@@ -323,7 +334,10 @@ function register(ipcMain) {
   ipcMain.handle("proxy_status", handle(() => gatewayStatus()));
   ipcMain.handle("proxy_start", handle(async () => {
     const r = await server.start(settings);
-    if (r.ok) rememberRunning(true);
+    // claimed 时**不许**记 restoreOnLaunch=true（评审 I3）：那条分支里本进程连 runtime 都没有，
+    // 端口归那台常驻网关。把它当"本机监听"写进配置，下次开机会据此以为后台已经在跑，
+    // 而接管方的存活与否则没人负责——恢复语义就此说谎。
+    if (r.ok && !r.claimed) rememberRunning(true);
     events.emit({ type: "status" });
     // claimed：端口其实被**已常驻的网关**占着（server.cjs 的 EADDRINUSE 分支查过 gateway.json 并双检通过），
     // 此时本进程没有监听，接管状态与端口归属都由认领方维持（Task 6 的认领路径依赖这条不报错）
@@ -339,6 +353,9 @@ function register(ipcMain) {
   ipcMain.handle("proxy_restart", handle(async () => {
     await server.stopAsync();
     const r = await server.start(settings);
+    // 这里的 restoreOnLaunch 与 proxy_start 不同、**不**排除 claimed：restart 的语义是"用户要它开着"，
+    // 端口被常驻网关接管时该意愿仍然成立（本机没监听，但那台网关在维持）。proxy_start 记的是"本机起了
+    // 监听"这件事的状态，见上面那条 claimed 守卫（两者语义在 Task 6 重定义 restoreOnLaunch 时一并复核）。
     if (r.ok) rememberRunning(true);
     credits.startScheduler(() => settings().creditsRefreshMin); // 刷新周期一并热生效
     events.emit({ type: "status" });
@@ -649,4 +666,5 @@ function attachGatewayMode({ emit } = {}) {
 // gatewayStatus 一并导出：proxy_status 命令走它，Task 1 的闸直接断言 vaultOk 字段，
 // Task 5 的转发化也要按这个名字取（藏在 register 里没法单测）
 // dispatchTable/dispatch/attachGatewayMode/gracefulShutdown：二期 Task 3 的子进程入口与管道出口
-module.exports = { boot, shutdown, gracefulShutdown, register, settings, gatewayStatus, dispatchTable, dispatch, attachGatewayMode };
+// shutdownBudgetMs/DRAIN_BUDGET_MS：停机预算的四个数字之一，供 dev-gateway-pipe-test 断言它们仍复合
+module.exports = { boot, shutdown, gracefulShutdown, shutdownBudgetMs, DRAIN_BUDGET_MS, register, settings, gatewayStatus, dispatchTable, dispatch, attachGatewayMode };

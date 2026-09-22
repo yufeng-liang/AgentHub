@@ -21,29 +21,67 @@ const server = require("./backend/proxy/server.cjs");
 const proxy = require("./backend/proxy/index.cjs");
 
 const WATCHDOG_MS = 5000;
-// 停机到 process.exit 的硬上界：它必须大于 index.cjs 里 drainLibuvWork 的预算（1 s），
-// 否则「必须退」会抢在「等干净」之前拿到决定权，等于把根因又盖回去。
+// 停机到 process.exit 的硬上界：它必须大于「等干净」的总预算
+// （server.CLOSE_BUDGET_MS + index.DRAIN_BUDGET_MS + 本文件的 RESPONSE_FLUSH_MS），
+// 否则「必须退」会抢在「等干净」之前拿到决定权，等于把根因又盖回去（评审 I2②）。
+// 这四个数字由 scripts/dev-gateway-pipe-test.cjs 的**同一条断言**钉住：改一个忘改另一个当场变红。
 const EXIT_CEILING_MS = 2000;
+// 优雅停机完成后留给 gateway_shutdown 响应帧 flush 的窗口（评审 I2③：drained/forced 必须先送到
+// 父进程手上，才允许关管道 / 退进程）。见 gracefulExit 里那串时序注释。
+const RESPONSE_FLUSH_MS = 300;
+// 「停不干净」的退出码：0 只留给真排干的那一支。父进程在 child-exit 里看得见它，
+// Task 7 的报错文案据此区分「停干净」与「抢在上界前硬退」。
+const UNCLEAN_EXIT_CODE = 3;
 
-// 看门狗与优雅停机都要读的三个模块内引用：由 main() 装配时赋值（不是全局状态装饰）。
+// 看门狗与优雅停机都要读的几个模块内引用：由 main() 装配时赋值（不是全局状态装饰）。
 let persistent = false;
 let srvRef = null;
 let watchdogTimer = null;
+// 看门狗盯的映像路径：由握手投递（真实形态下就是 process.execPath）。父进程才是知道"哪个映像必须被
+// 解锁"的一方（装更/卸载互锁等的是它），投递顺带给 exe-gone 这条判据留了一个可构造的入口。
+let watchedExe = process.execPath;
+// 落盘 gateway.json 的那份记录：port 会随子进程的监听状态被回写（见 publishListeningPort）
+let gatewayRecord = null;
+// detach 之后不再轮询父进程（父进程本就该不在了），但**必须继续盯 exe**——见 startWatchdog 的注释
+let watchParent = true;
+
+// 会改变监听状态的命令：跑完就必须把端口回写进 gateway.json（评审 I1）。
+// 只有这三条会动 server.status()，别的命令跑了不重复落盘。
+const PORT_BOUND_CMDS = new Set(["proxy_start", "proxy_stop", "proxy_restart"]);
 
 // token 只从 stdin 来（不放 argv：任务管理器和进程列表看得见，而它能调用返回明文 Key 的命令）
 function readHandshake() {
   return new Promise((resolve, reject) => {
     let s = "";
     process.stdin.setEncoding("utf8");
-    process.stdin.on("data", (d) => { s += d; if (s.includes("\n")) { const l = s.split("\n")[0].trim(); if (l) { cleanup(); resolve(JSON.parse(l)); } } });
+    process.stdin.on("data", (d) => {
+      s += d;
+      if (!s.includes("\n")) return;
+      const l = s.split("\n")[0].trim();
+      if (!l) return;
+      let o = null;
+      try {
+        o = JSON.parse(l);
+      } catch (e) {
+        // 半行 / 坏 JSON 不许变成 uncaughtException：那样崩因只会出现在 stderr，连一行 boot 日志都没有，
+        // 主进程侧只剩"起不来"（规格 §七.1 要的是报得人话）。留痕后按握手失败收。
+        log.line("handshake-bad-json", { message: String((e && e.message) || e), bytes: l.length });
+        cleanup();
+        reject(new Error("握手不是合法 JSON（父进程投递被截断？）"));
+        return;
+      }
+      cleanup();
+      resolve(o);
+    });
     process.stdin.on("end", () => reject(new Error("stdin 提前关闭：父进程未投递握手")));
     function cleanup() { try { process.stdin.pause(); } catch { /* 已关 */ } }
   });
 }
 
 async function main() {
-  const hs = await readHandshake();            // { token, parentPid, persistent, pipePath }
-  persistent = !!hs.persistent;                // 看门狗与 gracefulExit 都读它（装配序，见文件头三个 let）
+  const hs = await readHandshake();            // { token, parentPid, persistent, pipePath, exePath? }
+  persistent = !!hs.persistent;                // 看门狗与 gracefulExit 都读它（装配序，见文件头那几个 let）
+  watchedExe = String(hs.exePath || process.execPath);
   log.line("boot", { version: util.appVersion(), secretBackend: secretbox.backend(), persistent });
   secretbox.assertUsable();                    // 凭据不可用 → 启动期失败，不空号池空转
   rules.init(); store.open();                  // 与一期 boot() 同一装配序（不含 server.start）
@@ -53,26 +91,50 @@ async function main() {
     // 两条内建命令不属于那 43 条，故不进 preload 白名单；gateway_echo 供认领双检验 token，
     // gateway_shutdown 供 Task 7 互锁（它复用 gracefulExit → proxy.gracefulShutdown，不开第二份停机实现）。
     // 其余一律交给网关自己的命令表。
-    dispatch: (cmd, args) =>
-      cmd === "gateway_echo" ? { v: String((args && args.v) || "") }
-      : cmd === "gateway_shutdown" ? gracefulExit("gateway-shutdown")
-      : proxy.dispatch(cmd, args),
+    // 监听状态一变就得回写 gateway.json 的 port（评审 I1）：那一份盘上文件是父进程侧
+    // stopAndWait 的 portFreed 与 probeResidentGateway 的端口归属**唯一**的真相来源，
+    // 写死 0 时那两条判据一个恒真、一个恒不成立。
+    dispatch: async (cmd, args) => {
+      if (cmd === "gateway_echo") return { v: String((args && args.v) || "") };
+      if (cmd === "gateway_shutdown") return gracefulExit("gateway-shutdown");
+      const r = await proxy.dispatch(cmd, args);
+      if (PORT_BOUND_CMDS.has(cmd)) publishListeningPort();
+      return r;
+    },
   });
   srvRef = srv;
   // sink 必须在 srv 建好之后注入（否则子进程启动早期 events.emit 无处可写）——这是装配序，不是风格
   proxy.attachGatewayMode({ emit: (payload) => srv.broadcast({ k: "evt", payload }) });
-  writeGatewayFile({
+  gatewayRecord = {
     pid: process.pid, pipe: srv.pipePath, token: hs.token, port: 0,
     version: util.appVersion(), startedAt: Date.now(), secretBackend: secretbox.backend(),
-  });
+  };
+  writeGatewayFile(gatewayRecord);
   startWatchdog(hs.parentPid);
   await srv.ready;                             // 主进程连上后才算 ready
+}
+
+/** 把当前监听端口回写进 gateway.json（值真变了才写，不是每条命令落一次盘）。
+ *  写失败必须留痕：port 不落盘 = 父进程侧两条判据失去真相源，静默等于把缺陷藏回日志之外。 */
+function publishListeningPort() {
+  if (!gatewayRecord) return;
+  const st = server.status();
+  const port = st.running ? st.port : 0;
+  if (Number(gatewayRecord.port) === Number(port)) return;
+  gatewayRecord = { ...gatewayRecord, port };
+  try {
+    writeGatewayFile(gatewayRecord);
+    log.line("gateway-port", { port, written: true });
+  } catch (e) {
+    log.line("gateway-port", { port, written: false, message: String((e && e.message) || e) });
+  }
 }
 
 /** gateway.json 落盘：握手认领的依据，主进程可能在子进程写的中途去读，故走「写中转名 → rename」。
  *  中转名必须带 pid（Task 2 的写权闸按结构判据守这条：同一变量的 writeFileSync + renameSync 配对
  *  ⇒ 构造式必须含 process.pid）；拼法沿用 proxy/ 目录既有口径 `${file}.tmp-${process.pid}`。
- *  不抽公共 helper：一旦 write 与 rename 一起搬进 helper，那条结构判据就完全隐身（Task 2 §9.8-1）。 */
+ *  不抽公共 helper：一旦 write 与 rename 一起搬进 helper，那条结构判据就完全隐身（Task 2 §9.8-1）。
+ *  监听端口的回写（publishListeningPort）也走这**同一个**写法，不另起第二处中转。 */
 function writeGatewayFile(obj) {
   const target = path.join(store.proxyDir(), "gateway.json");
   const tmp = `${target}.tmp-${process.pid}`;
@@ -90,14 +152,19 @@ function writeGatewayFile(obj) {
  *  代价是打断在途 SSE —— 只在主 App 启动时发现 version ≠ util.appVersion() 才发生，
  *  与 Task 7 的装更互锁共用同一条 stopAndWait 实现，不开第二条口子。 */
 
-// 看门狗：父进程没了且 persistent=off → 自行退出，避免孤儿进程占着 9527。
-// 同时监视 exe 映像：卸载/升级会删掉安装目录，届时留着进程只会锁文件（实测 portable stub 也是 RMDir /r）。
+// 看门狗两条规则（评审 I4 后各自独立）：
+//  · 父进程没了 → 交 gracefulExit("parent-exit") 定夺：常驻则 detach 继续服务，非常驻则自行退出，
+//    避免孤儿进程占着 9527；
+//  · exe 映像不在了（升级/卸载删掉安装目录）→ 一律收摊，NSIS 最需要解锁映像的就是这一刻。
+// detach（常驻）只允许关掉**第一条**的轮询：常驻形态下父进程本来立刻就没了，若把整个计时器 clear 掉，
+// 第二条的 exe 监视就此永久失效——而 detach 恰恰是唯一需要它的情形（旧代码正是这么错的）。
+// 两条规则的取舍按 reason 走，不按"当前是否在监听"走：见 gracefulExit 的注释。
 function startWatchdog(parentPid) {
   const t = setInterval(() => {
     let parentAlive = true;
     try { process.kill(parentPid, 0); } catch (e) { parentAlive = e.code !== "ESRCH"; }
-    if (!parentAlive && !persistent) { gracefulExit("parent-exit"); return; }
-    if (!fs.existsSync(process.execPath)) { gracefulExit("exe-gone"); return; }
+    if (watchParent && !parentAlive) { gracefulExit("parent-exit"); return; }
+    if (!fs.existsSync(watchedExe)) { gracefulExit("exe-gone"); return; }
   }, WATCHDOG_MS);
   watchdogTimer = t;
   if (t.unref) t.unref();
@@ -114,32 +181,84 @@ function stopWatchdog() {
  *  · 主进程的 gateway_shutdown 命令（Task 7 的装更与卸载互锁走的就是这条命令）
  * 所以它的返回值就是那条命令的响应体。返回值之后进程一定会退出：主进程侧 stopAndWait 等的是
  * 「socket 关闭 + pid 消失」（规格 §5.6），因此这里必须连进程一起收，只停子系统不算停。
+ *
+ * detach 保护只对 parent-exit 生效（评审 I4）：简报伪码把这条保护写在了 reason 之前，于是
+ * exe-gone 在常驻形态下被同一个 return 吞掉——两规则冲突时 reason 优先。
+ *
+ * 停机结论（drained / forced / port）一定要送到父进程手上（评审 I2③）。投递路径选了「先发响应、
+ * 再关管道、最后退进程」这一条，理由：
+ *  · 备选①「只走子进程日志」：父进程得去解析自己不该拥有格式的日志文件，且 stopAndWait 的返回契约
+ *    里至今没有这两个字段，Task 7 的报错文案就没法据此判"这次停干净了没有"；
+ *  · 备选②「另开一条投递通道」（管道之外再起一条 socket/文件）：为两个布尔新增一条 IPC，
+ *    与「不新增端口、不新增第二条停机实现」的既定边界冲突；
+ *  · 现有那条 gateway_shutdown 响应本来就是这次停机的天然回执，只差没被丢掉。而它过去确实被丢掉：
+ *    老代码在 dispatch 还没 resolve 时就同步 srvRef.close()，destroy 掉 socket 把响应帧一起带走了。
+ *    所以顺序改成：done 出结论 → 微任务里 pipe 写帧 → 等 RESPONSE_FLUSH_MS 让 uv_write 落到内核缓冲
+ *    → 才关管道（关早了就又丢帧）→ 干净则退 0；不干净**不**退 0，交给事件循环自然收摊，
+ *    收不了摊由 EXIT_CEILING_MS 那条上界计时器以 UNCLEAN_EXIT_CODE 硬退（它是唯一的硬退点）。
  */
 function gracefulExit(reason) {
-  if (persistent && server.status().running) {                 // 常驻形态：父进程没了正是设计目标，不退出
-    log.line("detach-keep", { reason, port: server.status().port });
-    stopWatchdog();                                            // 但必须停掉对父进程的轮询，别每 5s 刷日志
-    return Promise.resolve({ ok: true, detached: true });
+  const st = server.status();
+  // 常驻 + 「父进程没了」这一条 reason：不退出，只与父进程脱钩（这正是本期设计目标）。
+  // 判据是 persistent 而不是 persistent && running：常驻的定义是"活过主 App"，与此刻有没有在监听无关
+  // （闸 ③ 的常驻用例子进程本来就不监听）。旧代码把这条保护写在 reason 之前，于是 exe-gone 也被吞掉。
+  if (reason === "parent-exit" && persistent) {
+    log.line("detach-keep", { reason, port: st.port });
+    watchParent = false;                       // 只对父进程"脱钩"，exe 那一检继续（见 startWatchdog）
+    return Promise.resolve({ ok: true, detached: true, port: st.port });
   }
   log.line("exit", { reason });
   stopWatchdog();
+  // 唯一的硬退点：上界计时器。它 ref 着事件循环，所以"没排干净"这一支一定会在 EXIT_CEILING_MS 后
+  // 以 UNCLEAN_EXIT_CODE 收场（不是静默 0），父进程在 child-exit 那行看得见。
+  let exited = false;
+  const finish = (code) => { if (exited) return; exited = true; process.exit(code); };
+  setTimeout(() => finish(UNCLEAN_EXIT_CODE), EXIT_CEILING_MS);
   const done = proxy.gracefulShutdown()
     .then((r) => {
-      const drained = !!(r && r.drained);
-      log.line("shutdown-done", { drained });        // drained:false = 停机没排干净，Task 7 的报错文案要看得见他
-      return { ok: true, drained };
+      const rep = {
+        ok: true,
+        drained: !!(r && r.drained),
+        forced: !!(r && r.forced),              // 监听没在 CLOSE_BUDGET_MS 内释放（server.stopAsync 认的输）
+        port: (r && Number(r.port)) || 0,       // 刚释放的那个端口，父进程据此探"是不是真空了"
+      };
+      log.line("shutdown-done", { drained: rep.drained, forced: rep.forced, port: rep.port });
+      return rep;
     })
     .catch((e) => {
-      log.line("shutdown-error", { message: String((e && e.message) || e) });
-      return { ok: false, message: String((e && e.message) || e) };
+      const rep = { ok: false, drained: false, forced: false, port: 0, message: String((e && e.message) || e) };
+      log.line("shutdown-error", { message: rep.message });
+      return rep;
     });
-  if (srvRef) srvRef.close();        // 不用 gatewayPipe.closeAll()（无此 API）：管道由本文件唯一那条 srv 引用负责
-  // 停机做完（或最多再等 2 s）才退。这里**不能**在 done 落定的同一刻直接 process.exit()：
-  // gracefulShutdown() 内部已经等到 libuv 线程池的在途作业（chokidar 首扫的 readdir/stat）落地，
-  // 那是 0xC0000409 fastfail 的根因；2 s 这条上界是「停不干净也必须给 NSIS 解锁映像」的兜底，
-  // 不是用来掩盖没排空的事实——真没排空，drainLibuvWork 会把 drained:false 回给 gateway_shutdown。
-  Promise.race([done, new Promise((r) => setTimeout(r, EXIT_CEILING_MS))]).then(() => process.exit(0));
+  // 响应帧的投递窗口：dispatch 的 Promise 一旦 resolve，gateway-pipe 在**同一个微任务**里 writeFrame；
+  // setImmediate 是宏任务（必然后于微任务）→ 此刻帧已进 socket 写队列。再等 RESPONSE_FLUSH_MS 让
+  // uv_write 真落到内核缓冲，之后才关管道（srvRef.close() 会 destroy 所有 socket，关早了帧就没了），
+  // 最后把结论 resolve 出去（= 响应里带的就是这份）。
+  const acked = done.then((rep) => new Promise((resolve) => {
+    setImmediate(() => setTimeout(() => {
+      if (srvRef) { try { srvRef.close(); } catch { /* 已关 */ } }
+      resolve(rep);
+    }, RESPONSE_FLUSH_MS).unref());            // unref：帧没写完时 socket 自身还 ref 着循环，不需要这条计时器续命
+  }));
+  acked.then((rep) => {
+    if (rep.ok && rep.drained && !rep.forced) { finish(0); return; }   // 排干了：管道已关、响应已出，退 0
+    // 没排干（或 gracefulShutdown 自己抛了错）：**不**走 process.exit(0)。上面那次 srvRef.close() 已经把
+    // 本文件持有的句柄（管道 server + 客户端 socket）全部交出，watcher / 周期 checkpoint 计时器 / 库句柄
+    // 由 gracefulShutdown 交出：事件循环空了就自然收摊，还挂着别的 ref 句柄就说明"停不干净"，
+    // 由那条上界计时器以 UNCLEAN_EXIT_CODE 硬退（它是本函数唯一的硬退点）。
+    log.line("shutdown-unclean", {
+      reason, drained: rep.drained, forced: rep.forced, ok: rep.ok, message: rep.message || "",
+    });
+  });
   return done;
 }
 
-main().catch((e) => { log.line("fatal", { message: String((e && e.message) || e) }); process.exit(1); });
+// 只在**作为入口**被跑时才装配（被 require 时一个副作用都不许有）。dev-gateway-pipe-test 要把停机预算的
+// 四个数字拿在手里断言（评审 I2②：改一个忘改另一个必须当场变红），而那几个数字的真相源就是本文件；
+// 没有这道守卫，require 会直接把 main() 跑起来等握手。
+// 实测 require.main === module 在 ELECTRON_RUN_AS_NODE=1 那条路上同样成立（真子进程闸 ①③ 全绿即证据）。
+if (require.main === module) {
+  main().catch((e) => { log.line("fatal", { message: String((e && e.message) || e) }); process.exit(1); });
+}
+
+module.exports = { EXIT_CEILING_MS, RESPONSE_FLUSH_MS, UNCLEAN_EXIT_CODE, WATCHDOG_MS };

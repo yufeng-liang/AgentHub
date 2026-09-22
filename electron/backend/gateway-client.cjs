@@ -127,7 +127,19 @@ async function start({ persistent } = {}) {
     env: Object.assign({}, process.env, { ELECTRON_RUN_AS_NODE: "1", AGENT_SKILLS_HOME: process.env.AGENT_SKILLS_HOME || "" }),
     cwd: path.dirname(process.execPath), stdio: ["pipe", "pipe", "pipe"], detached: !!persistent, windowsHide: true,
   });
-  child.stdin.write(encode({ token, parentPid: process.pid, persistent: !!persistent, pipePath }) + "\n");
+  // spawn 的失败是**异步**的（exe 被别的安装器锁着 / 权限不足）：那时 stdin 已被 destroy，
+  // 下面这条 write 会以 'error' 事件冒出来（ERR_STREAM_DESTROYED）。没有 handler 就是主进程一条
+  // uncaughtException——规格 §七.1 要的是"起不来要能报出人话"，所以 handler 必须挂在 write **之前**，
+  // 报人话那一句交给下面 connect 超时的返回值。
+  if (child.stdin) child.stdin.on("error", (e) => log.line("child-stdin-error", { message: String((e && e.message) || e) }));
+  try {
+    // exePath：告诉子进程该盯哪个映像（装更/卸载等的是这个）。真实形态下与 process.execPath 同值。
+    child.stdin.write(encode({
+      token, parentPid: process.pid, persistent: !!persistent, pipePath, exePath: process.execPath,
+    }) + "\n");
+  } catch (e) {
+    log.line("child-stdin-error", { message: String((e && e.message) || e), sync: true });
+  }
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (d) => log.line("child-stderr", { text: String(d).slice(0, 400) }));   // 子进程崩因必须留痕，否则只剩"起不来"
   if (child.stdout) {
@@ -159,37 +171,54 @@ async function start({ persistent } = {}) {
  * 停掉子进程并等端口真的释放（Task 7 装更/卸载互锁的唯一出口）。
  * 只经已认证的管道下 gateway_shutdown：不按 pid 盲杀，因此 pid 复用场景下不会误伤别的进程。
  * 超时停不下来时**只报告不兜底强杀**——强杀是 Task 7 互锁要加的那一步（它需要先给用户报错文案）。
+ *
+ * 返回 { stopped, portFreed, drained, forced, port, message }：
+ *  · portFreed 的端口取**盘上那份** gateway.json（子进程一开始监听就回写，见 gateway.cjs 的
+ *    publishListeningPort），盘上是 0 时再退到停机响应带回的那个端口。评审 I1 之前这里只有
+ *    `Number(cur.port)` 而 port 恒为 0 → portFreed 恒真，这条闸自我实现、不可能红。
+ *  · drained / forced 三态（true / false / null）：null = 压根没拿到响应（子进程原本不在，或它没等到
+ *    回包就退了）。投递顺序见 gateway.cjs 的 gracefulExit 注释（先写帧 → flush 窗口 → 才关管道）。
  */
 async function stopAndWait({ timeoutMs = 5000 } = {}) {
-  // 优先读盘上的那份：端口由子进程在开始监听时写进去（内存镜像可能是监听之前的旧值）
+  // 只信盘上的那一份：内存镜像可能是监听之前的旧值（评审 I1②）
   const cur = readGatewayFile() || mirror;
-  if (!cur || !cur.pipe || !cur.token) return { stopped: true, portFreed: true, message: "没有网关子进程（gateway.json 不存在或已陈旧）" };
-  const port = Number(cur.port) || 0;
+  if (!cur || !cur.pipe || !cur.token) return { stopped: true, portFreed: true, drained: null, forced: null, port: 0, message: "没有网关子进程（gateway.json 不存在或已陈旧）" };
+  const diskPort = Number(cur.port) || 0;
   const aliveBefore = pidAlive(cur.pid);
   let own = null;
+  let ack = Promise.resolve(null);
   if (aliveBefore) {
     own = conn && conn.connected ? conn : await gatewayPipe.connect({ pipePath: cur.pipe, token: cur.token, timeoutMs: 1500 }).catch(() => null);
     // 子进程会在回包前就退出，收不到响应是预期：忽略 reject，只看进程是否真的没了。
     // 注意这条连接**不能立刻 close**：destroy 会丢掉 socket 里还没 flush 出去的 shutdown 帧，
     // 于是「停不下来」会被误判成对端不配合。等进程没了再收。
-    if (own) own.call("gateway_shutdown", {}, { timeoutMs: Math.max(200, timeoutMs) }).catch(() => {});
+    if (own) ack = own.call("gateway_shutdown", {}, { timeoutMs: Math.max(200, timeoutMs) })
+      .then((r) => r, (e) => ({ __failed: String((e && e.message) || e) }));
   }
   const deadline = Date.now() + timeoutMs;
   while (pidAlive(cur.pid) && Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 100));
   }
   const stopped = !pidAlive(cur.pid);
+  const rep = await ack;
   if (own && own !== conn) { try { own.close(); } catch { /* 已断 */ } }
   dropConnection();
   mirror = null;
+  const ackPort = rep && !rep.__failed ? Number(rep.port) || 0 : 0;
+  const port = diskPort || ackPort;
   const portFreed = port ? !(await probePortBusy(port)) : true;
-  log.line("stopAndWait", { pid: cur.pid, stopped, portFreed, wasAlive: aliveBefore });
-  return {
-    stopped,
-    portFreed,
-    message: stopped ? (portFreed ? "已停止" : "子进程已退出但端口 " + port + " 仍被占用")
-      : "子进程未在 " + timeoutMs + "ms 内退出（pid " + cur.pid + " 仍在）",
-  };
+  // detached（常驻 + 在监听时收到 gateway_shutdown）没有"排干"这回事：那次压根没停机
+  const drained = rep && !rep.__failed && !rep.detached ? !!rep.drained : null;
+  const forced = rep && !rep.__failed && !rep.detached ? !!rep.forced : null;
+  log.line("stopAndWait", { pid: cur.pid, stopped, portFreed, port, drained, forced, wasAlive: aliveBefore });
+  let message = stopped ? (portFreed ? "已停止" : "子进程已退出但端口 " + port + " 仍被占用")
+    : "子进程未在 " + timeoutMs + "ms 内退出（pid " + cur.pid + " 仍在）";
+  if (stopped && drained === false) {
+    // 本任务最坏的失败形态必须在返回值里看得见（评审 I2③）：Task 7 的互锁据此决定报错文案，
+    // 而不是拿一个"看起来停了"的 stopped:true 放行
+    message += "（停机未排干：drained=false forced=" + (forced ? "true" : "false") + "，详见子进程日志 shutdown-unclean）";
+  }
+  return { stopped, portFreed, drained, forced, port, message };
 }
 
 /** 端口是否还有人 accept：连上 = 占用（false = 已释放）。ECONNREFUSED / 超时都算释放。 */
@@ -226,9 +255,11 @@ function onEvent(cb) {
   return () => eventCbs.delete(cb);
 }
 
-/** gateway.json 的内存镜像 + { alive, connected } */
+/** gateway.json 的内存镜像 + { alive, connected }。
+ *  端口/管道这些**会被子进程改**的字段一律以盘上那份为准（评审 I1②）：镜像是 spawn 当时抄的快照，
+ *  子进程开始监听后回写的 port 它永远看不到。镜像只在盘上文件还没落下时兜个底。 */
 function state() {
-  const base = mirror || readGatewayFile() || {};
+  const base = readGatewayFile() || mirror || {};
   return { ...base, alive: pidAlive(base.pid), connected: !!(conn && conn.connected) };
 }
 

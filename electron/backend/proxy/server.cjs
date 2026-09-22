@@ -665,7 +665,11 @@ function buildApp(settings) {
     const summaries = store.CHANNELS.map((c) => pool.poolSummary(c.id));
     const credFail = store.decryptFailureActive() > 0;
     const healthy = summaries.some((s) => s.onlineCount > 0);
-    res.status(healthy ? 200 : 503).json({ ok: healthy, credFail, detail: credFail ? "凭据解密失败" : "号池无可用账号" });
+    // detail 与 status 必须自相洽：healthy 时（HTTP 200）不许再写「号池无可用账号」，
+    // 否则 Task 5 的错误态渲染会拿到一条「200 + 没号」的字段组合。
+    res.status(healthy ? 200 : 503).json({
+      ok: healthy, credFail, detail: credFail ? "凭据解密失败" : (healthy ? "就绪" : "号池无可用账号"),
+    });
   });
 
   // 调试快照：默认关闭（设置里显式开启），且校验回环地址（方案 §6.7）
@@ -724,6 +728,9 @@ function start(settingsGetter) {
       // 占用者可能正是「已常驻的网关」：上面的 already 只判本进程 runtime，跨进程无感知，
       // 不查就会误报「端口已被占用，请更换端口」（规格 §七.5）。查完再回，文案才分得开。
       residentGatewayOwnsPort(s.port).then((claimed) => {
+        // claimed 分支**故意不建 runtime**：本进程什么都没监听，端口归属与接管状态都由常驻的那台维持。
+        // 所以 status().running 恒 false 就是「接管 ≠ 本机监听」的机器可核形式（评审 I3），
+        // 调用方（index.cjs 的 proxy_start）据此决定不许把 restoreOnLaunch 记成 true。
         if (claimed) resolve({ ok: true, claimed: true, port: s.port });
         else resolve({ ok: false, message: `端口 ${s.port} 绑定失败：已被占用，请更换端口` });
       });
@@ -742,18 +749,33 @@ function stop() {
   return { ok: true };
 }
 
-/** 停止并等监听完全释放（换端口/重启监听前调用，避免在途连接被 Reset 或新监听 EADDRINUSE） */
+/** 等监听释放的预算（ms）。它与 index.cjs 的 DRAIN_BUDGET_MS、gateway.cjs 的 RESPONSE_FLUSH_MS /
+ *  EXIT_CEILING_MS 一起构成「停机三段等待之和 < 硬退上界」这条不变式，四个数字由
+ *  scripts/dev-gateway-pipe-test.cjs 的同一条断言钉住（改一个忘改另一个必须当场变红）。 */
+const CLOSE_BUDGET_MS = 500;
+
+/** 停止并等监听完全释放（换端口/重启监听前调用，避免在途连接被 Reset 或新监听 EADDRINUSE）。
+ *  返回 { ok, forced, port }：
+ *   · forced=true = 端口没在 CLOSE_BUDGET_MS 内释放、是兜底计时器认的输。以前这条分支与「真释放」
+ *     都回同一个 {ok:true}（评审 I2①），于是 index.cjs 把"停不干净"读成成功、gateway.cjs 只能 exit(0)；
+ *   · port = 刚刚在监听的那个端口，供父进程侧 stopAndWait 探端口是否真空出来（它不信内存镜像）。 */
 function stopAsync() {
-  if (!runtime) return Promise.resolve({ ok: true });
+  if (!runtime) return Promise.resolve({ ok: true, forced: false, port: 0 });
   const r = runtime;
   runtime = null;
   return new Promise((resolve) => {
+    let settled = false;
+    const finish = (forced) => {
+      if (settled) return;                       // close 回调与兜底计时器只认第一个结论
+      settled = true;
+      resolve({ ok: true, forced, port: r.port });
+    };
     try {
       r.server.closeAllConnections && r.server.closeAllConnections();
-      r.server.close(() => resolve({ ok: true }));
-      setTimeout(() => resolve({ ok: true }), 1000).unref(); // 兜底不阻塞
+      r.server.close(() => finish(false));
+      setTimeout(() => finish(true), CLOSE_BUDGET_MS).unref();   // 兜底不阻塞，但如实报 forced:true
     } catch {
-      resolve({ ok: true });
+      finish(true);                                                // 连 close 都没法调 = 更不干净
     }
   });
 }
@@ -768,4 +790,4 @@ function status() {
   };
 }
 
-module.exports = { start, stop, stopAsync, status };
+module.exports = { start, stop, stopAsync, status, CLOSE_BUDGET_MS };
