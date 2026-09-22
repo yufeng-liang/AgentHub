@@ -1,27 +1,22 @@
-// 反代网关 · 存储层：SQLite（WAL）+ DPAPI 加密凭据
+// 反代网关 · 存储层：SQLite（WAL）+ 系统级加密凭据
 // 表结构对齐方案 §5.1：keys / agents / accounts / credits_history / usage_requests
-// 驱动优先 better-sqlite3（方案选型），ABI 不匹配等加载失败时回退 Node 22 内置 node:sqlite（接口对齐）
-// 凭据（token/refreshToken）不落明文：复用 config.cjs 的 safeStorage(DPAPI) enc:v1: 信封，等效方案 vault.bin
+// 驱动只有 node:sqlite 一种（二期整张图跑在 Node 22+ 的内嵌运行时里）。曾经这里还挂着一条
+// better-sqlite3 回退分支：该包既不在 dependencies、node_modules/better-sqlite3 也实测不存在，
+// 属于永远走不到的死代码（规格 §九 指定二期改 store.cjs 时顺手清掉）。
+// 凭据（token/refreshToken/Key）不落明文：走 proxy/secretbox.cjs 的 enc:v1: 信封，等效方案 vault.bin
 "use strict";
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const config = require("../config.cjs");
 
-// 驱动与用量同步模块一致：Node 22 内置 node:sqlite 优先（纯 JS 无原生编译依赖）；
-// 老运行时没有 node:sqlite 时回退 better-sqlite3（方案选型，接口对齐）
 let Database = null;
 let driver = "none";
 try {
   Database = require("node:sqlite").DatabaseSync;
   driver = "node:sqlite";
 } catch {
-  try {
-    Database = require("better-sqlite3");
-    driver = "better-sqlite3";
-  } catch {
-    Database = null;
-  }
+  Database = null;
 }
 
 /** 网关数据目录：%APPDATA%\AgentHub\proxy\（stats.db / rules / logs 都在这里） */
@@ -122,7 +117,7 @@ const CHANNELS = [
 /** 打开数据库（幂等）；建表 + WAL + 三渠道种子 + 90 天流水 GC */
 function open() {
   if (db) return db;
-  if (!Database) throw new Error("无可用 SQLite 驱动（better-sqlite3 加载失败且无 node:sqlite）");
+  if (!Database) throw new Error("无可用 SQLite 驱动：运行时没有 node:sqlite（Node 22+ 内置）");
   const file = path.join(proxyDir(), "stats.db");
   db = new Database(file);
   db.exec("PRAGMA journal_mode=WAL;");
@@ -200,7 +195,7 @@ function listKeys() {
     id: r.id,
     name: r.name,
     mask: `${r.key_prefix}····${r.key_suffix}`,
-    secret: r.key_enc ? config.decryptSecret(r.key_enc) : "",
+    secret: decryptForRead(r.key_enc),
     route: r.route,
     dailyQuota: r.daily_quota,
     rateLimit: r.rate_limit,
@@ -272,6 +267,34 @@ function setPoolStrategy(channel, strategy) {
 
 // ===== 号池账号 =====
 
+/** 凭据解密失败计数：secretbox.decrypt 从「返回 ""」改成「抛错」后，读路径接住抛错但必须留下痕迹。
+ *  Task 3 的 /readyz 用它区分「号池真没号」与「有号但解不开」（换机器 / 主密钥不可得），
+ *  后者不该被报成前者。只记次数与首条原因，绝不记明文/密文/密钥。 */
+let decryptFailures = 0;
+let decryptFailureReason = "";
+let decryptFailureLogged = false;
+function rememberDecryptFailure(e) {
+  decryptFailures++;
+  if (!decryptFailureReason) decryptFailureReason = String((e && e.message) || e).split("\n")[0].slice(0, 200);
+  if (!decryptFailureLogged) {
+    decryptFailureLogged = true;
+    try { console.error("[proxy/store] 凭据解密失败（原因只记一次，计数继续累加）：" + decryptFailureReason); } catch { /* 无 stderr 的宿主忽略 */ }
+  }
+}
+function decryptFailureCount() { return decryptFailures; }
+
+/** 读路径的解密：解不开回空串（等价旧行为，不新增抛穿面），但一定计数 */
+function decryptForRead(stored) {
+  if (!stored) return "";
+  try {
+    return config.decryptSecret(stored);
+  } catch (e) {
+    e.credentialFailure = true;
+    rememberDecryptFailure(e);
+    return "";
+  }
+}
+
 /** 行内凭据是否真的可用：号池同步曾把空 token 的账号（加密空串信封）传播进库，
  *  hasToken 只看 token_enc 非空会把这类坏号当可用号调度（全 401）。这里真实解密判一次。
  *  解密结果按信封 memo（信封不变=结果不变；更新凭据会写新信封），避免每次选号都打 DPAPI */
@@ -284,8 +307,10 @@ function tokenUsable(r) {
   let ok = false;
   try {
     ok = !!config.decryptSecret(r.token_enc);
-  } catch {
+  } catch (e) {
     ok = false;
+    e.credentialFailure = true;
+    rememberDecryptFailure(e);   // 解不开 ≠ 没号：交给 /readyz 说清差别
   }
   usableCache.set(r.token_enc, ok);
   return ok;
@@ -341,11 +366,13 @@ function getAccount(id) {
   return r || null;
 }
 
-/** 取解密后的凭据（仅主进程内部使用，绝不外传渲染层） */
+/** 取解密后的凭据（仅主进程内部使用，绝不外传渲染层）。
+ *  热路径每请求走到这里一次：解不开时回空串 + 计数，不把抛错打到请求链路上——
+ *  选号阶段 tokenUsable 已经过滤过，这里抛穿的后果是整条请求 500，而不是换下一个号。 */
 function accountSecrets(r) {
   return {
-    token: config.decryptSecret(r.token_enc),
-    refreshToken: config.decryptSecret(r.refresh_enc),
+    token: decryptForRead(r.token_enc),
+    refreshToken: decryptForRead(r.refresh_enc),
   };
 }
 
@@ -579,6 +606,7 @@ function deleteModelCooldowns(accId, model) {
 module.exports = {
   open, close, proxyDir, dayStr, dayStartMs,
   driver: () => driver,
+  decryptFailureCount,
   CHANNELS,
   channelDisplay: (id) => (CHANNELS.find((c) => c.id === id) || {}).display || String(id),
   createKey, listKeys, findKeyBySecret, updateKey, deleteKey, keyTodayReq,

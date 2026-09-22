@@ -22,27 +22,25 @@ function isPortable() {
   return !!process.env.PORTABLE_EXECUTABLE_DIR;
 }
 
-// WebDAV 密码用系统级密钥加密落盘（safeStorage 不可用就降级明文）。
-// 渲染层永远只拿掩码，真值留在主进程
-let safeStorage = null;
-try { safeStorage = require("electron").safeStorage; } catch { /* 自测环境无 electron */ }
-const ENC_PREFIX = "enc:v1:";
+// WebDAV 密码 / 号池凭据的系统级加解密：实现唯一落在 proxy/secretbox.cjs（后端优先级
+// safeStorage → v10 → plain-dev → none），这里只保留既有导出名，config.cjs / proxy/store.cjs 的调用点不动。
+// 语义变化（Task 1）：解不开时 **抛错** 而不是静默返回 ""——静默空串会让「换了机器」伪装成
+// 「号池没号」。配置读取链路（loadConfig）例外，见 decryptSecretLenient()。
+// 渲染层永远只拿掩码，真值留在主进程。
+const secretbox = require("./proxy/secretbox.cjs");
 
-function encryptSecret(plain) {
-  const s = String(plain || "");
-  if (!s || s.startsWith(ENC_PREFIX)) return s; // 空值或已是密文不重复加密
-  if (!safeStorage || !safeStorage.isEncryptionAvailable()) return s;
-  return ENC_PREFIX + safeStorage.encryptString(s).toString("base64");
-}
+function encryptSecret(plain) { return secretbox.encrypt(plain); }
 
-function decryptSecret(stored) {
-  const s = String(stored || "");
-  if (!s.startsWith(ENC_PREFIX)) return s; // 明文（降级环境存的）直接用
-  if (!safeStorage || !safeStorage.isEncryptionAvailable()) return "";
+function decryptSecret(stored) { return secretbox.decrypt(stored); }
+
+/** 配置读取专用的宽容版：解不开就是「密码为空」，让用户重填（旧语义）。
+ *  loadConfig 是全站入口级的公共路径（网关 settings() 每次请求都读），
+ *  那里冒未捕获抛错会让整个配置读取炸掉，比空号池严重得多，故只在这两处降级。 */
+function decryptSecretLenient(stored) {
   try {
-    return safeStorage.decryptString(Buffer.from(s.slice(ENC_PREFIX.length), "base64"));
+    return secretbox.decrypt(stored);
   } catch {
-    return ""; // 密文来自其他机器解不开，让用户重填
+    return "";
   }
 }
 
@@ -319,9 +317,9 @@ function loadConfig() {
   if (merged.proxy && "autoStart" in merged.proxy) delete merged.proxy.autoStart;
   if (merged.theme !== "dark" && merged.theme !== "light") merged.theme = "dark";
   merged.moduleOrder = normalizeModuleOrder(merged.moduleOrder);
-  merged.webdav.password = decryptSecret(merged.webdav.password);
+  merged.webdav.password = decryptSecretLenient(merged.webdav.password);
   merged.webdavShared = normalizeShared(merged.webdavShared);
-  merged.webdavShared.password = decryptSecret(merged.webdavShared.password);
+  merged.webdavShared.password = decryptSecretLenient(merged.webdavShared.password);
   // deviceId / 本机名惰性补全并写回，保证多次调用稳定
   if (!merged.webdav.deviceId || !merged.webdav.deviceName) {
     if (!merged.webdav.deviceId) merged.webdav.deviceId = crypto.randomUUID();

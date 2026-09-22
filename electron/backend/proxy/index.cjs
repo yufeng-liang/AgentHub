@@ -554,4 +554,6 @@ function register(ipcMain) {
   ipcMain.handle("proxy_poolsync_cancel", handle(() => poolsync.cancel()));
 }
 
-module.exports = { boot, shutdown, register, settings };
+// gatewayStatus 一并导出：proxy_status 命令走它，Task 1 的闸直接断言 vaultOk 字段，
+// Task 5 的转发化也要按这个名字取（藏在 register 里没法单测）
+module.exports = { boot, shutdown, register, settings, gatewayStatus };

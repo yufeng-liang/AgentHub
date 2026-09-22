@@ -21,36 +21,44 @@ const { spawnSync } = require("node:child_process");
 
 const ROOT = path.resolve(__dirname, "..");
 const work = fs.mkdtempSync(path.join(os.tmpdir(), "agenthub-gwnode-"));
+// 清理挂在 exit 上：断言抛错（红的那条路）也要把临时目录带走，不然每次失败都漏一份网关依赖图拷贝
+process.on("exit", () => { try { fs.rmSync(work, { recursive: true, force: true }); } catch { /* Windows 偶发 EBUSY，交给系统回收 */ } });
 // 拷贝保持与仓库相同的相对深度（package.json 在 electron/backend/proxy 上溯 3 级），
 // 这样 util.appVersion() 在拷贝里读的仍是同一份真实 version
 const GATEWAY = path.join(work, "gateway");
 fs.cpSync(path.join(ROOT, "electron", "backend"), path.join(GATEWAY, "electron", "backend"), { recursive: true });
 fs.copyFileSync(path.join(ROOT, "package.json"), path.join(GATEWAY, "package.json"));
-// 反向自咬样本：顶层 require 一个本环境解析不到的包，必须炸
+// 反向自咬样本：顶层 require 一个本环境解析不到的包，必须炸。
+// 必须落在 proxyDir 里面——CJS 解析看的是**被 require 文件自身位置**的上溯链，
+// 放上一层等于测了另一个位置的规则，而「拷贝树里混进 node_modules/electron」正是 proxyDir 这一层的事。
+const BAD = path.join(GATEWAY, "electron", "backend", "proxy", "bad.cjs");
 fs.writeFileSync(
-  path.join(work, "bad.cjs"),
+  BAD,
   '"use strict";\nconst { shell } = require("electron");\nmodule.exports = shell;\n'
 );
 
 // 子进程里跑断言集（路径一律用正斜杠，Windows 的 fs 同样接受）
 const fwd = (p) => p.split(path.win32.sep).join("/");
 const child = `"use strict";
+const fs = require("node:fs");
 const path = require("node:path");
 const gw = ${JSON.stringify(fwd(path.join(GATEWAY, "electron", "backend")))};
 const work = ${JSON.stringify(fwd(work))};
 const proxyDir = path.join(gw, "proxy");
-// ① 真·无 electron 绑定环境下的整体加载（任何一处顶层 require("electron") 都会在这里炸）
-const names = ["server","store","rules","pool","poolsync","adapters","credits","discovery","events","ideswitch","ccswitch","util","raccoonAuth","secretbox","index"];
-for (const n of names) require(path.join(proxyDir, n + ".cjs"));
+// ① 真·无 electron 绑定环境下的整体加载（任何一处顶层 require("electron") 都会在这里炸）。
+//    清单从目录派生而不是硬编码：proxy/ 下新增模块自动进闸，改名也不会漏。
+const names = fs.readdirSync(proxyDir).filter((f) => f.endsWith(".cjs") && f !== "bad.cjs").sort();
+if (names.length < 15) throw new Error("proxy 模块清单异常（只看到 " + names.length + " 个 .cjs，拷贝没成功？）");
+for (const n of names) require(path.join(proxyDir, n));
 require(path.join(gw, "config.cjs"));
 // 自证：加载的确实是仓库外那份拷贝，而不是绕路又摸回了仓库
 const secretbox = require(path.join(proxyDir, "secretbox.cjs"));
 if (path.resolve(String(secretbox.__selfCheck)) !== path.resolve(proxyDir)) {
   throw new Error("__selfCheck 不是拷贝目录，require 命中了仓库原件：" + secretbox.__selfCheck);
 }
-// ② 反向自咬：同目录的顶层 require("electron") 必须解析失败
+// ② 反向自咬：proxyDir 里那份顶层 require("electron") 的样本必须解析失败
 let bit = false;
-try { require(path.join(work, "bad.cjs")); }
+try { require(${JSON.stringify(fwd(BAD))}); }
 catch (e) { bit = e.code === "MODULE_NOT_FOUND" && /Cannot find module 'electron'/.test(String(e.message)); }
 if (!bit) throw new Error("隔离判定失败：bad.cjs 竟然 require 到了 electron，上面的加载断言全是假绿");
 // 这份环境里拿不到 safeStorage，后端必须降级（不是 safeStorage）
@@ -119,5 +127,5 @@ assert.deepStrictEqual(
   "electron/backend/proxy 下出现顶层 require(\"electron\")，纯 Node 子进程会加载失败：" + offenders.join(", ")
 );
 
-try { fs.rmSync(work, { recursive: true, force: true }); } catch { /* Windows 偶发 EBUSY，交给系统回收 */ }
+// 临时目录由开头的 process.on("exit") 钩子回收（绿的路和红的路都覆盖）
 console.log("OK 网关依赖图在纯 Node（无 electron 绑定）下可整体加载，且 proxy/ 无顶层 require(\"electron\")");
