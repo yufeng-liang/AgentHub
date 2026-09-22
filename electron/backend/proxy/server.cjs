@@ -11,6 +11,8 @@ const provider = require("./provider.cjs");
 const openaiOut = require("./protocols/openai-out.cjs");
 const anthropicIn = require("./protocols/anthropic-in.cjs");
 const anthropicOut = require("./protocols/anthropic-out.cjs");
+const responsesIn = require("./protocols/responses-in.cjs");
+const responsesOut = require("./protocols/responses-out.cjs");
 const util = require("./util.cjs");
 const events = require("./events.cjs");
 
@@ -251,6 +253,8 @@ const OPENAI_SURFACE = {
   readKey: (req) => ({ key: String(req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim() }),
 };
 const ANTHROPIC_SURFACE = { name: "anthropic", createSink: anthropicOut.create, readKey: anthropicIn.readKey };
+// Responses 入站的鉴权读法与 OpenAI 通路一致（Codex 走 Authorization: Bearer），复用同一个 readKey
+const RESPONSES_SURFACE = { name: "responses", createSink: responsesOut.create, readKey: OPENAI_SURFACE.readKey };
 
 /** chat/completions 主流程（stream 双态共用一套 emit → 出线或聚合）
  *  surface 只决定「这一串事件写成什么字节」：OpenAI / Anthropic / Responses 各一个工厂。
@@ -642,6 +646,27 @@ function buildApp(settings) {
   // 官方文档把 count_tokens 列为可选（缺了客户端退化成字符估算）。这里用网关自己的
   // length/4 口径实现——与客户端兜底同量级，胜在 /status 与统计页能看到同一个数。
   app.post("/v1/messages/count_tokens", (req, res) => res.json(anthropicIn.countTokens(req.body || {})));
+
+  // Responses 入口（Codex CLI）：Codex 已删除 wire_api="chat"，没有这一层就只能靠 CC Switch 翻译。
+  // enableResponses 与 enableAnthropic 同性质——默认开的紧急止血开关，关掉即回到「该端点不存在」。
+  app.post("/v1/responses", (req, res) => {
+    if (settings().enableResponses === false) {
+      res.status(404).json({ error: { message: "该网关未启用 /v1/responses", type: "not_found_error", param: null, code: null } });
+      return undefined;
+    }
+    const r = responsesIn.toInternal(req.body || {});
+    if (!r.ok) {
+      res.status(400).json({ error: { message: r.message, type: "invalid_request_error", param: null, code: null } });
+      return undefined;
+    }
+    if (r.notes && r.notes.length) {
+      console.warn(`[gateway] /v1/responses 转换损失: ${r.notes.join(" | ")}`);
+    }
+    req.body = r.body;
+    return handleChat(req, res, settings(), RESPONSES_SURFACE).catch((e) => {
+      if (!res.headersSent) res.status(500).json({ error: { message: String((e && e.message) || e), type: "api_error", param: null, code: null } });
+    });
+  });
 
   // 模型目录：全渠道合并视图（含自定义提供商的 标识/模型名）。
   // 三条硬约束，都是客户端侧实测出来的：① Claude Code 发 ?limit=1000 且 3s 超时，

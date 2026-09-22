@@ -2,11 +2,14 @@
 // 只读写 ~/.cc-switch/cc-switch.db 的 providers 表（固定 id），绝不动其它 provider。
 //
 // meta 里的字段语义见 CC Switch 源码：
-// 1) apiFormat = "openai_chat"：网关只提供 Chat Completions，需要 CC Switch 做协议翻译。
+// 1) apiFormat = "openai_chat"：让 CC Switch 把客户端协议翻成 Chat Completions。
+//    这是网关只有 /v1/chat/completions 时期的方案，今天已是能力而非必需——网关自己会讲
+//    /v1/messages（③）与 /v1/responses（⑤），proxy.ccSwitchNativeFormat 置 true 即不写这个
+//    字段、让客户端直连网关，少一跳翻译。默认仍为 false（翻译链路是用户实测在用的路径）。
 //    必须显式写 meta.apiFormat，不能只靠 base_url 兜底——CC Switch 的
 //    codex_provider_uses_chat_completions() 在读到 config 里的 wire_api 后**提前 return**，
 //    base_url 那层永远轮不到；而 Codex 的 wire_api 按 Codex 侧语义必须是 "responses"，
-//    于是判定为「非 chat」→ 不转换 → Codex 的 /v1/responses 直接打到网关 → 404。
+//    于是判定为「非 chat」→ 不转换 → Codex 的 /v1/responses 直接打到网关 → 那时才会 404。
 //    （Claude 侧同理走 meta.apiFormat，见 get_claude_api_format()。）
 // 2) commonConfigEnabled = true：切换条目时 CC Switch 会用条目内容**整体覆写** live 配置，
 //    只有 true 才会把用户的「通用配置片段」合并进来。设 false 等于每次切到本条目就丢掉
@@ -154,8 +157,12 @@ function rotateBackups(dir, keep) {
   return removed;
 }
 
-/** 组装条目的 settings_config / meta（字符串化后入库） */
-function buildEntry(appType, { base, apiKey, model }) {
+/** 组装条目的 settings_config / meta。
+ *  opts.native=true 时不写 meta.apiFormat（= 让客户端直连网关的原生端点，不由 CC Switch 翻译），
+ *  见文件头注释 1。默认 false，行为与开关存在之前完全一致。 */
+function buildEntry(appType, { base, apiKey, model, native }) {
+  // 需要「翻译」时才写 apiFormat；claude-desktop 永远要写（它只能走 CC Switch 的本地网关做角色映射）
+  const translate = native ? {} : { apiFormat: "openai_chat" };
   if (appType === "claude") {
     // 真实上游模型必须留在 *_MODEL：CC Switch 接管时会把 live 里的角色字段改写成
     // claude-sonnet-5 等别名，再由 model_mapper 用这里的 *_MODEL 映射回真实模型。
@@ -177,7 +184,7 @@ function buildEntry(appType, { base, apiKey, model }) {
         },
       },
       meta: {
-        apiFormat: "openai_chat",
+        ...translate,
         commonConfigEnabled: true,
         apiKeyField: "ANTHROPIC_AUTH_TOKEN",
       },
@@ -251,7 +258,7 @@ function buildEntry(appType, { base, apiKey, model }) {
       },
     },
     meta: {
-      apiFormat: "openai_chat",
+      ...translate,
       commonConfigEnabled: true,
       // 思考能力：Codex 客户端经 CC Switch 转 Chat 时，声明上游网关支持思考模式与思考深度档位。
       // supportsThinking / supportsEffort 即 CC Switch「支持思考模式 / 支持思考等级」开关
@@ -259,14 +266,15 @@ function buildEntry(appType, { base, apiKey, model }) {
       // 网关为通用 Chat 层，effort 档位按 passthrough 原样透传（modelCatalog.reasoningLevels 已背书 low/high/max），
       // thinking/effort 参数名取上游默认值（thinking / reasoning_effort，顶层 OpenAI 风格字段，
       // 与本机跑通的「赔钱国模」等 Chat 上游条目一致）。
-      codexChatReasoning: {
+      // 与本机跑通的「赔钱国模」等 Chat 上游条目一致。原生直连时这段没有作用，不写。
+      ...(native ? {} : { codexChatReasoning: {
         supportsThinking: true,
         supportsEffort: true,
         thinkingParam: "thinking",
         effortParam: "reasoning_effort",
         effortValueMode: "passthrough",
         outputFormat: "auto",
-      },
+      } }),
     },
   };
 }
@@ -339,10 +347,11 @@ function register({ appType, apiKey, model, port } = {}) {
   const mdl = String(model || "").trim();
   if (!key) return { ok: false, message: "请先选择网关 API Key" };
   if (!mdl) return { ok: false, message: "请填写默认模型" };
-  if (!Number.isFinite(port) || port <= 0) {
-    const cfg = config.loadConfig();
-    port = (cfg && cfg.proxy && cfg.proxy.port) || 9527;
-  }
+  // 直连开关：默认关（翻译链路是用户当下实测在用的路径），置 true 才让客户端原生打网关的
+  // /v1/messages 与 /v1/responses。只在注册时读一次，改完要重新点一次「注册」。
+  const proxyCfg = (config.loadConfig() || {}).proxy || {};
+  if (!Number.isFinite(port) || port <= 0) port = proxyCfg.port || 9527;
+  const native = proxyCfg.ccSwitchNativeFormat === true;
   const p = dbPath();
   if (!fs.existsSync(p)) {
     return { ok: false, message: "未检测到 CC Switch（缺少 ~/.cc-switch/cc-switch.db），请先安装并启动一次 CC Switch" };
@@ -370,7 +379,7 @@ function register({ appType, apiKey, model, port } = {}) {
 
     // 3) 组装并 upsert
     const base = `http://127.0.0.1:${port}`;
-    const entry = buildEntry(t, { base, apiKey: key, model: mdl });
+    const entry = buildEntry(t, { base, apiKey: key, model: mdl, native });
     const now = Date.now();
     const name = APP_NAMES[t];
     const settings = JSON.stringify(entry.settings_config);

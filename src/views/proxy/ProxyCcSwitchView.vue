@@ -1,6 +1,8 @@
-<!-- 反代网关 · 生态接入（CC Switch）：把 AgentHub 网关注册为 CC Switch 的 provider 条目，
-     上游格式 = OpenAI Chat Completions（http://127.0.0.1:{port}/v1），Claude Code / Codex / Claude Desktop 的原生协议
-     由 CC Switch 翻译后再打到网关；注册前自动备份 CC Switch 数据库，且只 upsert 固定 id 条目 -->
+<!-- 反代网关 · 生态接入（CC Switch）：把 AgentHub 网关注册为 CC Switch 的 provider 条目。
+     默认口径：上游格式 = OpenAI Chat Completions（http://127.0.0.1:{port}/v1），Claude Code / Codex 的
+     原生协议由 CC Switch 翻译后再打到网关。网关自身也已支持 /v1/messages 与 /v1/responses，
+     把配置项 proxy.ccSwitchNativeFormat 置 true 即改为不翻译、直连网关（默认关，动它前看 §本页提示）。
+     注册前自动备份 CC Switch 数据库，且只 upsert 固定 id 条目 -->
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import * as api from "../../api/ipc";
@@ -26,7 +28,9 @@ const APP_LABELS: Record<CcSwitchAppType, string> = {
 
 const installed = computed(() => !!st.value?.installed);
 const incompatible = computed(() => !!st.value?.incompatible);
-/** CC Switch 的「本地路由」未开启时不会做协议转换，直连网关必 404（Claude /v1/messages、Codex /v1/responses、Desktop 映射模式失联） */
+/** 「本地路由」未开启时 CC Switch 不做转换，也不做 Desktop 的角色映射：
+ *  Claude Code / Codex 于是直连网关的原生端点（今天网关自己会讲，能跑通，只是少一层加工），
+ *  Claude Desktop 则必须靠 CC Switch 的本地网关，不开就完全不可用。 */
 const needsTakeover = computed(() =>
   (["claude", "codex", "claude-desktop"] as const).filter((t) => entry(t)?.registered && !takeoverOf(t)),
 );
@@ -168,7 +172,7 @@ onMounted(() => {
     <div class="page-head">
       <div>
         <div class="page-title">生态接入</div>
-        <div class="page-sub">把 AgentHub 网关注册为 CC Switch 的 provider，Claude Code / Codex / Claude Desktop 的协议翻译由 CC Switch 完成</div>
+        <div class="page-sub">把 AgentHub 网关注册为 CC Switch 的 provider；协议翻译默认由 CC Switch 完成，也可让客户端直连网关原生端点</div>
       </div>
       <div class="page-actions">
         <button class="btn btn-primary" :disabled="!installed || incompatible || busy === 'claude'" @click="register('claude')">
@@ -222,15 +226,18 @@ onMounted(() => {
         </div>
         <div v-else-if="incompatible" class="set-desc">检测到 CC Switch 数据库但结构不符，可能版本过旧；注册时会有更具体的报错。</div>
         <div v-else class="set-desc">
-          网关协议为 OpenAI Chat Completions。Claude Code、Codex 与 Claude Desktop 的原生协议由
-          CC Switch 翻译成 Chat Completions 再打到网关；每次注册前自动备份 CC Switch 数据库，且不修改其它 provider。
+          注册项默认让 CC Switch 把原生协议翻成 Chat Completions 再打到网关；网关自身也已支持
+          /v1/messages 与 /v1/responses，需要少一跳翻译时把配置项 <span class="mono">proxy.ccSwitchNativeFormat</span>
+          置 true 并重新注册。每次注册前自动备份 CC Switch 数据库，且不修改其它 provider。
         </div>
         <div v-if="installed && !incompatible && needsTakeover.length" class="set-desc err-text" style="margin-top: 8px">
           检测到 {{ needsTakeover.map((t) => APP_LABELS[t]).join(" / ") }}
-          已注册但未开启本地路由。CC Switch 只在本地路由开启时做协议转换，直接「打开终端」或普通切换会把原生请求打到网关而报 404。
+          已注册但未开启本地路由。Claude Desktop 只能经 CC Switch 的本地网关做角色映射，不开即不可用；
+          Claude Code / Codex 不开也能直连网关的原生端点，只是跳过 CC Switch 那一层转换与思考参数加工。
         </div>
         <div v-else-if="installed && !incompatible" class="set-desc" style="margin-top: 8px">
-          本地路由已开启；请勿使用条目的「打开终端」直连，那条路径不经过 CC Switch 协议转换。
+          本地路由已开启。条目的「打开终端」不经过 CC Switch 转换：那条路径下 Claude Code / Codex
+          会直连网关原生端点，Claude Desktop 则不可用。
         </div>
         <div class="kpis" style="margin-top: 12px">
           <div class="kpi"><span>网关地址</span><b class="mono">127.0.0.1:{{ port }}/v1</b></div>

@@ -89,6 +89,7 @@ function closeHint() {
 const endpoints = [
   { key: "chat", text: "POST /v1/chat/completions" },
   { key: "messages", text: "POST /v1/messages" },
+  { key: "responses", text: "POST /v1/responses" },
   { key: "models", text: "GET /v1/models" },
   { key: "health", text: "GET /healthz" },
 ] as const;
@@ -107,7 +108,28 @@ function goKeys() {
   app.setPage("keys");
 }
 
-const exTab = ref<"curl" | "py" | "app">("curl");
+const exTab = ref<"curl" | "py" | "app" | "cli">("curl");
+
+/** 编程 CLI 的接法：两家拼 URL 的规矩正好相反，写错一侧就是 404，所以两段都标在注释里 */
+const cliCmd = computed(() => {
+  const origin = base.value.replace(/\/v1$/, "");
+  return (
+    `# Claude Code —— 走 /v1/messages\n` +
+    `setx ANTHROPIC_BASE_URL   "${origin}"      # 只到端口：它自己拼 /v1/messages\n` +
+    `setx ANTHROPIC_AUTH_TOKEN "sk-你的Key"\n` +
+    `setx ANTHROPIC_MODEL      "我的中转/claude-sonnet-4-5"\n\n` +
+    `# Codex CLI —— 走 /v1/responses，配置在 ~/.codex/config.toml\n` +
+    `model_provider = "agenthub"\n` +
+    `model = "我的中转/gpt-4o"        # 自定义 base_url 时 Codex 不拉模型目录，只能手填\n\n` +
+    `[model_providers.agenthub]\n` +
+    `name = "AgentHub 网关"\n` +
+    `base_url = "${base.value}"    # 必须自带 /v1：它只做 base + "/responses"\n` +
+    `wire_api = "responses"            # "chat" 已从 Codex 删除，写它会硬报错\n` +
+    `env_key = "AGENTHUB_API_KEY"\n` +
+    `stream_idle_timeout_ms = 300000\n\n` +
+    `setx AGENTHUB_API_KEY "sk-你的Key"        # 换终端才生效；macOS/Linux 用 export`
+  );
+});
 
 /** 本页是否处于前台：页面经 v-show 保活，切走后轮询与事件刷新必须停下来，
     否则总览在后台持续拉数据重渲染，挤占前台页（号池等）的每一帧 */
@@ -245,6 +267,7 @@ onUnmounted(() => {
           <button class="ex-tab" :class="{ on: exTab === 'curl' }" @click="exTab = 'curl'">curl 命令</button>
           <button class="ex-tab" :class="{ on: exTab === 'py' }" @click="exTab = 'py'">Python（OpenAI SDK）</button>
           <button class="ex-tab" :class="{ on: exTab === 'app' }" @click="exTab = 'app'">桌面客户端</button>
+          <button class="ex-tab" :class="{ on: exTab === 'cli' }" @click="exTab = 'cli'">编程 CLI</button>
           <span class="ex-note">把 <b>sk-你的Key</b> 换成第 2 步生成的 Key<span class="qwrap">
             <span class="qmark" :class="{ on: openHint === 'replace' }" @click.stop="toggleHint('replace')">?</span>
             <span v-if="openHint === 'replace'" class="qpop">示例里的"sk-你的Key"和模型名都是占位符，替换成你自己的真实值才能跑通。</span>
@@ -252,6 +275,7 @@ onUnmounted(() => {
         </div>
         <div v-if="exTab === 'curl'" class="code">{{ curlCmd }}</div>
         <div v-if="exTab === 'py'" class="code">{{ pyCmd }}</div>
+        <div v-if="exTab === 'cli'" class="code">{{ cliCmd }}</div>
         <ol v-if="exTab === 'app'" class="app-steps">
           <li>打开客户端的「设置 → 模型服务」，点「添加」，选择 <b>OpenAI 兼容 / 自定义</b> 类型。</li>
           <li>API 地址：填上方第 3 步的 Base URL（以 <b>/v1</b> 结尾；个别客户端只要求填到端口，按它的提示来）。</li>

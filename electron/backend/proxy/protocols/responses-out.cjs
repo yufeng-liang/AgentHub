@@ -1,0 +1,304 @@
+// 反代网关 · 出线协议：OpenAI Responses（Codex CLI 看到的字节）
+//
+// 与 anthropic-out 同构：输入是调度核心交出来的四种事件（delta / usage / finish / error），
+// 输出是 Responses 的事件流。item 边界同样由这里从 OpenAI 形态的 delta 推导：
+//   reasoning_content → reasoning item；首个非空 content → message item；
+//   tool_calls[i] 首现 → function_call item；收尾时按开项顺序逐项关闭。
+//
+// 三条来自 Codex 解析器的硬约束（改这里之前先核对，都在闸里有对应断言）：
+//   1. EOF 之前必须出现 response.completed，否则 Codex 报 "stream closed before response.completed"；
+//      response.incomplete 会被它当**失败**处理，所以 max_tokens 截断也发 completed，
+//      截断信息放在 incomplete_details 里而不是靠 status 表达。
+//   2. reasoning item 的 JSON 里 encrypted_content 这个 key 必须存在（值可为 null）——
+//      它是 Option<String> 但没有 serde(default)，缺 key 会让整个 item 解析失败并被静默丢弃。
+//   3. function_call item 的 name / arguments / call_id 三个 key 必需，且 call_id 要与入站保真。
+//
+// 与 Anthropic 通路一样必须 deferredOpen：换号重发时出现第二个 response.created，客户端必炸。
+"use strict";
+const util = require("../util.cjs");
+
+function ev(type, data) {
+  return `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+function errorEnvelope(message, type) {
+  return { error: { message: String(message || "网关错误"), type: type || "api_error", param: null, code: null } };
+}
+
+/**
+ * @param ctx {{
+ *   res, reqId, requestedModel, wantStream, estInputTokens?: number
+ * }}
+ */
+function create(ctx) {
+  const { res, reqId, requestedModel, wantStream } = ctx;
+  let clientGone = false;
+  res.on("close", () => { clientGone = true; });
+  const write = (text) => {
+    // 非流式由 endOk 一次性 res.json：中途裸写会先发出 chunked 正文，之后 res.json 必抛
+    // "headers already sent"（anthropic-out 就是被这条坑过的）
+    if (!wantStream) return;
+    if (clientGone || res.writableEnded) return;
+    res.write(text);
+  };
+
+  const respId = `resp_${reqId}`;
+  const createdAt = Math.floor(Date.now() / 1000);
+  const deferred = [];        // response.created 起、首个实质内容之前的所有帧
+  let opened = false;         // response.created 是否已落盘
+  let seq = 0;
+  let usage = null;
+  let finishReason = "";
+  let lastError = "";
+  const items = [];           // 按开项顺序排列，output_index 即下标
+  let textItem = null;
+  let thinkItem = null;
+  const toolOf = new Map();   // OpenAI tool_call index → function_call item
+  const acc = { text: "", thinking: "" };
+
+  /** 发一帧：未开流时进缓冲（deferredOpen），已开流时直接落盘 */
+  const frame = (type, extra) => {
+    const text = ev(type, Object.assign({ type, sequence_number: seq++ }, extra || {}));
+    if (opened) write(text);
+    else deferred.push(text);
+  };
+
+  function createdResponse() {
+    return {
+      id: respId, object: "response", created_at: createdAt, status: "in_progress",
+      error: null, incomplete_details: null, model: requestedModel, output: [], usage: null,
+    };
+  }
+  /** 响应头与首帧同批落地：首帧被扣住时头也不能提前写，否则客户端拿到一个没声明 SSE 内容类型的流 */
+  function ensureHead() {
+    if (res.headersSent) return;
+    res.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache",
+      "connection": "keep-alive",
+    });
+  }
+  function flushDeferred() {
+    if (opened) return;
+    opened = true;
+    if (!wantStream) { deferred.length = 0; return; }
+    ensureHead();
+    const first = deferred.length ? deferred.splice(0) : [ev("response.created", { type: "response.created", response: createdResponse(), sequence_number: seq++ })];
+    for (const f of first) write(f);
+  }
+
+  function mkItem(kind, extra) {
+    const item = {
+      kind,
+      id: `${kind === "message" ? "msg" : kind === "reasoning" ? "rs" : "fc"}_${reqId}_${items.length}`,
+      index: -1,
+      text: "",
+      args: "",
+      call_id: "",
+      name: "",
+      opened: false,
+      done: false,
+      addedShape() {
+        if (this.kind === "message") return { type: "message", id: this.id, status: "in_progress", role: "assistant", content: [] };
+        // encrypted_content 这个 key 必须在（文件头硬约束 2）
+        if (this.kind === "reasoning") return { type: "reasoning", id: this.id, summary: [], encrypted_content: null };
+        return { type: "function_call", id: this.id, call_id: this.call_id, name: this.name, arguments: "", status: "in_progress" };
+      },
+      doneShape() {
+        if (this.kind === "message") return { type: "message", id: this.id, status: "completed", role: "assistant", content: [{ type: "output_text", text: this.text, annotations: [] }] };
+        if (this.kind === "reasoning") return { type: "reasoning", id: this.id, summary: this.text ? [{ type: "summary_text", text: this.text }] : [], encrypted_content: null };
+        return { type: "function_call", id: this.id, call_id: this.call_id, name: this.name, arguments: this.args, status: "completed" };
+      },
+    };
+    return Object.assign(item, extra || {});
+  }
+
+  function openItem(item) {
+    item.index = items.length;
+    item.opened = true;
+    items.push(item);
+    frame("response.output_item.added", { output_index: item.index, item: item.addedShape() });
+    if (item.kind === "message") {
+      frame("response.content_part.added", { item_id: item.id, output_index: item.index, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
+    } else if (item.kind === "reasoning") {
+      frame("response.reasoning_summary_part.added", { item_id: item.id, output_index: item.index, summary_index: 0, part: { type: "summary_text", text: "" } });
+    }
+    return item;
+  }
+
+  /** 关一个 item：先把该协议的 *.done 事件补齐，再发 output_item.done（item 必须是完整可反序列化对象） */
+  function closeItem(item) {
+    if (!item || item.done) return;
+    item.done = true;
+    if (item.kind === "message") {
+      frame("response.output_text.done", { item_id: item.id, output_index: item.index, content_index: 0, text: item.text });
+      frame("response.content_part.done", { item_id: item.id, output_index: item.index, content_index: 0, part: { type: "output_text", text: item.text, annotations: [] } });
+    } else if (item.kind === "reasoning") {
+      frame("response.reasoning_summary_text.done", { item_id: item.id, output_index: item.index, summary_index: 0, text: item.text });
+      frame("response.reasoning_summary_part.done", { item_id: item.id, output_index: item.index, summary_index: 0, part: { type: "summary_text", text: item.text } });
+    } else {
+      frame("response.function_call_arguments.done", { item_id: item.id, output_index: item.index, name: item.name, arguments: item.args });
+    }
+    frame("response.output_item.done", { output_index: item.index, item: item.doneShape() });
+  }
+  function closeAll() {
+    for (const it of items) closeItem(it);
+  }
+  /** 新 item 开出来之前关掉当前还开着的（Responses 的 item 不交错） */
+  function closeCurrent() {
+    if (thinkItem) { closeItem(thinkItem); thinkItem = null; }
+    if (textItem) { closeItem(textItem); textItem = null; }
+  }
+
+  function textDelta(s) {
+    if (!s) return;
+    acc.text += s;
+    if (thinkItem) { closeItem(thinkItem); thinkItem = null; } // 正文开始后思考不再回投（item 已关）
+    if (!textItem) textItem = openItem(mkItem("message"));
+    textItem.text += s;
+    frame("response.output_text.delta", { item_id: textItem.id, output_index: textItem.index, content_index: 0, delta: s, logprobs: [] });
+  }
+  function thinkingDelta(s) {
+    if (!s) return;
+    acc.thinking += s;
+    if (!thinkItem) thinkItem = openItem(mkItem("reasoning"));
+    thinkItem.text += s;
+    frame("response.reasoning_summary_text.delta", { item_id: thinkItem.id, output_index: thinkItem.index, summary_index: 0, delta: s });
+  }
+  function toolDelta(tcs) {
+    for (const tc of tcs) {
+      if (!tc || typeof tc !== "object") continue;
+      const key = String(tc.index || 0);
+      const fn = (tc.function && typeof tc.function === "object") ? tc.function : {};
+      let it = toolOf.get(key);
+      if (!it) {
+        it = mkItem("function_call");
+        toolOf.set(key, it);
+      }
+      if (tc.id) it.call_id = String(tc.id);
+      if (fn.name) it.name += fn.name;
+      const args = typeof fn.arguments === "string" ? fn.arguments : "";
+      // 只有拿到 id 或 name 才开项：上游偶发的空壳 tool_calls 分片不该变成一个无名工具
+      if (!it.opened && (tc.id || it.name)) {
+        closeCurrent();
+        openItem(it);
+      }
+      if (args && it.opened) {
+        it.args += args;
+        frame("response.function_call_arguments.delta", { item_id: it.id, output_index: it.index, delta: args });
+      }
+    }
+  }
+
+  function usageObj() {
+    const u = usage || {};
+    const inp = Number(u.prompt_tokens || u.input_tokens) || Number(ctx.estInputTokens) || 0;
+    const outp = Number(u.completion_tokens || u.output_tokens) || 0;
+    return { input_tokens: inp, output_tokens: outp, total_tokens: Number(u.total_tokens) || inp + outp };
+  }
+  /** status 只有 completed / failed 两种：见文件头硬约束 1 */
+  function responsePayload(status) {
+    return {
+      id: respId,
+      object: "response",
+      created_at: createdAt,
+      status,
+      model: requestedModel,
+      output: items.map((it) => it.doneShape()),
+      output_text: acc.text,
+      usage: usageObj(),
+      error: status === "failed" ? { message: lastError, type: "api_error", param: null, code: null } : null,
+      incomplete_details: status === "completed" && finishReason === "length" ? { reason: "max_output_tokens" } : null,
+    };
+  }
+
+  return {
+    protocol: "responses",
+
+    writeHead() {
+      if (!wantStream) return;
+      deferred.push(ev("response.created", { type: "response.created", response: createdResponse(), sequence_number: seq++ }));
+    },
+
+    /** 一个上游 delta。返回「客户端真能消费的实质内容有没有出现过」——调度侧据此置 ttft/sent 位 */
+    onDelta(d) {
+      const delta = d || {};
+      const substantive = util.hasConsumableDelta(delta);
+      if (substantive) flushDeferred();
+      if (delta.reasoning_content) thinkingDelta(delta.reasoning_content);
+      if (delta.content) textDelta(delta.content);
+      if (Array.isArray(delta.tool_calls) && delta.tool_calls.length) toolDelta(delta.tool_calls);
+      return substantive;
+    },
+
+    onUsage(u) {
+      usage = u;
+    },
+
+    onFinish(reason) {
+      if (reason) finishReason = reason;
+    },
+
+    /** 流中出现 error：已出线才下发（一条都没出时返回 false，交给调度换号） */
+    onStreamError(err, { sent }) {
+      if (!(wantStream && sent)) return false;
+      lastError = String((err && err.message) || "上游错误");
+      flushDeferred();
+      closeAll();
+      write(ev("response.failed", { type: "response.failed", response: responsePayload("failed"), sequence_number: seq++ }));
+      return true;
+    },
+
+    keepAlive() {
+      // 用 SSE 注释行而不是编造一个 "*.delta" 事件：Codex 只读 data 里的 type，注释行按 SSE 规范
+      // 被忽略，既能重置它的 stream_idle_timeout_ms，又不污染事件流
+      if (wantStream) write(": keep-alive\n\n");
+    },
+
+    endOk() {
+      flushDeferred();
+      closeAll();
+      if (!wantStream) {
+        res.json(responsePayload("completed"));
+        return;
+      }
+      write(ev("response.completed", { type: "response.completed", response: responsePayload("completed"), sequence_number: seq++ }));
+      res.end();
+    },
+
+    endErr(status, message, type) {
+      lastError = String(message || "网关错误");
+      if (wantStream && res.headersSent) {
+        flushDeferred();
+        closeAll();
+        write(ev("response.failed", { type: "response.failed", response: responsePayload("failed"), sequence_number: seq++ }));
+        res.end();
+        return;
+      }
+      res.status(status).json(errorEnvelope(message, type));
+    },
+
+    /** 调度侧要 completion_tokens 的估算口径 */
+    aggregated() {
+      return { content: acc.text, reasoning: acc.thinking };
+    },
+
+    /** 换号 / 回退链重发前：整棵 item 树与缓冲作废（调用点保证只在未出线时走到） */
+    resetAttempt() {
+      deferred.length = 0;
+      opened = false;
+      seq = 0;
+      usage = null;
+      finishReason = "";
+      lastError = "";
+      items.length = 0;
+      textItem = null;
+      thinkItem = null;
+      toolOf.clear();
+      acc.text = "";
+      acc.thinking = "";
+    },
+  };
+}
+
+module.exports = { create };
