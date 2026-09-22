@@ -12,11 +12,12 @@ const CUSTOM_ALPHABET = "_doRTgHZBKcGVjlvpC,@aFSx#DPuNJme&i*MzLOEn)sUrthbf%Y^w.(
 
 function md5hex(s) { return crypto.createHash("md5").update(String(s), "utf8").digest("hex"); }
 
-/** URL 的 path 去掉 /algo 前缀、不含查询串（协议参考 §3.3 第 6 步） */
+/** URL 的 path 去掉 /algo 前缀、不含查询串（协议参考 §3.3 第 6 步）。
+ *  必须带尾斜杠判定：/algorithm 这类非 COSY 路径不能被误切。 */
 function sigPathOf(url) {
   const u = new URL(String(url));
   const p = u.pathname;
-  return p.startsWith("/algo") ? p.slice(5) || "/" : p;
+  return p.startsWith("/algo/") ? p.slice(5) || "/" : p;
 }
 
 /** encode_body 三步变换（cosy.rs:212-240 逐字移植）：标准 base64 → 尾段/中段/首段重排

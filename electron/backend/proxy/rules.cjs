@@ -108,6 +108,30 @@ const DEFAULTS = {
         { id: "glm-5.3-flash", name: "GLM-5.3-Flash", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1048576, maxOutputTokens: 131072 },
       ],
     },
+    // Qoder 静态兜底（协议参考 §3.8 global 区 17 条快照，rate=price_factor，0 是合法值）；
+    // 拉取 model/list 成功后整段覆盖对应渠道。cn 区清单在适配器 QODER_FALLBACK 内置
+    qoder: {
+      syncedAt: 0,
+      models: [
+        { id: "Qwen3.8-Flash", name: "Qwen3.8-Flash", rate: 0.1, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "Qwen3.8-Max", name: "Qwen3.8-Max", rate: 0.5, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "Auto", name: "Auto", rate: 1, capabilities: { images: true, reasoning: false, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "Ultimate", name: "Ultimate", rate: 1.6, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "Performance", name: "Performance", rate: 1.1, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "Efficient", name: "Efficient", rate: 0.3, capabilities: { images: true, reasoning: false, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "Sonus", name: "Sonus", rate: 3.2, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "Cantus", name: "Cantus", rate: 3.2, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "Qwen3.7-Max", name: "Qwen3.7-Max", rate: 0.5, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "Qwen3.7-Plus", name: "Qwen3.7-Plus", rate: 0.1, capabilities: { images: true, reasoning: false, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "Kimi-K3", name: "Kimi-K3", rate: 0.8, capabilities: { images: true, reasoning: false, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "Kimi-K2.8-Preview", name: "Kimi-K2.8-Preview", rate: 0.3, capabilities: { images: true, reasoning: false, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "GLM-5.3", name: "GLM-5.3", rate: 0.6, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "GLM-5.3-Flash", name: "GLM-5.3-Flash", rate: 0.1, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "DeepSeek-V4-Pro", name: "DeepSeek-V4-Pro", rate: 0.8, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "DeepSeek-Flash", name: "DeepSeek-Flash", rate: 0.2, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "MiniMax-M3", name: "MiniMax-M3", rate: 0.2, capabilities: { images: true, reasoning: false, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+      ],
+    },
   },
   // Trae function 字段按模型分发（TraeWorkAssistant models_sync.rs 实证：
   // 部分模型仅在 solo_agent 下可用，其余走 solo_work_lite；未命中默认 solo_work_lite）

@@ -4,6 +4,8 @@
 // WorkBuddy CN 与国际版共享适配器核心，配置层隔离、代码零复制（方案 §2.3）
 "use strict";
 const crypto = require("node:crypto");
+const path = require("node:path");
+const os = require("node:os");
 const rules = require("./rules.cjs");
 const store = require("./store.cjs");
 const util = require("./util.cjs");
@@ -12,6 +14,7 @@ const clineAuth = require("./clineAuth.cjs");
 const acCred = require("./autoclawCredentials.cjs");
 const acPrompt = require("./autoclawPrompt.cjs");
 const aup = require("./protocols/anthropic-up.cjs");
+const qcosy = require("./qoderCosy.cjs");
 
 const FIRST_BYTE_MS = 30000; // 首 token 30s 超时判失败。实测成功请求 TTFT P99≈8.7s、最大 20.2s，
 // 10s 会误杀慢模型/thinking 首包（参考项目无首字节总超时，读空闲容忍 300s，这里取全覆盖+余量的折中）
@@ -2002,6 +2005,395 @@ function makeAutoClaw(region) {
 const autoclaw = makeAutoClaw("cn");
 const autoclaw_intl = makeAutoClaw("intl");
 
+// ===== Qoder（阿里，国际/中国版单渠道按账号地区切换；协议参考 §3） =====
+// 四组域名按 region 内置切换（地区不接受任意 URL）；模型目录/凭证两地区不通用。
+const QODER_REGIONS = {
+  global: { openApi: "https://openapi.qoder.sh", center: "https://center.qoder.sh", webOrigin: "https://qoder.com", gateway: "https://api3.qoder.sh/" },
+  cn: { openApi: "https://openapi.qoder.com.cn", center: "https://gateway.qoder.com.cn", webOrigin: "https://qoder.com.cn", gateway: "https://gateway.qoder.com.cn/" },
+};
+const QODER_CHAT_PATH = "algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1"; // gateway 基址带尾斜杠
+const QODER_MODEL_LIST_PATH = "algo/api/v2/model/list?Encode=1";
+const QODER_REFRESH_PATH = "/algo/api/v3/user/refresh_token"; // center 域
+const QODER_USERINFO_PATH = "/api/v1/userinfo"; // open_api 域
+// 兜底清单（协议参考 §3.8；upstreamKey/reasoning/efforts/vision/倍率快照 2026-09-20 实测；global 17 / cn 10）
+const QODER_FALLBACK = {
+  global: [
+    ["Qwen3.8-Flash", "qfmodel", true, ["low", "medium", "xhigh"], true, "0.1"],
+    ["Qwen3.8-Max", "qmodel_38max", true, ["low", "medium", "xhigh"], true, "0.5"],
+    ["Auto", "auto", false, [], true, "1"],
+    ["Ultimate", "ultimate", true, [], true, "1.6"],
+    ["Performance", "performance", true, [], true, "1.1"],
+    ["Efficient", "efficient", false, [], true, "0.3"],
+    ["Sonus", "smodel", true, [], true, "3.2"],
+    ["Cantus", "cmodel", true, [], true, "3.2"],
+    ["Qwen3.7-Max", "qmodel_latest", true, [], true, "0.5"],
+    ["Qwen3.7-Plus", "qmodel", false, [], true, "0.1"],
+    ["Kimi-K3", "kmodel_latest", false, [], true, "0.8"],
+    ["Kimi-K2.8-Preview", "kmodel", false, [], true, "0.3"],
+    ["GLM-5.3", "gmodel", true, [], true, "0.6"],
+    ["GLM-5.3-Flash", "gfmodel", true, [], true, "0.1"],
+    ["DeepSeek-V4-Pro", "dmodel", true, [], true, "0.8"],
+    ["DeepSeek-Flash", "dfmodel", true, [], true, "0.2"],
+    ["MiniMax-M3", "mmodel", false, [], true, "0.2"],
+  ],
+  cn: [
+    ["Qwen3.8-Flash", "qfmodel", true, ["low", "medium", "xhigh"], true, "0.1"],
+    ["Qwen3.8-Max", "qmodel_38max", true, ["low", "medium", "xhigh"], true, "0.5"],
+    ["Auto", "auto", false, [], true, "1"],
+    ["Qwen3.7-Max", "qmodel_latest", true, [], true, "0.5"],
+    ["Qwen3.7-Plus", "qmodel", false, [], true, "0.1"],
+    ["DeepSeek-V4-Pro", "dmodel", true, [], true, "0.8"],
+    ["DeepSeek-Flash", "dfmodel", false, [], true, "0.2"],
+    ["GLM-5.3", "gmodel", true, [], true, "0.6"],
+    ["Kimi-K2.8-Preview", "kmodel", true, [], true, "0.3"],
+    ["MiniMax-M3", "mmodel", false, [], true, "0.2"],
+  ],
+};
+
+/** 错误分类（协议参考 §3.6，按顺序判；先看响应体语义再看状态码）。
+ *  403 双语义：带 pricing/额度特征是套餐不足（402 换号），裸 403 才是登录态（401 刷新）——
+ *  只看状态码会把「该充值」误报成「登录失效」。 */
+function qoderClassify({ httpStatus, text }) {
+  const t = String(text || "");
+  const hasPricing = /https?:\/\/[^"\\]*\/pricing[^"\\]*/i.test(t) || /pricingurl|insufficient|no_quota|quota_exceed|exceed_quota|exceeded|credit|upgrade|subscription|plan|trial/i.test(t);
+  if (hasPricing || /"code"\s*:\s*112/.test(t)) return { status: 402, message: "当前账号额度不足或套餐不支持该模型" };
+  if (httpStatus === 429 || /rate limit|too many/i.test(t)) return { status: 402, message: t.slice(0, 300) || "上游限流" };
+  if (httpStatus === 401 || httpStatus === 403) return { status: 401, message: t.slice(0, 300) || "登录态失效或权限不足" };
+  return { status: 502, message: t.slice(0, 300) || "上游错误" };
+}
+
+/** 会话/记录 id 派生（协议参考 §3.4 公式：sha256 前 16 hex，\0 分隔） */
+function qoderIds({ userId, upstreamKey, maxTokens, seed }) {
+  const h = (label, ...parts) => crypto.createHash("sha256").update(label + "\0" + parts.join("\0")).digest("hex").slice(0, 16);
+  return {
+    sessionId: h("qoder-session", String(userId || ""), String(upstreamKey || "")) + "-" + (seed || util.uuid()),
+    recordId: h("qoder-record", String(upstreamKey || ""), "mt=" + String(maxTokens)),
+  };
+}
+
+/** 内部 OpenAI body → Qoder 固定业务信封（协议参考 §3.4 逐字段） */
+function qoderBody({ internal, modelEntry, ids, requestId, lastUserText }) {
+  const maxTokens = Math.min(Number((internal && internal.max_tokens) || 0) || 32768, 32768); // >32K 上游退化
+  const srcMessages = (internal && Array.isArray(internal.messages) ? internal.messages : []).slice();
+  const sysTexts = []; // system/developer 收集置顶（上游不看顶层 system 字段）
+  const rest = [];
+  for (const m of srcMessages) {
+    if (m && (m.role === "system" || m.role === "developer")) {
+      const t = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+      if (t && t.trim()) sysTexts.push(t.trim());
+    } else rest.push(m);
+  }
+  const messages = [];
+  if (sysTexts.length) messages.push({ role: "system", content: sysTexts.join("\n\n") });
+  for (const m of rest) {
+    if (!m || typeof m.role !== "string") continue;
+    if (m.role === "user") {
+      if (Array.isArray(m.content)) { // 无图压平文本；有图 → [{text},{image_url}]（image_url 原样抽出）
+        const parts = [];
+        for (const p of m.content) {
+          if (p && p.type === "text") parts.push({ type: "text", text: String(p.text || "") });
+          else if (p && p.type === "image_url") parts.push({ type: "image_url", image_url: p.image_url });
+        }
+        messages.push({ role: "user", content: parts });
+      } else messages.push({ role: "user", content: String(m.content ?? "") });
+    } else if (m.role === "assistant") {
+      const hasToolCalls = Array.isArray(m.tool_calls) && m.tool_calls.length;
+      const content = m.content == null || m.content === "" ? (hasToolCalls ? " " : "") : String(m.content); // 纯空体会被拒
+      const out = { role: "assistant", content };
+      if (hasToolCalls) out.tool_calls = m.tool_calls;
+      messages.push(out);
+    } else if (m.role === "tool") {
+      messages.push({ role: "tool", tool_call_id: String(m.tool_call_id || ""), content: typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "") });
+    }
+  }
+  const isReasoning = !!(modelEntry && modelEntry.is_reasoning);
+  return {
+    request_id: String(requestId),
+    request_set_id: ids.recordId,
+    chat_record_id: ids.recordId,
+    session_id: ids.sessionId,
+    stream: true, // 恒 true（非流式由 Aggregator 本地聚合）
+    chat_task: "FREE_INPUT",
+    is_reply: true,
+    is_retry: false,
+    source: 1,
+    version: "3",
+    session_type: "qodercli",
+    agent_id: "agent_common",
+    task_id: "common",
+    code_language: "",
+    chat_prompt: "",
+    image_urls: null,
+    aliyun_user_type: "",
+    system: "",
+    messages,
+    tools: Array.isArray(internal && internal.tools) ? internal.tools : [],
+    parameters: { max_tokens: maxTokens }, // enable_thinking/reasoning_effort 仅显式开思考时追加（发 false 会把思考混进正文或断连）
+    chat_context: {
+      chatPrompt: "",
+      imageUrls: null,
+      extra: { context: [], modelConfig: { key: String(modelEntry.key), is_reasoning: isReasoning }, originalContent: String(lastUserText || "") },
+      features: [],
+      text: String(lastUserText || ""),
+    },
+    model_config: { key: String(modelEntry.key), is_reasoning: isReasoning, is_vl: !!(modelEntry && modelEntry.is_vl), source: "system" }, // 精简版：剥 thinking_config（原样回传会覆盖 parameters.enable_thinking）
+    business: { product: "cli", version: "1.0.0", type: "agent", stage: "start", id: util.uuid(), name: String(lastUserText || "").slice(0, 30), begin_at: Date.now() },
+  };
+}
+
+/** 信封 SSE 帧解包（协议参考 §3.5）：HTTP 恒 200，{statusCodeValue, body}，body 是内层 JSON 字符串需二次解析；
+ *  body 也可能直接是 "[DONE]" 字符串或非字符串对象。 */
+function qoderUnpack(frame) {
+  const code = Number(frame && frame.statusCodeValue);
+  if (code !== 200) {
+    const bodyVal = frame && frame.body;
+    const text = typeof bodyVal === "string" ? bodyVal : JSON.stringify(bodyVal ?? "");
+    return { ok: false, status: code, text };
+  }
+  const bodyVal = frame && frame.body;
+  if (bodyVal === "[DONE]") return { done: true };
+  const inner = typeof bodyVal === "string" ? parseJson(bodyVal) : bodyVal;
+  return { ok: true, chunk: inner || null };
+}
+
+/** thinking 标签跨分片状态机（协议参考 §3.5）：reasoning 以 <thinking>/<think>/<reasoning>/<thought>
+ *  混在 content，标签可能切在任意位置；闭标签后吃掉紧跟换行（先 \n\n 再单个）；流结束必须 flush。 */
+class TagSplitter {
+  constructor() { this.buf = ""; this.inTag = false; }
+  feed(piece) {
+    this.buf += piece;
+    let out = "";
+    for (;;) {
+      if (!this.inTag) {
+        const m = this.buf.match(/<(thinking|think|reasoning|thought)>/);
+        if (!m) {
+          const keep = Math.min(this.buf.length, 8); // 最长开标签半截（"<thought>" 8 字符内）
+          const safe = this.buf.slice(0, this.buf.length - keep);
+          this.buf = this.buf.slice(safe.length);
+          return out + safe;
+        }
+        out += this.buf.slice(0, m.index);
+        this.buf = this.buf.slice(m.index + m[0].length);
+        this.inTag = true;
+      } else {
+        const m = this.buf.match(/<\/(thinking|think|reasoning|thought)>/);
+        if (!m) {
+          const keep = Math.min(this.buf.length, 9); // "</thought>" 9 字符内
+          const safe = this.buf.slice(0, this.buf.length - keep);
+          this.buf = this.buf.slice(safe.length);
+          return out;
+        }
+        this.buf = this.buf.slice(m.index + m[0].length).replace(/^\r?\n\r?\n/, "").replace(/^\r?\n/, "");
+        this.inTag = false;
+      }
+    }
+  }
+  flush() { const rest = this.buf; this.buf = ""; return rest; }
+}
+
+function makeQoder() {
+  return {
+    id: "qoder",
+    refreshWindowSec: 300, // 临期 5 分钟（协议参考 §3.7）
+
+    _regionOf(account) {
+      const m = (account && account.meta && (account.meta.mode || account.meta.edition)) || "global";
+      return m === "cn" ? "cn" : "global"; // ""/global/intl → Global，cn → Cn（协议参考 §3.1）
+    },
+
+    models() {
+      const seen = [];
+      for (const region of ["global", "cn"]) for (const [id] of QODER_FALLBACK[region]) if (!seen.includes(id)) seen.push(id);
+      return unionIds([...catalogMap("qoder").values()].map((m) => String(m.id)), seen); // 两区并集、global 优先
+    },
+    modelEntries() {
+      const seen = new Map();
+      for (const region of ["global", "cn"]) {
+        for (const [id, key, reasoning, efforts, vision, rate] of QODER_FALLBACK[region]) {
+          if (!seen.has(id.toLowerCase())) seen.set(id.toLowerCase(), {
+            client: id, upstream: key,
+            entry: { id, name: id, rate: Number(rate) || 0, capabilities: { images: vision, reasoning, tools: true }, contextLength: 200000, maxOutputTokens: 0, _key: key, _efforts: efforts },
+          });
+        }
+      }
+      for (const m of catalogMap("qoder").values()) {
+        if (!seen.has(String(m.id).toLowerCase())) seen.set(String(m.id).toLowerCase(), { client: String(m.id), upstream: String(m.id), entry: { ...m, _key: String(m.id), _efforts: [] } });
+      }
+      return [...seen.values()];
+    },
+    upstreamFor(model) {
+      const e = this.modelEntries().find((x) => x.client.toLowerCase() === String(model || "").toLowerCase());
+      return e ? e.upstream : String(model || "");
+    },
+    _resolveEntry(model) {
+      const s = String(model || "").toLowerCase();
+      const hit = this.modelEntries().find((x) => x.client.toLowerCase() === s || (x.entry._key || "").toLowerCase() === s);
+      return hit ? hit.entry : null;
+    },
+
+    rewriteBody(model, body) {
+      const out = { ...(body || {}) };
+      out.stream = true;
+      if (!out.stream_options || typeof out.stream_options !== "object") out.stream_options = {};
+      out.stream_options.include_usage = true;
+      delete out.conversation_id; delete out.conversationId; delete out.prompt_cache_key;
+      return out; // 信封组装在 chat 里做（需要 account 上下文）
+    },
+
+    async chat({ account, secrets, model, body, emit }) {
+      const cfg = QODER_REGIONS[this._regionOf(account)];
+      const entry = this._resolveEntry(model) || { key: "auto", is_reasoning: false, is_vl: false, _efforts: [] };
+      const lastUser = [...(body.messages || [])].reverse().find((m) => m.role === "user");
+      const lastUserText = typeof (lastUser && lastUser.content) === "string" ? lastUser.content : "";
+      const prepared = this.rewriteBody(model, body);
+      const requestId = util.uuid();
+      const userId = (account && ((account.meta && account.meta.user_id) || account.uid)) || "";
+      const machineId = qoderMachineId();
+      const ids = qoderIds({ userId, upstreamKey: entry.key, maxTokens: prepared.max_tokens, seed: (prepared.session_id || "") || undefined });
+      const envelope = qoderBody({ internal: prepared, modelEntry: entry, ids, requestId, lastUserText });
+      // 思考档位（协议参考 §3.4）：reasoning_effort → reasoning → thinking 命中即停；off/none/disabled/false 不发；
+      // true/null → enable_thinking:true 无档位；minimal/min→low、high/max→xhigh；白名单 = 目录 efforts，不支持退默认档
+      const effSrc = prepared.reasoning_effort ?? prepared.reasoning ?? prepared.thinking;
+      if (effSrc !== undefined && !["off", "none", "disabled", false].includes(effSrc)) {
+        if (effSrc === true || effSrc === null) {
+          envelope.parameters.enable_thinking = true;
+        } else {
+          const map = { minimal: "low", min: "low", high: "xhigh", max: "xhigh" };
+          let effort = map[String(effSrc)] || String(effSrc);
+          const allow = (entry._efforts && entry._efforts.length) ? entry._efforts : ["low", "medium", "xhigh"];
+          if (!allow.includes(effort)) effort = allow.includes("medium") ? "medium" : allow[0];
+          envelope.parameters.enable_thinking = true;
+          envelope.parameters.reasoning_effort = effort;
+        }
+      }
+      const encoded = qcosy.encodeBody(Buffer.from(JSON.stringify(envelope), "utf8")); // 必须先编码后签名
+      const url = `${cfg.gateway}${QODER_CHAT_PATH}`;
+      const headers = {
+        ...qcosy.buildCosyHeaders({ url, body: encoded, uid: userId, token: (secrets && secrets.token) || "", name: (account && account.name) || "", email: (account && account.meta && account.meta.email) || "", machineId, requestId }),
+        "content-type": "application/json",
+        "accept": "text/event-stream",
+        "cache-control": "no-cache",
+        "accept-encoding": "identity",
+        "x-model-key": String(entry.key),
+        "x-model-source": "system",
+      };
+      const { resp, cancelTimer } = await fetchStream(url, { method: "POST", headers, body: encoded });
+      const result = { status: 200, planLimit: false };
+      const splitter = new TagSplitter();
+      let usage = null; // usage 取最后一帧（协议参考 §3.5）
+      const flushUsage = () => { if (usage) emit({ type: "usage", usage }); };
+      try {
+        // HTTP 恒 200；错误在信封 statusCodeValue 里——fetchStream 的 !resp.ok 分支不会触发
+        await pumpSse(resp, (_event, raw) => {
+          if (raw === "[DONE]") { flushUsage(); emit({ type: "finish", reason: "" }); return; }
+          const frame = parseJson(raw);
+          if (!frame) return;
+          const u = qoderUnpack(frame);
+          if (u.done) { flushUsage(); emit({ type: "finish", reason: "" }); return; }
+          if (!u.ok) {
+            const cls = qoderClassify({ httpStatus: u.status, text: u.text });
+            if (cls.status === 402) result.planLimit = true;
+            emit({ type: "error", status: cls.status, code: 0, message: cls.message });
+            return;
+          }
+          const chunk = u.chunk;
+          if (!chunk) return;
+          const choice = Array.isArray(chunk.choices) && chunk.choices[0];
+          if (choice && choice.delta) {
+            const delta = { ...choice.delta };
+            if (typeof delta.content === "string" && delta.content) delta.content = splitter.feed(delta.content);
+            if (Object.keys(delta).length) emit({ type: "delta", delta });
+          }
+          if (choice && choice.finish_reason) { flushUsage(); emit({ type: "finish", reason: choice.finish_reason }); }
+          if (chunk.usage) usage = { prompt_tokens: Number(chunk.usage.prompt_tokens) || 0, completion_tokens: Number(chunk.usage.completion_tokens) || 0, total_tokens: Number(chunk.usage.total_tokens) || 0 };
+        });
+        const tail = splitter.flush();
+        if (tail) emit({ type: "delta", delta: { content: tail } }); // 不 flush 会丢末尾文字
+      } finally { cancelTimer(); }
+      return result;
+    },
+
+    /** 刷新（协议参考 §3.7）：secrets.refreshToken 是打包串——
+     *  5 段 `pat|<PAT>|<作业刷新令牌>|<userId>|<machineId>`（PAT 来源，重走 jobToken/exchange）
+     *  3 段 `<oauth刷新令牌>|<userId>|<machineId>`（OAuth 来源，走 center refresh_token） */
+    async refreshToken(account, secrets) {
+      const packed = String((secrets && secrets.refreshToken) || "");
+      const cfg = QODER_REGIONS[this._regionOf(account)];
+      const segs = packed.split("|");
+      const baseHeaders = { "content-type": "application/json", "cosy-version": "1.0.1", "cosy-clienttype": "5", "user-agent": "qoder-local-proxy" };
+      if (segs.length >= 5 && segs[0] === "pat") {
+        const r = await httpJson(`${cfg.openApi}/api/v1/jobToken/exchange`, { method: "POST", headers: baseHeaders, body: JSON.stringify({ personal_token: segs[1] }) })
+          .catch((e) => ({ ok: false, status: 0, data: null, message: String(e) }));
+        const token = r.ok && r.data && r.data.data && r.data.data.token ? String(r.data.data.token) : "";
+        if (!token) return { ok: false, message: `PAT 换取失败 HTTP ${r.status}` };
+        const exp = Number(util.jwtDecode(token).exp || 0) * 1000;
+        return { ok: true, token, refreshToken: packed, expiresAt: exp };
+      }
+      if (segs.length >= 3) {
+        const r = await httpJson(`${cfg.center}${QODER_REFRESH_PATH}`, { method: "POST", headers: { ...baseHeaders, authorization: `Bearer ${(secrets && secrets.token) || ""}` }, body: JSON.stringify({ refreshToken: segs[0] }) })
+          .catch((e) => ({ ok: false, status: 0, data: null, message: String(e) }));
+        if (r.status === 401) return { ok: false, expired: true, message: "登录态已过期，请重新登录" };
+        const d = r.data && (r.data.data || r.data);
+        const token = d && d.token ? String(d.token) : "";
+        if (!r.ok || !token) return { ok: false, message: (d && d.message) || `刷新失败 HTTP ${r.status}` };
+        // refresh_token 不得含 |（协议参考 §2.3/oauth.rs 同判据）；缺失沿用旧值
+        const nextRt = d.refresh_token && !String(d.refresh_token).includes("|") ? `${String(d.refresh_token)}|${segs[1]}|${segs[2]}` : packed;
+        const exp = Number(util.jwtDecode(token).exp || 0) * 1000;
+        return { ok: true, token, refreshToken: nextRt, expiresAt: exp };
+      }
+      return { ok: false, message: "refreshToken 打包串格式不认识（应为 3 段或 pat| 开头 5 段）" };
+    },
+
+    async userInfo(token) {
+      // 声明在 payload（util.jwtDecode 顶层只有 token/uid/exp；简报直取 .user_id 是笔误，按真实接口修正）
+      const c = util.jwtDecode(token).payload || {};
+      return { uid: String(c.user_id || c.sub || ""), name: String(c.nickname || c.name || "Qoder 账号") };
+    },
+
+    /** 远程目录（COSY 签名 + 信封，按地区缓存 1h 由 proxy_models_sync 层处理）；失败如实回错由 UI 引导手填 */
+    async fetchModels(account, secrets) {
+      const cfg = QODER_REGIONS[this._regionOf(account)];
+      const url = `${cfg.gateway}${QODER_MODEL_LIST_PATH}`;
+      const requestId = util.uuid();
+      const encoded = qcosy.encodeBody(Buffer.from(JSON.stringify({ region: this._regionOf(account) }), "utf8"));
+      const headers = qcosy.buildCosyHeaders({ url, body: encoded, uid: (account && account.uid) || "", token: (secrets && secrets.token) || "", name: "", email: "", machineId: qoderMachineId(), requestId });
+      const r = await httpJson(url, { method: "GET", headers }).catch((e) => ({ ok: false, status: 0, data: null, message: String(e) }));
+      const chat = r.data && (r.data.chat || (r.data.data && r.data.data.chat));
+      if (!r.ok || !Array.isArray(chat)) return { ok: false, message: `目录拉取失败（HTTP ${r.status || 0}）` };
+      const models = chat.filter((m) => m && m.key).map((m) => ({
+        id: String(m.display_name || m.key).replace(/\s+/g, ""), // 对外 id = display_name 去所有空白（协议参考 §3.8）
+        name: String(m.display_name || m.key),
+        rate: Number(m.price_factor) || 0, // 0 是合法值不能当缺失丢弃
+        capabilities: { images: !!m.is_vl, reasoning: !!m.is_reasoning, tools: true },
+        contextLength: 200000, maxOutputTokens: 0,
+        _key: String(m.key),
+        _efforts: (m.thinking_config && m.thinking_config.enabled && Object.keys(m.thinking_config.enabled.efforts || {})) || [],
+      }));
+      return models.length ? { ok: true, models } : { ok: false, message: "目录为空" };
+    },
+  };
+}
+
+/** qoder 机器标识（协议参考 §3.7）：按序找候选文件，第一个存在的非空（≤256 字符、无控制字符）用之；
+ *  都没有则生成 UUID v4 写入 <config_dir>/qoder-machine-id，进程内缓存。 */
+let _qoderMid = null;
+function qoderMachineId() {
+  if (_qoderMid) return _qoderMid;
+  const fs = require("node:fs");
+  const configDir = store.proxyDir();
+  const candidates = [path.join(configDir, "qoder-machine-id"), path.join(os.homedir(), ".qoder-proxy", "machine_id"), path.join(os.homedir(), ".qoder", ".auth", "machine_id"), path.join(os.homedir(), ".qoder", "machine_id")];
+  for (const f of candidates) {
+    try {
+      const v = fs.readFileSync(f, "utf8").trim();
+      if (v && v.length <= 256 && !/[\x00-\x1f\x7f]/.test(v)) { _qoderMid = v; return _qoderMid; }
+    } catch { /* 下一个候选 */ }
+  }
+  _qoderMid = util.uuid();
+  try { fs.mkdirSync(configDir, { recursive: true }); fs.writeFileSync(path.join(configDir, "qoder-machine-id"), _qoderMid); } catch { /* 只读环境用内存值 */ }
+  return _qoderMid;
+}
+const qoder = makeQoder();
+
 // ===== 自定义提供商：通用 OpenAI 兼容适配器（按 agents 行动态实例化，一张表行 = 一个上游端点） =====
 
 /** extraBody 深合并：只递归普通对象，数组与标量整体替换。
@@ -2256,7 +2648,7 @@ function compatAdapter(id) {
   return ad;
 }
 
-const ADAPTERS = { trae, workbuddy, workbuddy_ai, raccoon, cline_free, cline_pass, autoclaw, autoclaw_intl };
+const ADAPTERS = { trae, workbuddy, workbuddy_ai, raccoon, cline_free, cline_pass, autoclaw, autoclaw_intl, qoder };
 
 /** 渠道 → 适配器：内置 8 家查静态表，未命中再试动态提供商。
  *  ADAPTERS 本身保持只含内置 —— mergedModels()/modelOwners() 靠这个前提把裸模型名
@@ -2370,4 +2762,10 @@ module.exports = {
   // autoclaw 窥视口：签名公式与路由解析纯函数，dev-autoclaw-test 直测
   _autoclawSign: autoclawSign,
   _autoclawResolveRoute: autoclawResolveRoute,
+  // qoder 窥视口：错误分类/id 派生/信封体/双层解包/标签状态机纯函数，dev-qoder-test 直测
+  _qoderClassify: qoderClassify,
+  _qoderIds: qoderIds,
+  _qoderBody: qoderBody,
+  _qoderUnpack: qoderUnpack,
+  _TagSplitter: TagSplitter,
 };
