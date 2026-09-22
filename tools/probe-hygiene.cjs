@@ -19,6 +19,9 @@
 // Run 项删掉。探针进程在应用外，无法替实例「显式调 applyAutoStart(false)」豁免——
 // 集中形式因此是：起跑前快照 HKCU Run 全表，探针退出时重查比对，发现被删/改/增就**原样恢复**
 // 并打 WARN（比 §八 要求的「收尾核对未变」更进一步：核对失败时自动兜底回写）。
+// 安全侧规则：启动快照或退出复查**不可信**时（reg 读失败，或「空表」与「读不到」分不清），
+// 退出钩子只打 WARN、跳过全部恢复动作——绝不在不可信基线上做「比对删除」：空 Map 会被
+// 误判成「用户全部 Run 项都是本次新增」，退出比对会把真实自启项删光。
 // 注意：exit 钩子只在正常退出（含 process.exit）时跑，探针被强杀时不兜底，需人工按快照比对。
 "use strict";
 const fs = require("node:fs");
@@ -40,7 +43,10 @@ function parseRunValues(text) {
 
 function queryRun() {
   const r = spawnSync("reg.exe", ["query", RUN_KEY], { encoding: "utf8" });
-  return r.stdout || "";
+  // ok=false 表示这次读不可信：spawn 出错（本机实录：PATH 缺 System32 → reg.exe ENOENT）
+  // 或 reg 返回非零（键不存在/权限问题）。「空注册表」和「读不到」靠 status 也分不全，
+  // 所以上层还叠加「stdout 全空则同样按不可信」的兜底判定。
+  return { ok: !r.error && r.status === 0, stdout: r.stdout || "" };
 }
 
 function hygiene(name) {
@@ -54,12 +60,30 @@ function hygiene(name) {
   fs.mkdirSync(process.env.AGENT_SKILLS_HOME, { recursive: true });
 
   // HKCU Run 快照 + 退出恢复（applyAutoStart 副作用的集中中和，见文件头说明）
-  const baseline = parseRunValues(queryRun());
+  const first = queryRun();
+  const parsed = parseRunValues(first.stdout);
+  // 基线可信性判定：读失败（error / status≠0）直接不可信；「解析为空且 stdout 全空」
+  // 同样按不可信——空注册表和读不到分不清，宁可放弃恢复能力（安全侧误报），也不能
+  // 拿着空基线进退出比对，把用户真实的 Run 项全当「本次新增」删光。
+  const baselineUnreliable = !first.ok || (parsed.size === 0 && !String(first.stdout).trim());
+  const baseline = baselineUnreliable ? new Map() : parsed;
   let done = false;
   process.on("exit", () => {
     if (done) return;
     done = true;
-    const after = parseRunValues(queryRun());
+    // 这个模块的存在意义是保护用户注册表：快照读不到时「什么都不做」才是安全侧，
+    // 写/删动作只能发生在基线（和退出复查）都可信的前提下。
+    if (baselineUnreliable) {
+      console.log("[probe-hygiene] WARN: 启动时 HKCU Run 快照不可信（reg query 失败或空表无法区分），退出钩子跳过全部恢复动作（不比对、不写、不删），请人工核对注册表");
+      return;
+    }
+    const second = queryRun();
+    const after = parseRunValues(second.stdout);
+    // 退出复查同样按可信性把关：复查读不到就跳过，避免把快照值盲目回写覆盖用户现状
+    if (!second.ok || (after.size === 0 && !String(second.stdout).trim())) {
+      console.log("[probe-hygiene] WARN: 退出时 HKCU Run 复查不可信，无法可信比对，跳过全部恢复动作（不比对、不写、不删），请人工核对注册表");
+      return;
+    }
     let touched = 0;
     for (const [k, v] of baseline) {
       const cur = after.get(k);
