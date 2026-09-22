@@ -1,5 +1,5 @@
 // 反代网关 · HTTP 服务（方案 §4/§6.1）：Express @ 127.0.0.1:9527（可配置）
-// 端点：POST /v1/chat/completions（SSE 双态）/ GET /v1/models / GET /healthz / GET /status（调试，默认关）
+// 端点：POST /v1/chat/completions（SSE 双态）/ GET /v1/models / GET /healthz（liveness）/ GET /readyz（readiness）/ GET /status（调试，默认关）
 // 错误语义对齐 OpenAI：401 invalid_api_key / 429 配额或限流 / 400 参数 / 502 上游 / 503 渠道不可用
 // 转发不用现成反代中间件：Dispatch(Key→渠道) → PoolService(号池选号) → Adapter(渠道改写) → SSE 转换输出
 "use strict";
@@ -650,10 +650,22 @@ function buildApp(settings) {
     res.json({ object: "list", data: adapters.mergedModels() });
   });
 
-  // 探活：无健康渠道时 503
-  app.get("/healthz", (_req, res) => {
-    const healthy = store.CHANNELS.some((c) => pool.poolSummary(c.id).onlineCount > 0);
-    res.status(healthy ? 200 : 503).json({ ok: healthy });
+  // /healthz = liveness：进程活着且能应答就 200（监督器据此重启的依据只能是它，
+  // 用它判健康会对空号池打重启循环——这是一期评审点出的现状缺陷）。
+  app.get("/healthz", (_req, res) => res.status(200).json({
+    ok: true, version: util.appVersion(), uptime: runtime ? Date.now() - runtime.startedAt : 0,
+  }));
+  // /readyz = readiness：号池有可用号 且 没有凭据解密失败
+  // （credFail 把「有号但解不开」与「真没号」分开说清：换机器 / 主密钥不可得时旧行为会被误报成空号池。
+  //  顺序不能反：必须先按号池把每条凭据真解一遍（poolSummary→accountView→tokenUsable），
+  //  decryptFailureActive() 才有结论可给——它只报「最近一次真解过且解不开」的，不主动去解。
+  //  另外别拿 decryptFailureCount()（进程内只增不减的累计次数）当判据：那样 ok 都能 true 而
+  //  credFail 永久 true，两个字段互相矛盾，用户删掉坏号也洗不掉。四个渠道都要算，不能用 some() 短路。）
+  app.get("/readyz", (_req, res) => {
+    const summaries = store.CHANNELS.map((c) => pool.poolSummary(c.id));
+    const credFail = store.decryptFailureActive() > 0;
+    const healthy = summaries.some((s) => s.onlineCount > 0);
+    res.status(healthy ? 200 : 503).json({ ok: healthy, credFail, detail: credFail ? "凭据解密失败" : "号池无可用账号" });
   });
 
   // 调试快照：默认关闭（设置里显式开启），且校验回环地址（方案 §6.7）
@@ -681,6 +693,18 @@ function buildApp(settings) {
   return app;
 }
 
+/** 端口被占着的那个进程是不是「已常驻的网关」（规格 §七.5）。
+ *  gateway-client 是主进程侧监督器，这里只在 EADDRINUSE 这条冷分支里惰性 require：
+ *  热路径不背它；子进程角色下它也只是读 gateway.json + 连一次管道，不会反过来 require 本文件。 */
+async function residentGatewayOwnsPort(port) {
+  try {
+    const gw = require("../gateway-client.cjs");
+    return await gw.probeResidentGateway(port);
+  } catch {
+    return false;   // 判不出来就退回原文案：宁可让用户看到「请更换端口」，也不许谎报「已接管」
+  }
+}
+
 /** 启动服务（settingsGetter 每次请求取最新配置 = 设置热生效；端口例外需重启监听） */
 function start(settingsGetter) {
   if (runtime) return { ok: true, already: true, port: runtime.port };
@@ -693,7 +717,16 @@ function start(settingsGetter) {
       resolve({ ok: true, port: s.port });
     });
     server.on("error", (e) => {
-      resolve({ ok: false, message: `端口 ${s.port} 绑定失败：${e.code === "EADDRINUSE" ? "已被占用，请更换端口" : e.message}` });
+      if (e.code !== "EADDRINUSE") {
+        resolve({ ok: false, message: `端口 ${s.port} 绑定失败：${e.message}` });
+        return;
+      }
+      // 占用者可能正是「已常驻的网关」：上面的 already 只判本进程 runtime，跨进程无感知，
+      // 不查就会误报「端口已被占用，请更换端口」（规格 §七.5）。查完再回，文案才分得开。
+      residentGatewayOwnsPort(s.port).then((claimed) => {
+        if (claimed) resolve({ ok: true, claimed: true, port: s.port });
+        else resolve({ ok: false, message: `端口 ${s.port} 绑定失败：已被占用，请更换端口` });
+      });
     });
   });
 }

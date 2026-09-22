@@ -19,7 +19,9 @@ try {
   Database = null;
 }
 
-/** 网关数据目录：%APPDATA%\AgentHub\proxy\（stats.db / rules / logs 都在这里） */
+/** 网关数据目录：%APPDATA%\AgentHub\proxy\（stats.db / rules / logs 都在这里）。
+ *  这句「logs 在这里」到二期 Task 3 才成真：网关子进程日志落在本目录的 logs/gateway.log，
+ *  实现与轮转策略见 backend/gateway-log.cjs（目录真相源就是本函数，别处不再另拼一条路径）。 */
 function proxyDir() {
   const d = path.join(config.dataDir(), "proxy");
   fs.mkdirSync(d, { recursive: true });
@@ -273,7 +275,10 @@ function setPoolStrategy(channel, strategy) {
 
 /** 凭据解密失败计数：secretbox.decrypt 从「返回 ""」改成「抛错」后，读路径接住抛错但必须留下痕迹。
  *  Task 3 的 /readyz 用它区分「号池真没号」与「有号但解不开」（换机器 / 主密钥不可得），
- *  后者不该被报成前者。只记次数与首条原因，绝不记明文/密文/密钥。 */
+ *  后者不该被报成前者。只记次数与首条原因，绝不记明文/密文/密钥。
+ *  ⚠ 本计数是**本次进程内的累计次数，只增不减**（Task 1 定的契约，dev-secretbox-test 守着）：
+ *  它是诊断量，不能直接当 readiness 判据——那会让 credFail 一旦为真就永久为真。
+ *  要「当前是否还解不开」请用它下面那条 decryptFailureActive()。 */
 let decryptFailures = 0;
 let decryptFailureReason = "";
 let decryptFailureLogged = false;
@@ -287,14 +292,40 @@ function rememberDecryptFailure(e) {
 }
 function decryptFailureCount() { return decryptFailures; }
 
-/** 读路径的解密：解不开回空串（等价旧行为，不新增抛穿面），但一定计数 */
+/** 最近一次**真去解**且解不开的密文信封（抛错才算，解出空串不算：那是号池同步传播进来的空 token，
+ *  属「这号本来就没凭据」而不是「本机主密钥不可得」）。解密成功时从集合里摘掉，所以它表达的是
+ *  「按当前这台机器的状态，这些凭据还解不开」，而不是「这个进程历史上失败过」。 */
+const decryptFailedEnvelopes = new Set();
+
+/** 当前仍解不开的凭据条数（readiness 判据）。与 decryptFailureCount() 的分工看上面那条注释。
+ *  两点必须知道：
+ *  ① 只在**读路径真的解过**之后才有结论（没解过就回 0，宁可少报也不误报），所以 /readyz 里
+ *    要先算号池（poolSummary→accountView→tokenUsable 会把号池里每条凭据都解一遍）再算本函数；
+ *  ② 与库内存活信封对账后顺手清掉历史信封——用户删号或换上新凭据后本函数会自己掉回 0，
+ *    不会因为一次失败就永久把「没号」误报成「解不开」。 */
+function decryptFailureActive() {
+  open();
+  const live = new Set();
+  for (const r of db.prepare("SELECT token_enc AS e, refresh_enc AS r FROM accounts").all()) {
+    if (r.e) live.add(r.e);
+    if (r.r) live.add(r.r);
+  }
+  for (const r of db.prepare("SELECT key_enc AS e FROM keys").all()) if (r.e) live.add(r.e);
+  for (const e of [...decryptFailedEnvelopes]) if (!live.has(e)) decryptFailedEnvelopes.delete(e);
+  return decryptFailedEnvelopes.size;
+}
+
+/** 读路径的解密：解不开回空串（等价旧行为，不新增抛穿面），但一定留下痕迹 */
 function decryptForRead(stored) {
   if (!stored) return "";
   try {
-    return config.decryptSecret(stored);
+    const v = config.decryptSecret(stored);
+    decryptFailedEnvelopes.delete(stored);          // 解得开就把「当前解不开」这条划掉，readiness 才不会粘住
+    return v;
   } catch (e) {
     e.credentialFailure = true;
     rememberDecryptFailure(e);
+    decryptFailedEnvelopes.add(stored);
     return "";
   }
 }
@@ -311,10 +342,12 @@ function tokenUsable(r) {
   let ok = false;
   try {
     ok = !!config.decryptSecret(r.token_enc);
+    if (ok) decryptFailedEnvelopes.delete(r.token_enc);
   } catch (e) {
     ok = false;
     e.credentialFailure = true;
     rememberDecryptFailure(e);   // 解不开 ≠ 没号：交给 /readyz 说清差别
+    decryptFailedEnvelopes.add(r.token_enc);
   }
   usableCache.set(r.token_enc, ok);
   return ok;
@@ -579,9 +612,12 @@ function usageView(r) {
 }
 
 /** 关闭数据库句柄（应用退出 / 网关停机时调用；重复调用安全）。
- *  关之前先 checkpoint(TRUNCATE)：正常退出留不下大 WAL，下次开机不用先解一截孤儿日志。 */
+ *  关之前先 checkpoint(TRUNCATE)：正常退出留不下大 WAL，下次开机不用先解一截孤儿日志。
+ *  成对停掉周期 checkpoint 计时器（Task 2 登记给 Task 3 的那条）：计时器的回调打的是即将置 null 的
+ *  db，留着它就是一条无人认领的 interval——startCheckpointTimer() 的 stop 出口本就是给这里用的。 */
 function close() {
   if (db) {
+    stopCheckpointTimer();
     checkpoint();
     try { db.close(); } catch { /* 已关 */ }
     db = null;
@@ -642,7 +678,8 @@ function deleteModelCooldowns(accId, model) {
 module.exports = {
   open, close, proxyDir, dayStr, dayStartMs,
   driver: () => driver,
-  decryptFailureCount,
+  decryptFailureCount,                 // 进程内累计次数（只增不减，诊断/日志用）
+  decryptFailureActive,                // 当前仍解不开的条数（/readyz 的 credFail 用它，见函数注释）
   checkpoint, startCheckpointTimer, walBytes,   // WAL 收敛与句柄归属（Task 2）；stop 由 startCheckpointTimer 的返回值给出
   CHANNELS,
   channelDisplay: (id) => (CHANNELS.find((c) => c.id === id) || {}).display || String(id),

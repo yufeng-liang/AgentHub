@@ -89,7 +89,10 @@ function closeHint() {
 const endpoints = [
   { key: "chat", text: "POST /v1/chat/completions" },
   { key: "models", text: "GET /v1/models" },
+  // 二期 Task 3 拆语义：/healthz = 进程活着（liveness），/readyz = 号池可用（readiness）。
+  // 两条都列出来，免得只看 healthz 以为「200 = 网关能干活」
   { key: "health", text: "GET /healthz" },
+  { key: "ready", text: "GET /readyz" },
 ] as const;
 const copied = ref("");
 let copiedTimer: ReturnType<typeof setTimeout> | undefined;

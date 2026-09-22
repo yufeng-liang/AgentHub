@@ -49,7 +49,7 @@ async function main() {
   assert(!pool.pickAccount("trae", "expire_first", []), "冷却账号不参与调度");
   pool.coolAccount(aid, "credit");
   assert(store.getAccount(aid).status === "exhausted", "402 耗尽至次日");
-  pool.coolAccount(aid, "rate"); // 最终保持 cooling，供 healthz 503 断言用
+  pool.coolAccount(aid, "rate"); // 最终保持 cooling，供 readyz 503 断言用
 
   // 4. 规则热加载
   rules.init();
@@ -213,9 +213,11 @@ async function main() {
   const sr = await server.start(settings);
   assert(sr.ok, "网关启动: " + (sr.message || ""));
   const base = "http://127.0.0.1:19527";
-  // healthz 语义：无健康渠道 503。此刻唯一账号 cooling → 应 503
+  // healthz/readyz 语义（二期 Task 3 拆开）：此刻唯一账号 cooling → liveness 仍 200、readiness 503
   let r = await fetch(base + "/healthz");
-  assert(r.status === 503, "无健康渠道 healthz 503（唯一账号冷却中）— 实际: " + r.status);
+  assert(r.status === 200, "进程活着即 liveness 200（哪怕号池全冷却）— 实际: " + r.status);
+  r = await fetch(base + "/readyz");
+  assert(r.status === 503, "无健康渠道 readyz 503（唯一账号冷却中）— 实际: " + r.status);
   r = await fetch(base + "/v1/models");
   assert(r.ok && (await r.json()).data.length > 5, "/v1/models");
   r = await fetch(base + "/v1/chat/completions", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
