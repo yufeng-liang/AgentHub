@@ -31,6 +31,38 @@ let quitting = false;
 // 监听在渲染层挂载后才注册），所以先记账，等那个窗口的 did-finish-load 补投，投完即清
 let pendingFocusUpdate = false;
 
+// ===== Task 7 退出/装更互锁：三条入口共用唯一退出口 quitForInstall() =====
+// installPhase：idle（未进互锁）→ stopping（stopAndWait 在飞）→ stopped（已停干净，放行续跑）。
+// 它同时是防重入闸：triggerInstall 的 quitAndInstall 会再触发一次 before-quit，第二次必须直落续跑路径。
+let installPhase = "idle";
+
+/**
+ * Task 7 的唯一退出口：拦下本次退出 → 停干净网关子进程 → 再续跑（装更或退出）。
+ * 三条入口都汇到这里：
+ *  · before-quit 检出装更意愿（updater.pendingInstall() / pendingInstallRequested()）；
+ *  · before-quit 的非托盘退出（!quitting：quitAndInstall 重入 / OS 会话结束引发的 quit）；
+ *  · 渲染层 install_update（ipc.cjs 只经 updater.requestInstall() 打标记 + app.quit()，
+ *    不再直连 quitAndInstall 绕过本函数）。
+ * 停机走 gatewayClient.stopAndWait（gateway_shutdown → 等进程退 → 实测 connect 端口失败），
+ * 子进程赖着不走时它内部强杀兜底；端口仍未释放时**显式通知**而不是静默卡住（规格 §5.6）。
+ */
+function quitForInstall(wantInstall) {
+  if (installPhase !== "idle") return;   // 在飞/已完成：本次 before-quit 只被拦下，不重入
+  installPhase = "stopping";
+  scheduler.stop();
+  usageScheduler.stop();
+  watch.stop();
+  gatewayClient.stopAndWait({ timeoutMs: 5000 })
+    // stopAndWait 自己抛错也不能把退出挂死在 preventDefault 上：按「没停干净」续跑并留痕
+    .catch((e) => ({ stopped: false, portFreed: false, message: String((e && e.message) || e) }))
+    .then((r) => {
+      installPhase = "stopped";
+      if (!r.portFreed) notify("AgentHub", "网关端口未释放，安装可能失败：" + r.message); // 报错而不是静默卡住
+      if (wantInstall) updater.triggerInstall();
+      else app.quit();
+    });
+}
+
 /** 资源目录：打包后为 process.resourcesPath 的相邻 build，开发时为项目 build/ */
 function buildDir() {
   return app.isPackaged ? path.join(process.resourcesPath, "build") : path.join(__dirname, "..", "build");
@@ -427,19 +459,22 @@ if (!gotLock) {
   });
 
   app.on("before-quit", (e) => {
-    // 下载完的更新：拦下这次退出，静默装完自动重启
-    if (updater.pendingInstall()) {
+    // 互锁判定（简报 Step 2 模板语义）：installPhase !== "stopped" && (wantInstall || !quitting)
+    //  · wantInstall：装更必须先停干净子进程 —— NSIS 覆盖安装要解锁 exe 映像、新进程要拿到端口。
+    //    pendingInstallRequested() 堵 triggerInstall 的洞：它先置 installTriggered 再 quitAndInstall，
+    //    后者再触发 before-quit 时 pendingInstall() 已是 false，光看它装更路径会漏检。
+    //  · !quitting：非托盘发起的退出（装更重入 / OS 会话结束）同样走互锁。
+    //  托盘「退出」（quitting=true 且无装更意愿）**有意不拦**：常驻网关「活过主 App」是 Task 6 的
+    //  定案语义（看门狗 parent-exit → detach-keep），而 gateway_shutdown 没有常驻豁免，走互锁等于
+    //  每次退出都杀掉常驻网关。非常驻子进程由 parent-exit 的优雅停机兜住（≤5s），无需主进程确认。
+    const wantInstall = updater.pendingInstall() || updater.pendingInstallRequested();
+    if (installPhase !== "stopped" && (wantInstall || !quitting)) {
       e.preventDefault();
-      quitting = true;
-      scheduler.stop();
-      usageScheduler.stop();
-      watch.stop();
-      updater.triggerInstall();
+      quitForInstall(wantInstall);
       return;
     }
-    // Task 5 起主进程不持有网关的任何句柄（store/rules 都在子进程），退出路径无需收口：
-    // 非常驻子进程由看门狗的 parent-exit 分支优雅停机（gateway.cjs gracefulExit，≤5s）；
-    // 常驻子进程按设计 detach 存活（活过主 App，Task 6/7 的停机语义复核点）。
+    // 续跑路径（互锁后的第二次 before-quit / 托盘退出）：只做与网关无关的收尾。
+    // Task 5 起主进程不持有网关的任何句柄（store/rules 都在子进程），这里不收口网关。
     quitting = true;
     scheduler.stop();
     usageScheduler.stop();

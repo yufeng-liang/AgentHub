@@ -203,14 +203,19 @@ async function startOnce({ persistent } = {}) {
 /**
  * 停掉子进程并等端口真的释放（Task 7 装更/卸载互锁的唯一出口）。
  * 只经已认证的管道下 gateway_shutdown：不按 pid 盲杀，因此 pid 复用场景下不会误伤别的进程。
- * 超时停不下来时**只报告不兜底强杀**——强杀是 Task 7 互锁要加的那一步（它需要先给用户报错文案）。
+ * 超时停不下来时**强杀兜底**（Task 7 互锁②）：子进程吞掉 gateway_shutdown / 停机上界内没退完时，
+ * 到点动手杀掉并等 pid 真消失，以 {stopped:true, forced:true} 回报 —— 装更宁可背着「没排干」
+ * 也要拿到解锁的映像，绝不拿一个还活着的子进程去开 NSIS。
  *
  * 返回 { stopped, portFreed, drained, forced, port, message }：
  *  · portFreed 的端口取**盘上那份** gateway.json（子进程一开始监听就回写，见 gateway.cjs 的
  *    publishListeningPort），盘上是 0 时再退到停机响应带回的那个端口。评审 I1 之前这里只有
  *    `Number(cur.port)` 而 port 恒为 0 → portFreed 恒真，这条闸自我实现、不可能红。
+ *    portFreed 本体是**实测 connect 端口失败**（probePortBusy），不是 close() 回调推断。
  *  · drained / forced 三态（true / false / null）：null = 压根没拿到响应（子进程原本不在，或它没等到
  *    回包就退了）。投递顺序见 gateway.cjs 的 gracefulExit 注释（先写帧 → flush 窗口 → 才关管道）。
+ *    forced:true 还有一种来历：父进程侧的强杀兜底动了手（gracefulExit 自己报的 forced 是子进程侧
+ *    server.stopAsync 认输，两码事，但调用方只需要「这次停机不干净」这一个事实）。
  */
 async function stopAndWait({ timeoutMs = 5000 } = {}) {
   // 只信盘上的那一份：内存镜像可能是监听之前的旧值（评审 I1②）
@@ -232,6 +237,34 @@ async function stopAndWait({ timeoutMs = 5000 } = {}) {
   while (pidAlive(cur.pid) && Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 100));
   }
+  // Task 7 互锁②：到点还没退 = 子进程赖着不走（吞掉 gateway_shutdown / 停机上界内没退完）→ 强杀。
+  // 强杀后必须真的等到 pid 消失再返回：返回 stopped:true 而进程还在是谎报，装更会在映像仍被锁时开跑。
+  // 句柄选择：本会话 spawn 的（child.pid 与记录一致）用 child 句柄；认领来的（无句柄）按记录 pid 杀
+  // ——那个 pid 在认领时经管道 token 双检认证过（probeAlive），且刚刚还活着，不是盲 pid。
+  let parentForced = false;
+  if (pidAlive(cur.pid)) {
+    log.line("stopAndWait-force-kill", { pid: cur.pid, owned: !!(child && child.pid === cur.pid) });
+    try {
+      if (child && child.pid === cur.pid) child.kill();
+      else process.kill(cur.pid);
+    } catch (e) {
+      log.line("stopAndWait-force-kill-failed", { pid: cur.pid, message: String((e && e.message) || e) });
+    }
+    const killDeadline = Date.now() + 3000;
+    while (pidAlive(cur.pid) && Date.now() < killDeadline) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    parentForced = !pidAlive(cur.pid);
+    // Windows 实测：TerminateProcess 之后 pid 先消失、内核还要片刻才释放监听 socket，
+    // 会撞出「pid 已死但端口仍 accept」的窗口。给一个有界宽限期再实测端口，宽限后仍占着
+    // 就由下面的 portFreed 如实报 false（调用方据此显式报错，不静默放行装更）。
+    if (parentForced && diskPort) {
+      const settleDeadline = Date.now() + 2000;
+      while ((await probePortBusy(diskPort)) && Date.now() < settleDeadline) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    }
+  }
   const stopped = !pidAlive(cur.pid);
   const rep = await ack;
   if (own && own !== conn) { try { own.close(); } catch { /* 已断 */ } }
@@ -242,10 +275,13 @@ async function stopAndWait({ timeoutMs = 5000 } = {}) {
   const portFreed = port ? !(await probePortBusy(port)) : true;
   // detached（常驻 + 在监听时收到 gateway_shutdown）没有"排干"这回事：那次压根没停机
   const drained = rep && !rep.__failed && !rep.detached ? !!rep.drained : null;
-  const forced = rep && !rep.__failed && !rep.detached ? !!rep.forced : null;
-  log.line("stopAndWait", { pid: cur.pid, stopped, portFreed, port, drained, forced, wasAlive: aliveBefore });
-  let message = stopped ? (portFreed ? "已停止" : "子进程已退出但端口 " + port + " 仍被占用")
-    : "子进程未在 " + timeoutMs + "ms 内退出（pid " + cur.pid + " 仍在）";
+  const forced = parentForced ? true
+    : (rep && !rep.__failed && !rep.detached ? !!rep.forced : null);
+  log.line("stopAndWait", { pid: cur.pid, stopped, portFreed, port, drained, forced, wasAlive: aliveBefore, parentForced });
+  let message = stopped
+    ? (portFreed ? (parentForced ? "子进程未在时限内自行退出，已强杀，端口已释放" : "已停止")
+      : "子进程已退出但端口 " + port + " 仍被占用")
+    : "子进程未在 " + timeoutMs + "ms 内退出（强杀后 pid " + cur.pid + " 仍在）";
   if (stopped && drained === false) {
     // 本任务最坏的失败形态必须在返回值里看得见（评审 I2③）：Task 7 的互锁据此决定报错文案，
     // 而不是拿一个"看起来停了"的 stopped:true 放行

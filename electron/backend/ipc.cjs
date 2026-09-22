@@ -121,7 +121,10 @@ function register(ctx) {
   ipcMain.handle("get_update_status", () => updater.getStatus());
   ipcMain.handle("check_update", () => updater.check(true));
   ipcMain.handle("download_update", () => updater.download());
-  ipcMain.handle("install_update", () => updater.triggerInstall());
+  // 「立即安装」经 requestInstall 打装更标记 + app.quit()，把退出交回 main.cjs before-quit 的
+  // 唯一停机出口 quitForInstall()（Task 7）：先停干净网关子进程并实测端口释放，然后才 quitAndInstall。
+  // 直连 updater.triggerInstall() 会绕过停机互锁（scripts/dev-gateway-interlock-test.cjs ③ 钉死）。
+  ipcMain.handle("install_update", () => updater.requestInstall());
   ipcMain.handle("open_release_page", () => updater.openReleases());
   ipcMain.handle("open_repo_page", () => updater.openRepo());
 
