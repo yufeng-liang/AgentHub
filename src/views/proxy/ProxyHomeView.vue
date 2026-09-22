@@ -74,7 +74,7 @@ const steps = computed<{ id: string; title: string; desc: string; link?: boolean
 const tips: Record<string, string> = {
   start: "服务启动后网关才开始转发请求；监听端口和绑定地址可以在「配置 → 反代网关」里修改，改完需要重新启动服务。",
   key: "API Key 相当于访问网关的密码，客户端用它证明身份。生成后可随时在 Key 列表里查看 / 复制完整 Key；泄露或丢失就删掉重新生成一个。",
-  base: "这是 OpenAI 兼容地址——所有支持“自定义 OpenAI 接口”的软件都能直接填用，不需要装任何插件。默认只监听本机，局域网其他设备访问需在「配置 → 反代网关」里改绑定地址。",
+  base: "同一个地址讲两种协议：OpenAI 兼容软件（Cursor / Cline / Roo / TRAE 等）直接填上面的 Base URL；<br />Claude Code 走 <span class=\"mono\">ANTHROPIC_BASE_URL</span>，它会把地址拼成 <span class=\"mono\">&lt;base&gt;/v1/messages</span>，所以要填<b>去掉末尾 /v1</b> 的形式（例如 http://127.0.0.1:9527），Key 填在 <span class=\"mono\">ANTHROPIC_AUTH_TOKEN</span>。<br />默认只监听本机；局域网其他设备访问需在「配置 → 反代网关」里改绑定地址。",
   model: "模型名要填网关实际提供的名称（在「模型目录」页能看到）。接入自定义提供商后，用它的前缀形态 <b>标识/模型名</b>（如 myrelay/gpt-4o）——这个形式是唯一确定的路由写法，裸模型名一律先归内置生态渠道，只有内置目录里没有、且恰好只有一家提供商拥有时才会落到提供商。",
 };
 const openHint = ref<string | null>(null);
@@ -88,6 +88,7 @@ function closeHint() {
 /** 地址条与端点标签：点一下整条进剪贴板；文本全部来自实时配置，改端口/绑定后跟着变 */
 const endpoints = [
   { key: "chat", text: "POST /v1/chat/completions" },
+  { key: "messages", text: "POST /v1/messages" },
   { key: "models", text: "GET /v1/models" },
   { key: "health", text: "GET /healthz" },
 ] as const;

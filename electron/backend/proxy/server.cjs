@@ -9,6 +9,8 @@ const pool = require("./pool.cjs");
 const adapters = require("./adapters.cjs");
 const provider = require("./provider.cjs");
 const openaiOut = require("./protocols/openai-out.cjs");
+const anthropicIn = require("./protocols/anthropic-in.cjs");
+const anthropicOut = require("./protocols/anthropic-out.cjs");
 const util = require("./util.cjs");
 const events = require("./events.cjs");
 
@@ -240,18 +242,32 @@ function applyCool(accId, model, cls, message) {
   }
 }
 
+/** 入站协议面：同一套调度核心，按端点换「怎么读网关 Key / 写成什么字节」。
+ *  readKey 与 createSink 成对出现——鉴权失败的错误形状也必须按本协议回，
+ *  否则 Claude Code 收到一个 OpenAI 形状的 401 会直接判连接失败。 */
+const OPENAI_SURFACE = {
+  name: "openai",
+  createSink: openaiOut.create,
+  readKey: (req) => ({ key: String(req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim() }),
+};
+const ANTHROPIC_SURFACE = { name: "anthropic", createSink: anthropicOut.create, readKey: anthropicIn.readKey };
+
 /** chat/completions 主流程（stream 双态共用一套 emit → 出线或聚合）
- *  makeSink 只决定「这一串事件写成什么字节」：OpenAI / Anthropic / Responses 各一个工厂。
+ *  surface 只决定「这一串事件写成什么字节」：OpenAI / Anthropic / Responses 各一个工厂。
  *  下面的鉴权、别名、回退链、号池换号、冷却决策对所有协议共用同一份代码——
  *  这是当初定下「内部规范形 = OpenAI chat + emit 词汇不扩」的全部回报。 */
-async function handleChat(req, res, settings, makeSink) {
+async function handleChat(req, res, settings, surface) {
   const startedAt = Date.now();
   const reqId = util.uuid().replace(/-/g, "").slice(0, 24);
   const body = req.body || {};
   // wantStream 提前算：sink 要在鉴权之前建（鉴权失败也得按本协议的形状回错）。
   // body.stream 在此之前不会被改，所以与原先"晚算"完全等价。
   const wantStream = !!body.stream;
-  const sink = makeSink({ res, reqId, requestedModel: String(body.model || ""), wantStream });
+  const sink = surface.createSink({
+    res, reqId, requestedModel: String(body.model || ""), wantStream,
+    // 入站 tokens 只能本地估：真分词在上游手里，我们只在拿不到 usage 时用它兜底
+    estInputTokens: util.estimateTokens(JSON.stringify(body.messages || "")),
+  });
   const usageRow = { ts: startedAt, reqId, keyId: "", keyName: "", channel: "", accountId: "", accountName: "", model: String(body.model || ""), status: 0 };
 
   const record = (extra) => {
@@ -262,10 +278,13 @@ async function handleChat(req, res, settings, makeSink) {
     emitRequestThrottled();
   };
 
-  // ===== 鉴权：Bearer sk-…，库中只存哈希，实时查表（启停/删除即时生效） =====
-  const auth = String(req.headers.authorization || "");
-  const secret = auth.replace(/^Bearer\s+/i, "").trim();
-  const key = secret ? store.findKeyBySecret(secret) : null;
+  // ===== 鉴权：库中只存哈希，实时查表（启停/删除即时生效）。Key 从哪个头读由协议面定 =====
+  const keyed = surface.readKey(req) || {};
+  if (keyed.error) {
+    record({ status: 401, error: "ambiguous_api_key" });
+    return sink.endErr(401, keyed.error, "invalid_request_error", "invalid_api_key");
+  }
+  const key = keyed.key ? store.findKeyBySecret(keyed.key) : null;
   if (!key) {
     record({ status: 401, error: "invalid_api_key" });
     return sink.endErr(401, "无效的 API Key", "invalid_request_error", "invalid_api_key");
@@ -592,15 +611,52 @@ function buildApp(settings) {
   });
   app.use(express.json({ limit: "32mb" })); // 方案 §6.9：单请求体上限 32MB（多模态 base64）
 
-  // 同一个调度核心，按端点换一套出线字节：③ /v1/messages、⑤ /v1/responses 各带自己的 sink 工厂
-  app.post("/v1/chat/completions", (req, res) => handleChat(req, res, settings(), openaiOut.create).catch((e) => {
+  app.post("/v1/chat/completions", (req, res) => handleChat(req, res, settings(), OPENAI_SURFACE).catch((e) => {
     if (!res.headersSent) sendError(res, 500, String((e && e.message) || e), "server_error");
   }));
 
-  // 模型目录：三渠道合并视图，鉴权可选（方案 §6.1）
-  app.get("/v1/models", (_req, res) => {
-    res.json({ object: "list", data: adapters.mergedModels() });
+  // Anthropic Messages 入口：入站归一成内部规范形后，与 chat 通路共用同一个 handleChat。
+  // 归一失败按 Messages 的错误形状回（Claude Code 只认这个形状），而不是 OpenAI 的 400。
+  // enableAnthropic 是紧急止血开关（默认开，只在 config.json 里给）：新协议面一旦把某个
+  // 客户端卡住，关掉即回到「该端点不存在」，不必回滚代码也不必重新打包。
+  app.post("/v1/messages", (req, res) => {
+    if (settings().enableAnthropic === false) {
+      res.status(404).json({ type: "error", error: { type: "not_found_error", message: "该网关未启用 /v1/messages" } });
+      return undefined;
+    }
+    const r = anthropicIn.toInternal(req.body || {});
+    if (!r.ok) {
+      res.status(400).json({ type: "error", error: { type: "invalid_request_error", message: r.message } });
+      return undefined;
+    }
+    if (r.notes && r.notes.length) {
+      // 转换中的语义损失（thinking.signature 不回投、document/图片 file 源丢弃等）必须留痕：
+      // 用户看到的是"同样的对话在 Anthropic 官方能跑、走网关差一点"，无线索就无法归因
+      console.warn(`[gateway] /v1/messages 转换损失: ${r.notes.join(" | ")}`);
+    }
+    req.body = r.body;
+    return handleChat(req, res, settings(), ANTHROPIC_SURFACE).catch((e) => {
+      if (!res.headersSent) res.status(500).json({ type: "error", error: { type: "api_error", message: String((e && e.message) || e) } });
+    });
   });
+  // 官方文档把 count_tokens 列为可选（缺了客户端退化成字符估算）。这里用网关自己的
+  // length/4 口径实现——与客户端兜底同量级，胜在 /status 与统计页能看到同一个数。
+  app.post("/v1/messages/count_tokens", (req, res) => res.json(anthropicIn.countTokens(req.body || {})));
+
+  // 模型目录：全渠道合并视图（含自定义提供商的 标识/模型名）。
+  // 三条硬约束，都是客户端侧实测出来的：① Claude Code 发 ?limit=1000 且 3s 超时，
+  // 所以必须同步返回、绝不打上游；② 任何 redirect 都被它判失败，故连尾斜杠都单独注册；
+  // ③ 有 anthropic-version 头时按 Messages 形状回，否则按 OpenAI 形状回。
+  const modelsPayload = (req) => {
+    const list = adapters.mergedModels();
+    if (!req.headers["anthropic-version"]) return { object: "list", data: list };
+    return {
+      data: list.map((m) => ({ type: "model", id: m.id, display_name: m.name || m.id, created_at: m.created || 0 })),
+      has_more: false, first_id: list.length ? list[0].id : null, last_id: list.length ? list[list.length - 1].id : null,
+    };
+  };
+  app.get("/v1/models", (_req, res) => res.json(modelsPayload(_req)));
+  app.get("/v1/models/", (_req, res) => res.json(modelsPayload(_req)));
 
   // 探活：无健康渠道时 503（自定义提供商的 Key 同样是可用凭据，故走合并视图）
   app.get("/healthz", (_req, res) => {
