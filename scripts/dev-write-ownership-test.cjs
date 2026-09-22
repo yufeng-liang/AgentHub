@@ -3,9 +3,15 @@
 // 二期把网关搬进独立 Node 子进程之后，**两个进程同时写同一份文件**是这期最容易出隐性数据损坏的地方。
 // 本闸先把写权与句柄收干净：
 //  ① 原子写的临时文件名带 pid —— 主进程与子进程同刻写盘时，固定名会互相 rename 踩掉对方的半成品；
-//  ② 全仓（electron/backend 及其 proxy/ 子目录，递归）凡「写盘用的固定 .tmp 名」都必须拼 process.pid，已知写点一个不许漏；
-//    判据只认 `.tmp`（或 `.tmp-` 前缀）这种原子写临时名，os.tmpdir()/mkdtemp 派生的临时目录（adapter-* 那几处）不算、不误报；
+//  ② 全仓（electron/**/*.cjs 递归，含 backend/ 与 backend/proxy/）凡「写进中转名再 rename 覆盖目标」的原子写点，
+//    该中转名的构造式里都必须拼 process.pid —— **结构判据，不锚 `.tmp` 这个词元**：
+//      锚词元时 proxy/raccoonAuth.cjs 的 `${file}.agenthub-tmp`（不含 `.tmp`、写的却是用户真实登录文件）静默漏网，
+//      「同类漏项」于是绕过了扫描面本身。改判据后临时名叫什么一律同等对待（`.tmp` / `.tmp-` / `agenthub-tmp`）；
+//      「把已存在的文件改名挪走」（.bak 留档轮转、技能搬移、下载落位）不算中转，实测逐条核过不误报；
+//    旧的词元判据（凡出现 `.tmp` 写盘名就必须带 pid）作为副闸保留：它窄但零误报，两条一起守。
 //  ③ store.checkpoint() 真能把 stats.db 的 -wal 收敛（本机实测曾长到 1.59 MB 且零次 checkpoint）；
+//    close() 的「先 checkpoint 再关句柄」除静态体外，另加**运行期兜底**：spy node:sqlite 的 exec/close，
+//    断言 db.close() 之前真的发出过 PRAGMA wal_checkpoint（文件系统层区分不出 close 前有没有显式收敛，驱动调用层能）；
 //  ④ store.close() 不再是「定义了没人调」——proxy.shutdown() 运行期真把句柄关掉、WAL 清零；
 //  ⑤ 主进程对 proxy 域的 require 数不得比基线增加（棘轮，硬零由 Task 5 接管）。
 //
@@ -237,41 +243,89 @@ async function main() {
   assert.deepStrictEqual(residue, [], "原子写残留了 .tmp 半成品：" + residue.join(", "));
   pass("① 收尾：文件是两者之一的完整载荷（marker=" + markerWon + " theme=" + disk.theme + "），.tmp 残留 0");
 
-  // ===== ② 全仓（含 proxy/ 子目录，递归）写盘用的固定 .tmp 名必须拼 pid =====
-  // Task 2 首轮把扫描面写死在 electron/backend 顶层，proxy/ideswitch.cjs:272 的固定名因此漏网——
-  // 这条补口把扫描面递归提到 proxy/**，让它成为同类漏项的守门。
-  // 判据：字符串里出现「.tmp」且后面不接字母 = 原子写的临时文件名，两种口径都覆盖：
-  //   · 命中 config/hub/sync-config/sync 的 `${p}.${pid}.tmp`（`.tmp` 收尾），以及 proxy/ideswitch 的 `${file}.tmp-${pid}`（`.tmp-` 前缀，含 :91 与 :272 两处）；
-  //   · 不误报 os.tmpdir() 派生的临时目录/文件（adapter-* 那几处本就带 pid 或走 mkdtemp）——它们的 `.tmp` 后紧跟 `dir`，被「后不接字母」挡掉；注释行再单独剔除。
+  // ===== ② 全仓原子写点（写进中转名 → rename 覆盖目标）的中转名必须拼 pid —— 结构判据 =====
+  // 前两轮把判据锚在「.tmp」这个词元上：扫描面 widened 到 proxy/ 之后，它守住了 ideswitch:272，
+  // 却因同一个词元锚点漏掉了同目录的 proxy/raccoonAuth.cjs:79 `${file}.agenthub-tmp`（不含 `.tmp`，
+  // rename 覆盖的是用户真实小浣熊登录文件）。锚词元 = 只覆盖「按这个习惯起名」的写点，本任务要的
+  // 是「任何经临时文件中转的原子写」，所以判据换成结构形状，与临时名怎么起名无关。
+  //   主判据（结构）：同一文件内 `const|let|var X = <名>` → 同一个 X 被 writeFileSync 写过 → 再 renameSync(X, 目标)
+  //                 = 中转覆盖，该 X 的构造式里必须有 process.pid。
+  //   不进清单的非中转 rename（实测逐条核过，判据靠「声明与 rename 之间是否真的写过这个变量」区分）：
+  //     config.cjs:308 / sync-config.cjs:465  .bak 留档轮转（rename 源 p 从未被 writeFileSync 写过）
+  //     hub.cjs:117 / :153                    技能搬移与回收站落位
+  //     sync.cjs:214 / :265                   还原回滚挪回、下载文件落位
+  //   副闸（词元，保留前两轮那条）：凡出现 `.tmp`（后不接字母）的写盘名都必须带 pid。它窄但零误报，
+  //   两条并存 = 覆盖面只增不减：结构判据是它的严格超集（实测 7 处 ⊇ 6 处）。
+  // 关于两种 pid 拼法并存（backend 顶层 `${p}.${pid}.tmp`；proxy/ 用户登录文件 `${file}.tmp-${pid}`
+  // 与 `${file}.agenthub-tmp-${pid}`）：换成结构判据后拼法不再影响判定力，统一它纯属外观，而代价是要动
+  // ideswitch:91 那条本仓没有任何运行期覆盖的用户真实登录文件写路径——为外观做无运行期证据的改动不做
+  // （理由见 task-2-report §九）。新增写点就近沿用同目录口径，别再造第三种拼法。
+  const ELECTRON = path.join(ROOT, "electron");
+  const IDENT = "([A-Za-z_$][\\w$]*)";                       // 只认「裸变量名」：`b.dst` 这类成员表达式天然不匹配
+  const WRITE_RE = new RegExp("\\bwriteFileSync\\(\\s*" + IDENT + "\\s*,", "g");
+  const RENAME_RE = new RegExp("\\brenameSync\\(\\s*" + IDENT + "\\s*,", "g");
   const TMP_LITERAL = /\.tmp(?![A-Za-z])/;    // .tmp 后不接字母 = 写盘临时名；os.tmpdir() 的 `.tmpdir` 不命中
   const COMMENT = /^\s*(\/\/|\*|\/\*)/;
-  const KNOWN_SITES = ["config.cjs", "hub.cjs", "sync-config.cjs", "sync.cjs", "proxy/ideswitch.cjs"];
-  const hits = [];
-  // 递归走 electron/backend（含 proxy/），文件名统一记成相对 BACKEND 的 posix 路径（config.cjs / proxy/ideswitch.cjs）
+  const DECL_OF = (name) => new RegExp(`^\\s*(?:const|let|var)\\s+${name}\\s*=`);
+  // 已知原子写点（相对 electron/ 的 posix 路径）：新增写点就登记在这里，漏登记会被「少了一个」那条咬
+  const KNOWN_SITES = [
+    "backend/config.cjs", "backend/hub.cjs", "backend/sync-config.cjs", "backend/sync.cjs",
+    "backend/proxy/ideswitch.cjs", "backend/proxy/raccoonAuth.cjs",
+  ];
+  const sites = [];      // 结构判据清单（中转覆盖型原子写）
+  const litHits = [];    // 词元副闸命中
   const walkCjs = (dir, rel) => {
     for (const e of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : 1))) {
       const abs = path.join(dir, e.name);
       const r = rel ? `${rel}/${e.name}` : e.name;
       if (e.isDirectory()) { walkCjs(abs, r); continue; }
       if (!e.name.endsWith(".cjs")) continue;
-      fs.readFileSync(abs, "utf8").split(/\r?\n/).forEach((line, i) => {
-        if (COMMENT.test(line) || !TMP_LITERAL.test(line)) return;
-        hits.push({ file: r, line: i + 1, text: line.trim() });
+      const lines = fs.readFileSync(abs, "utf8").split(/\r?\n/);
+      const writes = [], renames = [];
+      lines.forEach((line, i) => {
+        if (COMMENT.test(line)) return;                     // 注释里的写法不算
+        if (TMP_LITERAL.test(line)) litHits.push({ file: r, line: i + 1, text: line.trim() });
+        for (const m of line.matchAll(WRITE_RE)) writes.push({ name: m[1], line: i + 1 });
+        for (const m of line.matchAll(RENAME_RE)) renames.push({ name: m[1], line: i + 1 });
       });
+      for (const rn of renames) {
+        // rename 的源必须是本文件里声明的局部变量（挪走参数/外部传入的路径 = 不是中转名）
+        let decl = -1;
+        const isDecl = DECL_OF(rn.name);
+        for (let i = rn.line - 2; i >= 0; i--) if (isDecl.test(lines[i])) { decl = i; break; }
+        if (decl < 0) continue;
+        // 声明与 rename 之间必须真的写过这个变量 —— 这一条就是「中转覆盖」与「改名挪走」的分界
+        const wr = writes.find((w) => w.name === rn.name && w.line > decl && w.line < rn.line);
+        if (!wr) continue;
+        // 声明语句全文（多行声明往下取到分号，最多 3 行，够装下模板字符串）
+        let stmt = lines[decl];
+        for (let i = decl + 1; i <= Math.min(decl + 3, rn.line - 1) && !stmt.includes(";"); i++) stmt += " " + lines[i];
+        sites.push({ file: r, name: rn.name, declLine: decl + 1, writeLine: wr.line, renameLine: rn.line, stmt: stmt.trim() });
+      }
     }
   };
-  walkCjs(BACKEND, "");
-  assert.ok(hits.length >= KNOWN_SITES.length,
-    `.tmp 写点扫描到 ${hits.length} 处，少于已知的 ${KNOWN_SITES.length} 处 —— 扫描面缩了，这条闸会变成空闸`);
-  for (const h of hits) {
-    assert.ok(h.text.includes("process.pid"),
-      `固定临时文件名（跨进程会互踩）：electron/backend/${h.file}:${h.line}  ${h.text}`);
+  walkCjs(ELECTRON, "");
+  assert.ok(sites.length >= KNOWN_SITES.length,
+    `结构判据只扫到 ${sites.length} 处原子写中转点，少于已知的 ${KNOWN_SITES.length} 个写点 —— 配对形状或扫描面退化了，这条闸会变成空闸`);
+  for (const s of sites) {
+    assert.ok(/process\.pid/.test(s.stmt),
+      `原子写的中转名没拼 pid（同刻两个写入者会互踩半成品）：electron/${s.file}:${s.declLine}  ${s.stmt}`
+      + `\n  配对形状：writeFileSync @${s.writeLine} → renameSync @${s.renameLine} 的源是同一个变量 ${s.name}`);
   }
   for (const f of KNOWN_SITES) {
-    assert.ok(hits.some((h) => h.file === f), `已知原子写点少了一个（被删、被改成不走 .tmp，或扫描面没覆盖到它）：${f}`);
+    assert.ok(sites.some((s) => s.file === f),
+      `已知原子写点少了一个（被删、被改成不走中转文件，或扫描面没覆盖到它）：electron/${f}`);
   }
-  const hitFiles = [...new Set(hits.map((h) => h.file))];
-  pass(`② electron/backend 递归（含 proxy/）扫到 ${hits.length} 处 .tmp 写盘（${hitFiles.length} 个文件、${KNOWN_SITES.length} 个已知写点齐），全部拼 process.pid`);
+  for (const h of litHits) {
+    assert.ok(h.text.includes("process.pid"),
+      `固定临时文件名（跨进程会互踩，词元副闸）：electron/${h.file}:${h.line}  ${h.text}`);
+  }
+  const siteFiles = [...new Set(sites.map((s) => s.file))];
+  assert.ok(sites.length >= litHits.length,
+    `结构判据（${sites.length} 处）比词元副闸（${litHits.length} 处）还窄 —— 判据换窄了，会漏掉原来守得住的写点`);
+  pass(`② electron/** 递归（backend + proxy，结构判据）扫到 ${sites.length} 处中转覆盖型原子写`
+    + `（${siteFiles.length} 个文件、${KNOWN_SITES.length} 个已知写点齐），中转名全部拼 process.pid`
+    + `；词元副闸 ${litHits.length} 处同样齐`);
 
   // ===== ③ WAL 真的收敛：checkpoint() / 周期计时器 / walBytes() =====
   const store = require(path.join(BACKEND, "proxy", "store.cjs"));
@@ -314,20 +368,53 @@ async function main() {
   assert.ok(afterStop > 4096, `stop() 之后 -wal 还是被压回 ${afterStop} B —— 计时器没停，会留一个无人认领的 interval`);
   pass(`③ 周期 checkpoint：计时器把 WAL 压到 ${timerCk} B，stop() 后又涨回 ${afterStop} B`);
 
-  // close() 的语义：先 checkpoint 再关句柄（正常退出留不下大 WAL）
+  // close() 的语义：先 checkpoint 再关句柄（正常退出留不下大 WAL）。
+  // 静态判据只是**第一道**：那条正则靠「列 0 的 }」收口函数体，日后有人把嵌套块写成列 0、或把
+  // checkpoint 抽进 helper，被捕获的范围会静默变化而判据仍绿。故下面补一条运行期兜底，两闸并存。
   const storeSrc = fs.readFileSync(path.join(BACKEND, "proxy", "store.cjs"), "utf8");
   const closeBody = /function close\(\)\s*\{([\s\S]*?)\n\}/.exec(storeSrc);
   assert.ok(closeBody, "store.cjs 里找不到 function close() 的函数体");
   assert.match(closeBody[1], /checkpoint\(\)/,
     "close() 关句柄前没有先 checkpoint()：退出路径留下的 WAL 只能靠 SQLite 自己收，运行期无人收敛");
-  pass("③ close() 体内先 checkpoint() 再 db.close()（退出路径不留大 WAL）");
+  pass("③ close() 体内先 checkpoint() 再 db.close()（静态：退出路径不留大 WAL）");
 
-  // 父进程自己也照这条要求做：交出句柄，否则最后删临时目录会被 Windows 咬住（EBUSY）
+  // 运行期兜底：直接盯 node:sqlite 的调用序列，断言 db.close() 之前真的发出过 PRAGMA wal_checkpoint。
+  // 为什么非要这条：SQLite 关掉最后一个连接时自己也会收敛并删掉 -wal，所以「close 前有没有显式 checkpoint」
+  // 在文件系统层不可区分（两边都是 0 B）；驱动调用层可区分，spy 原型方法即可覆盖 store 已持有的那个连接实例。
+  const { DatabaseSync } = require("node:sqlite");
+  const origExec = DatabaseSync.prototype.exec;
+  const origDbClose = DatabaseSync.prototype.close;
+  const seq = [];                                   // 按发生顺序记 {ck} / {close} / {sql}
+  DatabaseSync.prototype.exec = function (sql, ...rest) {
+    const flat = String(sql).replace(/\s+/g, " ").trim();
+    seq.push(/wal_checkpoint/i.test(flat) ? { ck: true } : { sql: flat.slice(0, 20) });
+    return origExec.call(this, sql, ...rest);
+  };
+  DatabaseSync.prototype.close = function (...rest) {
+    seq.push({ close: true });
+    return origDbClose.apply(this, rest);
+  };
+  rows(500, 1500);
+  const grownBeforeClose = store.walBytes();
+  assert.ok(grownBeforeClose > 4096, `close 兜底的前提不成立：-wal 只有 ${grownBeforeClose} B，没长起来就看不出它被收敛过`);
+  // 父进程自己也照这条要求交出句柄，否则最后删临时目录会被 Windows 咬住（EBUSY）
   store.close();
+  DatabaseSync.prototype.exec = origExec;
+  DatabaseSync.prototype.close = origDbClose;
+  const seqText = seq.map((x) => (x.close ? "db.close()" : x.ck ? "wal_checkpoint" : "exec:" + x.sql)).join(" → ") || "（一次调用都没发出）";
+  const ckAt = seq.findIndex((x) => x.ck);
+  const closeAt = seq.findIndex((x) => x.close);
+  assert.ok(ckAt >= 0,
+    `store.close() 期间没向 SQLite 发出过 PRAGMA wal_checkpoint（调用序列：${seqText}）—— 静态那条绿了也不作数，退出路径的 WAL 只能靠 SQLite 自己收`);
+  assert.ok(closeAt >= 0, `store.close() 没有真的关掉数据库句柄（调用序列：${seqText}）`);
+  assert.ok(ckAt < closeAt,
+    `PRAGMA wal_checkpoint 落在 db.close() 之后或同级（调用序列：${seqText}）—— 「关之前先收敛」这个时机不对`);
+  pass(`③ close() 运行期兜底：spy 到 wal_checkpoint 在 db.close() 之前发出（序列 ${seqText}，close 前 -wal ${grownBeforeClose} B）`);
+
   assert.strictEqual(store.walBytes(), 0, "close() 之后 -wal 没被收干净：句柄可能还挂在父进程手里");
   assert.strictEqual(store.checkpoint(), false, "close() 之后再 checkpoint 必须回 false（句柄确实没了，不是假关）");
 
-  // ===== ④ store.close() 有真实调用点：静态引用 + 运行期真跑到 =====
+  // ===== ④ store.close() 有真实调用点：静态引用 + 运行期真跑到 proxy.shutdown() =====
   const idxSrc = fs.readFileSync(path.join(BACKEND, "proxy", "index.cjs"), "utf8");
   const shutdownBody = /function shutdown\(\)\s*\{([\s\S]*?)\n\}/.exec(idxSrc);
   assert.ok(shutdownBody, "proxy/index.cjs 里找不到停机函数 function shutdown()");
