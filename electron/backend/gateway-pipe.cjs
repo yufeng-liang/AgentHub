@@ -1,11 +1,19 @@
-// 网关命令管道的**最小可用版**（二期 Task 3）：serve / connect / call / broadcast 四件套齐全，
-// 够把「子进程这个存在」立起来——spawn 后主进程能连上、能验 token、能回传事件。
+// 网关命令管道（二期 Task 3 立起最小版，Task 4 硬化到位）：serve / connect / call / broadcast 四件套。
 //
-// 刻意不含的东西都归 Task 4 硬化，别在这里顺手做掉：
-//  · 响应配对乱序的正确性论证与 pending 上界（MAX_PENDING 常量已在 proto 里，本文件不 enforce）
-//  · 默认 10 s 超时（这里只在调用方显式传 opts.timeoutMs 时才计时；默认**永不超时**）
-//  · 「带写副作用的命令不重放」（今天压根没有重放逻辑，等有了再守）
-//  · 溢出断开的策略细化（createParser 的 onOverflow 这里只关连接）
+// 四条判据各有闸项（scripts/dev-gateway-pipe-test.cjs 的 ⑨ 组），改之前先看它们红什么：
+//  · 配对：响应按帧里的 id 认领 pending，**不**按到达顺序、不按 FIFO。派发顺序 = 帧到达顺序，
+//    完成顺序可以任意乱（⑨a 用真命令表、⑨a-2 用人为反序的 hold 梯度各钉一半）。
+//  · 默认超时：除 proto.NO_TIMEOUT_CMDS 那三条之外，每条 call 都有 proto.DEFAULT_TIMEOUT_MS 的上界。
+//    这既兜「子进程里那条命令挂死」，也兜「响应帧压根没写出去」（见 writeFrame 的返回值）。
+//    没有这条上界时，「主进程发出去的命令永远不回来」是静默的——Task 3 的注释就是这么承诺的。
+//  · 有界队列：单条连接在途（pending）不超过 proto.MAX_PENDING，超出**立即**拒，不排队也不等超时。
+//    上界刻意落在**客户端**：pending 这本账本来就记在连接上，而生产里唯一的客户端就是主进程，
+//    于是子进程同刻要处理的命令数被同一个数钉住（闸 ⑨d 两头都量：客户端拒了多少 + 服务端峰值在飞多少）。
+//    被拒的命令一条都没投出去，所以「重复执行写操作」的风险为零，语义与重放不同。
+//  · 不重放：本期**不实现任何自动重试**。实测依据（不是推测）：pool.cjs 的 poolAccounts() 会把
+//    「派生复活」经 store.updateAccount() 回写、effectiveStatus() 在 cooling/exhausted 到期时真落库，
+//    所以 proto.NON_IDEMPOTENT_READS 里那两条「读」都带写副作用；二期没有幂等表，重放一次就是重复执行一次写。
+//    所有失败路径（断连 / 超时 / 未投递 / 队列满）回的 Error 都带 notRetried 标记，闸 ⑨e 数服务端调用次数钉死它。
 //
 // 传输：Windows named pipe，走 net.createServer / net.connect 的 pipe path 形态（`\\.\pipe\…`）。
 // 不开第二个 TCP 端口（规格 §5.2）：不占端口、无防火墙面、随进程消失。
@@ -17,11 +25,45 @@ const log = require("./gateway-log.cjs");
 let SEQ = 0;
 const nextId = () => String(++SEQ);
 
-/** 一行帧写出去；连接已不可写就 silently drop（事件帧丢了就丢了，命令帧由 pending 超时兜）。 */
+/**
+ * 一行帧写出去，**返回到底写没写出去**。
+ * 静默丢帧是这里最坏的失败形态：调用方拿不到任何信号，命令就只剩「永远不回来」。事件帧可以接受丢
+ * （广播本来就是 best-effort，掉一帧订阅端下次还能看到状态），命令/响应帧的丢弃必须被上层看见并留痕。
+ */
 function writeFrame(sock, frame) {
+  if (!sock || !sock.writable) return false;
   try {
-    if (sock && sock.writable) sock.write(proto.encode(frame));
-  } catch { /* 对端已断 */ }
+    sock.write(proto.encode(frame));
+    return true;
+  } catch {
+    return false;                 // 对端已断：socket 自己会走 close，调用方只需别再以为投出去了
+  }
+}
+
+/** 「这条命令不会被自动重放」的统一错因（文件头第四条）。 */
+function noRetryError(message, cmd) {
+  const idempotencyRisk = proto.NON_IDEMPOTENT_READS.has(String(cmd));
+  const e = new Error(message + "（不会自动重放"
+    + (idempotencyRisk
+      ? "：" + cmd + " 带写副作用（号池派生复活要回写库），重放等于重复执行写操作"
+      : "：二期无幂等表，重放的语义风险大于收益")
+    + "）");
+  e.notRetried = true;
+  e.command = String(cmd);
+  return e;
+}
+
+/**
+ * 这条 call 的超时上界（0 = 不设上界）。顺序有意义：
+ *  · NO_TIMEOUT_CMDS 那三条的语义本就是「立即返回 + 进度走 evt 帧」（长任务在子进程内部自己收），
+ *    管道层不给它们设上界——那是「允许长任务挂着管道」的反面：它们压根不挂；
+ *  · 其余一律有默认上界，调用方显式给的 opts.timeoutMs（> 0）优先。
+ * 要放宽就传显式值；要免超时只能进那份清单（三个名字由闸 ⑨ 钉着，不许随手加）。
+ */
+function timeoutFor(cmd, opts) {
+  if (proto.NO_TIMEOUT_CMDS.has(String(cmd))) return 0;
+  const explicit = Number(opts && opts.timeoutMs) > 0 ? Number(opts.timeoutMs) : 0;
+  return explicit || proto.DEFAULT_TIMEOUT_MS;
 }
 
 /**
@@ -58,10 +100,17 @@ function serve({ token, pipePath, dispatch } = {}) {
       if (!authed) { try { sock.destroy(); } catch { /* 已断 */ } return; }
       if (f.k !== "req") return;      // 本期渲染层不向子进程发其它帧类型
       const id = String(f.id);
+      const cmd = String(f.cmd);
+      const reply = (frame) => {
+        if (writeFrame(sock, frame)) return;
+        // 响应帧没写出去 = 客户端那条 id 只能等它自己的默认超时才有结论。留痕，否则排查时只剩
+        // 「主进程说子进程不回话」，而子进程日志里连一次派发记录都没有。
+        log.line("pipe-frame-dropped", { k: "res", id, cmd, peerWritable: !!(sock && sock.writable) });
+      };
       Promise.resolve()
-        .then(() => dispatch(String(f.cmd), f.args))
-        .then((data) => writeFrame(sock, { k: "res", id, ok: true, data }))
-        .catch((e) => writeFrame(sock, { k: "res", id, ok: false, message: String((e && e.message) || e) }));
+        .then(() => dispatch(cmd, f.args))
+        .then((data) => reply({ k: "res", id, ok: true, data }))
+        .catch((e) => reply({ k: "res", id, ok: false, message: String((e && e.message) || e) }));
     };
     const feed = proto.createParser(onFrame, () => {
       log.line("pipe-overflow", { maxBytes: proto.MAX_FRAME_BYTES });
@@ -86,6 +135,7 @@ function serve({ token, pipePath, dispatch } = {}) {
         pipePath,
         /** 主进程连上第一帧并通过 token 校验后才算 ready（gateway.cjs 在写 gateway.json 之后 await 它） */
         ready,
+        // 事件帧是 best-effort：掉一帧下次状态还能对上，不值得为它断连或排队（命令帧走 call，另一条路）。
         broadcast: (frame) => { for (const c of clients) writeFrame(c, frame); },
         close: () => {
           for (const c of clients) { try { c.destroy(); } catch { /* 已断 */ } }
@@ -104,7 +154,8 @@ function serve({ token, pipePath, dispatch } = {}) {
  * timeoutMs 的语义是「**在这个时限内反复重试到管道出现**」，不是「一次 connect 的 socket 超时」。
  * 这是实测逼出来的：具名管道还没被 listen 时 net.connect 是**立刻**回 ENOENT 的，
  * 单次 socket 超时会把 start() 的 8 s 与 probeAlive 的 1.5 s 在第一毫秒就判成死（子进程还没起来就被认成没起）。
- * 建上之后不再有空闲超时——空闲长连接是设计常态，per-call 默认超时归 Task 4。
+ * 建上之后不再有空闲超时——空闲长连接是设计常态（管道 ≠ 监听，Task 5 全靠这条），per-call 的超时上界
+ * 由 timeoutFor() 给：除 NO_TIMEOUT_CMDS 三条之外一律有 proto.DEFAULT_TIMEOUT_MS 兜底。
  */
 function connect({ pipePath, token, timeoutMs } = {}) {
   if (!pipePath) return Promise.reject(new Error("connect 需要 pipePath"));
@@ -153,11 +204,11 @@ function connect({ pipePath, token, timeoutMs } = {}) {
         if (!f || typeof f !== "object") return;
         if (f.k === "res") {
           const p = pending.get(String(f.id));
-          if (!p) return;               // 迟到的响应（已被超时判死）：丢弃，不重发
+          if (!p) return;               // 迟到的响应（已被超时或断连判死）：丢弃，绝不重发也不复活
           pending.delete(String(f.id));
           if (p.timer) clearTimeout(p.timer);
           if (f.ok) p.resolve(f.data);
-          else p.reject(new Error(String(f.message || "子进程返回失败")));
+          else p.reject(new Error(String(f.message || "子进程返回失败")));   // 业务失败：命令真跑了，不属于「重放」范畴
           return;
         }
         if (f.k === "evt") {
@@ -173,9 +224,11 @@ function connect({ pipePath, token, timeoutMs } = {}) {
       function drop(e) {
         if (dead) return;
         dead = true;
+        // 传输层失败一律带上「不会自动重放」的错因：这些命令可能已经在子进程里跑完了（写副作用已落库），
+        // 客户端只是没听到回执——恰恰是最不该被重试的那一类。
         for (const p of pending.values()) {
           if (p.timer) clearTimeout(p.timer);
-          p.reject(e);                  // token 被拒 = 服务端直接 destroy，这里的 reject 就是认领双检的判据
+          p.reject(noRetryError(String((e && e.message) || e), p.cmd));
         }
         pending.clear();
         try { sock.destroy(); } catch { /* 已断 */ }
@@ -184,19 +237,30 @@ function connect({ pipePath, token, timeoutMs } = {}) {
       const conn = {
         pipePath,
         get connected() { return !dead && sock.writable; },
-        /** 只给**已建连**的连接用：opts.timeoutMs 显式传才计时（默认永不超时，见文件头） */
+        /** 投一条命令并等自己的响应帧。四件事按文件头那四条判据逐条落：有上界、有队列、不重放、按 id 配对。 */
         call: (cmd, args, opts) => new Promise((resolve2, reject2) => {
-          if (dead) { reject2(new Error("管道已断开，命令未投递：" + cmd)); return; }
           const id = nextId();
-          const rec = { resolve: resolve2, reject: reject2, timer: null };
-          const ms = opts && Number(opts.timeoutMs) > 0 ? Number(opts.timeoutMs) : 0;
+          if (dead) { reject2(noRetryError("管道已断开，命令未投递：" + cmd, cmd)); return; }
+          // 有界队列：超出上界**立即**拒（不等默认超时，那会让渲染层白等 10 s）。错误里必须带上当前
+          // pending 数与上界，否则排障时「队列已满」和「子进程不回话」分不开。
+          if (pending.size >= proto.MAX_PENDING) {
+            reject2(noRetryError("命令队列已满（待响应 " + pending.size + " 条 / 上界 " + proto.MAX_PENDING
+              + "），命令未投递：" + cmd, cmd));
+            return;
+          }
+          const ms = timeoutFor(cmd, opts);
+          const rec = { resolve: resolve2, reject: reject2, timer: null, cmd: String(cmd) };
           if (ms) rec.timer = setTimeout(() => {
-            if (!pending.has(id)) return;
+            if (!pending.has(id)) return;         // 已经有结论了（响应先到），这条计时器就是余数
             pending.delete(id);
-            reject2(new Error("子进程未在 " + ms + "ms 内应答：" + cmd));
+            reject2(noRetryError("子进程未在 " + ms + "ms 内应答：" + cmd, cmd));
           }, ms);
           pending.set(id, rec);
-          writeFrame(sock, { k: "req", id, cmd: String(cmd), args: args || {} });
+          if (!writeFrame(sock, { k: "req", id, cmd: String(cmd), args: args || {} })) {
+            if (rec.timer) clearTimeout(rec.timer);
+            pending.delete(id);
+            reject2(noRetryError("命令帧未能写入管道，未投递：" + cmd, cmd));
+          }
         }),
         onEvent: (cb) => { eventCbs.add(cb); return () => eventCbs.delete(cb); },
         unref: () => { try { sock.unref(); } catch { /* 已断 */ } },
@@ -207,4 +271,7 @@ function connect({ pipePath, token, timeoutMs } = {}) {
   });
 }
 
-module.exports = { serve, connect };
+// __hooks：只给闸（scripts/dev-gateway-pipe-test.cjs ⑨c）钉「不可写的 socket 上 writeFrame 必须回 false」
+// 这条不变式——它没有别的确定性入口（OS 的断连时序窗口抓不住）。与 secretbox.__selfCheck 同类的测试可见性：
+// 产品路径（gateway.cjs / gateway-client.cjs）一个都不引用它，也不写任何状态。
+module.exports = { serve, connect, __hooks: { writeFrame } };

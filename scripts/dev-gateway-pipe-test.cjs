@@ -35,7 +35,26 @@
 //     既拿到 claimed:true、又**不**把 restoreOnLaunch 记成「本机在监听」、本进程 status().running 仍为 false。
 //  ⊘ 停机预算的四个数字必须仍然复合（评审 I2②）：stopAsync 500 + drain 800 + 响应 flush 300 < 硬退 2000。
 //     四个数分处三个文件，改一个忘改另一个就得当场变红。
+//  ⑨ 命令通道硬化（Task 4，简报五条逐条落）：
+//     ⑨a 配对——真子进程上并发 30 条 proxy_status + 5 条 gateway_echo，每条只认自己的响应（echo 的 v 逐条
+//        不同 = 串号必红），proxy_status 的 uptime 按请求序号排必须单调不减且不恒为 0；桩服务上再补一条
+//        「完成顺序确实被人为打乱了」的反证，否则这条配对是在顺序返回上自我实现的。
+//     ⑨b 事件回流——真调用点 credits.cjs:128 的 {type:"credits"} 必须回到 onEvent；再用桩构造
+//        「响应帧先到、事件帧后到」那一半（真代码只有「事件先」这一半），两种顺序都要投递成功。
+//     ⑨c 超时——挂 12 s 的**普通**命令必须在 proto.DEFAULT_TIMEOUT_MS(10 s) 报 timeout（Task 3 的
+//        「默认永不超时 + writeFrame 静默丢帧」组合起来就是永久悬挂，这条是它的对立面）；
+//        NO_TIMEOUT_CMDS 三条不被误拒（用 proxy_checkin_run 的桩，不打真上游）；超时后连接仍可用、
+//        迟到的响应帧被丢弃而不是把已判死的 id 复活。writeFrame 不可写时必须回 false（丢帧不静默）。
+//     ⑨d 队列有界——夹具进程里一次压 200 条：恰好 200-MAX_PENDING 条被**立即**拒（含「队列已满」+
+//        当前 pending 数 + 上界），服务端同时在飞绝不超过 MAX_PENDING，该进程 rss 增长 < 20 MB。
+//     ⑨e 不重放——断连时 in-flight 的 proxy_pool 必须 reject 且带 notRetried；重连后再发**别的**命令，
+//        服务端 proxy_pool 的调用计数必须还是 1；随后显式再调一次必须变 2（证明那个计数是活的，
+//        不是恒成立的表达式）。实测依据见 gateway-pipe.cjs 的注释（pool.cjs 的 poolAccounts 会回写派生复活）。
 //  ⑧ 收尾卫生：真实 %APPDATA%\AgentHub\proxy\stats.db 零写入、HKCU Run 项未变。
+//
+// `--bench` 只跑性能回归（简报 Step 3）：proxy_pool 单次往返的中位数 / p90 / p95 / min / max 必须 < 30 ms，
+// 并给出跨进程那部分开销的归因（同一条命令在子进程内本地执行的耗时、以及空载 gateway_echo 的往返）。
+// 单独跑是因为它跟断言组无关，且要往沙箱库里播 40 个号。
 //
 // 卫生约束（AGENTS.md 与探针三件套，硬要求）：
 //  · APPDATA / AGENT_SKILLS_HOME / CCSWITCH_DB_PATH 在任何产品代码 require 之前指进临时目录；
@@ -66,6 +85,7 @@ const KEEP_PORT = 19534;                              // ③-b 常驻且在监�
 const EXE_PORT = 19535;                               // ③-c exe-gone
 const BUSY_PORT = 19536;                              // ⑥b 「pid 已死但端口仍被占着」的那个占用者
 const TAKEOVER_PORT = 19537;                          // ⑦-b 端到端接管
+const PAIR_PORT = 19538;                              // ⑨ 配对：要让 uptime 真在走，子进程必须处在监听态
 process.env.APPDATA = SANDBOX;
 process.env.AGENT_SKILLS_HOME = path.join(work, "hub");
 process.env.CCSWITCH_DB_PATH = path.join(work, "ccswitch.db");
@@ -75,8 +95,10 @@ const gw = require(path.join(BE, "gateway-client.cjs"));
 const util = require(path.join(BE, "proxy", "util.cjs"));
 const log = require(path.join(BE, "gateway-log.cjs"));
 const gatewayPipe = require(path.join(BE, "gateway-pipe.cjs"));
+const proto = require(path.join(BE, "gateway-proto.cjs"));
 // ⊘ 停机预算的四个数字分处三个文件，require 进来才比得动。gateway.cjs 有 require.main 守卫，
-// 被 require 时一个副作用都不许有（装配全在 main() 里）——这条本身也是装配边界的一部分。
+// 被 require 时除一行 entry-not-main 留痕外一个副作用都不许有（装配全在 main() 里）——这条本身也是装配
+// 边界的一部分，那一行留痕由 ⑨ 断言（它同时是「入口没被当 main 跑」唯一的可观测形式）。
 const gwEntry = require(path.join(ROOT, "electron", "gateway.cjs"));
 const proxy = require(path.join(BE, "proxy", "index.cjs"));
 const serverMod = require(path.join(BE, "proxy", "server.cjs"));
@@ -341,6 +363,98 @@ const isAlive = (p) => { try { process.kill(p, 0); return true; } catch (e) { re
 })().catch((e) => { console.log("REAP-THREW " + String((e && e.message) || e)); process.exit(1); });
 `;
 
+// ===== 夹具 G：⑨d 队列有界——**在自己的进程里**量 rss =====
+// 为什么不在本测试进程里量：前九组断言已经建过 sqlite 句柄、起过 server、读过 16 MB 的 bait，
+// rss 的基线噪声本身就能吃掉 20 MB 阈值。夹具进程从空基线起，量到的才是「压 200 条」这一件事的成本。
+const QUEUE_SRC = `"use strict";
+const path = require("node:path");
+const fs = require("node:fs");
+const be = process.argv[2];
+const reportFile = process.argv[3];
+const total = Number(process.argv[4] || 200);
+const holdMs = Number(process.argv[5] || 150);
+const proto = require(path.join(be, "gateway-proto.cjs"));
+const gwpipe = require(path.join(be, "gateway-pipe.cjs"));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+(async () => {
+  const rss0 = process.memoryUsage().rss;
+  let inFlight = 0, peak = 0, dispatches = 0;
+  const pipePath = String.raw\`\\\\.\\pipe\\agenthub-gw-t4queue-\${process.pid}-\${Date.now().toString(36)}\`;
+  const token = "t4-queue-token-0123456789abcdef";
+  const srv = await gwpipe.serve({
+    pipePath, token,
+    dispatch: async (cmd) => {
+      dispatches++; inFlight++; if (inFlight > peak) peak = inFlight;
+      await sleep(holdMs);
+      inFlight--;
+      return { cmd: String(cmd) };
+    },
+  });
+  const conn = await gwpipe.connect({ pipePath, token, timeoutMs: 5000 });
+  const t0 = Date.now();
+  const results = await Promise.all(Array.from({ length: total }, (_, i) =>
+    conn.call("proxy_status", { i }).then(
+      () => ({ i, ok: true, at: Date.now() - t0 }),
+      (e) => ({ i, ok: false, at: Date.now() - t0, message: String((e && e.message) || e), notRetried: !!(e && e.notRetried) })
+    )));
+  const rejected = results.filter((r) => !r.ok);
+  const badRejects = rejected.filter((r) => !/队列已满/.test(r.message));
+  fs.writeFileSync(reportFile, JSON.stringify({
+    total, accepted: results.length - rejected.length, rejected: rejected.length,
+    queueMax: proto.MAX_PENDING, dispatches, peak,
+    maxRejectMs: rejected.length ? Math.max(...rejected.map((r) => r.at)) : -1,
+    sampleReject: rejected.length ? rejected[0].message : "",
+    otherRejects: badRejects.slice(0, 2).map((r) => r.message),
+    notRetriedAll: rejected.every((r) => r.notRetried),
+    rssGrowthMb: (process.memoryUsage().rss - rss0) / 1048576,
+  }), "utf8");
+  conn.close();
+  srv.close();
+  process.exit(0);
+})().catch((e) => { console.log("QUEUE-THREW " + String((e && e.message) || e)); process.exit(1); });
+`;
+
+// ===== 夹具 H：--bench 的服务端——把**真** proxy_pool 接上管道 =====
+// 号池是本地库派生的（poolView → 4 渠道 × poolAccounts/poolSummary/accountModelCool），不走上游，
+// 所以基准可以在沙箱库里播假号；管道两端的 JSON 编解码与生产完全同源，这才是「跨进程到底加了多少毫秒」的答数。
+const BENCH_SRC = `"use strict";
+const path = require("node:path");
+const be = process.argv[2];
+const seed = Number(process.argv[3] || 40);
+const store = require(path.join(be, "proxy", "store.cjs"));
+const proxy = require(path.join(be, "proxy", "index.cjs"));
+const gwpipe = require(path.join(be, "gateway-pipe.cjs"));
+for (let i = 0; i < seed; i++) {
+  store.addAccount({
+    channel: store.CHANNELS[i % store.CHANNELS.length].id, uid: "bench-" + i,
+    name: "基准账号 " + i, token: "tok-" + i, refreshToken: "", source: "bench",
+    expiresAt: Date.now() + 86400000,
+  });
+}
+(async () => {
+  const pipePath = String.raw\`\\\\.\\pipe\\agenthub-gw-t4bench-\${process.pid}-\${Date.now().toString(36)}\`;
+  const token = "t4-bench-token-0123456789abcdef";
+  const srv = await gwpipe.serve({
+    pipePath, token,
+    dispatch: async (cmd, args) => {
+      // gateway_echo：空载往返 = 管道本身的税（不碰库、不派生号池）
+      if (cmd === "gateway_echo") return { v: String((args && args.v) || "") };
+      // bench_local：同一条 proxy_pool 在**本进程内**跑一次的耗时与响应体量（不编帧、不过 socket）——
+      // 父进程拿「管道往返 − 这一条」给跨进程开销归因，而不是靠猜。
+      if (cmd === "bench_local") {
+        const t = process.hrtime.bigint();
+        const data = await proxy.dispatch("proxy_pool", {});
+        const ms = Number(process.hrtime.bigint() - t) / 1e6;
+        return { ms, bytes: JSON.stringify(data).length, accounts: seed };
+      }
+      return proxy.dispatch(cmd, args);
+    },
+  });
+  console.log("BENCH-LISTEN " + JSON.stringify({ pipePath, token }));
+  void srv;
+})().catch((e) => { console.log("BENCH-THREW " + String((e && e.message) || e)); process.exit(1); });
+`;
+
 /** 夹具：④ 的探针——真实 server + 真实库（都在自己的沙箱里新建），量 liveness 与 readiness 的分工。
  *  停机那段必须走 proxy.gracefulShutdown() 这一条产品实现，不能在夹具里自己 stopAsync()+close() 凑：
  *  它内含 rules.close() 与「等 libuv 线程池在途作业落地」两步，缺了就会被工作线程往已关闭的
@@ -420,7 +534,8 @@ const preBait = () => {
 })().catch((e) => { console.log("READY-THREW " + String((e && e.message) || e)); process.exit(1); });
 `;
 
-async function main() {
+/** 夹具脚本落到临时目录：断言路径与 --bench 路径都要（bench 只需要后两个，但一次写全省得分叉） */
+function writeFixtures() {
   fs.writeFileSync(path.join(work, "gw-parent.cjs"), PARENT_SRC, "utf8");
   fs.writeFileSync(path.join(work, "gw-spawn.cjs"), SPAWN_SRC, "utf8");
   fs.writeFileSync(path.join(work, "gw-stopper.cjs"), STOPPER_SRC, "utf8");
@@ -428,6 +543,12 @@ async function main() {
   fs.writeFileSync(path.join(work, "gw-listen.cjs"), LISTEN_SRC, "utf8");
   fs.writeFileSync(path.join(work, "gw-takeover.cjs"), TAKEOVER_SRC, "utf8");
   fs.writeFileSync(path.join(work, "gw-reap.cjs"), REAP_SRC, "utf8");
+  fs.writeFileSync(path.join(work, "gw-queue.cjs"), QUEUE_SRC, "utf8");
+  fs.writeFileSync(path.join(work, "gw-bench.cjs"), BENCH_SRC, "utf8");
+}
+
+async function main() {
+  writeFixtures();
   // 真实用户库的「零写入」基线：只 stat，不开库
   const realDbDir = path.join(REAL_APPDATA, "AgentHub", "proxy");
   const statOrZero = (p) => { try { const s = fs.statSync(p); return s.size + "@" + Math.round(s.mtimeMs); } catch { return "absent"; } };
@@ -463,6 +584,8 @@ async function main() {
   assert.ok(alive(r1.pid), "① 子进程 pid 不活着：" + r1.pid);
   knownPids.add(r1.pid);
   const file = gw.readGatewayFile();
+  // 这条**故意不加轮询等待**：它钉的是子进程侧的装配序不变式「管道连得上 ⇒ 握手文件已在盘上」
+  // （见 gateway.cjs：writeGatewayFile 在 serve() 之前）。改成 waitForFile 就是把这条判据删掉。
   assert.ok(file, "① gateway.json 不存在或不是合法 JSON（握手没落盘）");
   for (const k of ["pid", "pipe", "token", "port", "version", "startedAt", "secretBackend"]) {
     assert.ok(k in file, "① gateway.json 缺字段 " + k + "：" + JSON.stringify(Object.keys(file)));
@@ -824,7 +947,7 @@ fs.writeFileSync(path.join(d,"names.txt"), fs.readdirSync(path.join(d,"AgentHub"
   assert.strictEqual(rp.claimed, false, "⑥ 双检没过却被认领上了：" + JSON.stringify(rp));
   assert.ok(alive(victim.pid),
     "⑥ 回收陈旧握手文件时把那个 pid 的进程杀了 —— 能走到这条路的进程恰恰是「活着但认证不过」的，pid 复用场景下那是**别人的**进程"
-    + "（一期踩过宽匹配杀进程的坑）。回收只许把 gateway.json 挪走：" + JSON.stringify(rp));
+    + "（一期踩过宽匹配杀进程的坑）。回收只许删掉 gateway.json（见 gateway-client 的 reap 注释）：" + JSON.stringify(rp));
   pass(`⑥ 陈旧 pid → 回收 + 新起（${r1.pid} → ${r4.pid}），再次 stopAndWait 停干净：${stop2.message}；`
     + `两次停机子进程退出码全 0、shutdown-done drained:true/forced:false（共 ${codes.length} 次）；`
     + `reap-stale 点名 ${rp.beforePid} 且那个无辜进程仍活着（${victim.pid}）`);
@@ -908,6 +1031,272 @@ fs.writeFileSync(path.join(d,"names.txt"), fs.readdirSync(path.join(d,"AgentHub"
   pass(`⑦-b 端到端接管成立：真子进程监听 ${to.startedPort} 且 port 已回写盘 → 第二个进程 proxy_start 得 {ok:true,claimed:true}、`
     + `本机 running=false、restoreOnLaunch 仍 ${to.restoreOnLaunch}；停机 drained=${to.stop.drained} forced=${to.stop.forced}`);
 
+  // ===== ⑨ 命令通道硬化（Task 4：配对 / 事件回流 / 默认超时 / 有界队列 / 不重放）=====
+  // 结构前提：Task 3 把四个 proto 常量定义出来了却没有消费方（报告里登记成「常量在，判据不在」）。
+  // 本任务的定义性动作就是把它们变成真判据，所以第一条钉「消费方存在」——谁把消费方删掉就当场红。
+  const pipeSrcText = fs.readFileSync(path.join(BE, "gateway-pipe.cjs"), "utf8");
+  for (const name of ["MAX_PENDING", "DEFAULT_TIMEOUT_MS", "NO_TIMEOUT_CMDS", "NON_IDEMPOTENT_READS"]) {
+    assert.ok(new RegExp("proto\\." + name + "\\b").test(pipeSrcText),
+      "⑨ gateway-pipe.cjs 里找不到 proto." + name + " 的消费方 —— 这个常量又退化成「写了但没 enforce」");
+  }
+  assert.strictEqual(proto.DEFAULT_TIMEOUT_MS, 10000, "⑨ 默认超时上界必须是简报钉的 10 s，实得 " + proto.DEFAULT_TIMEOUT_MS);
+  assert.strictEqual(proto.MAX_PENDING, 64, "⑨ 待响应上界必须是简报钉的 64，实得 " + proto.MAX_PENDING);
+  assert.strictEqual(proto.NO_TIMEOUT_CMDS.size, 3, "⑨ 免超时清单必须只有简报那三条，实得：" + [...proto.NO_TIMEOUT_CMDS].join(","));
+  assert.deepStrictEqual([...proto.NON_IDEMPOTENT_READS].sort(), ["proxy_pool", "proxy_status"],
+    "⑨ 带写副作用的读命令清单被改动：" + [...proto.NON_IDEMPOTENT_READS].join(","));
+  pass(`⑨ 四个 proto 常量都有消费方，且数值与简报一致（DEFAULT_TIMEOUT_MS=${proto.DEFAULT_TIMEOUT_MS}、MAX_PENDING=${proto.MAX_PENDING}、免超时 ${proto.NO_TIMEOUT_CMDS.size} 条、不重放清单 ${[...proto.NON_IDEMPOTENT_READS].join("/")}`);
+
+  // 入口被当模块 require 的那一行留痕（本闸就是那个 require）。没有它时「gateway.cjs 没被当入口跑」是
+  // 零副作用的静默退出，排查时连一行 boot 日志都没有——这条同时钉住上面那句「除一行留痕外不许有副作用」。
+  const notMain = await waitForLogLine(/entry-not-main \{"filename":/, 3000);
+  assert.ok(notMain.line, "⑨ 入口被 require 时没留 entry-not-main 痕（SANDBOX 的 gateway.log 里找不到）："
+    + notMain.text.slice(0, 300));
+  pass("⑨ 入口被 require（非 main）时留下一行 entry-not-main 留痕，其余零副作用");
+
+  // ---- ⑨a 配对（真子进程 + 真命令表）：并发 30 条 proxy_status + 5 条 gateway_echo ----
+  const r9 = await gw.start({ persistent: false });
+  assert.strictEqual(r9.ok, true, "⑨a 前提不成立：子进程起不来，后面五组都测不到：" + (r9.message || ""));
+  knownPids.add(r9.pid);
+  fs.writeFileSync(path.join(SANDBOX, "AgentHub", "config.json"), JSON.stringify({ proxy: { port: PAIR_PORT } }), "utf8");
+  const start9 = await gw.call("proxy_start", {});
+  assert.strictEqual(start9.ok, true, "⑨a 前提不成立：子进程没进监听态（uptime 会恒为 0，「单调不减」就自我实现了）：" + JSON.stringify(start9));
+  await sleep(50);                       // 让 uptime 真的走过几毫秒，30 条之间要能分出先后
+  const reqs9 = [];
+  for (let i = 0; i < 30; i++) reqs9.push({ cmd: "proxy_status", tag: "s" + i });
+  for (let i = 0; i < 5; i++) reqs9.push({ cmd: "gateway_echo", tag: "e" + i });
+  const out9 = await Promise.all(reqs9.map((rq, i) => gw.call(rq.cmd, rq.cmd === "gateway_echo" ? { v: rq.tag } : {})
+    .then((d) => ({ i, rq, d }), (e) => ({ i, rq, err: String((e && e.message) || e) }))));
+  const errs9 = out9.filter((r) => r.err);
+  assert.deepStrictEqual(errs9.map((r) => r.err), [],
+    "⑨a 并发 35 条里有命令没拿到响应（配对错乱 / 悬挂就会在这里现形）：" + JSON.stringify(errs9.slice(0, 3)));
+  const echoes9 = out9.filter((r) => r.rq.cmd === "gateway_echo");
+  assert.strictEqual(echoes9.length, 5, "⑨a 前提不成立：gateway_echo 不是 5 条");
+  for (const r of echoes9) {
+    assert.strictEqual(r.d && r.d.v, r.rq.tag,
+      "⑨a gateway_echo 拿回了**别的请求**的载荷 = id 串号：" + JSON.stringify({ i: r.i, want: r.rq.tag, got: r.d && r.d.v }));
+  }
+  const ups9 = out9.filter((r) => r.rq.cmd === "proxy_status").sort((a, b) => a.i - b.i).map((r) => Number(r.d.uptime));
+  assert.ok(ups9.every((u) => Number.isFinite(u)), "⑨a proxy_status 没带回 uptime 字段：" + JSON.stringify(ups9.slice(0, 3)));
+  for (let i = 1; i < ups9.length; i++) {
+    assert.ok(ups9[i] >= ups9[i - 1], "⑨a 按请求序号排的 uptime 出现倒退（第 " + i + " 条 " + ups9[i - 1] + " → " + ups9[i] + "）：响应与请求配错了");
+  }
+  assert.ok(new Set(ups9).size >= 2,
+    "⑨a 30 条 proxy_status 的 uptime 全等于 " + ups9[0] + " —— 「单调不减」是被常量实现的，这条闸自我实现");
+  pass(`⑨a 真子进程并发 35 条全部各归各（echo 5/5 载荷对得上、proxy_status 的 uptime 按请求序单调不减且非恒定）`);
+
+  // 上面那一条**没有**构造出乱序：真命令表的派发是同步跑完的，完成顺序天然等于请求顺序。
+  // 「乱序返回不串号」必须再拿桩补一半——故意让先发的挂久一点，完成顺序与请求顺序相反。
+  const TOK9 = "task4-stub-token-0123456789abcdef0123456789abcdef";
+  const pipe9 = (tag) => String.raw`\\.\pipe\agenthub-gw-t4-${tag}-${process.pid}-${Date.now().toString(36)}`;
+  let seqStub = 0;
+  const PP_A = pipe9("pair-stub");
+  const srvA = await gatewayPipe.serve({
+    token: TOK9, pipePath: PP_A,
+    dispatch: async (cmd, args) => {
+      // 序号在**派进入口**时领（对应真代码里「帧到达顺序 = 派发顺序」这一事实），hold 之后才回，
+      // 于是完成顺序与请求顺序相反——这正是本条要造出来的乱序。
+      const mine = ++seqStub;
+      const hold = Number((args && args.hold) || 0);
+      if (hold) await sleep(hold);
+      return { v: String((args && args.v) || ""), seq: mine, uptime: mine * 1000 };
+    },
+  });
+  const connA = await gatewayPipe.connect({ pipePath: PP_A, token: TOK9, timeoutMs: 5000 });
+  const planA = [{ tag: "a", hold: 120 }, { tag: "b", hold: 90 }, { tag: "c", hold: 60 }, { tag: "d", hold: 0 }, { tag: "e", hold: 30 }, { tag: "f", hold: 10 }];
+  const arrivedA = [];
+  const resA = await Promise.all(planA.map((p, i) => connA.call("proxy_status", { v: p.tag, hold: p.hold })
+    .then((d) => { arrivedA.push(d.v); return { i, p, d }; }, (e) => ({ i, p, err: String((e && e.message) || e) }))));
+  assert.deepStrictEqual(resA.filter((r) => r.err).map((r) => r.err), [], "⑨a-2 乱序场景里有命令没回来：" + JSON.stringify(resA.filter((r) => r.err)));
+  assert.ok(resA.every((r) => r.d.v === r.p.tag), "⑨a-2 乱序返回时串号了：" + JSON.stringify(resA.map((r) => ({ want: r.p.tag, got: r.d && r.d.v }))));
+  assert.notDeepStrictEqual(arrivedA, planA.map((p) => p.tag),
+    "⑨a-2 完成顺序与请求顺序相同 → hold 梯度没生效，这条压根没测到乱序（自我实现）：" + arrivedA.join(","));
+  const upsA = resA.slice().sort((x, y) => x.i - y.i).map((r) => Number(r.d.uptime));
+  for (let i = 1; i < upsA.length; i++) {
+    assert.ok(upsA[i] >= upsA[i - 1], "⑨a-2 乱序下按请求序号排仍须单调不减，第 " + i + " 条破了：" + JSON.stringify(upsA));
+  }
+  connA.close();
+  srvA.close();
+  pass(`⑨a-2 完成顺序被人为打乱（实际到达序 ${arrivedA.join(">")}）后 6 条仍各归各，串号必红`);
+
+  // ---- ⑨b 事件回流：真调用点（credits.cjs 的 events.emit）+ 反过来的帧序 ----
+  const got9 = [];
+  const off9 = gw.onEvent((p) => got9.push(p));
+  const creditsRep = await gw.call("proxy_credits_refresh", {});
+  assert.strictEqual(creditsRep.ok, true, "⑨b 子进程里 proxy_credits_refresh 失败：" + JSON.stringify(creditsRep));
+  for (let i = 0; i < 60 && !got9.some((p) => p && p.type === "credits"); i++) await sleep(25);
+  assert.ok(got9.some((p) => p && p.event === "proxy" && p.type === "credits"),
+    "⑨b 真调用点（proxy_credits_refresh → credits 的 events.emit）的事件没回流到 onEvent：" + JSON.stringify(got9));
+  pass(`⑨b 真调用点回流：proxy_credits_refresh → onEvent 收到 {event:'proxy',type:'credits'}（本连接共 ${got9.length} 帧）`);
+
+  // 真代码只有「事件先、响应后」这一半，另外一半（响应先到、事件后到）用桩构造：
+  let srvB = null;
+  const PP_B = pipe9("evt-order");
+  srvB = await gatewayPipe.serve({
+    token: TOK9, pipePath: PP_B,
+    dispatch: async (cmd, args) => {
+      if (cmd === "proxy_credits_refresh") {
+        setTimeout(() => srvB.broadcast({ k: "evt", payload: { event: "proxy", type: "credits", late: true } }), 40);
+        return { ok: true, total: 0, failed: 0 };
+      }
+      return { v: String((args && args.v) || "") };
+    },
+  });
+  const connB = await gatewayPipe.connect({ pipePath: PP_B, token: TOK9, timeoutMs: 5000 });
+  const orderB = [];
+  connB.onEvent((p) => orderB.push("evt:" + (p && p.type) + ":" + (p && p.late)));
+  // 必须是 push：两条投递各按自己**收到的时刻**入列。写 splice(0,0,"res") 会把响应钉在第一位，
+  // 那条「响应先到、事件后到」的判据就自我实现了（变异「广播改同步先发」实测照样绿）。
+  await connB.call("proxy_credits_refresh", {}).then(() => orderB.push("res"), () => orderB.push("res-fail"));
+  await sleep(250);
+  assert.deepStrictEqual(orderB, ["res", "evt:credits:true"],
+    "⑨b 「响应帧先到、事件帧后到」必须照常投递（真代码只覆盖了事件先那一半），实得：" + JSON.stringify(orderB));
+  const aliveB = await connB.call("gateway_echo", { v: "evt-not-mistaken-for-res" });
+  assert.strictEqual(aliveB.v, "evt-not-mistaken-for-res", "⑨b 事件帧被当成响应帧走了 id 分流的话，这里就拿不到自己的响应了");
+  connB.close();
+  srvB.close();
+  pass("⑨b 帧序两半都过：事件先（真子进程）与响应先（桩）都能投递，evt 帧不占 id 分流");
+
+  // ---- ⑨c 默认超时上界 + NO_TIMEOUT_CMDS 免误拒 + 丢帧不静默 ----
+  const HANG_MS = 12000;                 // 必须 > DEFAULT_TIMEOUT_MS：只有真挂死才测得出「有上界」
+  const PP_C = pipe9("timeout");
+  const srvC = await gatewayPipe.serve({
+    token: TOK9, pipePath: PP_C,
+    dispatch: async (cmd, args) => {
+      const hold = Number((args && args.hold) || 0);
+      if (hold) await sleep(hold);
+      if (cmd === "proxy_checkin_run") return { stubbed: "checkin", held: hold };
+      if (cmd === "proxy_will_hang") return { never: true };
+      return { v: String((args && args.v) || "") };
+    },
+  });
+  const connC = await gatewayPipe.connect({ pipePath: PP_C, token: TOK9, timeoutMs: 5000 });
+  const tHang = Date.now();
+  const hungP = connC.call("proxy_will_hang", { hold: HANG_MS });          // 不传 opts：走**默认**上界
+  const tFree = Date.now();
+  const freeP = connC.call("proxy_checkin_run", { hold: HANG_MS });        // 同在 NO_TIMEOUT_CMDS 里的另一条同理
+  // 这条 await 必须自带看门狗：没有默认超时时 hungP 永远不 settle，本闸只能靠 420 s 的整体硬超时收，
+  // 红是红了但指不到「缺默认上界」这一条。给它一个上界的 1.5 倍，超了就如实造一个错。
+  const hungR = await Promise.race([
+    hungP.then(() => null, (e) => ({ e, ms: Date.now() - tHang })),
+    sleep(proto.DEFAULT_TIMEOUT_MS * 2).then(() => ({
+      ms: -1, e: new Error("命令在 " + proto.DEFAULT_TIMEOUT_MS * 2 + " ms 内既没返回也没被判超时（默认上界不存在）"),
+    })),
+  ]);
+  assert.ok(hungR, "⑨c 挂 12 s 的普通命令竟然正常返回了 —— 默认超时没生效，Task 3 那条「默认永不超时」回来了");
+  assert.match(String(hungR.e.message), /未在 10000ms 内应答/, "⑨c 超时要报得人话，实得：" + String(hungR.e.message));
+  assert.ok(hungR.ms >= proto.DEFAULT_TIMEOUT_MS - 500 && hungR.ms <= proto.DEFAULT_TIMEOUT_MS + 2000,
+    "⑨c 超时落在 " + hungR.ms + " ms，不在 proto.DEFAULT_TIMEOUT_MS(" + proto.DEFAULT_TIMEOUT_MS + ") 附近 → 上界不是这个常量给的");
+  assert.strictEqual(hungR.e.notRetried, true, "⑨c 超时的 reject 必须带 notRetried 标记（简报 Step 2）：" + String(hungR.e.message));
+  const freeR = await freeP.then((d) => ({ d, ms: Date.now() - tFree }), (e) => ({ e, ms: Date.now() - tFree }));
+  assert.ok(freeR.d, "⑨c NO_TIMEOUT_CMDS 里的 proxy_checkin_run 被误拒了：" + String(freeR.e && freeR.e.message)
+    + " —— 免超时清单没生效，长任务会被管道层砍掉");
+  assert.ok(freeR.ms >= HANG_MS - 300, "⑨c 桩挂 " + HANG_MS + " ms 却在 " + freeR.ms + " ms 就返回了？免超时那条不是靠真等出来的");
+  assert.strictEqual(freeR.d.stubbed, "checkin", "⑨c 免超时命令的响应内容不对：" + JSON.stringify(freeR.d));
+  await sleep(250);                        // 让那条 12 s 才落地的迟到响应穿过客户端
+  const aliveC = await connC.call("gateway_echo", { v: "after-timeout-and-late-frame" });
+  assert.strictEqual(aliveC.v, "after-timeout-and-late-frame",
+    "⑨c 超时 + 迟到响应帧之后连接必须仍可用（迟到的 id 只能被丢弃，不许把连接搞坏）");
+  const tightC = await connC.call("proxy_will_hang", { hold: 500 }, { timeoutMs: 120 }).then(() => null, (e) => e);
+  assert.ok(tightC && /未在 120ms 内应答/.test(String(tightC.message)),
+    "⑨c 显式 opts.timeoutMs 必须仍然说了算（收紧与放宽都由调用方定），实得：" + String(tightC && tightC.message));
+  const looseC = await connC.call("proxy_will_hang", { hold: 300 }, { timeoutMs: 3000 });
+  assert.strictEqual(looseC.never, true, "⑨c 显式放宽到 3 s 后，300 ms 的命令不该被判超时");
+  // 丢帧不静默：writeFrame 必须把「写不出去」如实回给调用方。Task 3 的注释写着「命令帧由 pending 超时兜」，
+  // 那之前得先知道帧没了——用假 socket 钉这条判据本身，不依赖 OS 的断连时序窗口。
+  const hooks = gatewayPipe.__hooks;
+  assert.ok(hooks && typeof hooks.writeFrame === "function",
+    "⑨c 必须导出 __hooks.writeFrame 供这条判据钉死（与 secretbox.__selfCheck 同类的测试可见性，不进产品路径）");
+  let wroteCalls = 0;
+  assert.strictEqual(hooks.writeFrame({ writable: false, write() { wroteCalls += 1; } }, { k: "req", id: "1" }), false,
+    "⑨c 不可写的 socket 上 writeFrame 必须回 false（回 true / 不回值 = 静默丢帧，命令就永远不回来）");
+  assert.strictEqual(wroteCalls, 0, "⑨c 既然判定不可写，就不该再去碰 write()");
+  assert.strictEqual(hooks.writeFrame({ writable: true, write() { wroteCalls += 1; } }, { k: "req", id: "2" }), true,
+    "⑨c 可写的 socket 上 writeFrame 必须回 true");
+  assert.strictEqual(wroteCalls, 1, "⑨c 可写时 write 应被调用恰好一次，实得 " + wroteCalls);
+  const connDead = await gatewayPipe.connect({ pipePath: PP_C, token: TOK9, timeoutMs: 5000 });
+  connDead.close();
+  const tDead = Date.now();
+  const deadR = await connDead.call("proxy_pool", {}).then(() => null, (e) => ({ e, ms: Date.now() - tDead }));
+  assert.ok(deadR, "⑨c 已断开的连接上 call 必须 reject，不许静默悬挂");
+  assert.match(String(deadR.e.message), /未投递/, "⑨c 断连后的失败必须说清「命令没投出去」：" + String(deadR.e.message));
+  assert.ok(deadR.ms < 1000, "⑨c 断连后的命令必须立即失败而不是等默认超时：" + deadR.ms + " ms");
+  assert.strictEqual(deadR.e.notRetried, true, "⑨c 未投递的错也要带 notRetried：" + String(deadR.e.message));
+  connC.close();
+  srvC.close();
+  pass(`⑨c 默认上界生效：挂 12 s 的普通命令在 ${hungR.ms} ms 报 timeout（常量 ${proto.DEFAULT_TIMEOUT_MS}），`
+    + `免超时的 proxy_checkin_run 撑满 ${freeR.ms} ms 正常返回；显式 timeoutMs 仍说了算；`
+    + `writeFrame 不可写时回 false、断连后 ${deadR.ms} ms 立即「未投递」`);
+
+  // ---- ⑨d 有界队列（夹具进程里量 rss，见夹具 G 的注释）----
+  const qReport = path.join(work, "queue.json");
+  const qRun = await spawnFixture("gw-queue.cjs", [BE, qReport, "200", "150"], {
+    APPDATA: sandboxDir("queue"), AGENT_SKILLS_HOME: path.join(work, "hub-queue"),
+  }).done;
+  assert.strictEqual(qRun.code, 0, "⑨d 队列夹具跑挂了：" + qRun.out + qRun.err);
+  await waitForFile(qReport, 15000);
+  const q = JSON.parse(fs.readFileSync(qReport, "utf8"));
+  assert.strictEqual(q.rejected, q.total - q.queueMax,
+    "⑨d 压 " + q.total + " 条应当只拒 " + (q.total - q.queueMax) + " 条，实得 " + q.rejected + "（上界没生效 / 拒过头了）");
+  assert.strictEqual(q.accepted, q.queueMax, "⑨d 前 " + q.queueMax + " 条必须被受理，实得 " + q.accepted);
+  assert.deepStrictEqual(q.otherRejects, [], "⑨d 拒的理由必须全是「队列已满」，其它原因：" + JSON.stringify(q.otherRejects));
+  assert.match(q.sampleReject, /队列已满/, "⑨d 拒绝信息必须含「队列已满」，实得：" + q.sampleReject);
+  assert.match(q.sampleReject, /待响应\s*64/, "⑨d 拒绝信息必须带上**当前** pending 数（可诊断），实得：" + q.sampleReject);
+  assert.match(q.sampleReject, /上界\s*64/, "⑨d 拒绝信息必须带上界，实得：" + q.sampleReject);
+  assert.strictEqual(q.notRetriedAll, true, "⑨d 被拒的命令也必须带 notRetried（它们从未投递，重放语义同样不成立）");
+  assert.ok(q.maxRejectMs < 1000,
+    "⑨d 第 65 条必须**立刻**被拒（实测最晚一条在 " + q.maxRejectMs + " ms 才拒）：等满超时就是渲染层假死");
+  assert.strictEqual(q.dispatches, q.queueMax,
+    "⑨d 服务端只该收到 " + q.queueMax + " 条，实收 " + q.dispatches + " 条：客户端的上界没真的挡住投递");
+  assert.ok(q.peak <= q.queueMax, "⑨d 服务端同时在飞 " + q.peak + " 条 > 上界 " + q.queueMax + "（子进程堆内存就是这么压爆的）");
+  assert.ok(q.rssGrowthMb < 20, "⑨d 夹具进程 rss 增长 " + q.rssGrowthMb.toFixed(1) + " MB ≥ 20 MB");
+  pass(`⑨d 有界队列：200 条并发 → 受理 ${q.accepted} / 立即拒 ${q.rejected} 条（${q.maxRejectMs} ms 内），服务端峰值在飞 ${q.peak}，rss +${q.rssGrowthMb.toFixed(2)} MB`);
+
+  // ---- ⑨e 不重放：断连的 in-flight 命令不许在重连后自动重发 ----
+  // 实测依据（不是推测）：pool.cjs 的 poolAccounts() 会把「派生复活」经 store.updateAccount() 回写，
+  // effectiveStatus() 在 cooling/exhausted 到期时真落库 —— proxy_pool 这条「读」带写副作用，
+  // 任何重放都是重复执行写操作。二期没有幂等表，所以**不做**自动重试，本条守的就是「真的没有」。
+  const callsE = {};
+  const PP_E = pipe9("no-retry");
+  const srvE = await gatewayPipe.serve({
+    token: TOK9, pipePath: PP_E,
+    dispatch: async (cmd, args) => {
+      callsE[cmd] = (callsE[cmd] || 0) + 1;
+      if (cmd === "proxy_pool") { await sleep(400); return [{ channel: "trae", accounts: [] }]; }
+      return { v: String((args && args.v) || "") };
+    },
+  });
+  assert.ok(proto.NON_IDEMPOTENT_READS.has("proxy_pool"), "⑨e 前提：proxy_pool 必须在 NON_IDEMPOTENT_READS 清单里，否则这条判据没对象");
+  const connE = await gatewayPipe.connect({ pipePath: PP_E, token: TOK9, timeoutMs: 5000 });
+  const inFlightE = connE.call("proxy_pool", {});
+  await sleep(120);                        // 400 ms 才回，此刻确定在途
+  connE.close();                           // 模拟断连（token 被拒 / 管道被强拆都走同一条 drop）
+  const errE = await inFlightE.then(() => null, (e) => e);
+  assert.ok(errE, "⑨e 断连时 in-flight 的 proxy_pool 必须 reject，不许静默悬挂");
+  assert.strictEqual(errE.notRetried, true, "⑨e reject 的错误必须带 notRetried 标记（简报 Step 2）：" + String(errE.message));
+  assert.match(String(errE.message), /proxy_pool/, "⑨e 错误要点名那条命令：" + String(errE.message));
+  assert.match(String(errE.message), /重放/, "⑨e 错误要说明「不会自动重放」：" + String(errE.message));
+  await sleep(600);                        // 服务端那条 400 ms 的回包此刻落地：往已断开的 socket 写帧必须不炸也不重投
+  assert.strictEqual(callsE.proxy_pool || 0, 1,
+    "⑨e 断连之前服务端只该收到 1 次 proxy_pool，实得 " + (callsE.proxy_pool || 0) + " 次");
+  const connE2 = await gatewayPipe.connect({ pipePath: PP_E, token: TOK9, timeoutMs: 5000 });
+  const otherE = await connE2.call("gateway_echo", { v: "reconnected" });
+  assert.strictEqual(otherE.v, "reconnected", "⑨e 重连后的新连接不可用");
+  assert.strictEqual(callsE.proxy_pool || 0, 1,
+    "⑨e 重连后服务端 proxy_pool 的调用次数变成 " + (callsE.proxy_pool || 0) + " —— 有人在断连/重连路径上做了自动重放。"
+    + "proxy_pool 的读会回写派生复活（pool.cjs 的 poolAccounts → store.updateAccount），重放 = 重复执行写操作");
+  const explicitE = await connE2.call("proxy_pool", {});
+  assert.ok(Array.isArray(explicitE), "⑨e 显式再调一次 proxy_pool 必须正常返回，实得：" + JSON.stringify(explicitE));
+  assert.strictEqual(callsE.proxy_pool, 2,
+    "⑨e 那个计数必须是活的：显式再调一次后应为 2，实得 " + callsE.proxy_pool
+    + "（若恒为 1，上面那条 ===1 就是自我实现的假绿）");
+  connE2.close();
+  srvE.close();
+  off9();
+  const stop9 = await gw.stopAndWait({ timeoutMs: 8000 });
+  assert.strictEqual(stop9.stopped, true, "⑨e 收尾没停掉 ⑨a 起的子进程：" + stop9.message);
+  assert.ok(await waitForPortFree(PAIR_PORT, 5000), "⑨e 收尾后端口 " + PAIR_PORT + " 还有人 accept");
+  pass("⑨e 不重放有牙：断连的 proxy_pool 立即 reject(notRetried) 且服务端计数停在 1，显式重调才变 2（计数本身有牙）");
+
   // ===== ⑧ 收尾卫生核对（探针三件套 + 第五条）=====
   assert.strictEqual(realBaseline(), realBefore,
     "⑧ 真实 %APPDATA%\\AgentHub\\proxy\\stats.db 被本次运行写动了（size@mtime 变了）：\n  before " + realBefore + "\n  after  " + realBaseline());
@@ -915,13 +1304,87 @@ fs.writeFileSync(path.join(d,"names.txt"), fs.readdirSync(path.join(d,"AgentHub"
   pass("⑧ 收尾：真实 stats.db / -wal 的 size@mtime 未变（零写入直接证据）、HKCU Run 项未变");
 }
 
+// ===== --bench：性能回归（简报 Step 3），与断言组互不牵扯，单独一条命令跑 =====
+// 量的是**真** proxy_pool（4 渠道 × 全量号池派生 + JSON 编帧 + named pipe 往返），号池是本地库数据，
+// 不走上游，所以能在沙箱里播假号。「无窗期一次真补全的 TTFT」这里量不了：那要真凭据真上游，
+// 而本闸的硬约束是不碰真实登录文件与真实 %APPDATA%——已在报告里登记为 NOT-VERIFIED，
+// 用「空载往返 + 子进程内同一条命令的耗时」两项把跨进程那部分开销拆开给归因。
+const POOL_RTT_BUDGET_MS = 30;           // 简报 Step 3 钉的硬指标：全量号池×4 渠道经 JSON 的单次往返
+const pct = (sorted, p) => sorted[Math.max(0, Math.min(sorted.length - 1, Math.ceil(p / 100 * sorted.length) - 1))];
+const fmt = (x) => Number(x).toFixed(2);
+
+function stats(name, arr) {
+  const s = arr.slice().sort((a, b) => a - b);
+  const o = { name, n: s.length, min: s[0], p50: pct(s, 50), p90: pct(s, 90), p95: pct(s, 95), max: s[s.length - 1] };
+  console.log(`  ${name}: n=${o.n} min=${fmt(o.min)} p50=${fmt(o.p50)} p90=${fmt(o.p90)} p95=${fmt(o.p95)} max=${fmt(o.max)} ms`);
+  return o;
+}
+
+async function bench() {
+  writeFixtures();
+  const dir = sandboxDir("bench");
+  fs.mkdirSync(dir, { recursive: true });
+  const SEED = 40, N = 25;
+  console.log(`BENCH 基准：沙箱库播 ${SEED} 个号（4 渠道轮播），每条采样 ${N} 次`);
+  const child = spawn(process.execPath, [path.join(work, "gw-bench.cjs"), BE, String(SEED)], {
+    cwd: work, env: Object.assign({}, process.env, { APPDATA: dir, AGENT_SKILLS_HOME: path.join(work, "hub-bench") }),
+    stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
+  });
+  knownPids.add(child.pid);
+  child.stderr.setEncoding("utf8");
+  let childErr = "";
+  child.stderr.on("data", (d) => { childErr += d; });
+  child.stdout.setEncoding("utf8");
+  let out = "";
+  child.stdout.on("data", (d) => { out += d; });
+  const deadline = Date.now() + 30000;
+  let ep = null;
+  while (!ep && Date.now() < deadline) {
+    const m = /^BENCH-LISTEN (\{.*\})$/m.exec(out);
+    if (m) ep = JSON.parse(m[1]);
+    else await sleep(100);
+  }
+  assert.ok(ep, "BENCH 夹具子进程没报出管道名（30 s）：" + out + childErr);
+  const conn = await gatewayPipe.connect({ pipePath: ep.pipePath, token: ep.token, timeoutMs: 20000 });
+  const once = async (fn) => { const t = process.hrtime.bigint(); const r = await fn(); return { r, ms: Number(process.hrtime.bigint() - t) / 1e6 }; };
+  const pool = [], tiny = [];
+  for (let i = 0; i < N; i++) pool.push((await once(() => conn.call("proxy_pool", {}))).ms);
+  for (let i = 0; i < N; i++) tiny.push((await once(() => conn.call("gateway_echo", { v: "x" }))).ms);
+  const local = await once(() => conn.call("bench_local", {}));
+  const size = await once(() => conn.call("proxy_pool", {}));
+  const bytes = JSON.stringify(size.r).length;
+  conn.close();
+  try { process.kill(child.pid); } catch { /* 已退 */ }   // 只按本次记下的 pid 精确杀（绝不宽匹配进程名）
+  const sp = stats("proxy_pool 往返（管道全量：4 渠道 × " + SEED + " 号，响应 " + bytes + " B）", pool);
+  const st = stats("gateway_echo 往返（空载，纯管道税）", tiny);
+  console.log(`  proxy_pool 在子进程内本地执行（不含编帧/socket）：${fmt(local.r.ms)} ms，响应体 ${local.r.bytes} B`);
+  console.log(`  归因：往返 p50 ${fmt(sp.p50)} − 本地 ${fmt(local.r.ms)} ≈ ${fmt(sp.p50 - local.r.ms)} ms 是跨进程那一层（编帧 + 排队 + socket）；空载往返 p50 ${fmt(st.p50)} ms`);
+  assert.ok(sp.p50 < POOL_RTT_BUDGET_MS,
+    "BENCH proxy_pool 往返中位数 " + fmt(sp.p50) + " ms ≥ " + POOL_RTT_BUDGET_MS + " ms 硬指标。归因：本地执行 " + fmt(local.r.ms)
+    + " ms、跨进程层 " + fmt(sp.p50 - local.r.ms) + " ms、空载往返 " + fmt(st.p50) + " ms、响应 " + bytes
+    + " B。不许靠加缓存压这个数（proxy_pool 带写副作用，见 gateway-pipe.cjs 的 NON_IDEMPOTENT_READS 注释）");
+  console.log("BENCH 通过：proxy_pool 往返中位数 " + fmt(sp.p50) + " ms < " + POOL_RTT_BUDGET_MS + " ms");
+}
+
+if (process.argv.includes("--bench")) {
+  bench().then(() => {
+    cleanupOwnProcesses();
+    try { fs.rmSync(work, { recursive: true, force: true }); } catch { /* Windows 偶发 EBUSY，交给系统回收 */ }
+  }).catch((e) => {
+    cleanupOwnProcesses();
+    console.log("临时目录保留供排查：" + work);
+    console.error(e && e.message ? e.message : e);
+    process.exit(1);
+  });
+} else {
 main().then(() => {
   cleanupOwnProcesses();
   try { fs.rmSync(work, { recursive: true, force: true }); } catch { /* Windows 偶发 EBUSY，交给系统回收 */ }
-  console.log(`OK 生命周期基座四组判据全通过（共 ${steps} 项）`);
+  console.log(`OK 生命周期基座 + 命令通道判据全通过（共 ${steps} 项）`);
 }).catch((e) => {
   cleanupOwnProcesses();
   console.log("临时目录保留供排查：" + work);
   console.error(e && e.message ? e.message : e);
   process.exit(1);
 });
+}

@@ -84,8 +84,17 @@ async function main() {
   watchedExe = String(hs.exePath || process.execPath);
   log.line("boot", { version: util.appVersion(), secretBackend: secretbox.backend(), persistent });
   secretbox.assertUsable();                    // 凭据不可用 → 启动期失败，不空号池空转
-  rules.init(); store.open();                  // 与一期 boot() 同一装配序（不含 server.start）
+  rules.init(); store.open();
   store.startCheckpointTimer();
+  // 握手文件必须在**开始 accept 之前**落盘：主进程的 connect 一成功就返回 ok（它只等 socket 建成，
+  // 不等这份文件），文件写在 listen 之后就是让父进程读一个还不存在的真相源——实测会随机红
+  // （dev-gateway-pipe-test ①「gateway.json 不存在」，磁盘慢的那几次必中）。
+  // 不变式因此变成「管道连得上 ⇒ 握手文件已在盘上」，认领方与 stopAndWait 的 portFreed 都靠它。
+  gatewayRecord = {
+    pid: process.pid, pipe: hs.pipePath, token: hs.token, port: 0,
+    version: util.appVersion(), startedAt: Date.now(), secretBackend: secretbox.backend(),
+  };
+  writeGatewayFile(gatewayRecord);
   const srv = await gatewayPipe.serve({
     token: hs.token, pipePath: hs.pipePath,           // pipePath 由主进程命名并经握手投递（两端必须同一个值）
     // 两条内建命令不属于那 43 条，故不进 preload 白名单；gateway_echo 供认领双检验 token，
@@ -105,11 +114,6 @@ async function main() {
   srvRef = srv;
   // sink 必须在 srv 建好之后注入（否则子进程启动早期 events.emit 无处可写）——这是装配序，不是风格
   proxy.attachGatewayMode({ emit: (payload) => srv.broadcast({ k: "evt", payload }) });
-  gatewayRecord = {
-    pid: process.pid, pipe: srv.pipePath, token: hs.token, port: 0,
-    version: util.appVersion(), startedAt: Date.now(), secretBackend: secretbox.backend(),
-  };
-  writeGatewayFile(gatewayRecord);
   startWatchdog(hs.parentPid);
   await srv.ready;                             // 主进程连上后才算 ready
 }
@@ -194,8 +198,8 @@ function stopWatchdog() {
  *  · 现有那条 gateway_shutdown 响应本来就是这次停机的天然回执，只差没被丢掉。而它过去确实被丢掉：
  *    老代码在 dispatch 还没 resolve 时就同步 srvRef.close()，destroy 掉 socket 把响应帧一起带走了。
  *    所以顺序改成：done 出结论 → 微任务里 pipe 写帧 → 等 RESPONSE_FLUSH_MS 让 uv_write 落到内核缓冲
- *    → 才关管道（关早了就又丢帧）→ 干净则退 0；不干净**不**退 0，交给事件循环自然收摊，
- *    收不了摊由 EXIT_CEILING_MS 那条上界计时器以 UNCLEAN_EXIT_CODE 硬退（它是唯一的硬退点）。
+ *    → 才关管道（关早了就又丢帧）→ 干净则退 0；不干净**不**退 0，那条 ref 着的 EXIT_CEILING_MS 上界
+ *    计时器一定会在 2000 ms 后以 UNCLEAN_EXIT_CODE 硬退（它是唯一的硬退点，也是不干净那一支的唯一出口）。
  */
 function gracefulExit(reason) {
   const st = server.status();
@@ -242,10 +246,10 @@ function gracefulExit(reason) {
   }));
   acked.then((rep) => {
     if (rep.ok && rep.drained && !rep.forced) { finish(0); return; }   // 排干了：管道已关、响应已出，退 0
-    // 没排干（或 gracefulShutdown 自己抛了错）：**不**走 process.exit(0)。上面那次 srvRef.close() 已经把
-    // 本文件持有的句柄（管道 server + 客户端 socket）全部交出，watcher / 周期 checkpoint 计时器 / 库句柄
-    // 由 gracefulShutdown 交出：事件循环空了就自然收摊，还挂着别的 ref 句柄就说明"停不干净"，
-    // 由那条上界计时器以 UNCLEAN_EXIT_CODE 硬退（它是本函数唯一的硬退点）。
+    // 没排干（或 gracefulShutdown 自己抛了错）：**不**走 process.exit(0)，也不指望事件循环自然收摊——
+    // 上面那条 EXIT_CEILING_MS 的计时器是 ref 着的，所以这一支**必然**在 2000 ms 后由 finish(UNCLEAN_EXIT_CODE)
+    // 收场（父进程在 child-exit 那行看到 3）。换句话说：留痕之后这里没有第三条路，别把「事件循环空了就自己退」
+    // 当成本分支的行为——那条分支在有上界计时器之后已经不可达。
     log.line("shutdown-unclean", {
       reason, drained: rep.drained, forced: rep.forced, ok: rep.ok, message: rep.message || "",
     });
@@ -259,6 +263,10 @@ function gracefulExit(reason) {
 // 实测 require.main === module 在 ELECTRON_RUN_AS_NODE=1 那条路上同样成立（真子进程闸 ①③ 全绿即证据）。
 if (require.main === module) {
   main().catch((e) => { log.line("fatal", { message: String((e && e.message) || e) }); process.exit(1); });
+} else {
+  // 入口被当成模块 require 了（打包路径 / asar 前缀写错 / 有人顺手 import 它）：装配一行都没跑，
+  // 子进程会静默地什么都不做。留一痕，否则排查时连「入口没被当 main 跑」这条都看不到。
+  log.line("entry-not-main", { filename: __filename, parent: require.main && require.main.filename });
 }
 
 module.exports = { EXIT_CEILING_MS, RESPONSE_FLUSH_MS, UNCLEAN_EXIT_CODE, WATCHDOG_MS };
