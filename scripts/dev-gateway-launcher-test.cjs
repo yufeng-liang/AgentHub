@@ -17,6 +17,9 @@
 //     不出现）、不落任何 Run 项（applyAutoStart 的便携版早退 + start 本身不注册，两路合起来零注册）。
 //  ③ applyAutoStart 的注册目标随 schedule.persistentGateway 切换：off → 主 App exe（不传 path，
 //     Electron 默认 execPath）、on → 安装根目录 agenthub-gateway.cmd、关闭自启 → openAtLogin:false 注销。
+//     【终审修复】Windows 下 Run 项按 path+args 为键（electron.d.ts setLoginItemSettings 文档语义：
+//     传 path 与不传 path 是两个独立条目），换目标不会覆盖旧项——所以三档都是「注册/注销本档目标
+//     + 显式清另一目标」两次调用，双向对称防双残留。
 //     用注入 require.cache 的 mock electron 断言 setLoginItemSettings 入参，**绝不真改本机注册表**；
 //     收尾再按既有闸（dev-gateway-pipe-test ⑧）的 regValue() 手法核对 HKCU Run 原样。
 //
@@ -192,21 +195,25 @@ async function case2() {
 }
 
 // ===== ③ applyAutoStart 注册目标随 persistentGateway 切换（mock 入参断言，绝不真改注册表） =====
+// 【终审修复】双向对称：每一档都恰好两次调用——本档目标置位 + 另一目标显式清掉。
+// Windows 的 HKCU Run 项按 path+args 为键，换目标不清旧项 = 双残留（.cmd 与主 exe 并存），
+// 所以旧版「一次调用换 path 重注册」的断言序列整体作废，改按下面的六次调用逐条钉死。
 async function case3() {
   loginCalls.length = 0;
   const expectedCmd = path.join(path.dirname(process.execPath), "agenthub-gateway.cmd");
-  // off → 主 App exe：不传 path（Electron 默认注册 process.execPath）
+  // off 档（自启开、常驻关）→ 注册主 App exe + 清 .cmd 残留
   config.applyAutoStart({ schedule: { autoStart: true, persistentGateway: false } });
-  assert.strictEqual(loginCalls.length, 1, "off 档必须恰好注册一次");
-  assert.deepStrictEqual(loginCalls[0], { openAtLogin: true }, "off → 主 App exe（不得带 path，path 一旦传入目标就换了）");
-  // on → .cmd（安装根目录、与主 exe 同目录）
+  assert.deepStrictEqual(loginCalls[0], { openAtLogin: true }, "off 档第 1 调：注册主 App exe（不得带 path，path 一旦传入目标就换了）");
+  assert.deepStrictEqual(loginCalls[1], { openAtLogin: false, path: expectedCmd }, "off 档第 2 调：显式清 .cmd（上次常驻档留下的 Run 项不 supervise 会永久残留）");
+  // on 档（自启开、常驻开）→ 注册 .cmd + 清主 exe 残留
   config.applyAutoStart({ schedule: { autoStart: true, persistentGateway: true } });
-  assert.strictEqual(loginCalls.length, 2, "on 档必须恰好注册一次");
-  assert.deepStrictEqual(loginCalls[1], { openAtLogin: true, path: expectedCmd }, "on → 安装根目录 agenthub-gateway.cmd");
-  // 关闭自启：注销（openAtLogin:false），目标仍随 persistentGateway 给 .cmd（注销也要能对上旧目标）
+  assert.deepStrictEqual(loginCalls[2], { openAtLogin: true, path: expectedCmd }, "on 档第 1 调：注册安装根目录 agenthub-gateway.cmd");
+  assert.deepStrictEqual(loginCalls[3], { openAtLogin: false }, "on 档第 2 调：显式清主 exe（off 档留下的 Run 项必须一并注销）");
+  // 关闭自启 → 两个目标都注销（不管上次停在哪一档，两条 Run 项都得清干净）
   config.applyAutoStart({ schedule: { autoStart: false, persistentGateway: true } });
-  assert.deepStrictEqual(loginCalls[2], { openAtLogin: false, path: expectedCmd }, "关闭自启 = openAtLogin:false 注销");
-  assert.strictEqual(loginCalls.length, 3, "三次保存恰好三次注册调用，没有多也没有少");
+  assert.deepStrictEqual(loginCalls[4], { openAtLogin: false }, "关自启第 1 调：注销主 exe 目标");
+  assert.deepStrictEqual(loginCalls[5], { openAtLogin: false, path: expectedCmd }, "关自启第 2 调：注销 .cmd 目标（只清一边 = 另一边开机仍拉起）");
+  assert.strictEqual(loginCalls.length, 6, "三次保存恰好六次注册调用（每档 2 次：置位本档目标 + 清另一目标），没有多也没有少");
 }
 
 // ===== ④ 收尾卫生：HKCU Run 项原样（沿用既有闸的 regValue() 手法） =====

@@ -407,16 +407,33 @@ function setUpdateNotified(version) {
 //  · 关（默认）→ 主 App exe：开机拉起完整应用（不传 path，Electron 默认注册 process.execPath）；
 //  · 开 → 安装根目录的 agenthub-gateway.cmd（package.json extraFiles 落位，与主 exe 同目录）：
 //    开机只拉常驻网关子进程（--persistent，不建窗），主 App 由用户手动打开后认领该网关。
-// 打开/关闭都走同一条 setLoginItemSettings：openAtLogin:false 即注销，切目标 = 下次保存时换 path 重注册。
+// 【终审修复】双向注销对称：Windows 下登录项按 path+args 为键注册（electron.d.ts 对
+// setLoginItemSettings 的文档语义——「传了 path 的项」与「不传 path 默认注册 execPath 的项」
+// 是两个独立条目，openAtLogin:false 只注销与入参同键的那一个），换目标**不会**覆盖旧项。
+// 旧实现一次调用换 path 重注册，on→off 后 .cmd 的 Run 项永久残留（用户关掉常驻甚至关掉
+// 自启后开机仍拉常驻网关），off→on 后主 exe 项同理残留。故三条路径都显式双清：
+//  · autoStart=false：两个目标都注销；
+//  · autoStart=true && persistentGateway=false：注册主 exe + 清 .cmd；
+//  · autoStart=true && persistentGateway=true：注册 .cmd + 清主 exe。
 function applyAutoStart(cfg) {
   if (isPortable() || !electronApp || process.env.VITE_DEV_SERVER_URL) return;
   try {
     if (!electronApp.isPackaged) return;
-    const opts = { openAtLogin: !!(cfg.schedule && cfg.schedule.autoStart) };
-    if (cfg.schedule && cfg.schedule.persistentGateway) {
-      opts.path = path.join(path.dirname(process.execPath), "agenthub-gateway.cmd");
+    const autoStart = !!(cfg.schedule && cfg.schedule.autoStart);
+    const cmdPath = path.join(path.dirname(process.execPath), "agenthub-gateway.cmd");
+    if (!autoStart) {
+      // 关自启：不管上次停在哪一档，两条 Run 项都清干净
+      electronApp.setLoginItemSettings({ openAtLogin: false });
+      electronApp.setLoginItemSettings({ openAtLogin: false, path: cmdPath });
+      return;
     }
-    electronApp.setLoginItemSettings(opts);
+    if (cfg.schedule && cfg.schedule.persistentGateway) {
+      electronApp.setLoginItemSettings({ openAtLogin: true, path: cmdPath });
+      electronApp.setLoginItemSettings({ openAtLogin: false }); // 清主 exe 残留
+    } else {
+      electronApp.setLoginItemSettings({ openAtLogin: true });
+      electronApp.setLoginItemSettings({ openAtLogin: false, path: cmdPath }); // 清 .cmd 残留
+    }
   } catch { /* 注册失败不拦保存 */ }
 }
 

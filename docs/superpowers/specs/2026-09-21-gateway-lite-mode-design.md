@@ -69,7 +69,7 @@
 
 重开复用 `main.cjs:121-128` 的 `showWindow()`——它已有 `if (!mainWindow) createWindow()`，`createWindow()` 内的 `ready-to-show` 揭示（`:93-100`）与 `applyViewportZoom`（`:103-105`）都是每次重建走一遍，无需新增。
 
-两处窗口依赖要兜底，不重构：`ipc.cjs:109` 与 `proxy/index.cjs:413` 的 `dialog.showOpenDialog(BrowserWindow.getAllWindows()[0], ...)`。这两个调用只可能由已打开的窗口发起，但仍补「取不到窗口则不传 parent」的分支，避免将来把入口挪到托盘时静默抛错。
+两处窗口依赖要兜底，不重构：`ipc.cjs:115`（原文写 `:109`，一期后 `browse_dir` 处理器漂移到 `:112-116`）与 `proxy/index.cjs:413` 的 `dialog.showOpenDialog(BrowserWindow.getAllWindows()[0], ...)`。这两个调用只可能由已打开的窗口发起，但仍补「取不到窗口则不传 parent」的分支（ipc.cjs 侧已实装为 `:115` 的三元式），避免将来把入口挪到托盘时静默抛错。
 
 新增配置（见 §六）。
 
@@ -170,10 +170,10 @@
 
 ### 5.4 数据与配置写权
 
-- `stats.db` 由子进程**独占**：主进程不再 require 网关 store（现状 `ipc.cjs:472` → `proxy.register` 会把整张依赖图包括 `store.cjs` 拉进主进程）。
+- `stats.db` 由子进程**独占**：主进程不再 require 网关 store（一期前快照为 `ipc.cjs:472` 的 `proxy.register`，该行号已失效——Task 5 起 proxy 域整体迁入网关子进程，由 `electron/gateway.cjs:26` 装配 `proxy/index.cjs`，主进程对 proxy 域的 require 由 `scripts/dev-gateway-forward-parity-test.cjs` 钉死为零）。
 - WAL：`store.cjs:128-129` 只设 `journal_mode=WAL` + `busy_timeout=5000`，全仓无 `wal_checkpoint`，`store.close()`(`:551`) **无任何调用点**（`proxy.shutdown()` `index.cjs:177-182` 只停 server）。实测本机 WAL 已 1.59 MB 且自 16:41 起零次 checkpoint。补：退出路径调 `close()`、运行期周期性 `PRAGMA wal_checkpoint(TRUNCATE)`。`busy_timeout=5000` 在双进程争锁时会卡转发 5 秒，故必须单一写者。
 - `config.json` 唯一属主 = 主进程。子进程只读配置 + 通过管道请求写。`config.cjs:376`（一期落地后行号曾写 `:372`，原写 `:370`；行号以二期当前树为准）曾用固定 `.tmp` 名，跨进程 rename 会互踩，现临时文件名已统一加 pid。**同病实测共四处**，只改 `config.cjs` 会漏三处，四处一并列齐（行号以当前树为准）：`config.cjs:376`、`hub.cjs:41`（`~/.agent_skills/manifest.json`）、`sync-config.cjs:477`、`sync.cjs:187` —— 四处现均为 `${p}.${process.pid}.tmp`，由 `scripts/dev-write-ownership-test.cjs` 的结构判据钉住；其中前两处落在**两个安装共享**的 `~/.agent_skills`，互踩面比 `config.json` 更大。
-- 除 `config.json` 外还有四个数据文件要定写主（实测清单）：`proxyDir()/catalog.json`(`index.cjs:483`)、`rules` 的默认值与补键迁移(`rules.cjs:233/:244`)、`proxyDir()/sync-state.json`(`poolsync.cjs:77`)、`proxyDir()/pool-tombstones.json`(`poolsync.cjs:310`) —— 全部归子进程独占。**规格原来漏了一条反向跨界写**：`ipc.cjs:176` 的 `webdav_shared_save` 在主进程里直接 `require("./proxy/poolsync.cjs").onSharedPasswordMaybeChanged()`，那是从主进程写子进程独占的 `sync-state.json`；双拓扑下必须走管道，否则 §5.4 第一条从后门漏掉。
+- 除 `config.json` 外还有四个数据文件要定写主（实测清单）：`proxyDir()/catalog.json`(`index.cjs:483`)、`rules` 的默认值与补键迁移(`rules.cjs:233/:244`)、`proxyDir()/sync-state.json`(`poolsync.cjs:77`)、`proxyDir()/pool-tombstones.json`(`poolsync.cjs:310`) —— 全部归子进程独占。**规格原来漏了一条反向跨界写**：`ipc.cjs:180` 的 `webdav_shared_save`（原文写 `:176`，一期后处理器漂移）在一期前的主进程里直接 `require("./proxy/poolsync.cjs").onSharedPasswordMaybeChanged()`，那是从主进程写子进程独占的 `sync-state.json`；双拓扑下必须走管道，否则 §5.4 第一条从后门漏掉（Task 5 已实装：改经 `gatewayClient.call("proxy_poolsync_password_changed", ...)` 投递，见 `ipc.cjs:186`）。
 - `rules/*.json` 由子进程只读监听（`rules.cjs:269` chokidar）；写规则仍走主进程 `config` 域。
 
 ### 5.5 生命周期、认领与自启
