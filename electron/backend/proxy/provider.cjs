@@ -19,7 +19,9 @@ const SLUG_RE = /^[a-z0-9][a-z0-9_-]{1,31}$/;
 // 撞上的后果不是报错而是行为诡异——例如 slug="v1" 会让 `/v1/models` 的解析歧义。
 const RESERVED = new Set(["auto", "all", "v1", "models", "healthz", "status", "readyz"]);
 
-const KIND_OPENAI = "openai_compat";
+// 上游协议形态：绝大多数中转站是 OpenAI 兼容；Claude 中转生态里有相当一部分只开 /v1/messages
+const KINDS = new Set(["openai_compat", "anthropic_messages"]);
+const KIND_DEFAULT = "openai_compat";
 
 /** base_url 归一化：只在**写入侧**做一次并存规范值，出站一律 `base + "/chat/completions"`。
  *  留两处拼接口径迟早会漂（尾斜杠、/v1 有无是中转站两种常见写法）。
@@ -127,6 +129,8 @@ function validate(input, existing) {
   if (!headers.ok) return headers;
   const body = normalizeBody(input.extraBody ?? (existing && existing.extraBody));
   if (!body.ok) return body;
+  const kind = input.kind != null ? String(input.kind) : (existing && existing.kind) || KIND_DEFAULT;
+  if (!KINDS.has(kind)) return { ok: false, message: '上游协议形态只支持 openai_compat 与 anthropic_messages' };
   const enabled = input.enabled != null ? !!input.enabled : !existing || existing.enabled !== false;
   return {
     ok: true,
@@ -134,7 +138,7 @@ function validate(input, existing) {
       id,
       display: String(input.display ?? (existing && existing.display) ?? "").trim().slice(0, 64) || id,
       domain: base.domain,
-      kind: KIND_OPENAI,
+      kind,
       baseUrl: base.url,
       models: models.models,
       extraHeaders: headers.headers,
@@ -258,7 +262,7 @@ function findUniqueByBareModel(model) {
  *  两条路都刻意绕开 handleChat 与号池调度：不经 pickAccount（不动 lastUsed、不占租约）、
  *  不 insertUsage、不 applyCool。探测失败的后果绝不能是把号池里一把好 Key 打进冷却。
  *  这会产生真实上游计费，UI 文案要写清楚。 */
-async function probe({ id, accountId, baseUrl, key, model, extraHeaders, extraBody }) {
+async function probe({ id, accountId, baseUrl, key, model, kind, extraHeaders, extraBody }) {
   let secret = String(key || "").trim();
   if (!secret && accountId && id) {
     const acc = store.getAccount(String(accountId));
@@ -275,6 +279,7 @@ async function probe({ id, accountId, baseUrl, key, model, extraHeaders, extraBo
 
   const adapter = adapters.makeOpenaiCompat({
     id: id || "__probe__",
+    kind: KINDS.has(kind) ? kind : KIND_DEFAULT,
     baseUrl: base.url,
     models: [{ model: target, upstream: target }],
     extraHeaders: headers.headers,
@@ -313,12 +318,13 @@ function fetchModels(id) {
   if (!provider) return Promise.resolve({ ok: false, message: `提供商 "${id}" 不存在` });
   const row = store.accountRows(id).find((r) => r.status !== "disabled" && r.token_enc);
   if (!row) return Promise.resolve({ ok: false, message: "该提供商还没有可用 Key，先添加一把" });
+  if (provider.kind === "anthropic_messages") return Promise.resolve({ ok: false, message: "Anthropic 形态上游没有 /models 目录接口，请在模型清单里手填" });
   const adapter = adapters.makeOpenaiCompat({ ...provider, models: [] });
   return adapter.fetchModels({ token: config.decryptSecret(row.token_enc) || "", refreshToken: "" });
 }
 
 module.exports = {
-  KIND_OPENAI,
+  KINDS: [...KINDS],
   normalizeBaseUrl,
   normalizeModels,
   parseModelRef,

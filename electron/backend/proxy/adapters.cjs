@@ -8,6 +8,7 @@ const rules = require("./rules.cjs");
 const store = require("./store.cjs");
 const util = require("./util.cjs");
 const raccoonAuth = require("./raccoonAuth.cjs");
+const aup = require("./protocols/anthropic-up.cjs");
 
 const FIRST_BYTE_MS = 30000; // 首 token 30s 超时判失败。实测成功请求 TTFT P99≈8.7s、最大 20.2s，
 // 10s 会误杀慢模型/thinking 首包（参考项目无首字节总超时，读空闲容忍 300s，这里取全覆盖+余量的折中）
@@ -1698,6 +1699,11 @@ function statusFromCompatError(errObj, data) {
   return 502;
 }
 
+/** Anthropic 形态上游的端点：归一化后的 base 只补 /messages（与 openai 通路同一条约定） */
+function aupUrl(base) {
+  return `${base}/messages`;
+}
+
 function makeOpenaiCompat(row) {
   const entries = compatModelEntries(row);
   const chatUrl = `${row.baseUrl}/chat/completions`;
@@ -1754,9 +1760,14 @@ function makeOpenaiCompat(row) {
       return deepMerge(out, row.extraBody || {});
     },
 
-    /** 对话：OpenAI 协议 1:1 透传。事件词汇与内置适配器完全一致（delta/usage/finish/error），
-     *  这是"三协议入站不必改任何适配器"的前提，别在这里发明新事件类型。 */
-    async chat({ secrets, model, body, emit }) {
+    /** 对话：按提供商的上游协议形态分派。两种形态共用同一套 emit 词汇与同一份调度、号池、记账代码。
+     *  Anthropic 形态上游不发 stream_options / 不接 OpenAI body，见 chatAnthropic。 */
+    async chat(ctx) {
+      return row.kind === "anthropic_messages" ? this.chatAnthropic(ctx) : this.chatOpenai(ctx);
+    },
+
+    /** OpenAI 协议 1:1 透传 */
+    async chatOpenai({ secrets, model, body, emit }) {
       const payload = JSON.stringify(this.rewriteBody(model, body));
       const { resp, cancelTimer } = await fetchStream(chatUrl, { method: "POST", headers: this.headers(secrets), body: payload });
       const result = { status: 200, planLimit: false };
@@ -1798,6 +1809,50 @@ function makeOpenaiCompat(row) {
             });
           }
         });
+      } finally {
+        cancelTimer();
+      }
+      return result;
+    },
+
+    /**
+     * Anthropic Messages 形态上游（很多 Claude 中转站只开这一种）。
+     * 请求与事件流的互转都在 protocols/anthropic-up.cjs；这里只管 HTTP 与错误映射。
+     */
+    async chatAnthropic({ secrets, model, body, emit }) {
+      const t = aup.toRequest(this.upstreamFor(model), body);
+      if (!t.ok) throw Object.assign(new Error(t.message), { status: 400, fatal: true });
+      // extraBody 深合并：允许只覆盖 thinking.max_tokens 这类嵌套字段而不丢掉整个对象
+      const payloadObj = deepMerge(t.request, row.extraBody || {});
+      const headers = { "content-type": "application/json", accept: "application/json", "anthropic-version": "2023-06-01" };
+      for (const [k, v] of Object.entries(row.extraHeaders || {})) headers[k] = String(v);
+      headers["x-api-key"] = secrets.token || "";
+      const { resp, cancelTimer } = await fetchStream(aupUrl(row.baseUrl), { method: "POST", headers, body: JSON.stringify(payloadObj) });
+      const result = { status: 200, planLimit: false };
+      // type 表认不出的形状交给通用关键词表；而"欠费"无论上游把 type 写成什么都必须认出来——
+      // 只有 402 会走「切号 + planLimit」这条既有链路，落到 400/502 就是把坏 Key 当好 Key 反复打。
+      const statusOf = (errObj, data) => {
+        const byType = aup.upstreamErrorStatus(errObj);
+        const generic = statusFromCompatError(errObj, data);
+        const s = generic === 402 || byType === 502 ? generic : byType;
+        if (s === 402) result.planLimit = true;
+        return s;
+      };
+      const tr = aup.makeTranslator(emit, t.nameMap, statusOf);
+      try {
+        const ctype = String(resp.headers.get("content-type") || "");
+        if (!ctype.includes("event-stream")) {
+          const text = await resp.text();
+          const data = parseJson(text);
+          if (!data) throw Object.assign(new Error(`上游返回非 JSON（${text.slice(0, 200)}）`), { status: 502 });
+          aup.emitWhole(data, emit, t.nameMap, statusOf);
+          return result;
+        }
+        await pumpSse(resp, (_event, raw) => {
+          const data = parseJson(raw);
+          if (data) tr.push(data);
+        });
+        tr.close();
       } finally {
         cancelTimer();
       }

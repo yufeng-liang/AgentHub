@@ -295,7 +295,9 @@ export type ProxyBuiltinChannelId = "trae" | "workbuddy" | "workbuddy_ai" | "rac
  *  自建 slug 是运行期数据，编译期无从枚举，所以这里放宽成普通字符串（同 ProxyRoute 的既有做法），
  *  保留字面量联合只为了 IDE 补全。**需要"仅内置"约束的地方请用 ProxyBuiltinChannelId。** */
 export type ProxyChannelId = ProxyBuiltinChannelId | (string & {});
-export type ProxyChannelKind = "builtin" | "openai_compat";
+/** builtin = 内置生态渠道；另外两种是自定义提供商的**上游协议形态**（与入站协议无关） */
+export type ProxyProviderKind = "openai_compat" | "anthropic_messages";
+export type ProxyChannelKind = "builtin" | ProxyProviderKind;
 /** Key 路由：auto 或任一渠道 id（渠道后续扩充即为普通字符串，保留字面量仅为补全提示） */
 export type ProxyRoute = "auto" | ProxyChannelId | (string & {});
 export type ProxyAccountStatus = "online" | "cooling" | "exhausted" | "relogin" | "disabled";

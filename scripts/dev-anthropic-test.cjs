@@ -163,20 +163,25 @@ function post(pathName, body, key, headers) {
 
 const client = (model, extra) => Object.assign({ model, max_tokens: 512, stream: true, messages: [{ role: "user", content: "hi" }] }, extra);
 
+/** OpenAI 入口只认 Authorization: Bearer（x-api-key 是 /v1/messages 那侧的读法），
+ *  而 post() 默认发 x-api-key，所以打 chat 端点时必须显式换掉。 */
+let GWKEY = { secret: "" };
+const chatPost = (body) => post("/v1/chat/completions", body, "", { authorization: "Bearer " + GWKEY.secret, "x-api-key": undefined });
+
 (async () => {
   const { srv, seen } = await fakeUpstream();
   provider.create({ id: "rel", baseUrl: `http://127.0.0.1:${UP}/v1`, display: "假中转", models: ["claude-sonnet-4-5", "tooly", "trunc"] });
   provider.addKey("rel", { name: "限速的", key: "sk-bad" });
   provider.addKey("rel", { name: "好的", key: "sk-good" });
   store.open();
-  const gwKey = store.createKey({ name: "anthropic-e2e", route: "auto" });
+  GWKEY = store.createKey({ name: "anthropic-e2e", route: "auto" });
   const sr = await server.start(() => ({
     port: GW, bind: "127.0.0.1", rateLimitPerMin: 0, concurrency: 8, routeStrategy: "smart",
     fixedChannel: "trae", modelOverrides: {}, debugStatus: false, humanizeJitter: false,
   }));
   ok("网关在测试端口起来", sr.ok === true && sr.port === GW, sr);
 
-  const res1 = await post("/v1/messages", client("rel/claude-sonnet-4-5"), gwKey.secret);
+  const res1 = await post("/v1/messages", client("rel/claude-sonnet-4-5"), GWKEY.secret);
   const f1 = parseSse(res1.text);
   ok("流式 200 + SSE 内容类型", res1.status === 200 && /text\/event-stream/.test(res1.ctype || ""), [res1.status, res1.ctype]);
   ok("事件顺序：start→block起→thinking→text→block止→delta→stop", JSON.stringify(types(f1)) === JSON.stringify([
@@ -197,7 +202,7 @@ const client = (model, extra) => Object.assign({ model, max_tokens: 512, stream:
   ok("换号（第一把 Key 429）后仍不出现第二个 message_start", seen.length >= 2 && types(f1).filter((t) => t === "message_start").length === 1, seen);
   ok("上游收到的是去掉前缀的模型名", seen[0].model === "claude-sonnet-4-5", seen[0]);
 
-  const res2 = await post("/v1/messages", client("rel/tooly"), gwKey.secret);
+  const res2 = await post("/v1/messages", client("rel/tooly"), GWKEY.secret);
   const f2 = parseSse(res2.text);
   const toolStart = f2.find((f) => f.data.content_block && f.data.content_block.type === "tool_use");
   const pj = f2.filter((f) => f.data.delta && f.data.delta.type === "input_json_delta").map((f) => f.data.delta.partial_json).join("");
@@ -206,19 +211,19 @@ const client = (model, extra) => Object.assign({ model, max_tokens: 512, stream:
   ok("一个 tool_call 恰好三个事件", types(f2).filter((t) => t === "content_block_start").length === 1 && types(f2).filter((t) => t === "content_block_stop").length === 1, types(f2));
   ok("finish_reason=tool_calls → stop_reason=tool_use", f2[f2.length - 2].data.delta.stop_reason === "tool_use", f2[f2.length - 2].data);
 
-  const res3 = await post("/v1/messages", client("rel/trunc"), gwKey.secret);
+  const res3 = await post("/v1/messages", client("rel/trunc"), GWKEY.secret);
   ok("finish_reason=length → stop_reason=max_tokens", parseSse(res3.text)[parseSse(res3.text).length - 2].data.delta.stop_reason === "max_tokens", types(parseSse(res3.text)));
 
-  const res4 = await post("/v1/messages", client("rel/claude-sonnet-4-5", { stream: false }), gwKey.secret);
+  const res4 = await post("/v1/messages", client("rel/claude-sonnet-4-5", { stream: false }), GWKEY.secret);
   const j4 = JSON.parse(res4.text);
   ok("非流式回 Messages 对象（含 content 块与 stop_reason）", j4.type === "message" && j4.content.some((b) => b.type === "text" && b.text === "你好，世界") && j4.stop_reason === "end_turn", j4);
   ok("非流式 usage 用上游真值", j4.usage.output_tokens === 22, j4.usage);
 
-  const res5 = await post("/v1/messages", { model: "rel/claude-sonnet-4-5", messages: [] }, gwKey.secret);
+  const res5 = await post("/v1/messages", { model: "rel/claude-sonnet-4-5", messages: [] }, GWKEY.secret);
   ok("归一失败按 Anthropic 错误形状回 400", res5.status === 400 && JSON.parse(res5.text).error.type === "invalid_request_error", res5.text);
   const res6 = await post("/v1/messages", client("rel/claude-sonnet-4-5"), "sk-wrong-key");
   ok("鉴权失败也是 Anthropic 形状（不是 OpenAI 的 400 外壳）", res6.status === 401 && JSON.parse(res6.text).type === "error", res6.text);
-  const res7 = await post("/v1/messages", client("rel/claude-sonnet-4-5"), gwKey.secret, { "x-api-key": undefined, authorization: "Bearer " + gwKey.secret });
+  const res7 = await post("/v1/messages", client("rel/claude-sonnet-4-5"), GWKEY.secret, { "x-api-key": undefined, authorization: "Bearer " + GWKEY.secret });
   ok("Bearer 兜底可用", res7.status === 200, res7.status);
 
   const models = await new Promise((resolve) => {
@@ -235,9 +240,139 @@ const client = (model, extra) => Object.assign({ model, max_tokens: 512, stream:
     http.get({ host: "127.0.0.1", port: GW, path: "/v1/models/" }, (res) => { res.resume(); resolve(res.statusCode); });
   });
   ok("尾斜杠路径也 200（不靠重定向）", slash === 200, slash);
-  const ct = await post("/v1/messages/count_tokens", { model: "m", max_tokens: 10, messages: [{ role: "user", content: "abc" }] }, gwKey.secret);
+  const ct = await post("/v1/messages/count_tokens", { model: "m", max_tokens: 10, messages: [{ role: "user", content: "abc" }] }, GWKEY.secret);
   ok("count_tokens 端点可用", ct.status === 200 && JSON.parse(ct.text).input_tokens >= 1, ct.text);
 
+  // ===== ④ Anthropic 形态上游：内部规范形 ⇄ Messages 互转 =====
+  console.log("\nAnthropic 形态上游（provider.kind=anthropic_messages）:");
+  const aup = require("../electron/backend/proxy/protocols/anthropic-up.cjs");
+  const pure = aup.toRequest("claude-x", {
+    max_tokens: 900,
+    messages: [
+      { role: "system", content: "规则一" },
+      { role: "user", content: "你好" },
+      { role: "user", content: "再补一句" },
+      { role: "assistant", content: "好", tool_calls: [{ id: "call_1", type: "function", function: { name: "browser.use", arguments: '{"url":"http://a"}' } }] },
+      { role: "tool", tool_call_id: "call_1", content: "已打开" },
+    ],
+    tools: [{ type: "function", function: { name: "browser.use", description: "d", parameters: { type: "object" } } }],
+    tool_choice: "required",
+    temperature: 1.7,
+    stop: ["END"],
+  });
+  ok("system 抽出为顶层字符串", pure.request.system === "规则一", pure.request.system);
+  ok("相邻同角色合并（Anthropic 要求交替）", pure.request.messages.map((x) => x.role).join(",") === "user,assistant,user", pure.request.messages.map((x) => x.role));
+  ok("首条是 user", pure.request.messages[0].role === "user");
+  ok("max_tokens 必填有默认", aup.toRequest("m", { messages: [{ role: "user", content: "x" }] }).request.max_tokens === 4096);
+  ok("temperature 夹到 Anthropic 的 0~1", pure.request.temperature === 1, pure.request.temperature);
+  ok("stop → stop_sequences", JSON.stringify(pure.request.stop_sequences) === '["END"]');
+  ok("tool_choice required → any", pure.request.tool_choice.type === "any", pure.request.tool_choice);
+  const forced = aup.toRequest("m", {
+    messages: [{ role: "user", content: "x" }],
+    tools: [{ type: "function", function: { name: "browser.use", parameters: { type: "object" } } }],
+    tool_choice: { type: "function", function: { name: "browser.use" } },
+  });
+  ok("点名工具也走同一张改写表（否则上游认不出这个名字）", forced.request.tool_choice.type === "tool" && forced.request.tool_choice.name === "browser_use", forced.request.tool_choice);
+  ok("上游错误 type → 内部状态", aup.upstreamErrorStatus({ type: "authentication_error" }) === 401 && aup.upstreamErrorStatus({ type: "rate_limit_error" }) === 429 && aup.upstreamErrorStatus({ type: "unheard_of" }) === 502, [aup.upstreamErrorStatus({ type: "authentication_error" }), aup.upstreamErrorStatus({ type: "unheard_of" })]);
+  const evs = [];
+  aup.emitWhole(
+    { role: "assistant", content: [{ type: "text", text: "整包" }, { type: "tool_use", id: "t1", name: "browser_use", input: { a: 1 } }], stop_reason: "tool_use", usage: { input_tokens: 7, output_tokens: 3 } },
+    (e) => evs.push(e),
+    { browser_use: "browser.use" }
+  );
+  ok("整包响应也切成同一套 emit 词汇（正文/工具/usage/finish）", evs.filter((e) => e.type === "delta").length === 2 && evs.some((e) => e.type === "usage" && e.usage.prompt_tokens === 7 && e.usage.completion_tokens === 3) && evs.some((e) => e.type === "finish" && e.reason === "tool_calls"), evs);
+  ok("整包响应的工具名同样还原", /browser\.use/.test(JSON.stringify(evs)) && !/browser_use/.test(JSON.stringify(evs)), JSON.stringify(evs));
+  ok("非法工具名被可逆改写", pure.request.tools[0].name === "browser_use" && pure.nameMap.browser_use === "browser.use", [pure.request.tools[0].name, pure.nameMap]);
+  ok("assistant 的 tool_calls → tool_use 块（input 解析成对象）", pure.request.messages[1].content.some((b) => b.type === "tool_use" && b.input.url === "http://a"), pure.request.messages[1].content);
+  ok("tool 消息 → user 的 tool_result 块", pure.request.messages[2].content[0].type === "tool_result" && pure.request.messages[2].content[0].tool_use_id === "call_1", pure.request.messages[2].content);
+
+  const seenA = [];
+  const aUpStream = (res) => {
+    const send = (obj) => res.write(`event: ${obj.type}\ndata: ${JSON.stringify(obj)}\n\n`);
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    send({ type: "message_start", message: { id: "msg_1", role: "assistant", model: "claude-x", content: [], stop_reason: null, usage: { input_tokens: 30, output_tokens: 1 } } });
+    send({ type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "", signature: "" } });
+    send({ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "想一下" } });
+    send({ type: "content_block_stop", index: 0 });
+    send({ type: "content_block_start", index: 1, content_block: { type: "text", text: "" } });
+    send({ type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "上游说" } });
+    send({ type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "你好" } });
+    send({ type: "content_block_stop", index: 1 });
+    send({ type: "content_block_start", index: 2, content_block: { type: "tool_use", id: "tu_7", name: "browser_use", input: {} } });
+    send({ type: "content_block_delta", index: 2, delta: { type: "input_json_delta", partial_json: '{"q":1}' } });
+    send({ type: "content_block_stop", index: 2 });
+    send({ type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 44 } });
+    send({ type: "message_stop" });
+    res.end();
+  };
+  const aUp = http.createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c) => (raw += c));
+    req.on("end", () => {
+      seenA.push({ path: req.url, auth: req.headers["x-api-key"], ver: req.headers["anthropic-version"], body: JSON.parse(raw || "{}") });
+      aUpStream(res);
+    });
+  });
+  await new Promise((r) => aUp.listen(19563, "127.0.0.1", r));
+  provider.create({ id: "clauderelay", baseUrl: "http://127.0.0.1:19563/v1", display: "Claude 中转", kind: "anthropic_messages", models: ["claude-x"] });
+  provider.addKey("clauderelay", { key: "sk-anthropic-up" });
+
+  // 带一个 Anthropic 不合法的工具名（含点）：出站被可逆改写成 browser_use，
+  // 假上游原样回吐该别名，断言响应侧把它还原回客户端认识的写法——nameMap 只有在请求真的带 tools 时才非空。
+  const oa = await chatPost({
+    model: "clauderelay/claude-x",
+    messages: [{ role: "system", content: "规则" }, { role: "user", content: "你好" }],
+    tools: [{ type: "function", function: { name: "browser.use", description: "b", parameters: { type: "object", properties: {} } } }],
+    stream: true,
+  });
+  const oaText = oa.text;
+  ok("OpenAI 客户端打通 Anthropic 上游（200）", oa.status === 200, oa.status);
+  ok("出站是 /v1/messages + x-api-key + anthropic-version", seenA[0].path === "/messages" && seenA[0].auth === "sk-anthropic-up" && !!seenA[0].ver, seenA[0] && [seenA[0].path, seenA[0].auth, seenA[0].ver]);
+  ok("上游请求带默认 max_tokens", seenA[0].body.max_tokens === 4096, seenA[0].body.max_tokens);
+  ok("上游收到的是改写后的合法工具名", seenA[0].body.tools[0].name === "browser_use", seenA[0].body.tools && seenA[0].body.tools[0].name);
+  ok("text_delta → delta.content 拼出全文", /上游说/.test(oaText) && /你好/.test(oaText), oaText.slice(0, 300));
+  ok("thinking_delta → reasoning_content", /reasoning_content/.test(oaText) && /想一下/.test(oaText), oaText.slice(0, 300));
+  ok("tool_use 名还原成客户端认识的写法", /browser\.use/.test(oaText) && !/browser_use/.test(oaText), oaText.match(/"name":"[^"]*"/g));
+  ok("input_json → tool_calls arguments", /"arguments":"\{\\"q\\":1\}"/.test(oaText) || /\{\\"q\\":1\}/.test(oaText), oaText.match(/"arguments":"[^"]*"/));
+  ok("stop_reason=tool_use → finish_reason=tool_calls", /"finish_reason":"tool_calls"/.test(oaText), oaText.slice(-400));
+  ok("usage.output_tokens 落到 completion_tokens", /"completion_tokens":44/.test(oaText), oaText.slice(-400));
+
+  const cl = await post("/v1/messages", client("clauderelay/claude-x"), GWKEY.secret);
+  const clf = parseSse(cl.text);
+  ok("Claude Code 入口 → Anthropic 上游 → Messages 事件全链路", clf[0].data.type === "message_start" && clf[clf.length - 1].data.type === "message_stop" && types(clf).filter((t) => t === "message_start").length === 1, types(clf));
+  const fm = await provider.fetchModels("clauderelay");
+  ok("Anthropic 形态上游不假装支持 /models", fm.ok === false && /手填/.test(fm.message || ""), fm);
+
+  // 中转站无视 stream:true、直接回一整个 JSON 对象：SSE 扫描器一条事件都收不到，
+  // 没有 content-type 兜底的话客户端会拿到一个 200 空响应（chatOpenai 通路同有一条，两边都要有）
+  const jsonUp = http.createServer((req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ id: "msg_j", role: "assistant", model: "claude-y", content: [{ type: "text", text: "整包应答" }], stop_reason: "end_turn", usage: { input_tokens: 11, output_tokens: 5 } }));
+  });
+  await new Promise((r) => jsonUp.listen(19564, "127.0.0.1", r));
+  provider.create({ id: "jsonrelay", baseUrl: "http://127.0.0.1:19564/v1", display: "整包中转", kind: "anthropic_messages", models: ["claude-y"] });
+  provider.addKey("jsonrelay", { key: "sk-json" });
+  const js = await chatPost({ model: "jsonrelay/claude-y", messages: [{ role: "user", content: "hi" }], stream: true });
+  ok("整包 JSON 上游（流式请求）：正文不丢、usage 到账", js.status === 200 && /整包应答/.test(js.text) && /"completion_tokens":5/.test(js.text), [js.status, js.text.slice(0, 260)]);
+  const jsn = await chatPost({ model: "jsonrelay/claude-y", messages: [{ role: "user", content: "hi" }] });
+  const jsnBody = JSON.parse(jsn.text || "{}");
+  ok("整包 JSON 上游（非流式请求）：聚合成一条 chat.completion", jsn.status === 200 && jsnBody.choices && jsnBody.choices[0].message.content === "整包应答" && jsnBody.usage.total_tokens > 0, [jsn.status, jsn.text.slice(0, 260)]);
+  jsonUp.close();
+
+  // 200 + 错误体：中转站把欠费写成 invalid_request_error 是常态，认不出就只能把 502 抛给客户端，
+  // 而 402 才会走「切号 + 记 planLimit」这条既有链路
+  const errUp = http.createServer((req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "余额不足，请充值后重试" } }));
+  });
+  await new Promise((r) => errUp.listen(19565, "127.0.0.1", r));
+  provider.create({ id: "errrelay", baseUrl: "http://127.0.0.1:19565/v1", display: "欠费中转", kind: "anthropic_messages", models: ["claude-z"] });
+  provider.addKey("errrelay", { key: "sk-err" });
+  const er = await chatPost({ model: "errrelay/claude-z", messages: [{ role: "user", content: "hi" }] });
+  ok("欠费文案按 402 处理（不是 502）", er.status === 402, [er.status, er.text.slice(0, 200)]);
+  errUp.close();
+
+  aUp.close();
   srv.close();
   server.stop();
   store.close();

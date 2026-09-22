@@ -6,7 +6,7 @@ import type {
   WebDavStatus, RemoteDevice, WebDavLog, HubExtraRow, WatchStatus,
   ProxyGatewayStatus, ProxyKeyRow, ProxyChannelView, ProxyAccount, ProxyStatsOverview, ProxyStatsDetail,
   ProxyUsageRow, ProxyModel, ProxyScanCandidate, ProxyRuleFile, ProxyRoute, ProxyChannelId, ProxyBuiltinChannelId, ProxyPoolStrategy,
-  ProxyCheckinRow, ProxyProvider, ProxyProviderModel, ProxyProviderTestResult,
+  ProxyCheckinRow, ProxyProvider, ProxyProviderKind, ProxyProviderModel, ProxyProviderTestResult,
   CcSwitchStatus, CcSwitchRegisterResult, CcSwitchAppType,
 } from "../types";
 
@@ -16,7 +16,7 @@ export type {
   WebDavStatus, RemoteDevice, WebDavLog, WebDavEvent, HubExtraRow, WatchStatus,
   ProxyGatewayStatus, ProxyKeyRow, ProxyChannelView, ProxyAccount, ProxyStatsOverview, ProxyStatsDetail,
   ProxyUsageRow, ProxyModel, ProxyScanCandidate, ProxyRuleFile, ProxyRoute, ProxyChannelId, ProxyBuiltinChannelId, ProxyPoolStrategy,
-  ProxyAccountStatus, ProxyEvent, ProxyCheckinRow, ProxyProvider, ProxyProviderModel, ProxyProviderTestResult,
+  ProxyAccountStatus, ProxyEvent, ProxyCheckinRow, ProxyProvider, ProxyProviderKind, ProxyProviderModel, ProxyProviderTestResult,
   CcSwitchStatus, CcSwitchRegisterResult,
 } from "../types";
 
@@ -265,6 +265,8 @@ export interface ProxyProviderInput {
   id: string;
   display?: string;
   baseUrl: string;
+  /** 上游协议形态，缺省 openai_compat */
+  kind?: ProxyProviderKind;
   models?: ProxyProviderModel[];
   extraHeaders?: Record<string, string>;
   extraBody?: Record<string, unknown>;

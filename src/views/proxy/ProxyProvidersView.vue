@@ -4,7 +4,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import * as api from "../../api/ipc";
-import type { ProxyProvider, ProxyProviderModel, ProxyProviderTestResult, ProxyAccount } from "../../types";
+import type { ProxyProvider, ProxyProviderKind, ProxyProviderModel, ProxyProviderTestResult, ProxyAccount } from "../../types";
 import { ACCOUNT_STATUS, fmtAgo } from "./format";
 
 const rows = ref<ProxyProvider[]>([]);
@@ -38,6 +38,7 @@ const form = ref({
   id: "",
   display: "",
   baseUrl: "",
+  kind: "openai_compat" as ProxyProviderKind,
   modelsText: "",
   keysText: "",
   extraHeadersText: "",
@@ -92,7 +93,7 @@ function modelsPreview(text: string): string {
 
 function openCreate() {
   editingId.value = "";
-  form.value = { id: "", display: "", baseUrl: "", modelsText: "", keysText: "", extraHeadersText: "", extraBodyText: "", enabled: true };
+  form.value = { id: "", display: "", baseUrl: "", kind: "openai_compat", modelsText: "", keysText: "", extraHeadersText: "", extraBodyText: "", enabled: true };
   formErr.value = "";
   testResult.value = null;
   formOpen.value = true;
@@ -104,6 +105,7 @@ function openEdit(row: ProxyProvider) {
     id: row.id,
     display: row.display,
     baseUrl: row.baseUrl,
+    kind: row.kind === "anthropic_messages" ? "anthropic_messages" : "openai_compat",
     modelsText: row.models && row.models.length ? JSON.stringify(row.models, null, 2) : "",
     keysText: "",
     extraHeadersText: row.extraHeaders && Object.keys(row.extraHeaders).length ? JSON.stringify(row.extraHeaders, null, 2) : "",
@@ -138,6 +140,7 @@ async function doSave() {
       id: form.value.id.trim(),
       display: form.value.display.trim(),
       baseUrl: form.value.baseUrl.trim(),
+      kind: form.value.kind,
       models,
       extraHeaders: headers as Record<string, string>,
       extraBody: body,
@@ -325,10 +328,11 @@ onMounted(refresh);
       <div class="tbl-wrap" style="margin-top: 12px">
         <table class="tbl">
           <tbody>
-            <tr><th>标识</th><th>名称</th><th>上游地址</th><th>Key</th><th>模型</th><th>状态</th><th>更新</th><th>操作</th></tr>
+            <tr><th>标识</th><th>名称</th><th>上游协议</th><th>上游地址</th><th>Key</th><th>模型</th><th>状态</th><th>更新</th><th>操作</th></tr>
             <tr v-for="p in rows" :key="p.id">
               <td class="mono">{{ p.id }}</td>
               <td>{{ p.display }}</td>
+              <td><span class="tag tag-dim">{{ p.kind === "anthropic_messages" ? "Anthropic Messages" : "OpenAI Chat" }}</span></td>
               <td class="mono url-cell" :title="p.baseUrl">{{ p.baseUrl }}</td>
               <td class="mono num">{{ p.onlineCount ?? 0 }}/{{ p.keyCount ?? 0 }}</td>
               <td class="mono num">{{ p.models.length }}</td>
@@ -345,7 +349,7 @@ onMounted(refresh);
               </td>
             </tr>
             <tr v-if="!rows.length">
-              <td colspan="8" style="text-align: center; color: var(--text-3); padding: 18px">
+              <td colspan="9" style="text-align: center; color: var(--text-3); padding: 18px">
                 还没有自定义提供商 —— 点上方「添加提供商」接入中转站或自建端点；
                 接好后客户端用 <span class="mono">标识/模型名</span> 调用即可，与其他渠道共用同一个网关地址
               </td>
@@ -391,6 +395,17 @@ onMounted(refresh);
               <div class="set-desc">填到版本前缀为止，如 https://relay.example.com/v1；保存时会自动去掉尾部的 /v1 与 /chat/completions</div>
             </div>
             <input v-model="form.baseUrl" class="input mono" style="width: 300px" placeholder="https://relay.example.com/v1" />
+          </div>
+          <div class="set-row">
+            <div class="set-info">
+              <div class="set-name">上游协议</div>
+              <div class="set-desc">中转站给的是 OpenAI 兼容地址就选 OpenAI Chat；只认 /v1/messages 的 Claude 中转站选 Anthropic Messages。<br />两种网关都能接，内部会互转，客户端侧看不出区别。<br />
+                选 Anthropic Messages 时有几处转换是单向的：多段 system 会拼成一段、历史里的思考链与签名不带回上游、cache_control 与服务端工具（web_search 等）丢弃。</div>
+            </div>
+            <el-select v-model="form.kind" popper-class="glass-popper" style="width: 220px">
+              <el-option value="openai_compat" label="OpenAI Chat 兼容" />
+              <el-option value="anthropic_messages" label="Anthropic Messages" />
+            </el-select>
           </div>
           <div class="set-row">
             <div class="set-info">
