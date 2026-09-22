@@ -1,12 +1,14 @@
 import { createApp } from "vue";
 import { createPinia } from "pinia";
-import ElementPlus from "element-plus";
-import zhCn from "element-plus/es/locale/lang/zh-cn";
-import "element-plus/dist/index.css";
+// ElMessageBox 是显式 import 的服务式组件（Sidebar.vue:7 等三处），插件不接管它的样式
+import "element-plus/es/components/message-box/style/css";
+// select 只在懒加载视图里出现，它的样式会跟着 JS chunk 在 element.css 之后注入并反超覆盖层
+// （同特异性后到者赢）；显式静态引入，让它回到入口图里、排在 element.css 之前，顺带去重
+import "element-plus/es/components/select/style/css";
 // dark css-vars 绑定 html.dark，须在 element.css 之前引入，让项目主题变量赢
 import "element-plus/theme-chalk/dark/css-vars.css";
 import App from "./App.vue";
-import "./assets/phosphor/style.css";
+import "./assets/phosphor/phosphor-used.css";
 import "./styles/global.css";
 import "./styles/skills.css";
 import "./styles/sync.css";
@@ -17,8 +19,6 @@ import { setCursorFX } from "./motion/cursor";
 
 const app = createApp(App);
 app.use(createPinia());
-// 中文 locale：日期面板月份/星期/按钮等 Element 内置文案全部中文化
-app.use(ElementPlus, { locale: zhCn });
 // mount 前安装：动效开启的用户光标已就位，避免先闪一下系统箭头
 const fxOn = localStorage.getItem("agenthub.fx") === "1";
 document.documentElement.classList.toggle("fx-off", !fxOn);

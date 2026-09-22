@@ -25,6 +25,9 @@ app.setName("AgentHub");
 let mainWindow = null;
 let tray = null;
 let quitting = false;
+// 「跳到软件更新卡片」是一次性待办：窗口销毁态下 send 过去没有监听者（App.vue 的 app:event
+// 监听在渲染层挂载后才注册），所以先记账，等那个窗口的 did-finish-load 补投，投完即清
+let pendingFocusUpdate = false;
 
 /** 资源目录：打包后为 process.resourcesPath 的相邻 build，开发时为项目 build/ */
 function buildDir() {
@@ -90,36 +93,50 @@ function createWindow() {
   }
 
   // 首帧就绪后显示窗口（did-finish-load 兜底：HMR 重载等场景 ready-to-show 可能不触发）
+  // 与 close/closed 同一口径：闭包捕获 thisWindow，不再回读可能被别的窗口改写的全局
+  const thisWindow = mainWindow;
   let revealed = false;
   const reveal = () => {
-    if (revealed || !mainWindow || mainWindow.isDestroyed()) return;
+    if (revealed || thisWindow.isDestroyed()) return;
     revealed = true;
-    mainWindow.show();
+    thisWindow.show();
   };
   mainWindow.once("ready-to-show", reveal);
-  mainWindow.webContents.once("did-finish-load", reveal);
+  mainWindow.webContents.once("did-finish-load", () => {
+    reveal();
+    deliverFocusUpdate(true); // 页面已解析完，监听者就位，补投待办
+  });
 
   // 窗口尺寸变化 / 页面（重）载入后按当前宽度重算缩放
   applyViewportZoom();
   mainWindow.on("resize", applyViewportZoom);
   mainWindow.webContents.on("did-finish-load", applyViewportZoom);
 
-  // 关闭 → 缩到托盘（设置可关；托盘菜单「退出」才是真正退出），后台才能持续跑定时同步
-  mainWindow.on("close", (e) => {
+  // 关闭 → 缩到托盘：liteOnClose 开时销毁窗口，连渲染进程与合成表面一起回收
+  // （一期打包版实测：同一次运行 424.86 → 215.47 MB 私有，−49.3%，4 进程降到 3），
+  // 关掉则只 hide()（重开更快）；托盘菜单「退出」才是真正退出，后台才能持续跑网关与定时同步。
+  // 两个处理器都只用 thisWindow：destroy() 不会再触发 close，无递归。
+  thisWindow.on("close", (e) => {
     const cfg = config.loadConfig();
-    if (!quitting && cfg.schedule && cfg.schedule.minimizeToTray) {
-      e.preventDefault();
-      mainWindow.hide();
-    }
+    if (quitting || !cfg.schedule || !cfg.schedule.minimizeToTray) return;
+    e.preventDefault();
+    if (cfg.schedule.liteOnClose) thisWindow.destroy();
+    else thisWindow.hide();
   });
 
-  mainWindow.on("closed", () => {
-    mainWindow = null;
+  // 身份校验：destroy() 是否同步派发 closed 本机实测判别不了（竞态探针在无校验版本上同样通过），
+  // 两种时序的结论相反，所以按「两种都对」写——迟到的 closed 只能抹掉它自己那个窗口。
+  thisWindow.on("closed", () => {
+    if (mainWindow === thisWindow) mainWindow = null;
   });
 }
 
 function showWindow() {
-  if (!mainWindow) {
+  // 两种派发时序下都安全：本机判别不了 destroy() 与 closed（置 null）是否同批
+  // （Task 7 §0c 的竞态探针在无身份校验的版本上同样通过），所以不主张任一时序为事实，
+  // 而是同时挡「null」与「非 null 但已销毁」两种落点——只挡 null 时，若 closed 还没跑，
+  // show() 会抛 Object has been destroyed（主进程未捕获 → 进程退出）。
+  if (!mainWindow || mainWindow.isDestroyed()) {
     createWindow();
   } else {
     mainWindow.show();
@@ -207,7 +224,7 @@ function buildTrayMenu() {
   ];
   const st = updater.getStatus();
   if (st.status === "available" || st.status === "downloaded") {
-    items.push({ label: `发现新版本 v${st.latestVersion} →`, click: () => { showWindow(); focusSettingsUpdate(); } });
+    items.push({ label: `发现新版本 v${st.latestVersion} →`, click: focusSettingsUpdate });
     items.push({ type: "separator" });
   }
   items.push(
@@ -229,13 +246,29 @@ function buildTrayMenu() {
   return Menu.buildFromTemplate(items);
 }
 
-/** 新版本提示点击 → 打开配置中心 · 通用并定位到「软件更新」卡片 */
+/** 新版本提示点击（托盘条目与桌面通知共用）→ 打开主界面并定位到「软件更新」卡片 */
 function focusSettingsUpdate() {
+  pendingFocusUpdate = true;
+  showWindow();
+  deliverFocusUpdate();
+}
+
+/**
+ * 销账式投递：投成功才清待办。
+ * fromLoadFinished 是由那一次 did-finish-load 触发的补投——此刻渲染层监听者已就位；
+ * 别用 isLoadingMainFrame() 当就绪判据，它在 did-finish-load 之后仍为 true（本机探针实测：
+ * 用它做闸，补投这一路永远 return，销毁态点通知就是 0 次送达）。
+ */
+function deliverFocusUpdate(fromLoadFinished) {
+  if (!pendingFocusUpdate) return;
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (!fromLoadFinished && mainWindow.webContents.isLoadingMainFrame()) return;
   try {
-    for (const win of BrowserWindow.getAllWindows()) {
-      if (!win.isDestroyed()) win.webContents.send("app:event", { event: "focus-update" });
-    }
-  } catch { /* 无窗口就算了 */ }
+    mainWindow.webContents.send("app:event", { event: "focus-update" });
+    pendingFocusUpdate = false;
+  } catch {
+    /* 窗口刚好没了：待办留着，下次载入完成再补 */
+  }
 }
 
 function refreshTrayMenu() {
@@ -328,8 +361,9 @@ if (!gotLock) {
   app.on("second-instance", () => showWindow());
 
   app.whenReady().then(() => {
+    const boot = config.loadConfig();
     // 建窗前先应用主题，避免深色配置下标题栏先白后黑闪烁
-    applyNativeTheme(config.loadConfig().theme);
+    applyNativeTheme(boot.theme);
 
     // 用量同步：初始化本地库（惰性打开），并确保本机设备登记在册（设备列表/本机口径立即可用）
     usagedb.get();
@@ -342,12 +376,15 @@ if (!gotLock) {
     usagesync.setOnFinish(notifyUsageSync);
     // 反代网关：规则热加载 + 额度定时刷新 + 按配置自启网关服务（服务独立于窗口存续）
     proxy.boot();
-    createWindow();
+    // 启动即进托盘：首帧不建窗，GPU 侧连建窗残留都不产生（一期打包版实测私有 166.05 MB / GPU 32.2，
+    // 对比「建过再销毁」的 215.47 MB，再省 49.42 MB）。
+    // minimizeToTray 关时不生效 —— 那种配置下关窗就是退出，不该留一个没有界面的进程
+    if (!(boot.schedule.launchHidden && boot.schedule.minimizeToTray)) createWindow();
     createTray();
     scheduler.start();
     usageScheduler.start();
     watch.start();
-    updater.init({ onShowWindow: showWindow, onTrayRefresh: refreshTrayMenu });
+    updater.init({ onShowWindow: showWindow, onTrayRefresh: refreshTrayMenu, onFocusUpdate: focusSettingsUpdate });
 
     // 依据配置启用开机自启（便携版不支持：注册的会是临时解压副本路径，退出即失效）。
     // 开关唯一来源是框架配置（设置 · 通用 · 应用行为），用量模块旧配置字段不再参与

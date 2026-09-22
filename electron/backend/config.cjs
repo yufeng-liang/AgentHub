@@ -121,6 +121,8 @@ function defaultConfig() {
     // 后台与调度
     schedule: {
       minimizeToTray: true, // 关窗缩到托盘
+      liteOnClose: true,    // 关窗即销毁窗口回收 UI 内存（重开需重新加载首屏）
+      launchHidden: false,  // 启动不建窗，直接进托盘
       autoStart: false,     // 开机自启（便携版无效）
       hourly: false,        // 每小时自动同步
       daily: false,         // 每天定时同步

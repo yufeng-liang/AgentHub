@@ -231,6 +231,10 @@ export interface AppConfig {
   };
   schedule: {
     minimizeToTray: boolean;
+    /** 关窗即销毁窗口回收 UI 内存（重开需重新加载首屏）；依赖 minimizeToTray */
+    liteOnClose: boolean;
+    /** 启动不建窗，直接进托盘；依赖 minimizeToTray */
+    launchHidden: boolean;
     autoStart: boolean;
     hourly: boolean;
     daily: boolean;

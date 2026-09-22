@@ -1,14 +1,17 @@
 <script setup lang="ts">
-import { onMounted, ref, watch, computed } from "vue";
+import { onMounted, ref, watch, computed, defineAsyncComponent } from "vue";
 import { useSyncStore } from "../../stores/sync";
 import { useAppStore } from "../../stores/app";
 import { useUsageStore } from "../../stores/usage";
 import { formatToken } from "../../composables/useFormat";
-import TrendChart from "../../components/sync/TrendChart.vue";
 import Heatmap from "../../components/sync/Heatmap.vue";
 import UsageBreakdown from "../../components/sync/UsageBreakdown.vue";
 import DayModal from "../../components/sync/DayModal.vue";
 import EmptyState from "../../components/sync/EmptyState.vue";
+
+// 本页是首屏落点、整体保持静态，唯独图表按需加载：TrendChart -> utils/echarts 会把
+// echarts+zrender（约 473 KiB）拽进 entry，异步化后它才与 CostsView 的 CostTrendChart 共享同一个懒块
+const TrendChart = defineAsyncComponent(() => import("../../components/sync/TrendChart.vue"));
 
 const app = useSyncStore();
 const framework = useAppStore();
@@ -178,7 +181,11 @@ function showSettings() {
       </div>
 
       <!-- 用量趋势折线图（day 非空时为单日按小时模式） -->
-      <TrendChart :data="usage.trend" :range="range" :day="usage.trendDay" @change-range="changeRange" @change-day="changeDay" />
+      <!-- .trend-slot 只为预留高度而存在：TrendChart 异步期间这里是个零高度的注释节点，
+           不预留就会先塌陷再回填一次，把下方「各电脑用量构成」顶回去。算法见文末 style -->
+      <div class="trend-slot">
+        <TrendChart :data="usage.trend" :range="range" :day="usage.trendDay" @change-range="changeRange" @change-day="changeDay" />
+      </div>
 
       <!-- 各电脑用量构成 -->
       <section class="device-breakdowns">
@@ -202,3 +209,34 @@ function showSettings() {
     </div>
   </div>
 </template>
+
+<style scoped>
+/* 图表块异步后，pending 期整个 TrendChart 模板（连卡体节点一起）不渲染，这里只剩零高度的注释节点，
+   不预留就会先塌陷再回填一次，把下方「各电脑用量构成」顶回去。卡体样式（.sync-scope .card 的
+   padding/border/margin）在 sync.css、随 entry 立即注入；只有图高 .trend-chart{height:320px} 在
+   TrendChart 自己的 scoped CSS、随该异步块晚到——预留补的是「组件整体尚未挂载」这段，不是补 CSS。
+   预留值按组件挂载后真实占据的 border-box 高度算（全局 * { box-sizing: border-box }）：
+     18   卡上内边距      sync.css:1154
+     32   卡头            sync.css:1182 flex 不换行，最高子项是 .tabs（.tabs 自身不声明 height）：
+                          24(.tab 高 --ctl-h-sm，sync.css:1217) + 3×2 内边距 + 1×2 边框 = 32
+     16   卡头下边距      sync.css:1185
+    320   图高            TrendChart.vue:306 的 scoped .trend-chart 覆盖 sync.css:1298 的 300
+                          （特异性同为 (0,2,0)，它的样式表随块更晚注入，故后者胜出）
+     18   卡下内边距      sync.css:1154
+      2   上下各 1px 边框  sync.css:1152
+   = 406px（min-height 取 408 = 406 + 2 余量）。不含卡片自身的 margin-bottom:18：按 CSS 2.1 §8.3.1，父层无下内边距、无下边框且
+   height 仍为 auto 时子元素下边距穿透塌陷（min-height 不阻断塌陷），它会与相邻
+   .device-breakdowns 的 margin-top:18 折叠成同一个 18，于是预留后的排布与「未异步」时一致。
+   用 min-height 而非 height：真实渲染更高（卡头文案换行等）时只撑开、不裁切。
+
+   2026-09-22 CDP 实测复核（headless Chrome 1384×779，dev 与打包产物 dist/ 两份数字一致）：
+   .trend-slot offsetHeight 408 = scrollHeight 408，其唯一子 .card offsetHeight 406 → 图下常驻空档
+   只有 2px（不是 46px）；.card-head 实高 32（.tabs = 24 的 .tab + 上下 3 内边距 + 1 边框 ×2），
+   逐帧采样显示占位期 408 → 到位后 408，无塌陷回弹。把 .pages 压到 960 仍是 406/408；压到 760
+   卡头换行，.card 自然长到 414，min-height 是地板不是天花板，容器照样撑开（所以「窄窗缺 106px」
+   的说法不成立）。别把 408 往小改：地板 362 时占位期 362、到位后 406，凭空多一次 44px 回弹，
+   正是这块占位要防的事（关掉地板实测：0 → 406，下方 .device-breakdowns 从 443 跳到 865）。 */
+.trend-slot {
+  min-height: 408px;
+}
+</style>

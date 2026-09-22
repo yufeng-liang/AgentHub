@@ -1,6 +1,8 @@
 <!-- 沐辉制作：AgentHub Agent中控台入口 -->
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref, watch } from "vue";
+import zhCn from "element-plus/es/locale/lang/zh-cn";
+import { ElConfigProvider } from "element-plus";
+import { defineAsyncComponent, onMounted, onUnmounted, ref, watch } from "vue";
 import { animate, stagger } from "motion-v";
 import { usePreferredReducedMotion } from "@vueuse/core";
 import { useAppStore } from "./stores/app";
@@ -10,32 +12,36 @@ import { setCursorFX } from "./motion/cursor";
 import Sidebar from "./components/Sidebar.vue";
 import PageTabs from "./components/PageTabs.vue";
 import SettingsDialog from "./components/config/SettingsDialog.vue";
-import ConfigSkillsSection from "./components/config/ConfigSkillsSection.vue";
-import ConfigUsageSection from "./components/config/ConfigUsageSection.vue";
-import ConfigProxySection from "./components/config/ConfigProxySection.vue";
 import SkillsHelpDialog from "./components/SkillsHelpDialog.vue";
-// 三大模块的页面视图：各自独立目录，分别开发互不干扰
-import SkillsDashboardView from "./views/skills/SkillsDashboardView.vue";
-import SkillsLibraryView from "./views/skills/SkillsLibraryView.vue";
-import SkillsDedupView from "./views/skills/SkillsDedupView.vue";
-import SkillsSyncView from "./views/skills/SkillsSyncView.vue";
-import SkillsWebdavView from "./views/skills/SkillsWebdavView.vue";
-import SkillsSkillDetailView from "./views/skills/SkillsSkillDetailView.vue";
 // 用量统计模块（原「用量记录同步」）：数据源顶栏 + 五个页面 + 同步进度弹窗
 import SyncTopBar from "./components/sync/SyncTopBar.vue";
 import SyncDialog from "./components/sync/SyncDialog.vue";
+// 三大模块的页面视图：各自独立目录，分别开发互不干扰
+// 首屏落点三选一（moduleOrder 可被用户自定义排序覆盖，见 stores/app.ts:102-106）：留静态进 entry
+import SkillsDashboardView from "./views/skills/SkillsDashboardView.vue";
 import SyncOverviewView from "./views/sync/OverviewView.vue";
-import SyncDetailView from "./views/sync/DetailView.vue";
-import SyncCostsView from "./views/sync/CostsView.vue";
-import SyncBillingRulesView from "./views/sync/BillingRulesView.vue";
-import SyncLogView from "./views/sync/LogView.vue";
 import ProxyHomeView from "./views/proxy/ProxyHomeView.vue";
-import ProxyKeysView from "./views/proxy/ProxyKeysView.vue";
-import ProxyAgentsView from "./views/proxy/ProxyAgentsView.vue";
-import ProxyModelsView from "./views/proxy/ProxyModelsView.vue";
-import ProxyStatsView from "./views/proxy/ProxyStatsView.vue";
-import ProxyPoolSyncView from "./views/proxy/ProxyPoolSyncView.vue";
-import ProxyCcSwitchView from "./views/proxy/ProxyCcSwitchView.vue";
+
+// 其余页面按需加载。模板侧本来就是 v-if="seen(...)" 懒挂载（:560-589），
+// 改造前唯一的浪费是这些页面的代码也在首屏全量解析。
+const SkillsLibraryView = defineAsyncComponent(() => import("./views/skills/SkillsLibraryView.vue"));
+const SkillsDedupView = defineAsyncComponent(() => import("./views/skills/SkillsDedupView.vue"));
+const SkillsSyncView = defineAsyncComponent(() => import("./views/skills/SkillsSyncView.vue"));
+const SkillsWebdavView = defineAsyncComponent(() => import("./views/skills/SkillsWebdavView.vue"));
+const SkillsSkillDetailView = defineAsyncComponent(() => import("./views/skills/SkillsSkillDetailView.vue"));
+const SyncDetailView = defineAsyncComponent(() => import("./views/sync/DetailView.vue"));
+const SyncCostsView = defineAsyncComponent(() => import("./views/sync/CostsView.vue"));
+const SyncBillingRulesView = defineAsyncComponent(() => import("./views/sync/BillingRulesView.vue"));
+const SyncLogView = defineAsyncComponent(() => import("./views/sync/LogView.vue"));
+const ProxyKeysView = defineAsyncComponent(() => import("./views/proxy/ProxyKeysView.vue"));
+const ProxyAgentsView = defineAsyncComponent(() => import("./views/proxy/ProxyAgentsView.vue"));
+const ProxyModelsView = defineAsyncComponent(() => import("./views/proxy/ProxyModelsView.vue"));
+const ProxyStatsView = defineAsyncComponent(() => import("./views/proxy/ProxyStatsView.vue"));
+const ProxyPoolSyncView = defineAsyncComponent(() => import("./views/proxy/ProxyPoolSyncView.vue"));
+const ProxyCcSwitchView = defineAsyncComponent(() => import("./views/proxy/ProxyCcSwitchView.vue"));
+const ConfigSkillsSection = defineAsyncComponent(() => import("./components/config/ConfigSkillsSection.vue"));
+const ConfigUsageSection = defineAsyncComponent(() => import("./components/config/ConfigUsageSection.vue"));
+const ConfigProxySection = defineAsyncComponent(() => import("./components/config/ConfigProxySection.vue"));
 import * as api from "./api/ipc";
 import type { UpdateEvent } from "./types";
 
@@ -539,6 +545,11 @@ const seen = (mod: string, page: string) => !!visited.value[`${mod}/${page}`];
 </script>
 
 <template>
+  <el-config-provider :locale="zhCn">
+  <!-- 全库唯一的 locale 注入点：按需注册后没有 app.use(ElementPlus, { locale }) 了，
+       el-date-picker 面板的月份/星期等内置文案全靠这里，删掉会静默回退英文。
+       provider 自身不渲染 DOM 节点（config-provider.mjs 直接 renderSlot default），
+       包一层不改变结构与 .app 的背景层叠。 -->
   <!-- 最底层：粒子尘场（z-index: -2）→ 随机涌动的液态色块 + 两团跟着光标游走的光池（z-index: -1），
        都在玻璃壳之下被折射出来；3D 球体作为氛围浮在主区右上的玻璃之下；
        最上面一层是颗粒质感。都不吃鼠标事件 -->
@@ -594,4 +605,5 @@ const seen = (mod: string, page: string) => !!visited.value[`${mod}/${page}`];
     <SkillsHelpDialog />
     <SettingsDialog />
   </div>
+  </el-config-provider>
 </template>

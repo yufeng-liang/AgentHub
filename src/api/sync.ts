@@ -4,7 +4,6 @@ import type {
   PriceEntry, PriceRow, UnpricedModel, ImportPreview, ImportPreviewItem, RemotePricingConfig,
   DataDirInfo, SetDataDirResult, BackupInfo,
 } from "../types/sync";
-import { mock } from "./sync-mock";
 
 type InvokeFn = (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
 
@@ -26,7 +25,8 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
   if (isElectron()) {
     return (await window.agenthub!.invoke(cmd, args)) as T;
   }
-  // 浏览器回退：直接走 mock
+  // 浏览器回退（npm run dev:web 预览 UI）：动态引入，别让 mock 数据进 Electron 首屏 chunk
+  const { mock } = await import("./sync-mock");
   return (await mock.invoke(cmd, args)) as T;
 }
 

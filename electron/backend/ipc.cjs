@@ -106,7 +106,9 @@ function register(ctx) {
     return ok({});
   }));
   ipcMain.handle("browse_dir", handle(async () => {
-    const r = await dialog.showOpenDialog(BrowserWindow.getAllWindows()[0], { properties: ["openDirectory"] });
+    const parent = BrowserWindow.getAllWindows()[0];
+    const opts = { properties: ["openDirectory"] };
+    const r = await (parent ? dialog.showOpenDialog(parent, opts) : dialog.showOpenDialog(opts));
     return { ok: true, canceled: r.canceled, path: r.canceled ? null : r.filePaths[0] };
   }));
 

@@ -410,14 +410,16 @@ function register(ipcMain) {
   ipcMain.handle("proxy_account_import_file", handle(async ({ channel }) => {
     const fallback = adapters.get(channel) ? String(channel) : store.CHANNELS[0].id;
     const { dialog, BrowserWindow } = require("electron");
-    const r = await dialog.showOpenDialog(BrowserWindow.getAllWindows()[0], {
+    const parent = BrowserWindow.getAllWindows()[0];
+    const opts = {
       title: "选择账号 JSON / ZIP 文件",
       properties: ["openFile"],
       filters: [
         { name: "账号文件（JSON / ZIP）", extensions: ["json", "zip"] },
         { name: "所有文件", extensions: ["*"] },
       ],
-    });
+    };
+    const r = await (parent ? dialog.showOpenDialog(parent, opts) : dialog.showOpenDialog(opts));
     if (r.canceled || !r.filePaths.length) return ok({ canceled: true });
     const file = r.filePaths[0];
     const buf = fs.readFileSync(file);

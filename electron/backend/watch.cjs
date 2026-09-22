@@ -3,7 +3,7 @@
 // 设计：零冲突零 error 的新收纳/挂载自动执行（覆盖删除全进回收站可还原）；
 // 有冲突绝不替人裁决，只托盘提醒
 "use strict";
-const fs = require("node:fs");
+const fsp = require("node:fs/promises");
 const path = require("node:path");
 const config = require("./config.cjs");
 const adapter = require("./adapter.cjs");
@@ -17,22 +17,24 @@ let baseline = ""; // 已对过账的快照
 let pending = "";  // 刚变化、还没确认稳定的快照
 let lastScanAt = 0;
 let busy = false;
+let ticking = false; // 重入闸：fingerprint 异步化后跨拍可能重叠，两个 handle 并发会重复收纳
+let stopped = false; // 停机标志：stop() 拦不住已经 await 出去的那一拍，得由它自己作废
 let onEvent = null; // main.cjs 挂的桌面通知回调
 
-function fingerprint(cfg) {
+async function fingerprint(cfg) {
   const parts = [];
   for (const t of adapter.resolveScanTargets(cfg)) {
     const list = [];
     let entries;
     try {
-      entries = fs.readdirSync(t.dir, { withFileTypes: true });
+      entries = await fsp.readdir(t.dir, { withFileTypes: true });
     } catch {
       continue;
     }
     for (const e of entries) {
       let st;
       try {
-        st = fs.lstatSync(path.join(t.dir, e.name));
+        st = await fsp.lstat(path.join(t.dir, e.name));
       } catch {
         continue;
       }
@@ -42,7 +44,7 @@ function fingerprint(cfg) {
       let extra = "";
       if (kind === "d") {
         try {
-          const sm = fs.statSync(path.join(t.dir, e.name, "SKILL.md"));
+          const sm = await fsp.stat(path.join(t.dir, e.name, "SKILL.md"));
           extra = `${Math.round(sm.mtimeMs)}:${sm.size}`;
         } catch { /* 无 SKILL.md 或读不到 */ }
       }
@@ -87,17 +89,19 @@ function handle(cfg, fp) {
   }
 }
 
-function tick() {
+async function tick() {
   lastScanAt = Date.now();
+  if (ticking || busy) return; // await 引入后可能跨拍重叠，必须闸住
+  ticking = true;
   try {
-    if (busy) return;
     const cfg = config.loadConfig();
     if (!(cfg.watch && cfg.watch.enabled)) {
       baseline = "";
       pending = "";
       return;
     }
-    const fp = fingerprint(cfg);
+    const fp = await fingerprint(cfg);
+    if (stopped) return; // 停机期间 resume 的一拍直接作废，见 stop()
     if (!baseline) {
       baseline = fp; // 启动留基线，不立刻把历史存货收走
       return;
@@ -113,15 +117,25 @@ function tick() {
     pending = fp;
   } catch {
     /* 感知异常静默，下一拍重试 */
+  } finally {
+    ticking = false;
   }
 }
 
 function start() {
   if (timer) return;
+  stopped = false; // 允许重启感知：不清掉的话 start 之后每一拍都自我作废
   timer = setInterval(tick, INTERVAL_SECONDS * 1000);
 }
 
+// 只清 timer 不够：stop() 那一刻可能正有一拍挂在 fingerprint 的 await 上，它会在停机之后
+// resume 并走到 handle()（真搬文件）+ onEvent（桌面通知）。旧同步版一拍跑完，before-quit
+// 结构上看不到在飞扫描；现在必须留标志让那拍自己作废——尤其 main.cjs 的 pendingInstall
+// 分支会 preventDefault 后继续 pump 事件循环，stop() 之后循环还长着。
+// 判据用 stopped 而不是"timer 为空"：后者把"没排班"和"停机"混成一件事，而自测是直连 await
+// tick() 的（只有断言 7 前后各 start()/stop() 一次），按 timer 判空会把那些拍全作废。
 function stop() {
+  stopped = true;
   if (timer) {
     clearInterval(timer);
     timer = null;

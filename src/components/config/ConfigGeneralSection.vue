@@ -303,6 +303,20 @@ onUnmounted(() => {
         </div>
         <el-switch v-model="app.config.schedule.minimizeToTray" @change="toggleAppBehavior" />
       </div>
+      <div class="set-row">
+        <div class="set-info">
+          <div class="set-name">关窗后释放界面内存</div>
+          <div class="set-desc">关闭窗口即结束界面进程，后台只留反代网关与定时同步，占用内存更低；代价是重新打开要多加载一次界面</div>
+        </div>
+        <el-switch v-model="app.config.schedule.liteOnClose" :disabled="!app.config.schedule.minimizeToTray" @change="toggleAppBehavior" />
+      </div>
+      <div class="set-row">
+        <div class="set-info">
+          <div class="set-name">启动不打开主界面</div>
+          <div class="set-desc">开机后直接缩在托盘，需要时点托盘图标或菜单「显示主界面」再打开（下次启动生效）</div>
+        </div>
+        <el-switch v-model="app.config.schedule.launchHidden" :disabled="!app.config.schedule.minimizeToTray" @change="toggleAppBehavior" />
+      </div>
     </div>
 
     <div ref="updateCard" class="card" :class="{ flash: highlight }">

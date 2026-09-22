@@ -14,14 +14,16 @@
 
 | 阶段 | 形态 | 私有内存 | 依据 |
 |---|---|---|---|
-| 现状 | 关窗只 `hide()` | **321.5 MB** | 实测真实 app（另一次独立读数 315.9 MB） |
-| 一期后 | 关窗即销毁窗口 | **175.4 MB** | 探针实测 437.24 → 175.37 |
-| 一期后（可选） | 启动即不建窗 | **136.0 MB** | 探针实测，GPU 无建窗残留 |
-| 二期后 | 主 App 退出，网关独立常驻 | **33.2 MB** | 探针实测 electron.exe-as-node |
+| 现状 | 关窗只 `hide()` | **321.5 MB** | 真实 app 关窗后实测（另一次独立读数 315.9 MB） |
+| 一期后 | 关窗即销毁窗口 | **215.47 MB** | Task 7 真实打包版实测（无窗 3 进程，40 s 落定 5 次采样一字不差；相对开着窗的 424.86 省 209.39 MB / −49.3%） |
+| 一期后（可选） | 启动即不建窗 | **166.05 MB** | Task 7 真实打包版实测（n=3，GPU 仅 32.2 MB，无建窗残留） |
+| 二期后 | 主 App 退出，网关独立常驻 | **33.2 MB** | 探针实测 electron.exe-as-node（真实 app 的二期终态尚未量） |
+
+> **这张表在 Task 7 之前被污染过一次，此处是更正后的版本**：原先「一期后 175.4 MB / 136.0 MB」两行引的是 §三那支**合成探针**（只建一个 `BrowserWindow` 的裸 Electron app，`tmp/gateway-probe/raw-window-longsettle.jsonl`）的数字，不是本应用的地板价。真实打包版无窗是 215.47，比合成探针的 176.94 高 38.5 MB，其中 **+27.7 MB 在 main**（反代网关 express、两个 SQLite、watch 快照器、两个调度器、配置与号池模块常驻）——这条有独立旁证：对用户自己那份实例做只读枚举得 `main:125.98`，与本构建关窗后的 `main:126.84` 同值，即**这块驻留与窗口无关，关窗路径回收不了它**。教训：探针量的是 Electron，不是 AgentHub，凡引探针数字进验收判据必须标注来源。
 
 一期同时要满足：关窗后重开主界面**不掉体验**——这是「销毁窗口」方案不被察觉的前提。
 
-**二期要付的代价，先写明白**：D3 选了单一拓扑，则「主 App 开着、窗口开着」的常态下内存比现状高约 **25 MB**（多一个 33.2 MB 子进程，主进程只从 99.17 瘦到 91.06）。这笔钱只在窗口开着时付，换来的是关窗后 175 MB、退出后 33 MB，以及一套网关宿主实现。若不接受这个交换，退回 D3 的备选（可切换宿主），但那正是 D3 否掉的方向。
+**二期要付的代价，先写明白**：D3 选了单一拓扑，则「主 App 开着、窗口开着」的常态下内存比现状高约 **25 MB**（多一个 33.2 MB 子进程，主进程只从 99.17 瘦到 91.06）。**这两个 main 数是合成探针的，不是本应用的**——本应用真实 main 无窗驻留实测 126.84 MB（§一 表下说明），二期真正的靶子就是这 126.84 里网关 + 两个 SQLite 占的那部分，收益要按真实值重算，不能沿用 99.17→91.06 那 8 MB。这笔钱只在窗口开着时付，换来的是关窗后按一期实测的 215.47 MB、退出后的独立常驻进程（探针量 33.2 MB，真实终态待量），以及一套网关宿主实现。若不接受这个交换，退回 D3 的备选（可切换宿主），但那正是 D3 否掉的方向。
 
 ## 二、决策记录
 
@@ -30,8 +32,8 @@
 | D1 | 网关下沉到独立进程 | 曾估「只搬网关不改架构」，实测净亏：子进程 +33.2 MB，主进程 99.17→91.06 仅省 8 MB，净增约 25 MB。只有让窗口/主 App 一起消失才有收益 |
 | D2 | 双拓扑并存，用户可选 | 用户明确要求「主 App 常驻」与「退出后继续转发」两者都要 |
 | D3 | **单一宿主拓扑**：网关永远在子进程 | 备选「默认留主进程、常驻时才搬」被否：同一套网关代码两种宿主等于养两个 bug 面，且退出时需热迁移在途 SSE 流 |
-| D4 | 常驻形态**无系统托盘** | `Tray` 需要 Electron main，纯 Node 进程建不了（探针实测：无窗 Electron 地板价 136.0 MB）。备选「koffi 自写 `Shell_NotifyIcon`」工作量和长期维护成本最高，不采纳 |
-| D5 | 一期先出包，二期独立分支 | 二期含 4 个阻塞项（见 §五），任一卡住不该拖住一期已验证的 146 MB 收益 |
+| D4 | 常驻形态**无系统托盘** | `Tray` 需要 Electron main，纯 Node 进程建不了（探针实测 `tmp/gateway-probe/raw-tray.jsonl`：无窗 Electron 地板价 135.93/135.96 MB）。备选「koffi 自写 `Shell_NotifyIcon`」工作量和长期维护成本最高，不采纳 |
+| D5 | 一期先出包，二期独立分支 | 二期含 4 个阻塞项（见 §五），任一卡住不该拖住一期已实测到位的关窗收益（Task 7：同一次运行 424.86 → 215.47 MB，−49.3%，4→3 进程） |
 
 ## 三、实测证据（本会话，探针脚本在 `tmp/gateway-probe/`）
 
@@ -71,7 +73,12 @@
 
 新增配置（见 §六）。
 
-**验收**：关窗前 437 MB 级 → 关窗后 175 MB 级（同机同页面）；托盘双击/`second-instance` 能重开；重开后可交互耗时较一期基线不劣化（由 4.3 保证）。
+**验收**（Task 7 已按此量过；绝对区间那一版判据是错的，见 §一 表下更正说明）：
+
+- 关窗后进程数 4 → 3（renderer 消失），且**同一次运行内**相对开着窗的私有内存降幅 **≥45%**（实测 424.86 → 215.47 MB，−49.3%；工作集 618.95 → 348.37，−43.7%）。
+- 无窗三进程合计 **≤220 MB，且 main 单列 ≤130 MB**（实测 215.47 / main 126.84）。拆出 main 这一条是刻意的：main 里驻着网关与两个 SQLite，与窗口无关，关窗路径回收不动它——它是二期的靶子，不该让一期的门为它失败或为它放行。同一判据在**用户真实配置**（号池非空）的打包版上复算两轮：合计 201.22（冷）/ 211.73（热）MB，同样两条都成立。
+- 原「150–200 MB」绝对区间**不由关窗路径达成，移交二期**：`launchHidden` 实测 166.05 MB 已在区间内，剩下那 49 MB 要靠把网关搬出 main（§五）才拿得到。
+- 重开路径：**两条都已实测通过**。`second-instance` 3 次（同实例重开首帧 FCP 504/1880 ms、DCL 362–433 ms，均优于冷启动）；**托盘双击由用户本人点击、脚本客观捕获**（12:02:07 pages 1→0 且进程树 4→3，12:02:16 pages 0→1 且 3→4，间隔 9 s，主进程 pid 未变，故重建窗口的确实是原实例而非第二个进程）——`showWindow()` 六个调用点里托盘那一族（`main.cjs:221/:225`）自此真实走过。规格「销毁窗口不掉体验」目前只由 DCL/load 撑住，不含冷启动 FCP（实测 +19.6%，见 §4.3 注）。
 
 ### 4.2 后台扫描异步化（不改任何行为）
 
@@ -106,20 +113,22 @@
 
 > **必须同批改的高危点**：`main.ts:21` 的 `{ locale: zhCn }` 是全库唯一 locale 注入点。按需注册后没有全局配置，`el-date-picker` 面板的月份/星期会**静默回退英文**（用在 `TrendChart.vue:286`、`DetailView.vue:178`）。改用 `<el-config-provider :locale="zhCn">` 包住根节点。`ElMessageBox` 需手动引样式（`el-message-box.css` + overlay/input/button）。
 
-**(c) echarts 按需。** `TrendChart.vue:3` 与 `CostTrendChart.vue:3` 的 `import * as echarts`（全量 min 版 1,034,102 B）。实测只用到：series `LineChart`；组件 `GridComponent`/`TooltipComponent`/`LegendComponent` + **`LegendScrollComponent`**（`TrendChart.vue:223` 的 `legend.type:"scroll"`，二者是独立 install，漏则图例不渲染且无报错）；`CanvasRenderer`；`graphic.LinearGradient`（`echarts/core` 已导出，无需注册）。
+**(c) echarts 按需。** `TrendChart.vue:3` 与 `CostTrendChart.vue:3` 的 `import * as echarts`（全量 min 版 1,034,102 B）。实测只用到：series `LineChart`；组件 `GridComponent`/`TooltipComponent`/`LegendComponent` + `LegendScrollComponent`（`TrendChart.vue:223` 的 `legend.type:"scroll"`。这条**从来不是必需**——Task 3 用 `npm pack` 核对了 5.4.3 与 5.6.0，两者 `legend/install.js` 都自带 `use(installLegendScroll)`，只注册 `LegendComponent` 也能解析 `legend.scroll`；显式注册零成本，保留但别当必需、也别当冗余删）；`CanvasRenderer`；`graphic.LinearGradient`（`echarts/core` 已导出，无需注册）。
 **不需要** `HeatmapChart`——`Heatmap.vue` 是纯 DOM 格子（`:157-202`），完全不碰 echarts。`TooltipComponent` 内部已 `use(installAxisPointer)`，不必显式注册。全库无 `registerTheme`。
 `TrendChart.vue:15`/`CostTrendChart.vue:14` 的 `echarts.ECharts` 类型引用要转 `import type`，否则 `npm run build` 的 vue-tsc 会把整包重新拉回。
 
-**(d) Phosphor 子集。** `src/assets/phosphor/style.css`（82,758 B）定义 **1530** 个 `.ph.ph-*:before`，src 实际用到 **82** 个类名，加后端 `toolIcon()` 下发的 8 个（`electron/backend/*.cjs`：`ph-brain ph-code ph-command ph-folder-open ph-package ph-robot ph-sparkle ph-terminal-window`）共 **88** 个，CSS 侧做规则子集约 5 KB。`Phosphor.woff2` 147,380 B 的字形子集**推迟**：需要 `fontTools/pyftsubset`（本机有 Python 无 fontTools，不擅自装系统依赖），且字体文件是按需缓存的静态资源、不参与解析，收益只在安装体积上。
+**(d) Phosphor 子集。** `src/assets/phosphor/style.full.css`（82,758 B，Task 5 起从 `style.css` 改名以标清「全量参照表，不入库引用」）定义 **1530** 个 `.ph.ph-*:before`。实际用到多少：**Task 5 的实测并集是 83 个**，不是本节早先写的「82 个 src + 8 个后端 = 88」——那个 88 是我拍脑袋加出来的（src 静态扫描本身已含 82 个，后端 9 个字面量里除 `ph-airplane-tilt` 外全与 src 重合，并集只有 83）。生成器 `tools/gen-phosphor-subset.cjs` 现扫两个根（`src/` + `electron/backend/`）并在类名不在字体表时硬失败，`BACKEND_ICONS` 只作「扫描看不见的计算式图标名」的兜底。CSS 侧规则子集约 3.7 KB（压缩后实测净省 57 KB，见 §4.3 D1 归因）。`Phosphor.woff2` 147,380 B 的字形子集**推迟**：需要 `fontTools/pyftsubset`（本机有 Python 无 fontTools，不擅自装系统依赖），且字体文件是按需缓存的静态资源、不参与解析，收益只在安装体积上。
 
 **(e) 死重清理。** `src/api/ipc.ts:21` 无条件引 `mock.ts`(32.6 KB)、`src/api/sync.ts:7` 引 `sync-mock.ts`(26.4 KB)，仅 `dev:web` 浏览器预览用（`ipc.ts:49-50`）→ 约 58 KB 移出生产构建（改成浏览器回退分支里的动态 `import`）。`src/styles/element.css:320-355` 的 `.el-table` 整块删除（`<el-table` 全库零使用）。**`.el-textarea__inner` 不删**：它在 `:292`、`:301`、`:310` 是逗号选择器组的成员，删要拆组、收益不足 1 KB，风险与收益不成比例；`ProxyAgentsView.vue:885` 用的是原生 `<textarea>`，与 EP 那个类名无关，既不构成保留理由也不构成删除依据。
 
 **(f) CSS 不能整文件延后的三处。** `sync.css`(72.3 KB) 与 `skills.css`(18.5 KB) 被常驻组件依赖：`SyncDialog.vue:51`、`ConfigDataSection.vue:146`、`ConfigUsageSection.vue:228`、`ConfigWebdavSection.vue:182,228` 根节点都带 `sync-scope`；`SkillsHelpDialog.vue` 全用 `sk-*`。`Heatmap.vue:190` 的 `.heat-tip` Teleport 到 body 且不受 scope 约束（`sync.css:3187`），`@keyframes` 也是全局规则。`element.css:526` 的 `.el-popper.glass-popper` 被壳用（`Sidebar.vue:285`）。→ 这两份 CSS 留在 entry，只按规则块瘦身，不做整文件懒加载。
 `main.ts:5-13` 的引入顺序约束（EP index.css → dark css-vars → phosphor → global → skills → sync → element，注释在 `:6`）**保持不动**：分包只影响 JS 与异步 chunk 自带 CSS，entry CSS 内部相对顺序不变。
 
-**验收**：首屏 entry JS 目标 ≤700 KB（现 2445 KB），回归门槛按 **800 KB** 硬失败（留机器与 tree-shaking 抖动余量）；entry CSS **≤320 KB**（现 584 KB）——250 KB 这个初值与本节自己的约束矛盾：`sync.css` 72 KB 与 `skills.css` 18 KB 必须留 entry（见下条 (f)），加按需 EP 约 140 KB、`global.css` 66 KB，地板价就在 310 KB 上下。echarts 不进 entry chunk。构建产物用 `dist/assets/` 文件名与字节数直接核，不看构建退出码。
+**验收**：首屏 entry JS 目标 ≤700 KB（现 2445 KB），回归门槛按 **800 KB** 硬失败（留机器与 tree-shaking 抖动余量）；entry CSS **≤325 KiB**（现 584 KB）——250 KB 与本节自己的约束矛盾（`sync.css` 72 KB、`skills.css` 18 KB 必须留 entry），320 KB 又错在按 phosphor **源码** 82 KB 估可省量（压缩后实占 60 KB、子集 3.7 KB，实省 57 KB）；按需 EP 约 140 KB + `global.css` 66 KB 等叠起来的实测地板价是 **321.0 KiB**，门槛取 325 KiB。echarts 不进 entry chunk。构建产物用 `dist/assets/` 文件名与字节数直接核，不看构建退出码。
 
 ## 五、二期设计：网关下沉独立进程
+
+**二期继承的一期未达项（Task 7 实测带来，写死在这里免得丢）**：把无窗常驻从 215.47 MB 拉进原定的 150–200 MB 区间。靶子是 main 那 **126.84 MB**（与窗口无关，关窗回收不动；用户自己那份实例只读枚举同为 125.98 MB），二期把网关 express + 两个 SQLite + `credits`/`rules` 热路径下沉到子进程之后，必须重量这块并给出拆解，而不是沿用 §三 探针的 `99.17 → 91.06`（那是 Electron 的数，不是本应用的）。同一次量测要顺带回答一期留下的一个单点观测：一轮完整逐页导航后 main 从 121.32 涨到 147.10 MB（顾虑：会不会随使用继续爬）。
 
 ### 5.1 进程切分线
 
@@ -187,7 +196,7 @@
 | 字段 | 默认 | 期 | 语义 |
 |---|---|---|---|
 | `schedule.liteOnClose` | `true` | 一 | 关窗即销毁窗口回收 UI 内存；关掉则回到今天的 `hide()` 秒开行为 |
-| `schedule.launchHidden` | `false` | 一 | 启动不建窗，直接进托盘（再省约 39 MB GPU 残留） |
+| `schedule.launchHidden` | `false` | 一 | 启动不建窗，直接进托盘（实测 166.05 MB，比「建过再销毁」的 215.47 再省 49.42 MB） |
 | `schedule.persistentGateway` | `false` | 二 | 主 App 退出时保留网关进程（无托盘） |
 
 字段间的关系，避免实现时各写各的：
@@ -216,22 +225,23 @@
 |---|---|
 | 一期体积 | 核 `dist/assets/` 分块字节数（不用构建退出码代替产物检查）；目标见 §4.3 |
 | 一期耗时 | CDP 实测「建窗 → 可交互」（AGENTS.md 第三节流程）；探针 `tmp/gateway-probe/memtree.ps1` 可复用 |
-| 一期内存 | 关窗前后采 `PrivateMemorySize64`，对齐 §三基线 |
+| 一期内存 | 关窗前后采 `PrivateMemorySize64`，对齐 **§4.1 更正后的判据**（相对降幅 + main 单列）。**不要**对齐 §三——那张表是合成探针，量的是 Electron 不是本应用（教训见 §一 表下说明） |
+| 探针卫生（一期 Task 7 暴露，二期必须遵守） | 用临时 userData 起打包版实例**并不等于隔离**：`hubDir()` 按 `os.homedir()` 解析，仍会读写共享中央仓库 `~/.agent_skills`；packaged 且非便携的实例每次启动都调 `applyAutoStart`，`autoStart` 默认 false 时会把**用户自己的**开机自启 Run 项删掉。故探针三件套：`AGENT_SKILLS_HOME=<临时目录>`（或临时 config 里 `watch.enabled:false`）+ 网关端口改到非 9527（9527 归用户实例，拿它的应答当本构建的证据是错的）+ 收尾核对 HKCU Run 值列表未变。一期四个探针脚本在 gitignored 的 `tmp/gateway-probe/`，二期复用时**四个一起**提到 `tools/`，别只提 `.cjs`（会留下对 `memtree.ps1` 的悬空引用）。另注意 `proxy.boot()` 里的 `discovery.cjs:34,37,347` 会读**真实本机登录文件**（CodeBuddy/Trae 的本地 auth），临时 userData 挡不住它——一期那次隔离实例 `/v1/models` 能列出 `trae` 的模型就是这个原因（只读，discovery/adapter 侧无写入调用；但报告写「号池为空」时必须同时说明这点），二期把 discovery 下沉到子进程时要一并处理 |
 | 按需注册静默坏掉 | 新增 CDP 冒烟：6 个 chunk 落点页各截一次 DOM，断言图表 canvas 存在、`el-date-picker` 面板月份为中文、图例已渲染 |
 | 图标子集 | 纯静态比对：`src` 用到的类名 ∪ 后端 `toolIcon()` 下发集合 ⊆ 生成的子集 CSS |
 | 二期 | 矩阵：安装版/便携版 × 常驻开关 × 升级装更。验「主 App 退出后 9527 仍通」「重开认领不起第二个进程」「WAL 不再单调增长」「装更前子进程已停」 |
 | 回归底线 | `npm run build` + `tools/proxy-smoke.cjs` + `tools/proxy-regress.cjs` + `scripts/dev-ccswitch-test.cjs`（靠 `CCSWITCH_DB_PATH` 隔离，勿 `delete process.env` 构造缺库场景）+ `scripts/dev-sse-delta-test.cjs` 全绿 |
 
-打包前置：先杀运行中的 AgentHub 与 `%TEMP%` 里的便携版子进程（AGENTS.md 第二节）。
+打包前置：electron-builder 会被**自己产物目录里**的运行实例锁住（`release\win-unpacked\AgentHub.exe` 及其子进程、`%TEMP%` 里便携版解出的子进程），打包前只清这些。**用户自己安装的实例不在清理之列**（本机装在 `H:\AgentHub`，它不锁仓库产物）；真撞锁且归因不到自己头上，停下来报告，不擅自终止用户进程。
 
 ## 九、顺手修的既存缺陷
 
 只限于本次改动确实经过的文件：
 
 - `ph-radar`（`ConfigSkillsSection.vue:266`）、`ph-packages`（`SkillsHelpDialog.vue:56`）在字体表里不存在，现状即空白图标。子集化会让人误判为分包引起，一并纠正为已存在字形。
-- `src/assets/phosphor/style.css:4-7` 的 `@font-face` 声明了 `.woff`/`.ttf`/`.svg` 三个不存在于目录的文件，产物里仍留着这三条死 URL。子集重写时清掉。`font-display: block`（`:10`）改 `swap` 与否按首帧表现定，不作为本期目标。
+- `src/assets/phosphor/style.full.css:4-7` 的 `@font-face` 声明了 `.woff`/`.ttf`/`.svg` 三个不存在于目录的文件，产物里曾留着这三条死 URL —— Task 5 子集重写时已清掉。`font-display: block`（`:10`）**一期定案：不改 `swap`**，理由记录在此而非静默漂移：字体是本地产物（`file://` 读取，无网络往返），换 `swap` 只会让图标先空白再跳现、比现状更差；首帧实测 FCP +19.6% 由懒 chunk 的读盘+parse 解释（§4.1 注），与 `font-display` 无关，所以那条「按首帧表现定」的悬置条件已经用上并给出了结论。
 - `store.cjs:13-25` 的 `better-sqlite3` 回退分支是死代码（不在 `package.json` 依赖里）。二期中改 `store.cjs` 时顺手删。
-- `echarts` 在 `devDependencies` 且声明 `^5.4.3` 而实装 5.6.0；`Heatmap` 相关的历史注释若与实际不符一并订正。
+- `echarts` 在 `devDependencies` 且声明 `^5.4.3` 而实装 5.6.0 —— **一期定案：不动声明**。理由：实装版本由 lock 固定，改下限只影响将来的重装解析，且它不属于本期任何任务的改动面；本期已经实测过「`^5.4.3` 与 5.6.0 的按需安装集完全相同」（Task 2/3 用 `npm pack` 核对），所以这行既不是 bug 也没有回归风险，留给二期一并处理。`Heatmap` 的历史注释本期核实过：它不用 echarts，未动。
 - `main.cjs:328` 的 `second-instance` 忽略 argv，无法区分「点图标」与「重复启动带参数」，二期认领逻辑需要参数区分时补。
 
 ## 十、非目标

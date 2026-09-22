@@ -28,6 +28,7 @@ let currentCheckIsManual = false; // 手动检查时用户正看着页面，不�
 let timer = null;
 let showWindow = null;
 let onTrayRefresh = null; // 状态一变就刷新托盘菜单（更新提示条目随之出现/消失）
+let onFocusUpdate = null; // 通知点击的跳转交回主进程投递（销毁态下 getAllWindows() 是空的，自己 broadcast 投给空气）
 
 function isPortable() {
   if (process.env.PORTABLE_EXECUTABLE_DIR) return true;
@@ -68,8 +69,9 @@ function notify(title, body) {
   if (!Notification.isSupported()) return;
   const n = new Notification({ title, body, icon: notifyIcon() });
   n.on("click", () => {
-    broadcast({ event: "focus-update" });
-    if (showWindow) showWindow();
+    // 跳转交回主进程：liteOnClose 下窗口可能已销毁，自己 broadcast 等于投给空气
+    if (onFocusUpdate) onFocusUpdate();
+    else if (showWindow) showWindow();
   });
   n.show();
 }
@@ -314,6 +316,7 @@ function bindUpdaterEvents() {
 function init(opts) {
   showWindow = (opts && opts.onShowWindow) || null;
   onTrayRefresh = (opts && opts.onTrayRefresh) || null;
+  onFocusUpdate = (opts && opts.onFocusUpdate) || null;
   status = idleStatus();
   if (autoUpdater) {
     autoUpdater.autoDownload = false; // 下载让用户自己点
