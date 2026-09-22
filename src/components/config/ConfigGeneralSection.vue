@@ -491,13 +491,7 @@ onUnmounted(() => {
 }
 
 /* ===== 免责声明弹窗 ===== */
-.disclaimer-dialog {
-  max-width: calc(100vw - 48px);
-}
-.disclaimer-dialog :deep(.el-dialog__body) {
-  max-height: min(52vh, 460px);
-  overflow-y: auto;
-}
+/* 类名落点与限高的原因说明在文件末尾的全局样式块（append-to-body 弹窗不能走 scoped） */
 .dc-title {
   font-size: 15px;
   font-weight: 700;
@@ -528,5 +522,31 @@ onUnmounted(() => {
   font-size: 11px;
   color: var(--text-3);
   text-align: right;
+}
+</style>
+<style>
+/* ===== 免责声明弹窗：全局块（不能 scoped）===== */
+/* append-to-body 把弹窗传送到 body 之下，本组件的 data-v 作用域属性到不了 EP 内层元素——
+   1.0.0 起写在 scoped :deep 里的 body 限高从未命中，这就是内容超高时（一期实测 1109px 内容
+   > 779px 视口）整窗在 .el-overlay-dialog 的 overflow:auto 里顶对齐、「我已知晓」要滚到底才
+   点得到的根因。class 经 $attrs 逐字落在 .el-dialog 根元素上（EP 2.14.5 dialog.vue 把
+   $attrs 传给 dialog-content，其根节点即 .el-dialog），全局类名选择器必然命中。
+   限高取 calc(100vh - 64px)：上下各留 32px 呼吸位，align-center 的 flex 居中依旧成立；
+   内容不超高时 max-height 不约束，维持原视觉。 */
+.disclaimer-dialog {
+  max-width: calc(100vw - 48px);
+  max-height: calc(100vh - 64px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.disclaimer-dialog .el-dialog__header,
+.disclaimer-dialog .el-dialog__footer {
+  flex-shrink: 0;
+}
+.disclaimer-dialog .el-dialog__body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 </style>
