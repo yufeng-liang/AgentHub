@@ -55,7 +55,7 @@ ok("重复 slug 被拒", !provider.create({ id: "relay", ...base }).ok);
 ok("模型名含斜杠被拒", !provider.create({ id: "p2", ...base, models: ["google/gemini"] }).ok, provider.create({ id: "p2", ...base, models: ["google/gemini"] }).message);
 
 console.log("\n渠道视图与路由合法性:");
-ok("channelList 含内置 4 家 + relay", store.channelList().length === 5, store.channelList().map((c) => c.id));
+ok("channelList 含全部内置渠道 + relay", store.channelList().length === store.BUILTIN_CHANNELS.length + 1, store.channelList().map((c) => c.id));
 ok("relay 标记为 openai_compat", (store.channelList().find((c) => c.id === "relay") || {}).kind === "openai_compat");
 ok("内置渠道 kind=builtin", (store.channelList().find((c) => c.id === "trae") || {}).kind === "builtin");
 ok("routeOk 接受提供商 slug", store.channelList().some((c) => c.id === "relay"));
@@ -312,3 +312,8 @@ const call = async (base, secret, model, stream) => {
   console.error("\n闸自身异常:", e);
   process.exit(1);
 });
+
+console.log("新增内置渠道（Task 1）:");
+for (const id of ["cline_free", "cline_pass", "autoclaw", "autoclaw_intl", "qoder"]) {
+  ok(`${id} 是内置渠道`, store.isBuiltinChannel(id));
+}

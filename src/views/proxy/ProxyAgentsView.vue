@@ -41,6 +41,11 @@ const CHANNEL_META: Record<ProxyBuiltinChannelId, { icon: string; hint: string }
   workbuddy: { icon: "ph-buildings", hint: "官方登录 · 每日签到" },
   workbuddy_ai: { icon: "ph-globe-hemisphere-west", hint: "国际版 · 一次性加油包" },
   raccoon: { icon: "ph-paw-print", hint: "文件导入/粘贴 · 每日签到" },
+  cline_free: { icon: "ph-lightning", hint: "设备授权登录 · 粘贴 · 本机导入" },
+  cline_pass: { icon: "ph-crown", hint: "设备授权登录 · 粘贴 · 本机导入" },
+  autoclaw: { icon: "ph-robot", hint: "粘贴 · 本机导入（官方无网页登录）" },
+  autoclaw_intl: { icon: "ph-globe", hint: "OAuth 登录（滑块验证）· 粘贴" },
+  qoder: { icon: "ph-cursor", hint: "设备授权登录 · 粘贴" },
 };
 // 自定义提供商只有 API Key：没有登录态、没有签到、没有余额概念，措辞要与生态渠道明确区分
 const PROVIDER_META = { icon: "ph-plugs-connected", hint: "API Key 轮转 · 无余额概念" };
