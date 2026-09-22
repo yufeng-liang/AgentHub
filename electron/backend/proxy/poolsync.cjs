@@ -19,6 +19,7 @@ const store = require("./store.cjs");
 const webdav = require("../webdav.cjs");
 const zip = require("../zip.cjs");
 const events = require("./events.cjs");
+const util = require("./util.cjs");
 
 const POOL_DIR = "pool";
 const ZIP_ENTRY = "accounts.json";
@@ -423,7 +424,7 @@ async function run(opts) {
     }
     // 设备档案（每次同步都推，lastSyncAt 本来就该更新）
     await webdav.put(remoteUrl(w, POOL_DIR, "devices", `${myId}.json`), w,
-      JSON.stringify({ name: myName, appVersion: appVersion(), accountCount: snapshot.accounts.length, channel: channel || "", lastSyncAt: new Date().toISOString() }));
+      JSON.stringify({ name: myName, appVersion: util.appVersion(), accountCount: snapshot.accounts.length, channel: channel || "", lastSyncAt: new Date().toISOString() }));
 
     persisted.lastSyncAt = Date.now();
     savePersisted(persisted);
@@ -457,10 +458,6 @@ function checkAborted() {
   if (cancelSignal && cancelSignal.signal.aborted) {
     throw Object.assign(new Error("同步已取消"), { name: "AbortError" });
   }
-}
-
-function appVersion() {
-  try { return require("electron").app.getVersion(); } catch { return ""; }
 }
 
 /** 统一 WebDAV 密码改动后调用：令历史上传记账失效，下次同步用新密码重打包 */

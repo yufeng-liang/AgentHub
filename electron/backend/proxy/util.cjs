@@ -367,9 +367,16 @@ function estimateTokens(text) {
   return Math.max(1, Math.ceil(String(text || "").length / 4));
 }
 
+/** 版本号：两端同源。旧实现 poolsync.cjs:463 用 require("electron").app.getVersion()，
+ *  try 吞错后在子进程里恒返回 ""，会让 gateway.json 的版本比对（Task 3/7）永远"不匹配"→ 每次启动都重杀子进程。 */
+function appVersion() {
+  try { return require("../../../package.json").version || ""; } catch { return ""; }
+}
+
 module.exports = {
   uuid, traceId, jwtDecode, dig, toMs,
   isCompleteJson, parseRetryAfterHeaders, stableConvId, promptCacheKey,
   isDeepSeekModel, injectThinking, normalizeReasoningEffort, backfillReasoningContent,
   SseScanner, stripEmptyDelta, hasConsumableDelta, chunk, DONE, Aggregator, openaiError, validateChatBody, estimateTokens,
+  appVersion,
 };

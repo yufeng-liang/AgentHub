@@ -4,7 +4,6 @@
 "use strict";
 const fs = require("node:fs");
 const path = require("node:path");
-const { shell } = require("electron");
 const config = require("../config.cjs");
 const store = require("./store.cjs");
 const rules = require("./rules.cjs");
@@ -19,6 +18,19 @@ const ideswitch = require("./ideswitch.cjs");
 const poolsync = require("./poolsync.cjs");
 const ccswitch = require("./ccswitch.cjs");
 const zip = require("../zip.cjs");
+const secretbox = require("./secretbox.cjs");
+
+// shell 只在 4 条「留主进程」的命令里用到（openExternal / openPath）。
+// 顶层 require("electron") 会让整张依赖图在纯 Node 子进程里加载不了（Task 0 实测唯一 FAIL 点），
+// 故惰性取 + 拿不到时明确抛错，而不是让子进程 require 到一半炸掉。
+function getShell() {
+  try {
+    const el = require("electron");
+    return el && typeof el === "object" ? el.shell : null;
+  } catch {
+    return null;
+  }
+}
 
 // ===== 号池 JSON 导入（粘贴 / 文件共用）：单个对象或数组，字段容忍常见别名 =====
 
@@ -230,14 +242,9 @@ function gatewayStatus() {
   };
 }
 
-function vaultOk() {
-  try {
-    const ss = require("electron").safeStorage;
-    return !!(ss && ss.isEncryptionAvailable());
-  } catch {
-    return false;
-  }
-}
+// 保险可用性 = 「凭据能不能被解」，与在哪个进程无关。旧实现只看 safeStorage，
+// 子进程里没有 electron 绑定 → 恒 false → 网关页误报（见 §5.7 更正：这条命令因此可转发）。
+function vaultOk() { return secretbox.backend() !== "none"; }
 
 /** 记住网关的开关状态：每次启停都写回整体配置的 proxy.restoreOnLaunch，
  *  下次打开应用按它决定是否自动启动（默认 false，即首次打开是关闭的） */
@@ -388,7 +395,11 @@ function register(ipcMain) {
       }
       events.emit({ type: "oauth-done", channel: ch, ...result });
     });
-    if (r.ok && r.url) await shell.openExternal(r.url);
+    if (r.ok && r.url) {
+      const shell = getShell();
+      if (!shell) throw new Error("该操作需要主进程界面，不能由后台常驻网关执行");
+      await shell.openExternal(r.url);
+    }
     return r.ok ? ok({ url: r.url, mode: r.mode }) : fail(r.message);
   }));
   ipcMain.handle("proxy_oauth_cancel", handle(() => ok({ cancelled: discovery.cancelOAuth() })));
@@ -514,10 +525,14 @@ function register(ipcMain) {
   // ===== 规则文件 / 目录 / 安全 =====
   ipcMain.handle("proxy_rules_list", handle(() => rules.list()));
   ipcMain.handle("proxy_open_rules_dir", handle(async () => {
+    const shell = getShell();
+    if (!shell) throw new Error("该操作需要主进程界面，不能由后台常驻网关执行");
     await shell.openPath(rules.rulesDir());
     return ok({});
   }));
   ipcMain.handle("proxy_open_data_dir", handle(async () => {
+    const shell = getShell();
+    if (!shell) throw new Error("该操作需要主进程界面，不能由后台常驻网关执行");
     await shell.openPath(store.proxyDir());
     return ok({});
   }));
