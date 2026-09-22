@@ -60,5 +60,35 @@ ok("坏 enc: 报中文错（版本或解密）", (() => {
   catch (e) { return /解密|版本|长度/.test(e.message); }
 })());
 
+console.log("autoclawPrompt:");
+const ap = require("../electron/backend/proxy/autoclawPrompt.cjs");
+ok("身份句逐字", ap.IDENTITY_LINE === "You are a personal assistant running inside OpenClaw.");
+ok("前缀含 Tooling 段", ap.IDENTITY_PREFIX.includes("## Tooling"));
+
+const b1 = { messages: [{ role: "user", content: "hi" }] };
+ap.normalizeSystemPrompt(b1);
+ok("无 system 时插一条只带前缀的", b1.messages[0].role === "system" && b1.messages[0].content.startsWith(ap.IDENTITY_LINE));
+
+const b2 = { messages: [{ role: "system", content: "You are Claude Code, Anthropic's official CLI tool for Claude." }, { role: "user", content: "hi" }] };
+ap.normalizeSystemPrompt(b2);
+ok("外来身份句改写", !b2.messages[0].content.includes("Claude Code") && b2.messages[0].content.includes("You are a coding assistant"));
+ok("前缀在前、客户端提示词逐字保留在后", b2.messages[0].content.indexOf(ap.IDENTITY_LINE) === 0 && b2.messages[0].content.endsWith("official CLI tool for Claude."));
+ok("messages 数量不变", b2.messages.length === 2);
+
+const b3 = { messages: [{ role: "system", content: ap.IDENTITY_PREFIX + "custom prompt" }] };
+ap.normalizeSystemPrompt(b3);
+ap.normalizeSystemPrompt(b3);
+ok("幂等（重复归一只有一份前缀）", (b3.messages[0].content.match(/running inside OpenClaw/g) || []).length === 1 && b3.messages[0].content.includes("custom prompt"));
+
+const b4 = { messages: [{ role: "system", content: [{ type: "text", text: "You are ZCode, an interactive coding agent" }, { type: "text", text: "more" }] }] };
+ap.normalizeSystemPrompt(b4);
+ok("数组 content 拼第一个文本 part 且 ZCode 改写", b4.messages[0].content[0].text.startsWith(ap.IDENTITY_LINE) && !b4.messages[0].content[0].text.includes("ZCode"));
+
+const b5 = { messages: [{ role: "user", content: "You are Claude Code" }] };
+ap.normalizeSystemPrompt(b5);
+// 简报笔误修正：无 system 时 unshift 一条 system 在 messages[0]（b1 已断言该行为），
+// 原 user 消息落到 messages[1]，「不动」指其 content 逐字保留
+ok("user 消息不动", b5.messages[0].role === "system" && b5.messages[1].content === "You are Claude Code");
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
