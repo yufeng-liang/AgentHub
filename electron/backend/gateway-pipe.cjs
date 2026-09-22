@@ -1,6 +1,6 @@
 // 网关命令管道（二期 Task 3 立起最小版，Task 4 硬化到位）：serve / connect / call / broadcast 四件套。
 //
-// 四条判据各有闸项（scripts/dev-gateway-pipe-test.cjs 的 ⑨ 组），改之前先看它们红什么：
+// 每条判据都有闸项（scripts/dev-gateway-pipe-test.cjs 的 ⑨ 组），改之前先看它们红什么：
 //  · 配对：响应按帧里的 id 认领 pending，**不**按到达顺序、不按 FIFO。派发顺序 = 帧到达顺序，
 //    完成顺序可以任意乱（⑨a 用真命令表、⑨a-2 用人为反序的 hold 梯度各钉一半）。
 //  · 默认超时：除 proto.NO_TIMEOUT_CMDS 那三条之外，每条 call 都有 proto.DEFAULT_TIMEOUT_MS 的上界。
@@ -14,6 +14,12 @@
 //    「派生复活」经 store.updateAccount() 回写、effectiveStatus() 在 cooling/exhausted 到期时真落库，
 //    所以 proto.NON_IDEMPOTENT_READS 里那两条「读」都带写副作用；二期没有幂等表，重放一次就是重复执行一次写。
 //    所有失败路径（断连 / 超时 / 未投递 / 队列满）回的 Error 都带 notRetried 标记，闸 ⑨e 数服务端调用次数钉死它。
+//  · 溢出即判死：单帧超过 proto.MAX_FRAME_BYTES 时**断开这条连接**并记日志，绝不截断后继续解析
+//    （截断继续用 = 把一条被腰斩的帧当成合法命令）。两端各一份，闸 ⑨f 两头都灌一次真超限数据。
+//  · 两条队列都有界：命令帧在单连接上被客户端的 MAX_PENDING 钉住（超界立即拒）；事件帧没有 id 也没有
+//    ack、生产者却是周期性的（credits 调度、poolsync 进度、请求完成），所以 broadcast 在**写之前**看这条
+//    连接发送队列的 writableLength——已越过 highWaterMark 就丢该帧并记 event-frame-dropped，绝不在子进程里
+//    另排一条无界队列（规格 §5.2）。丢帧不判死连接：事件是尽力投递，命令帧走另一条路且各自有 id 与上界。
 //
 // 传输：Windows named pipe，走 net.createServer / net.connect 的 pipe path 形态（`\\.\pipe\…`）。
 // 不开第二个 TCP 端口（规格 §5.2）：不占端口、无防火墙面、随进程消失。
@@ -26,21 +32,35 @@ let SEQ = 0;
 const nextId = () => String(++SEQ);
 
 /**
- * 一行帧写出去，**返回到底写没写出去**。
- * 静默丢帧是这里最坏的失败形态：调用方拿不到任何信号，命令就只剩「永远不回来」。事件帧可以接受丢
- * （广播本来就是 best-effort，掉一帧订阅端下次还能看到状态），命令/响应帧的丢弃必须被上层看见并留痕。
+ * 一行文本写出去。返回值是 **`sock.write()` 的原话**，三态里只有两态是「失败」：
+ *  · `true`  —— 帧已被接受且没越过 highWaterMark；
+ *  · `false` 且 `sock.writable` 为真 —— **背压**：帧进了这条 socket 自己的发送队列（没丢！），只是越过了
+ *    highWaterMark，调用方该停手等 'drain'。把它当「写成功」= 以为能无限往下排（评审 I2 的成因就是这个返回值
+ *    被丢掉）；把它当「没写出去」= 误报「未投递」，而命令可能已经在子进程里跑完并落了库；
+ *  · `false` 且 `sock.writable` 为假 —— 真没写出去（对端已断 / socket 不可写 / write 抛错）。
+ * 静默丢帧是这里最坏的失败形态：调用方拿不到任何信号，命令就只剩「永远不回来」。
  */
-function writeFrame(sock, frame) {
+function writeText(sock, text) {
   if (!sock || !sock.writable) return false;
   try {
-    sock.write(proto.encode(frame));
-    return true;
+    return sock.write(text);
   } catch {
     return false;                 // 对端已断：socket 自己会走 close，调用方只需别再以为投出去了
   }
 }
 
-/** 「这条命令不会被自动重放」的统一错因（文件头第四条）。 */
+function writeFrame(sock, frame) {
+  let text;
+  try { text = proto.encode(frame); } catch { return false; }   // 载荷连 JSON 都不了 = 编程错，按「没写出去」处理
+  return writeText(sock, text);
+}
+
+/**
+ * 「这条命令不会被自动重放」的统一错因（文件头第四条）。
+ * 也是**所有**失败路径共用的错误形状：`notRetried` + `command`。管道层四类（断连 / 超时 / 未投递 / 队列满）
+ * 之外还有主进程侧那一支「压根没连接」——gateway-client.call() 的早退也走它（闸 ⑨h），因为 Task 5 的
+ * 转发体是按这个标记决定「能不能重发」的，形状不统一就会漏一支。
+ */
 function noRetryError(message, cmd) {
   const idempotencyRisk = proto.NON_IDEMPOTENT_READS.has(String(cmd));
   const e = new Error(message + "（不会自动重放"
@@ -102,10 +122,13 @@ function serve({ token, pipePath, dispatch } = {}) {
       const id = String(f.id);
       const cmd = String(f.cmd);
       const reply = (frame) => {
-        if (writeFrame(sock, frame)) return;
+        // 响应帧与事件帧在这里**相反**：背压时照排不误，只有「真没写出去」才留痕。理由是客户端那条 id 正在
+        // 等回执，中途丢弃就是「命令真跑了却没回执」的错判；而它不会堆成无界队列——单连接在飞的命令数被
+        // 客户端的 MAX_PENDING 钉住（见文件头第三条），这条连接上最多攒 64 帧响应。
+        if (writeFrame(sock, frame) || sock.writable) return;
         // 响应帧没写出去 = 客户端那条 id 只能等它自己的默认超时才有结论。留痕，否则排查时只剩
         // 「主进程说子进程不回话」，而子进程日志里连一次派发记录都没有。
-        log.line("pipe-frame-dropped", { k: "res", id, cmd, peerWritable: !!(sock && sock.writable) });
+        log.line("pipe-frame-dropped", { k: "res", id, cmd, peerWritable: false });
       };
       Promise.resolve()
         .then(() => dispatch(cmd, f.args))
@@ -135,8 +158,33 @@ function serve({ token, pipePath, dispatch } = {}) {
         pipePath,
         /** 主进程连上第一帧并通过 token 校验后才算 ready（gateway.cjs 在写 gateway.json 之后 await 它） */
         ready,
-        // 事件帧是 best-effort：掉一帧下次状态还能对上，不值得为它断连或排队（命令帧走 call，另一条路）。
-        broadcast: (frame) => { for (const c of clients) writeFrame(c, frame); },
+        // 事件帧的队列必须有界（规格 §5.2「队列不得无界……避免主 App 卡死时子进程堆内存」，评审 I2）。
+        // 事件帧与命令/响应帧不是一条路：它没有 id、不占客户端的 pending、也没有 ack，生产者却是周期性
+        // 的（credits 30 分钟调度、poolsync 进度、请求完成）。主进程卡死而连接还挂着时，这些帧会**全部**
+        // 堆在子进程的发送队列里 —— 命令帧不会，它在单条连接上被客户端的 MAX_PENDING 钉住（文件头第三条）。
+        // 所以这里给事件帧补第二条界：这条连接的发送队列已经越过 highWaterMark 就当场丢掉该帧并留痕，
+        // 绝不另排一条无界队列；也**不因为一帧丢弃把连接判死**（事件是尽力投递，掉一帧下次状态还能对上；
+        // 判死会把同一连接上正在跑的命令帧一起打成「未投递」，那才是真的把事办坏）。闸 ⑨g 两头都钉：
+        // 灌 50 MB 只让个位数帧入队 + 逐条留痕，且那条连接随后还能收命令帧。
+        broadcast: (frame) => {
+          let text;
+          try { text = proto.encode(frame); } catch { return; }        // 载荷连 JSON 都不了 = 编程错，整条丢掉
+          for (const c of clients) {
+            if (!c.writable) continue;              // 对端已断：close 马上会把它从 clients 里摘掉，不必留痕
+            // 背压的判据必须落在**写之前**：sock.write() 回 false 时那一帧已经在队列里了，拿它当
+            // 「丢掉这一帧」是句空话（实测那样写时 200 帧 / 50 MB 仍然全部入队，闸 ⑨g 就是这么红的）。
+            // 所以这里看的是「这条连接的发送队列是否已经堆到 highWaterMark」——越线即丢，一帧都不进队列。
+            if (c.writableLength >= (c.writableHighWaterMark || 16384)) {
+              log.line("event-frame-dropped", {
+                reason: "backpressure", k: String((frame && frame.k) || ""),
+                type: String((frame && frame.payload && frame.payload.type) || ""),
+                bytes: text.length, queued: c.writableLength, peerWritable: true,
+              });
+              continue;
+            }
+            writeText(c, text);                     // 返回 false 只是「这一帧把队列顶过了线」，下一帧会被丢掉
+          }
+        },
         close: () => {
           for (const c of clients) { try { c.destroy(); } catch { /* 已断 */ } }
           clients.clear();
@@ -256,7 +304,9 @@ function connect({ pipePath, token, timeoutMs } = {}) {
             reject2(noRetryError("子进程未在 " + ms + "ms 内应答：" + cmd, cmd));
           }, ms);
           pending.set(id, rec);
-          if (!writeFrame(sock, { k: "req", id, cmd: String(cmd), args: args || {} })) {
+          // 只有「真没写出去」才判未投递。背压（false 且仍 writable）时帧已进 socket 自己的发送队列，
+          // 照常等回执——误判成未投递会让调用方以为命令没跑，而它可能已经在子进程里落了库。
+          if (!writeFrame(sock, { k: "req", id, cmd: String(cmd), args: args || {} }) && !sock.writable) {
             if (rec.timer) clearTimeout(rec.timer);
             pending.delete(id);
             reject2(noRetryError("命令帧未能写入管道，未投递：" + cmd, cmd));
@@ -274,4 +324,5 @@ function connect({ pipePath, token, timeoutMs } = {}) {
 // __hooks：只给闸（scripts/dev-gateway-pipe-test.cjs ⑨c）钉「不可写的 socket 上 writeFrame 必须回 false」
 // 这条不变式——它没有别的确定性入口（OS 的断连时序窗口抓不住）。与 secretbox.__selfCheck 同类的测试可见性：
 // 产品路径（gateway.cjs / gateway-client.cjs）一个都不引用它，也不写任何状态。
-module.exports = { serve, connect, __hooks: { writeFrame } };
+// noRetryError 则是**产品路径共用的**错误形状：gateway-client.call() 的「未连接」早退也走它（闸 ⑨h）。
+module.exports = { serve, connect, noRetryError, __hooks: { writeFrame } };

@@ -50,6 +50,21 @@
 //     ⑨e 不重放——断连时 in-flight 的 proxy_pool 必须 reject 且带 notRetried；重连后再发**别的**命令，
 //        服务端 proxy_pool 的调用计数必须还是 1；随后显式再调一次必须变 2（证明那个计数是活的，
 //        不是恒成立的表达式）。实测依据见 gateway-pipe.cjs 的注释（pool.cjs 的 poolAccounts 会回写派生复活）。
+//     ⑨f 溢出断连（评审 I1：简报 Step 2 点名的硬化项，此前**全仓没有一条测试**触这条路径）——
+//        ⑨f-1 服务端：raw 对端灌一条超过 MAX_FRAME_BYTES 且永不结束的巨帧 → 那一条连接必须被判死、
+//             日志留 pipe-overflow、尾巴上偷偷接的那个合法帧不许被「截断解析后继续用」而回话，
+//             同一服务上另一条已建立的连接必须照常应答（判死不许判过头）；
+//        ⑨f-2 客户端：对端推来一条**永不结束**的超限巨帧（raw 服务端，理由见该处注释：合法的一整条
+//             8 MB 帧会被一次 read 全拿到并正常解析，broadcast 造不出确定性的溢出）→ 那条**免超时**的
+//             在途命令必须被 reject(notRetried)，它没有 per-call 上界，溢出断连是唯一的结论来源；
+//             日志留 pipe-client-overflow、连接状态跟着变 false（自带 6 s 看门狗区分 hung / resolved）。
+//     ⑨g 事件帧也有界（评审 I2，规格 §5.2「队列不得无界……避免主 App 卡死时子进程堆内存」）——夹具 I：
+//        一条认证后**一个字节都不读**的连接（= 主 App 卡死而连接还挂着）+ 200 × 256 KB 的事件帧广播：
+//        被送进子进程发送队列的字节必须是有界的个位数帧（不是 50 MB）、rss/external 增长有上界、
+//        日志逐条 event-frame-dropped{reason:"backpressure"}；且这条连接没被判死（同一条连接上随后投的
+//        命令帧照样拿回响应）、另一条会读的连接事后仍收到事件帧（丢 ≠ 一律不投递）。
+//     ⑨h 客户端早退的形状（评审 minor）：gateway-client.call() 在压根没连接时回的那一条也必须带
+//        notRetried + command，与管道层四类失败同形——Task 5 的转发体按标记分流才不会再漏一支。
 //  ⑧ 收尾卫生：真实 %APPDATA%\AgentHub\proxy\stats.db 零写入、HKCU Run 项未变。
 //
 // `--bench` 只跑性能回归（简报 Step 3）：proxy_pool 单次往返的中位数 / p90 / p95 / min / max 必须 < 30 ms，
@@ -414,6 +429,83 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 })().catch((e) => { console.log("QUEUE-THREW " + String((e && e.message) || e)); process.exit(1); });
 `;
 
+// ===== 夹具 I：⑨g 事件帧的背压丢弃——**在自己的进程里**量「主 App 卡死但连接还挂着」时的堆增长 =====
+// 为什么非得独立进程 + 一个「真不收」的对端：背压是内核管道缓冲被填满才出现的结果，而本测试进程既挂着
+// 前九组的 rss 噪声、又没有一条「真的不读」的客户端。这里的对端认证完就把读侧停住（不挂 data 监听），
+// 于是服务端每一条事件帧都只能往**自己**的发送队列里堆——正是规格 §5.2「队列不得无界……避免主 App 卡死时
+// 子进程堆内存」点名的失败场景（事件源是周期性的：credits 30 分钟调度、poolsync 进度、请求完成）。
+// 观测口径刻意取「对端复活后一共收到多少帧」：那等于「卡死期间堆在孩子发送队列里的字节数」，
+// 有界时是个位数帧，无界时是 frames × frameBytes 的常量——两者差一个数量级，不是恒真表达式。
+const BACKPRESSURE_SRC = `"use strict";
+const path = require("node:path");
+const fs = require("node:fs");
+const net = require("node:net");
+const be = process.argv[2];
+const reportFile = process.argv[3];
+const frames = Number(process.argv[4] || 200);
+const frameBytes = Number(process.argv[5] || 262144);
+const proto = require(path.join(be, "gateway-proto.cjs"));
+const gwpipe = require(path.join(be, "gateway-pipe.cjs"));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const mem = () => { const m = process.memoryUsage(); return { rss: m.rss, ext: m.external }; };
+(async () => {
+  const pipePath = String.raw\`\\\\.\\pipe\\agenthub-gw-t4bp-\${process.pid}-\${Date.now().toString(36)}\`;
+  const token = "t4-bp-token-0123456789abcdef";
+  let dispatches = 0;
+  const srv = await gwpipe.serve({
+    pipePath, token,
+    dispatch: async (cmd, args) => { dispatches++; return { v: String((args && args.v) || "") }; },
+  });
+  // 对端一：认证之后**一个字节都不读**（不挂 data 监听 = 读侧停在 paused），等价于主 App 卡死
+  const stalled = net.connect(pipePath);
+  let stalledClosed = false, stalledErr = "";
+  stalled.on("close", () => { stalledClosed = true; });
+  stalled.on("error", (e) => { stalledErr = String((e && e.message) || e); });
+  await new Promise((r, j) => { stalled.once("connect", r); stalled.once("error", j); });
+  stalled.write(proto.encode({ k: "hello", token }));
+  await sleep(250);                        // 让服务端把这条记进「已认证连接」表
+  // 风暴期间**只有这一条**已认证连接：编帧成本与「被留下的字节数」同量级，多一条连接只是把两个数一起翻倍，
+  // 什么也分不清。事后另建的那条连接用来证明服务本身没被拖坏（见阶段三）。
+  const m0 = mem();
+  for (let i = 0; i < frames; i++) {
+    srv.broadcast({ k: "evt", payload: { type: "poolsync-progress", seq: i, blob: "x".repeat(frameBytes) } });
+  }
+  await sleep(200);
+  const m1 = mem();
+  const closedDuringStorm = stalledClosed;   // 丢弃若把连接判死，close 会在这里之前就到
+  // 阶段二：让这条被灌过洪流的连接「复活」成会读的对端。它收到的字节数 = 卡死期间**留在孩子发送队列里**
+  // 的字节数（对端一直没读，一个字节都没少），这才是「队列有界」的直接读数，不受 GC 时机干扰。
+  let resp = null, receivedFrames = 0, receivedBytes = 0, gotAfterDrain = false;
+  const feed = proto.createParser((f) => {
+    if (!f || typeof f !== "object") return;
+    if (f.k === "evt") { receivedFrames++; if (f.payload && f.payload.type === "after-drain") gotAfterDrain = true; }
+    if (f.k === "res" && !resp) resp = f;
+  }, () => {});
+  stalled.setEncoding("utf8");
+  stalled.on("data", (d) => { receivedBytes += d.length; feed(d); });   // 挂上 data 才开始读
+  stalled.write(proto.encode({ k: "req", id: "bp-cmd-1", cmd: "gateway_echo", args: { v: "events-dropped-commands-alive" } }));
+  for (let i = 0; i < 100 && !resp; i++) await sleep(50);
+  const aliveCmdOk = !!(resp && resp.ok && resp.data && resp.data.v === "events-dropped-commands-alive");
+  // 阶段三：「丢」不许变成「一律不投递」。队列排空之后再广播一条小事件帧，同一条连接必须收到它。
+  srv.broadcast({ k: "evt", payload: { type: "after-drain", seq: -1 } });
+  for (let i = 0; i < 60 && !gotAfterDrain; i++) await sleep(50);
+  const late = await gwpipe.connect({ pipePath, token, timeoutMs: 5000 });
+  const lateEcho = await late.call("gateway_echo", { v: "server-still-fine" }, { timeoutMs: 4000 }).then(() => true, () => false);
+  fs.writeFileSync(reportFile, JSON.stringify({
+    frames, frameBytes,
+    attemptedMb: frames * frameBytes / 1048576,
+    receivedMb: receivedBytes / 1048576, receivedFrames,
+    rssGrowthMb: (m1.rss - m0.rss) / 1048576,
+    extGrowthMb: (m1.ext - m0.ext) / 1048576,
+    closedDuringStorm, stalledErr, aliveCmdOk, gotAfterDrain, lateEcho, dispatches,
+  }), "utf8");
+  late.close();
+  try { stalled.destroy(); } catch (e) { /* 已断 */ }
+  srv.close();
+  process.exit(0);
+})().catch((e) => { console.log("BP-THREW " + String((e && e.message) || e)); process.exit(1); });
+`;
+
 // ===== 夹具 H：--bench 的服务端——把**真** proxy_pool 接上管道 =====
 // 号池是本地库派生的（poolView → 4 渠道 × poolAccounts/poolSummary/accountModelCool），不走上游，
 // 所以基准可以在沙箱库里播假号；管道两端的 JSON 编解码与生产完全同源，这才是「跨进程到底加了多少毫秒」的答数。
@@ -544,6 +636,7 @@ function writeFixtures() {
   fs.writeFileSync(path.join(work, "gw-takeover.cjs"), TAKEOVER_SRC, "utf8");
   fs.writeFileSync(path.join(work, "gw-reap.cjs"), REAP_SRC, "utf8");
   fs.writeFileSync(path.join(work, "gw-queue.cjs"), QUEUE_SRC, "utf8");
+  fs.writeFileSync(path.join(work, "gw-backpressure.cjs"), BACKPRESSURE_SRC, "utf8");
   fs.writeFileSync(path.join(work, "gw-bench.cjs"), BENCH_SRC, "utf8");
 }
 
@@ -1042,9 +1135,17 @@ fs.writeFileSync(path.join(d,"names.txt"), fs.readdirSync(path.join(d,"AgentHub"
   assert.strictEqual(proto.DEFAULT_TIMEOUT_MS, 10000, "⑨ 默认超时上界必须是简报钉的 10 s，实得 " + proto.DEFAULT_TIMEOUT_MS);
   assert.strictEqual(proto.MAX_PENDING, 64, "⑨ 待响应上界必须是简报钉的 64，实得 " + proto.MAX_PENDING);
   assert.strictEqual(proto.NO_TIMEOUT_CMDS.size, 3, "⑨ 免超时清单必须只有简报那三条，实得：" + [...proto.NO_TIMEOUT_CMDS].join(","));
+  // 只比 size 的话「换成另外三条名字」照样绿（评审 minor）：名字才是判据。规格 §5.2 逐条点名这三条
+  // 是「本就立即返回、进度靠 evt 回流」的长任务——免超时对**它们**才成立，给一条真会挂管道的命令免了
+  // 上界就是回到「主进程发出去的命令永远不回来」。
+  assert.deepStrictEqual([...proto.NO_TIMEOUT_CMDS].slice().sort(),
+    ["proxy_checkin_run", "proxy_credits_refresh", "proxy_poolsync_run"],
+    "⑨ 免超时清单的三个**名字**必须与简报/规格 §5.2 一致（实得：" + [...proto.NO_TIMEOUT_CMDS].join(",")
+      + "）：清单被换成别的三条时 size 不变、闸却绿，那正是要防的那种改法");
   assert.deepStrictEqual([...proto.NON_IDEMPOTENT_READS].sort(), ["proxy_pool", "proxy_status"],
     "⑨ 带写副作用的读命令清单被改动：" + [...proto.NON_IDEMPOTENT_READS].join(","));
-  pass(`⑨ 四个 proto 常量都有消费方，且数值与简报一致（DEFAULT_TIMEOUT_MS=${proto.DEFAULT_TIMEOUT_MS}、MAX_PENDING=${proto.MAX_PENDING}、免超时 ${proto.NO_TIMEOUT_CMDS.size} 条、不重放清单 ${[...proto.NON_IDEMPOTENT_READS].join("/")}`);
+  pass(`⑨ 四个 proto 常量都有消费方，数值与**名字**都与简报一致（DEFAULT_TIMEOUT_MS=${proto.DEFAULT_TIMEOUT_MS}、MAX_PENDING=${proto.MAX_PENDING}、`
+    + `免超时 ${[...proto.NO_TIMEOUT_CMDS].sort().join("/")}、不重放清单 ${[...proto.NON_IDEMPOTENT_READS].join("/")}`);
 
   // 入口被当模块 require 的那一行留痕（本闸就是那个 require）。没有它时「gateway.cjs 没被当入口跑」是
   // 零副作用的静默退出，排查时连一行 boot 日志都没有——这条同时钉住上面那句「除一行留痕外不许有副作用」。
@@ -1210,9 +1311,17 @@ fs.writeFileSync(path.join(d,"names.txt"), fs.readdirSync(path.join(d,"AgentHub"
   assert.strictEqual(hooks.writeFrame({ writable: false, write() { wroteCalls += 1; } }, { k: "req", id: "1" }), false,
     "⑨c 不可写的 socket 上 writeFrame 必须回 false（回 true / 不回值 = 静默丢帧，命令就永远不回来）");
   assert.strictEqual(wroteCalls, 0, "⑨c 既然判定不可写，就不该再去碰 write()");
-  assert.strictEqual(hooks.writeFrame({ writable: true, write() { wroteCalls += 1; } }, { k: "req", id: "2" }), true,
-    "⑨c 可写的 socket 上 writeFrame 必须回 true");
+  assert.strictEqual(hooks.writeFrame({ writable: true, write() { wroteCalls += 1; return true; } }, { k: "req", id: "2" }), true,
+    "⑨c 可写且没越过 highWaterMark 时 writeFrame 必须回 true");
   assert.strictEqual(wroteCalls, 1, "⑨c 可写时 write 应被调用恰好一次，实得 " + wroteCalls);
+  // 三态里的第三态「背压」：sock.write() 自己回 false（帧进了发送队列但越过了 highWaterMark）时
+  // writeFrame 必须把这句话**原样**回出来。吞掉它 = 假装「写完了、还能接着写」，broadcast 就无从决定
+  // 该不该停手，事件帧会无界堆在子进程发送队列里（评审 I2 的成因正是这一句被丢掉）。
+  assert.strictEqual(hooks.writeFrame({ writable: true, write() { wroteCalls += 1; return false; } }, { k: "evt" }), false,
+    "⑨c sock.write() 回 false（背压）时 writeFrame 必须如实回 false，而不是硬编码成「写成功」");
+  assert.strictEqual(wroteCalls, 2, "⑨c 背压那一支帧是**进了队列**才被拒的，write() 必须被调到（实得 " + wroteCalls + "）");
+  assert.strictEqual(hooks.writeFrame({ writable: true, write() { wroteCalls += 1; throw new Error("EPIPE"); } }, { k: "evt" }), false,
+    "⑨c write() 抛错（对端刚断）时 writeFrame 回 false，且不许把异常漏给调用方");
   const connDead = await gatewayPipe.connect({ pipePath: PP_C, token: TOK9, timeoutMs: 5000 });
   connDead.close();
   const tDead = Date.now();
@@ -1291,11 +1400,153 @@ fs.writeFileSync(path.join(d,"names.txt"), fs.readdirSync(path.join(d,"AgentHub"
     + "（若恒为 1，上面那条 ===1 就是自我实现的假绿）");
   connE2.close();
   srvE.close();
+
+  // ---- ⑨f 溢出断连（评审 I1：简报 Step 2 点名的硬化项，此前**全仓没有一条测试**触这条路径）----
+  // 判据形态照 srvB/srvE 的桩夹具。巨帧只越界 4 KB 就够：这一条要钉的是「溢出即判死、绝不截断解析」，
+  // 不是压内存（压内存那一半归 ⑨g）。
+  const BIG = proto.MAX_FRAME_BYTES + 4096;
+  // ⑨f-1 服务端那一腿：raw 对端（能写任意字节）灌一条**永不结束**的巨帧，尾巴上偷偷接一个完整合法帧。
+  // 若服务端把超出的部分截断、拿剩下的半截继续解析，它就会对那个尾巴回话——规格明令禁止的正是这个。
+  const PP_F = pipe9("overflow-server");
+  const srvF = await gatewayPipe.serve({
+    token: TOK9, pipePath: PP_F,
+    dispatch: async (cmd, args) => ({ v: String((args && args.v) || "") }),
+  });
+  const victimF = net.connect(PP_F);
+  victimF.setEncoding("utf8");
+  let victimDataF = "", victimClosedF = false;
+  victimF.on("data", (d) => { victimDataF += d; });
+  victimF.on("close", () => { victimClosedF = true; });
+  victimF.on("error", () => { /* 断开时序里的 ECONNRESET 一类：判据看 close，不看这个 */ });
+  await new Promise((r, j) => { victimF.once("connect", r); victimF.once("error", j); });
+  victimF.write(proto.encode({ k: "hello", token: TOK9 }));
+  await sleep(150);                                 // 先让 hello 落地（authed），否则红点会落在「未认证」那一支
+  victimF.write(Buffer.alloc(BIG, 0x41));           // 8 MB + 4 KB 个 'A'，一个换行都没有
+  victimF.write(proto.encode({ k: "req", id: "trunc-99", cmd: "gateway_echo", args: { v: "must-never-be-answered" } }));
+  for (let i = 0; i < 100 && !victimClosedF; i++) await sleep(50);
+  assert.ok(victimClosedF, "⑨f-1 对端灌进超过 MAX_FRAME_BYTES(" + proto.MAX_FRAME_BYTES + ") 的巨帧之后，服务端没断开那一条连接。"
+    + "简报 Step 2：「溢出：单帧超 MAX_FRAME_BYTES 直接断开并记日志，绝不截断解析」——把 sock.destroy() 删掉只留一行日志，"
+    + "就退化成规格禁止的那一版，而这条断言必须当场红");
+  const overflowLog = await waitForLogLine(/pipe-overflow \{"maxBytes":\d+\}/, 3000);
+  assert.ok(overflowLog.line, "⑨f-1 溢出没留痕（SANDBOX 的 gateway.log 里找不到 pipe-overflow）：" + overflowLog.text.slice(-300));
+  assert.ok(!/trunc-99|must-never-be-answered/.test(victimDataF),
+    "⑨f-1 溢出之后服务端仍在这条连接上回话（" + JSON.stringify(victimDataF.slice(0, 200)) + "）：那说明巨帧被截断后，"
+    + "剩下的半截被当成合法帧解析并派发了");
+  const connHealthyF = await gatewayPipe.connect({ pipePath: PP_F, token: TOK9, timeoutMs: 5000 });
+  const okHealthyF = await connHealthyF.call("gateway_echo", { v: "only-that-connection-died" });
+  assert.strictEqual(okHealthyF.v, "only-that-connection-died",
+    "⑨f-1 一条连接溢出之后，同一服务上另一条已建立的连接不可用了（判死判过头，或把整个服务收摊了）");
+  try { victimF.destroy(); } catch { /* 已断 */ }
+  connHealthyF.close();
+  srvF.close();
+  pass(`⑨f-1 服务端溢出断连有牙：> ${proto.MAX_FRAME_BYTES} B 的巨帧灌进的那条连接被判死（且收不到任何截断响应）、`
+    + `日志留 pipe-overflow，同一服务的另一条连接照常应答`);
+
+  // ⑨f-2 客户端那一腿：对端推来一条**永不结束**的巨帧（没有换行的数据堆过上限才是溢出的真实形态）。
+  // 为什么这里换成一台 raw 服务端而不是 srvB 那种桩 + broadcast：实测（本机，第一次跑就是它红给我看的）
+  // 一条 8 MB 的**合法** NDJSON 巨帧会被一次 read 整个拿到，解析器先按换行把它吃掉、buf 归零，
+  // 溢出判定压根不亮——broadcast 造不出确定性的溢出。硬要按那个形态测只会测到「JSON.parse 一个 8 MB 的帧」，
+  // 而客户端这条判据真正要防的是「对端把上限当摆设、连着写不停手」，那就照那个形态造。
+  const PP_F2 = pipe9("overflow-client");
+  let baitSentF2 = false;
+  const rawSrvF2 = net.createServer((s) => {
+    s.on("data", () => {
+      if (baitSentF2) return;
+      baitSentF2 = true;
+      try { s.write(Buffer.alloc(BIG, 0x42)); } catch { /* 已断 */ }      // 8 MB + 4 KB，一个换行都没有
+    });
+  });
+  await new Promise((r) => rawSrvF2.listen(PP_F2, r));
+  const connF2 = await gatewayPipe.connect({ pipePath: PP_F2, token: TOK9, timeoutMs: 5000 });
+  // 载体用免超时清单里的那条命令：它**没有** per-call 上界，溢出断连是这条 promise 唯一的结论来源——
+  // 把 drop() 删掉的话这里不是「红得晚一点」，是永远不 settle，所以这条 await 自带看门狗。
+  let errF2 = null;
+  const t0F2 = Date.now();
+  const pF2 = connF2.call("proxy_checkin_run", {}).then(() => "resolved", (e) => { errF2 = e; return "rejected"; });
+  const outcomeF2 = await Promise.race([pF2, sleep(6000).then(() => "hung")]);
+  const msF2 = Date.now() - t0F2;
+  assert.strictEqual(baitSentF2, true, "⑨f-2 前提不成立：raw 服务端没把巨帧写出去（客户端没发帧？）");
+  assert.strictEqual(outcomeF2, "rejected",
+    "⑨f-2 客户端收到超过 MAX_FRAME_BYTES(" + proto.MAX_FRAME_BYTES + ") 且永不结束的帧之后，那条免超时的在途命令"
+    + outcomeF2 + "（rejected 才是对的）。resolved = 巨帧被当成普通帧继续用；hung = 溢出只记日志不断连（把 drop() 删掉），"
+    + "而这条命令没有别的上界兜底");
+  assert.match(String(errF2.message), /帧超过上限/, "⑨f-2 溢出的错要报得人话，实得：" + String(errF2.message));
+  assert.strictEqual(errF2.notRetried, true, "⑨f-2 溢出断连的 reject 必须带 notRetried：" + String(errF2.message));
+  assert.strictEqual(errF2.command, "proxy_checkin_run", "⑨f-2 溢出断连也要点名命令：" + JSON.stringify(errF2.command));
+  assert.ok(msF2 < 2500, "⑨f-2 判死太慢（" + msF2 + " ms）：看门狗 6000 ms、桩那边压根不会回，结论只能是溢出给的");
+  assert.strictEqual(connF2.connected, false, "⑨f-2 溢出断连后 connected 仍为 true（连接状态没跟着判死）");
+  const clientOverflowLog = await waitForLogLine(/pipe-client-overflow \{"maxBytes":\d+\}/, 3000);
+  assert.ok(clientOverflowLog.line, "⑨f-2 客户端溢出没留痕（找不到 pipe-client-overflow）：" + clientOverflowLog.text.slice(-300));
+  const connF2b = await gatewayPipe.connect({ pipePath: PP_F2, token: TOK9, timeoutMs: 3000 });
+  assert.strictEqual(connF2b.connected, true, "⑨f-2 一条连接溢出之后，新建的连接都不通了");
+  connF2.close();
+  connF2b.close();
+  try { rawSrvF2.close(); } catch { /* 已关 */ }
+  pass(`⑨f-2 客户端溢出断连有牙：永不结束的超限巨帧让那条免超时的在途命令在 ${msF2} ms 被 reject(notRetried,「帧超过上限」)，`
+    + `日志留 pipe-client-overflow、连接状态跟着变 false`);
+
+  // ---- ⑨g 事件帧也有界（评审 I2 / 规格 §5.2「队列不得无界……避免主 App 卡死时子进程堆内存」）----
+  // 夹具 I：一条认证后**一个字节都不读**的连接（= 主 App 卡死而连接还挂着）+ frames × frameBytes 的事件帧广播。
+  // 承重的读数是「这条连接事后一共收到了多少字节」：对端全程没读，所以那**就是**卡死期间留在子进程发送队列里的
+  // 字节数。有界时它是个位数帧的常量，无界时它等于 frames × frameBytes（随帧数线性）——不是恒真表达式。
+  const FRAMES = 200, FRAME_BYTES = 256 * 1024;      // 50 MB：正是「credits 30 分钟调度 + poolsync 进度」这种
+  const bpReport = path.join(work, "backpressure.json");   // 周期性事件源压上来的量级（一帧一帧攒出来的）
+  const bpRun = await spawnFixture("gw-backpressure.cjs", [BE, bpReport, String(FRAMES), String(FRAME_BYTES)], {
+    APPDATA: sandboxDir("bp"), AGENT_SKILLS_HOME: path.join(work, "hub-bp"),
+  }).done;
+  assert.strictEqual(bpRun.code, 0, "⑨g 背压夹具跑挂了：" + bpRun.out + bpRun.err);
+  await waitForFile(bpReport, 30000);
+  const bp = JSON.parse(fs.readFileSync(bpReport, "utf8"));
+  const bpLogFile = logFileOf(sandboxDir("bp"));
+  let bpLog = "";
+  for (let i = 0; i < 40; i++) {
+    try { bpLog = fs.readFileSync(bpLogFile, "utf8"); } catch { bpLog = ""; }
+    if (/event-frame-dropped/.test(bpLog)) break;
+    await sleep(100);
+  }
+  const drops = [...bpLog.matchAll(/event-frame-dropped \{[^{}]*"reason":"backpressure"[^{}]*"type":"poolsync-progress"[^{}]*\}/g)];
+  assert.ok(bp.receivedFrames <= 4,
+    "⑨g 卡死不读的对端最终收到 " + bp.receivedFrames + " 帧（试图投递 " + bp.frames + " 帧）：子进程的发送队列是**无界**的。"
+    + "规格 §5.2「队列不得无界……避免主 App 卡死时子进程堆内存」——broadcast 拿不到背压结论、照单全收就是这个形态");
+  assert.ok(bp.receivedMb < bp.attemptedMb / 10,
+    "⑨g 留在子进程发送队列里的字节 " + bp.receivedMb.toFixed(1) + " MB 不少于试图投递量 " + bp.attemptedMb.toFixed(1)
+    + " MB 的十分之一：队列随事件帧数线性增长，即「无界」");
+  assert.ok(drops.length >= bp.frames - 6,
+    "⑨g 只记了 " + drops.length + " 行 event-frame-dropped（试图投递 " + bp.frames + " 帧、实际入队 " + bp.receivedFrames
+    + " 帧）：丢弃没留痕 = 排障时只剩「主 App 没收到进度事件」，与规格要求的可见性不符");
+  assert.ok(Math.max(bp.rssGrowthMb, bp.extGrowthMb) < 30,
+    "⑨g 夹具进程在风暴中 rss +" + bp.rssGrowthMb.toFixed(1) + " MB / external +" + bp.extGrowthMb.toFixed(1)
+      + " MB ≥ 30 MB（试图投递 " + bp.attemptedMb.toFixed(1) + " MB）：这就是规格点名的「主 App 卡死时子进程堆内存」");
+  assert.strictEqual(bp.closedDuringStorm, false,
+    "⑨g 事件帧被丢之后那条连接也被判死了（close 在风暴期间就到）：事件帧是尽力投递，掉一帧不值得牺牲整条连接——"
+    + "同一连接上的命令帧还在等回执，判死会把它们一起打成「未投递」");
+  assert.strictEqual(bp.aliveCmdOk, true,
+    "⑨g 丢弃之后在**同一条连接**上投的命令帧拿不到响应（命令通道被误判死）：" + JSON.stringify(bp));
+  assert.strictEqual(bp.gotAfterDrain, true,
+    "⑨g 队列排空之后再广播一条小事件帧也没投递到（" + JSON.stringify(bp) + "）：「背压时丢」被做成了「一律不投递」");
+  assert.strictEqual(bp.lateEcho, true, "⑨g 风暴之后新建的连接不可用（服务本身被拖坏）：" + JSON.stringify(bp));
+  pass(`⑨g 事件帧有界：${bp.frames} × ${(bp.frameBytes / 1024)} KB = ${bp.attemptedMb.toFixed(1)} MB 灌向一条不收的连接，`
+    + `实际入队 ${bp.receivedFrames} 帧 / ${bp.receivedMb.toFixed(2)} MB（其余 ${drops.length} 帧记 event-frame-dropped{reason:backpressure}），`
+    + `rss +${bp.rssGrowthMb.toFixed(1)} MB / external +${bp.extGrowthMb.toFixed(1)} MB；连接没被判死、同连接命令帧照常回执`);
+
   off9();
   const stop9 = await gw.stopAndWait({ timeoutMs: 8000 });
   assert.strictEqual(stop9.stopped, true, "⑨e 收尾没停掉 ⑨a 起的子进程：" + stop9.message);
   assert.ok(await waitForPortFree(PAIR_PORT, 5000), "⑨e 收尾后端口 " + PAIR_PORT + " 还有人 accept");
   pass("⑨e 不重放有牙：断连的 proxy_pool 立即 reject(notRetried) 且服务端计数停在 1，显式重调才变 2（计数本身有牙）");
+
+  // ---- ⑨h 客户端早退的形状要和管道层四类失败一致（评审 minor）----
+  // 上面几组已经把「断连 / 超时 / 未投递 / 队列满」四类都钉成带 notRetried 的 Error，唯独
+  // gateway-client.call() 在压根没连接时早退的那一条是裸 Error —— 而 Task 5 的转发体最常撞上的恰恰是它。
+  // 按标记分流的调用方一旦漏了这一支，就会把「压根没投出去」当成「可以安全重发」，那是重放语义的另一个入口。
+  assert.strictEqual(gw.state().connected, false, "⑨h 前提不成立：stopAndWait 之后主进程那条连接应当已断");
+  const earlyH = await gw.call("proxy_pool", {}).then(() => null, (e) => e);
+  assert.ok(earlyH && /未连接/.test(String(earlyH.message)),
+    "⑨h 未连接时 call 必须 reject 并说清「没连接」，实得：" + JSON.stringify(earlyH));
+  assert.strictEqual(earlyH.notRetried, true,
+    "⑨h 「未连接」的早退必须带 notRetried（与管道层四类失败同形状），实得：" + String(earlyH.message));
+  assert.strictEqual(earlyH.command, "proxy_pool", "⑨h 早退也要点名命令：" + JSON.stringify(Object.keys(earlyH)));
+  pass(`⑨h 客户端早退与管道层同形状：notRetried:true、command:"proxy_pool"，错文「${String(earlyH.message).slice(0, 46)}…」`);
 
   // ===== ⑧ 收尾卫生核对（探针三件套 + 第五条）=====
   assert.strictEqual(realBaseline(), realBefore,

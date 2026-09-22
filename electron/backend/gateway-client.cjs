@@ -246,9 +246,16 @@ async function probeResidentGateway(port) {
   return probeAlive(cur);
 }
 
-/** 转发一条命令（Task 5 的转发体就一行）。管道断了回 reject，由上层错误态负责报给用户。 */
+/**
+ * 转发一条命令（Task 5 的转发体就一行）。管道断了回 reject，由上层错误态负责报给用户。
+ * 早退这一支也走 gatewayPipe.noRetryError()：错误形状（notRetried + command）必须与管道层四类失败
+ * 一致，否则 Task 5 按标记决定「能不能重发」时会把「压根没投出去」这一支漏成「可以重发」——
+ * 那是重放语义的另一个入口（闸 ⑨h 钉的就是这个形状）。
+ */
 function call(cmd, args, opts) {
-  if (!conn || !conn.connected) return Promise.reject(new Error("网关子进程未连接（命令：" + cmd + "）"));
+  if (!conn || !conn.connected) {
+    return Promise.reject(gatewayPipe.noRetryError("网关子进程未连接（命令未投递：" + cmd + "）", cmd));
+  }
   return conn.call(cmd, args, opts);
 }
 
