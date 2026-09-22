@@ -20,8 +20,21 @@
 //  ⑤ 日志自身：轮转到 2 MB 只留 1 份旧档。
 //  ⑥ 陈旧 pid（真死了）→ 回收 + 新起，且 stopAndWait 仍是唯一出口。再加两条停机留痕：
 //     父进程记下的 child-exit 退出码必须全 0（非 0 = 子进程停机时撞了 libuv 的 fastfail）、
-//     子进程自己记的 shutdown-done 必须 drained:true。
+//     子进程自己记的 shutdown-done 必须 drained:true / forced:false。
+//     再加两条「回收本身有牙」（minor④：reap 过去删掉判据仍绿）：日志里必须出现点名那个死 pid 的
+//     reap-stale；以及「回收绝不按 pid 杀进程」——握手文件里写一个**活着且无辜**的 pid，start() 之后它必须还在。
+//  ⑥b portFreed 必须能说「不」（评审 I1）：pid 已死、端口仍被**另一个进程**占着 → portFreed:false。
+//     ① 里那两条「子进程一开始监听就把端口回写进 gateway.json / proxy_stop 后回 0」是它的前提。
+//  ③-b ③-c detach 与 exe-gone 各配一条**真在监听**的用例（评审 I4 + minor④，这两处过去删掉判据仍绿）：
+//     ③-b 常驻 + 在监听 + 父进程没了 → 必须留下 detach-keep 痕迹、必须活过看门狗周期，再由另一个进程
+//          经唯一出口停干净，且停机结论 drained:true 要看得见（评审 I2③ 选的那条投递路径）；
+//     ③-c 常驻 + 在监听 + **exe 映像不在了** → 必须退出（旧代码的 detach 保护对所有 reason 一律不退，
+//          恰好把 exe-gone 吞掉，而升级/卸载删安装目录正是它唯一能起作用的时候）。
 //  ⑦ EADDRINUSE 的占用者判定（规格 §七.5）：占用者是已认证的常驻网关时报「接管」，不是「请更换端口」。
+//     ⑦-b 再把这条判据跑成**端到端**（评审 I3）：一台真子进程在监听，第二个进程调 proxy_start 必须
+//     既拿到 claimed:true、又**不**把 restoreOnLaunch 记成「本机在监听」、本进程 status().running 仍为 false。
+//  ⊘ 停机预算的四个数字必须仍然复合（评审 I2②）：stopAsync 500 + drain 800 + 响应 flush 300 < 硬退 2000。
+//     四个数分处三个文件，改一个忘改另一个就得当场变红。
 //  ⑧ 收尾卫生：真实 %APPDATA%\AgentHub\proxy\stats.db 零写入、HKCU Run 项未变。
 //
 // 卫生约束（AGENTS.md 与探针三件套，硬要求）：
@@ -48,6 +61,11 @@ const REAL_APPDATA = process.env.APPDATA || path.join(os.homedir(), "AppData", "
 const SANDBOX = path.join(work, "appdata-main");     // ① ② 的沙箱（本进程自己持有子进程）
 const CHILD_PORT = 19531;                             // ① 里子进程真监听的端口
 const PROBE_PORT = 19530;                             // ④ 里探针进程真监听的端口
+// ③-b ③-c ⑥b ⑦-b 各要一个真监听，端口互不重叠（全部非 9527：那是用户自己那台实例的）
+const KEEP_PORT = 19534;                              // ③-b 常驻且在监听
+const EXE_PORT = 19535;                               // ③-c exe-gone
+const BUSY_PORT = 19536;                              // ⑥b 「pid 已死但端口仍被占着」的那个占用者
+const TAKEOVER_PORT = 19537;                          // ⑦-b 端到端接管
 process.env.APPDATA = SANDBOX;
 process.env.AGENT_SKILLS_HOME = path.join(work, "hub");
 process.env.CCSWITCH_DB_PATH = path.join(work, "ccswitch.db");
@@ -57,6 +75,11 @@ const gw = require(path.join(BE, "gateway-client.cjs"));
 const util = require(path.join(BE, "proxy", "util.cjs"));
 const log = require(path.join(BE, "gateway-log.cjs"));
 const gatewayPipe = require(path.join(BE, "gateway-pipe.cjs"));
+// ⊘ 停机预算的四个数字分处三个文件，require 进来才比得动。gateway.cjs 有 require.main 守卫，
+// 被 require 时一个副作用都不许有（装配全在 main() 里）——这条本身也是装配边界的一部分。
+const gwEntry = require(path.join(ROOT, "electron", "gateway.cjs"));
+const proxy = require(path.join(BE, "proxy", "index.cjs"));
+const serverMod = require(path.join(BE, "proxy", "server.cjs"));
 
 const nap = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -64,8 +87,9 @@ let steps = 0;
 const pass = (msg) => { steps++; console.log(`  ${String(steps).padStart(2)}. ${msg}`); };
 const sandboxDir = (name) => path.join(work, "appdata-" + name);
 
-// 整闸硬超时：宁可红也不要让跑门禁的人干等（红/挂死时保留临时目录供排查）
-setTimeout(() => { console.log("FAIL 本闸 180 s 未跑完。临时目录保留供排查：" + work); process.exit(1); }, 180000).unref?.();
+// 整闸硬超时：宁可红也不要让跑门禁的人干等（红/挂死时保留临时目录供排查）。
+// ③-b ③-c（各等一个看门狗周期 + 停机）、⑥b、⑦-b 都是真进程真端口，180 s 装不下这些新用例。
+setTimeout(() => { console.log("FAIL 本闸 420 s 未跑完。临时目录保留供排查：" + work); process.exit(1); }, 420000).unref?.();
 
 /** 本次跑起来的所有 pid（清理只按这份名单，绝不按进程名宽匹配） */
 const knownPids = new Set();
@@ -119,9 +143,12 @@ async function waitForPortFree(port, ms) {
   }
 }
 
+/** 某个沙箱的子进程日志文件（③-b ③-c 用的是各自的沙箱，不只看 ① 那一份） */
+const logFileOf = (dir) => path.join(dir, "AgentHub", "proxy", "logs", "gateway.log");
+
 /** 等某个 kind 的日志行出现（父进程侧的 child-exit 是异步落盘的，不能假设 stopAndWait 返回时已写入） */
-async function waitForLogLine(re, ms) {
-  const f = path.join(SANDBOX, "AgentHub", "proxy", "logs", "gateway.log");
+async function waitForLogLineIn(dir, re, ms) {
+  const f = logFileOf(dir);
   const deadline = Date.now() + ms;
   for (;;) {
     let text = "";
@@ -132,6 +159,8 @@ async function waitForLogLine(re, ms) {
     await sleep(100);
   }
 }
+
+const waitForLogLine = (re, ms) => waitForLogLineIn(SANDBOX, re, ms);
 
 /** 只清理我们亲手起的那批 pid（先等它们自己退，仍活着才按 pid 强杀） */
 function cleanupOwnProcesses() {
@@ -204,9 +233,112 @@ const gw = require(path.join(be, "gateway-client.cjs"));
   const r = await gw.start({ persistent: true });                 // 认领常驻网关（不新起进程）
   const s = await gw.stopAndWait({ timeoutMs: 8000 });
   console.log("PROBE alive=" + alive + " claim=" + r.claimed + " pid=" + r.pid);
-  console.log("STOPPED stopped=" + s.stopped + " portFreed=" + s.portFreed + " message=" + (s.message || ""));
+  console.log("STOPPED stopped=" + s.stopped + " portFreed=" + s.portFreed + " drained=" + s.drained
+    + " forced=" + s.forced + " port=" + s.port + " message=" + (s.message || ""));
   process.exit(s.stopped ? 0 : 1);
 })().catch((e) => { console.log("STOPPER-THREW " + String((e && e.message) || e)); process.exit(1); });
+`;
+
+// ===== 夹具 D：按握手协议直接起 gateway.cjs 并**让它真的开始监听**（③-b ③-c 用）
+// 为什么这两个场景非得带一个真监听：
+//  · ③-b 要测 detach-keep 那一支，而它的条件是「常驻 + 父进程没了」；旧实现里 detach 时顺手 clear 掉
+//    整个计时器，exe 监视就此失效——所以 detach 之后还必须能继续观察到 exe-gone（③-c）。
+//  · ③-c 的 exePath 只能从握手投递（父进程才知道哪个映像必须被解锁；真实形态下与 process.execPath 同值），
+//    所以这里不走 gw.start() 而是自己按协议起。
+const LISTEN_SRC = `"use strict";
+const path = require("node:path");
+const fs = require("node:fs");
+const crypto = require("node:crypto");
+const { spawn } = require("node:child_process");
+const be = process.argv[2];
+const persistent = process.argv[3] === "1";
+const port = Number(process.argv[4]);
+const reportFile = process.argv[5];
+const exePath = process.argv[6] || process.execPath;
+const { encode } = require(path.join(be, "gateway-proto.cjs"));
+const gwpipe = require(path.join(be, "gateway-pipe.cjs"));
+const token = crypto.randomBytes(24).toString("hex");
+const pipePath = String.raw\`\\\\.\\pipe\\agenthub-gw-listen-\${process.pid}-\${Date.now().toString(36)}\`;
+fs.mkdirSync(path.join(process.env.APPDATA, "AgentHub"), { recursive: true });
+fs.writeFileSync(path.join(process.env.APPDATA, "AgentHub", "config.json"), JSON.stringify({ proxy: { port } }), "utf8");
+const child = spawn(process.execPath, [path.join(path.dirname(be), "gateway.cjs")], {
+  env: Object.assign({}, process.env, { ELECTRON_RUN_AS_NODE: "1" }),
+  cwd: path.dirname(process.execPath), stdio: ["pipe", "pipe", "pipe"], detached: true, windowsHide: true,
+});
+child.stderr.on("data", () => {});
+child.stdout.on("data", () => {});
+child.stdin.write(encode({ token, parentPid: process.pid, persistent, pipePath, exePath }) + "\\n");
+(async () => {
+  const c = await gwpipe.connect({ pipePath, token, timeoutMs: 25000 });
+  const r = await c.call("proxy_start", {}, { timeoutMs: 20000 });
+  const f = path.join(process.env.APPDATA, "AgentHub", "proxy", "gateway.json");
+  let diskPort = -1;
+  for (let i = 0; i < 100; i++) {
+    try { diskPort = JSON.parse(fs.readFileSync(f, "utf8")).port; } catch (e) { diskPort = -1; }
+    if (Number(diskPort) === Number(port)) break;
+    await new Promise((k) => setTimeout(k, 50));
+  }
+  fs.writeFileSync(reportFile, JSON.stringify({ pid: process.pid, gatewayPid: child.pid, started: r, diskPort }), "utf8");
+  console.log("LISTEN ok=" + (r && r.ok) + " port=" + (r && r.port) + " diskPort=" + diskPort);
+  c.close();
+  process.exit(0);
+})().catch((e) => { console.log("LISTEN-THREW " + String((e && e.message) || e)); process.exit(1); });
+`;
+
+// ===== 夹具 E：端到端接管（⑦-b，评审 I3）——一台**真子进程**在监听，第二个进程去 proxy_start =====
+const TAKEOVER_SRC = `"use strict";
+const path = require("node:path");
+const fs = require("node:fs");
+const be = process.argv[2];
+const reportFile = process.argv[3];
+const port = Number(process.argv[4]);
+const gw = require(path.join(be, "gateway-client.cjs"));
+const server = require(path.join(be, "proxy", "server.cjs"));
+const proxy = require(path.join(be, "proxy", "index.cjs"));
+const cfgFile = path.join(process.env.APPDATA, "AgentHub", "config.json");
+fs.mkdirSync(path.dirname(cfgFile), { recursive: true });
+const writeCfg = (restore) => fs.writeFileSync(cfgFile, JSON.stringify({ proxy: { port, restoreOnLaunch: restore } }), "utf8");
+(async () => {
+  writeCfg(false);
+  const r = await gw.start({ persistent: false });                 // 一台真子进程（本夹具是它的父进程）
+  const started = await gw.call("proxy_start", {});                // 它真的开始监听 port
+  const diskPort = (gw.readGatewayFile() || {}).port;              // 开始监听后必须回写（评审 I1）
+  // 站到「第二个主进程」的位置上按本机语义再调一次 proxy_start：走完整命令表，含 rememberRunning
+  writeCfg(false);
+  const take = await proxy.dispatch("proxy_start", {});
+  const cfg = JSON.parse(fs.readFileSync(cfgFile, "utf8"));
+  const out = {
+    gatewayPid: r.pid, startedPort: started && started.port, diskPort,
+    take, localRunning: server.status().running,
+    restoreOnLaunch: cfg.proxy && cfg.proxy.restoreOnLaunch,
+  };
+  const stop = await gw.stopAndWait({ timeoutMs: 8000 });
+  out.stop = { stopped: stop.stopped, portFreed: stop.portFreed, drained: stop.drained, forced: stop.forced, port: stop.port };
+  fs.writeFileSync(reportFile, JSON.stringify(out), "utf8");
+  console.log("TAKEOVER " + JSON.stringify(out));
+  process.exit(0);
+})().catch((e) => { console.log("TAKEOVER-THREW " + String((e && e.message) || e)); process.exit(1); });
+`;
+
+// ===== 夹具 F：回收一个「活着但与本任务无关」的 pid（⑥ 的 reap 牙齿：回收只挪文件，绝不按 pid 杀）=====
+const REAP_SRC = `"use strict";
+const path = require("node:path");
+const fs = require("node:fs");
+const be = process.argv[2];
+const reportFile = process.argv[3];
+const victim = Number(process.argv[4]);
+const gw = require(path.join(be, "gateway-client.cjs"));
+const isAlive = (p) => { try { process.kill(p, 0); return true; } catch (e) { return e.code !== "ESRCH"; } };
+(async () => {
+  const before = gw.readGatewayFile();
+  const r = await gw.start({ persistent: false });
+  const stop = await gw.stopAndWait({ timeoutMs: 8000 });
+  const out = { beforePid: before && before.pid, ok: !!r.ok, claimed: !!(r && r.claimed), newPid: r.pid,
+    stopped: stop.stopped, victimAlive: isAlive(victim) };
+  fs.writeFileSync(reportFile, JSON.stringify(out), "utf8");
+  console.log("REAP " + JSON.stringify(out));
+  process.exit(0);
+})().catch((e) => { console.log("REAP-THREW " + String((e && e.message) || e)); process.exit(1); });
 `;
 
 /** 夹具：④ 的探针——真实 server + 真实库（都在自己的沙箱里新建），量 liveness 与 readiness 的分工。
@@ -293,6 +425,9 @@ async function main() {
   fs.writeFileSync(path.join(work, "gw-spawn.cjs"), SPAWN_SRC, "utf8");
   fs.writeFileSync(path.join(work, "gw-stopper.cjs"), STOPPER_SRC, "utf8");
   fs.writeFileSync(path.join(work, "gw-ready.cjs"), READY_SRC, "utf8");
+  fs.writeFileSync(path.join(work, "gw-listen.cjs"), LISTEN_SRC, "utf8");
+  fs.writeFileSync(path.join(work, "gw-takeover.cjs"), TAKEOVER_SRC, "utf8");
+  fs.writeFileSync(path.join(work, "gw-reap.cjs"), REAP_SRC, "utf8");
   // 真实用户库的「零写入」基线：只 stat，不开库
   const realDbDir = path.join(REAL_APPDATA, "AgentHub", "proxy");
   const statOrZero = (p) => { try { const s = fs.statSync(p); return s.size + "@" + Math.round(s.mtimeMs); } catch { return "absent"; } };
@@ -303,6 +438,23 @@ async function main() {
   };
   const realBefore = realBaseline();
   const regBefore = regValue();
+
+  // ===== ⊘ 停机预算的四个数字必须仍然复合（评审 I2②）=====
+  // 三段「等干净」（等监听释放 / 等在途 libuv 作业 / 等响应帧 flush）之和必须真的小于「必须退」的硬上界。
+  // 旧实现是 1000 + 1000 ≥ 2000，注释却声称它小于——实测「必须退」总抢在「等干净」前面拿到决定权。
+  // 四个数分处三个文件，所以把它们写进**同一条断言**：改一个忘改另一个当场变红。
+  assert.strictEqual(serverMod.CLOSE_BUDGET_MS, 500, "⊘ server.stopAsync 等监听释放的预算被改动（实得 " + serverMod.CLOSE_BUDGET_MS + "）：动了它就得心头算 gateway.cjs 的 EXIT_CEILING_MS");
+  assert.strictEqual(proxy.DRAIN_BUDGET_MS, 800, "⊘ drainLibuvWork 的预算被改动（实得 " + proxy.DRAIN_BUDGET_MS + "）：同上");
+  assert.strictEqual(gwEntry.RESPONSE_FLUSH_MS, 300, "⊘ 响应帧 flush 窗口被改动（实得 " + gwEntry.RESPONSE_FLUSH_MS + "）：同上");
+  assert.strictEqual(gwEntry.EXIT_CEILING_MS, 2000, "⊘ 硬退上界被改动（实得 " + gwEntry.EXIT_CEILING_MS + "）：同上");
+  const budgetSum = serverMod.CLOSE_BUDGET_MS + proxy.DRAIN_BUDGET_MS + gwEntry.RESPONSE_FLUSH_MS;
+  assert.ok(budgetSum < gwEntry.EXIT_CEILING_MS,
+    "⊘ 停机预算不复合：stopAsync " + serverMod.CLOSE_BUDGET_MS + " + drain " + proxy.DRAIN_BUDGET_MS
+    + " + flush " + gwEntry.RESPONSE_FLUSH_MS + " = " + budgetSum + " ≥ 硬退上界 " + gwEntry.EXIT_CEILING_MS
+    + "。「必须退」会抢在「等干净」之前拿到决定权，drained/forced 这些停机结论形同虚设");
+  assert.ok(gwEntry.UNCLEAN_EXIT_CODE !== 0 && gwEntry.UNCLEAN_EXIT_CODE !== null,
+    "⊘ 「停不干净」的退出码不许是 0（那等于把最坏的失败形态当成通过）：实得 " + gwEntry.UNCLEAN_EXIT_CODE);
+  pass(`⊘ 停机预算复合：stopAsync ${serverMod.CLOSE_BUDGET_MS} + drain ${proxy.DRAIN_BUDGET_MS} + flush ${gwEntry.RESPONSE_FLUSH_MS} = ${budgetSum} < 硬退上界 ${gwEntry.EXIT_CEILING_MS}，停不干净的退出码=${gwEntry.UNCLEAN_EXIT_CODE}`);
 
   // ===== ① spawn / 握手 / 认领 =====
   const r1 = await gw.start({ persistent: false });
@@ -362,6 +514,11 @@ async function main() {
   const started = await gw.call("proxy_start", {});
   assert.strictEqual(started.ok, true, "① 子进程里 proxy_start 失败：" + (started.message || ""));
   assert.strictEqual(started.port, CHILD_PORT, "① 子进程监听的端口不是测试端口（必须是 19531，不许碰用户的 9527）：" + started.port);
+  // 评审 I1：开始监听后必须把端口**原子回写**进 gateway.json —— 那一份盘上文件是父进程侧
+  // stopAndWait 的 portFreed 与 probeResidentGateway 的端口归属唯一的真相来源。
+  assert.strictEqual(Number((gw.readGatewayFile() || {}).port), CHILD_PORT,
+    "① 子进程开始监听后没把端口回写进 gateway.json（实得 " + JSON.stringify((gw.readGatewayFile() || {}).port)
+    + "）：port 恒为 0 时 :180 的 `portFreed = port ? … : true` 短路成常量 true，闸 ③ 的自我实现就在此处");
   for (let i = 0; i < 80 && !got.some((p) => p && p.type === "status"); i++) await sleep(50);
   assert.ok(got.some((p) => p && p.event === "proxy" && p.type === "status"),
     "① 子进程的 events.emit 没回流到主进程 onEvent（收到：" + JSON.stringify(got) + "）");
@@ -369,6 +526,14 @@ async function main() {
   assert.strictEqual(childHealthz.ok, true, "① 子进程监听后 /healthz 应答不对：" + JSON.stringify(childHealthz));
   await gw.call("proxy_stop", {});
   assert.ok(await waitForPortFree(CHILD_PORT, 5000), "① proxy_stop 之后端口 " + CHILD_PORT + " 仍有人 accept");
+  let diskPortAfterStop = -1;
+  for (let i = 0; i < 40; i++) {
+    diskPortAfterStop = Number((gw.readGatewayFile() || {}).port);
+    if (diskPortAfterStop === 0) break;
+    await sleep(50);
+  }
+  assert.strictEqual(diskPortAfterStop, 0,
+    "① proxy_stop 之后 gateway.json 的 port 必须回 0（停在监听状态也得如实落盘）：不然认领方会去接管一个空端口，实得 " + diskPortAfterStop);
   off();
   assert.strictEqual(gw.state().connected, true, "① 停掉监听之后长连接必须还在（管道 ≠ 监听，Task 5 全靠这条）");
   assert.strictEqual(gw.state().pid, r1.pid, "① state() 的内存镜像 pid 不对：" + JSON.stringify(gw.state()));
@@ -448,6 +613,14 @@ async function main() {
   assert.strictEqual(sd.ok, true, "④ gracefulShutdown 没回 ok:true：" + JSON.stringify(sd));
   assert.strictEqual(sd.drained, true, "④ 停机没排干 libuv 线程池上的在途作业（drained:" + JSON.stringify(sd.drained)
     + "）：带着在途 FSReqCallback 退进程会撞 uv_async_send 的 UV_HANDLE_CLOSING 断言 → 0xC0000409：" + JSON.stringify(sd));
+  // 停机质量两个新字段（评审 I2①）：stopAsync 的「等没等到」与「刚释放的是哪个端口」必须一路可见
+  assert.strictEqual(sd.forced, false, "④ 监听没在 CLOSE_BUDGET_MS 内释放（forced:" + JSON.stringify(sd.forced)
+    + "）却仍被算成停机成功 —— 旧实现的 stopAsync 没这个字段，两条分支回同一个 {ok:true}：" + JSON.stringify(sd));
+  assert.strictEqual(sd.port, PROBE_PORT, "④ gracefulShutdown 必须把刚释放的端口并回返回值（父进程侧 stopAndWait 的 portFreed 靠它）：" + JSON.stringify(sd));
+  // detail 与状态码必须自相洽（评审 minor①：这是给 Task 5 错误态渲染用的字段）
+  assert.strictEqual(er.body.detail, "号池无可用账号", "④ 503 时 detail 该说没号：" + JSON.stringify(er.body));
+  assert.strictEqual(gd.body.detail, "就绪",
+    "④ /readyz 已经 200 了 detail 还写着「号池无可用账号」= 与状态码自相矛盾，Task 5 的错误态渲染会拿到冲突字段：" + JSON.stringify(gd.body));
   const pend = /^PENDING_REQ (.+)$/m.exec(ready.out);
   assert.ok(pend, "④ 探针没打印 PENDING_REQ 行：" + ready.out + ready.err);
   assert.strictEqual(pend[1], "none", "④ 停机之后进程里还压在异步作业：" + pend[1]);
@@ -519,6 +692,66 @@ async function main() {
   assert.ok(!alive(Number(pGw.pid)), "③ stopAndWait 返回 stopped:true 但进程还在（谎报）");
   pass(`③ persistent=on：脱离父进程后活过 8 s（> 看门狗周期），再由另一个进程 probeAlive→claim→stopAndWait 停干净（stopped/portFreed 均 true）`);
 
+  // ===== ③-b detach-keep 有牙（minor④）：常驻 + **真在监听** + 父进程没了 → 不退出、留痕、端口在盘上看得见 =====
+  // 旧用例（上面那条 persistent=on）的子进程不监听，把 detach-keep 整支删掉判据仍绿；这一条让它真在监听。
+  const keepSandbox = sandboxDir("keep");
+  fs.mkdirSync(keepSandbox, { recursive: true });
+  const keepReport = path.join(work, "keep.json");
+  const keepRun = await spawnFixture("gw-listen.cjs", [BE, "1", String(KEEP_PORT), keepReport], {
+    APPDATA: keepSandbox, AGENT_SKILLS_HOME: path.join(work, "hub-keep"),
+  }).done;
+  assert.strictEqual(keepRun.code, 0, "③-b 夹具没把常驻子进程带到监听：" + keepRun.out + keepRun.err);
+  const kr = JSON.parse(fs.readFileSync(keepReport, "utf8"));
+  knownPids.add(Number(kr.gatewayPid));
+  assert.ok(alive(Number(kr.gatewayPid)), "③-b 前提不成立：常驻子进程不在");
+  assert.strictEqual(Number(kr.diskPort), KEEP_PORT,
+    "③-b 子进程开始监听后没把端口回写进 gateway.json（跨进程看到的第二份证据，评审 I1）：实得 " + kr.diskPort);
+  await sleep(8000);
+  assert.ok(alive(Number(kr.gatewayPid)),
+    "③-b persistent=on 且正在监听时父进程没了，子进程却退了 —— detach（本期设计目标）失效");
+  const keepLog = await waitForLogLineIn(keepSandbox, /detach-keep \{"reason":"parent-exit"/, 12000);
+  assert.ok(keepLog.line, "③-b 日志里没有 detach-keep 那一行 = detach 分支压根没执行过（补这条就是不给「看起来有测」留错觉）："
+    + keepLog.text.slice(-400));
+  const keepStop = await spawnFixture("gw-stopper.cjs", [BE], {
+    APPDATA: keepSandbox, AGENT_SKILLS_HOME: path.join(work, "hub-keep2"),
+  }).done;
+  assert.strictEqual(keepStop.code, 0, "③-b 唯一出口 stopAndWait 停不掉「常驻 + 在监听」的网关（Task 7 的互锁会被它卡死）：" + keepStop.out + keepStop.err);
+  assert.ok(/STOPPED stopped=true portFreed=true drained=true forced=false/.test(keepStop.out),
+    "③-b 停机结论没回给父进程（评审 I2③：drained/forced 必须随 gateway_shutdown 的响应进 stopAndWait 的返回值）。"
+    + "旧代码在 dispatch 还没 resolve 时就同步 srvRef.close()，destroy 掉 socket 把响应帧一起带走了：" + keepStop.out);
+  assert.ok(!(await gw.probePortBusy(KEEP_PORT)), "③-b 报了 portFreed:true 但端口 " + KEEP_PORT + " 还有人 accept（谎报）");
+  pass(`③-b detach 有牙：常驻 + 真监听下父进程没了 → 活过 8 s 且留 detach-keep（diskPort=${kr.diskPort}）；另一个进程经唯一出口停干净并看见 ${keepStop.out.trim().split("\n")[1]}`);
+
+  // ===== ③-c exe-gone 在常驻形态下必须还能收摊（评审 I4）=====
+  // 旧代码 gracefulExit 第一句对**任何** reason 都 detach-return，于是 startWatchdog 里的 exe-gone
+  // 恰好被同一条保护吞掉；而升级/卸载删安装目录、NSIS 最需要映像解锁的时刻正是它唯一能起作用的时候。
+  const exeSandbox = sandboxDir("exegone");
+  fs.mkdirSync(exeSandbox, { recursive: true });
+  const exeReport = path.join(work, "exegone.json");
+  const GONE_EXE = path.join(work, "no-such-exe-dir", "AgentHub.exe");
+  const exeRun = await spawnFixture("gw-listen.cjs", [BE, "1", String(EXE_PORT), exeReport, GONE_EXE], {
+    APPDATA: exeSandbox, AGENT_SKILLS_HOME: path.join(work, "hub-exe"),
+  }).done;
+  assert.strictEqual(exeRun.code, 0, "③-c 夹具没把子进程带到监听：" + exeRun.out + exeRun.err);
+  const xr = JSON.parse(fs.readFileSync(exeReport, "utf8"));
+  knownPids.add(Number(xr.gatewayPid));
+  assert.ok(alive(Number(xr.gatewayPid)), "③-c 前提不成立：进程不在");
+  let exeDied = -1;
+  const exeT0 = Date.now();
+  for (let i = 0; i < 200; i++) {
+    if (!alive(Number(xr.gatewayPid))) { exeDied = Date.now() - exeT0; break; }
+    await sleep(100);
+  }
+  const exeLog = await waitForLogLineIn(exeSandbox, /exit \{"reason":"exe-gone"/, 4000);
+  assert.ok(exeDied >= 0,
+    "③-c exe-gone 在常驻形态下永久失效：exe 路径已不存在、进程正在监听且 persistent=on，20 s 了还活着（detach 保护把它吞了）。"
+    + "两规则冲突时应当 reason 优先：" + JSON.stringify(xr));
+  assert.ok(exeLog.line, "③-c 进程退了，但日志里没有 reason=exe-gone（那退的不是评审 I4 那条路）：" + exeLog.text.slice(-400));
+  assert.ok(!/shutdown-unclean/.test(exeLog.text),
+    "③-c exe-gone 那次停机没排干净（有 shutdown-unclean）——这一支的退出码必须是 UNCLEAN_EXIT_CODE 而不是 0，父进程在 child-exit 看得见：" + exeLog.text.slice(-400));
+  assert.ok(!(await gw.probePortBusy(EXE_PORT)), "③-c exe-gone 之后端口 " + EXE_PORT + " 仍被占着");
+  pass(`③-c exe-gone 有牙：常驻 + 真监听 + exe 映像不在 → ${exeDied} ms 内自己收摊（reason=exe-gone、端口释放、排干净）`);
+
   // ===== ⑤ 日志落盘与轮转（gateway-log 自身的判据） =====
   const lgDir = sandboxDir("log");
   fs.mkdirSync(lgDir, { recursive: true });
@@ -561,11 +794,59 @@ fs.writeFileSync(path.join(d,"names.txt"), fs.readdirSync(path.join(d,"AgentHub"
   assert.deepStrictEqual(codes.filter((c) => c !== 0), [],
     "⑥ 子进程退出码非 0：" + JSON.stringify(codes)
     + "。3221226505 = 0xC0000409 fastfail，成因见 ④ 的 SHUTDOWN/PENDING_REQ 两条（停机没排干在途异步作业）");
-  const drained = [...allLog.text.matchAll(/shutdown-done \{"drained":(true|false)/g)].map((m) => m[1]);
-  assert.ok(drained.length >= 2, "⑥ 子进程没记下优雅停机留痕（shutdown-done）：" + allLog.text.slice(-400));
-  assert.deepStrictEqual(drained.filter((d) => d !== "true"), [], "⑥ 子进程停机没排干在途作业：" + JSON.stringify(drained));
-  pass(`⑥ 陈旧 pid（真死了）→ 回收 + 新起（${r1.pid} → ${r4.pid}），再次 stopAndWait 停干净：${stop2.message}；`
-    + `两次停机子进程退出码全 0、shutdown-done drained:true（共 ${codes.length} 次）`);
+  const drained = [...allLog.text.matchAll(/shutdown-done \{"drained":(true|false),"forced":(true|false)/g)];
+  assert.ok(drained.length >= 2, "⑥ 子进程没记下优雅停机留痕（shutdown-done 带 drained/forced）：" + allLog.text.slice(-400));
+  assert.deepStrictEqual(drained.filter((d) => d[1] !== "true").map((d) => d[0]), [], "⑥ 子进程停机没排干在途作业：" + JSON.stringify(drained.map((d) => d[0])));
+  assert.deepStrictEqual(drained.filter((d) => d[2] !== "false").map((d) => d[0]), [],
+    "⑥ 有一次停机没在预算内等到监听释放（forced:true），却被当成正常收摊：" + JSON.stringify(drained.map((d) => d[0])));
+  // —— reap 的两条牙齿（minor④：这一处过去「删掉判据仍绿」）——
+  const reapLine = await waitForLogLine(new RegExp("reap-stale \\{\"pid\":" + r1.pid), 3000);
+  assert.ok(reapLine.line, "⑥ 日志里没有点名 pid=" + r1.pid + " 的 reap-stale —— 回收陈旧握手文件那一步压根没执行（把 reap() 整段删掉本闸今天照样绿）："
+    + reapLine.text.slice(-400));
+  // 「回收绝不按 pid 杀进程」：握手文件里写一个**活着但与本任务无关**的 pid，start() 之后它必须还在
+  const victim = spawn(process.execPath, ["-e", "setTimeout(function () { }, 120000)"], { cwd: work, stdio: "ignore", windowsHide: true });
+  knownPids.add(victim.pid);
+  await sleep(400);
+  assert.ok(alive(victim.pid), "⑥ 无辜进程夹具没起来（本条前提不成立）");
+  const reapSandbox = sandboxDir("reap2");
+  fs.mkdirSync(path.join(reapSandbox, "AgentHub", "proxy"), { recursive: true });
+  fs.writeFileSync(path.join(reapSandbox, "AgentHub", "proxy", "gateway.json"), JSON.stringify({
+    pid: victim.pid, pipe: String.raw`\\.\pipe\agenthub-gw-foreign-${process.pid}`, token: "e".repeat(48),
+    port: 0, version: util.appVersion(), startedAt: Date.now(), secretBackend: "plain-dev",
+  }), "utf8");
+  const reapReport = path.join(work, "reap.json");
+  const reapRun = await spawnFixture("gw-reap.cjs", [BE, reapReport, String(victim.pid)], {
+    APPDATA: reapSandbox, AGENT_SKILLS_HOME: path.join(work, "hub-reap"),
+  }).done;
+  assert.strictEqual(reapRun.code, 0, "⑥ 回收夹具跑挂了：" + reapRun.out + reapRun.err);
+  const rp = JSON.parse(fs.readFileSync(reapReport, "utf8"));
+  assert.strictEqual(rp.ok, true, "⑥ 握手文件的 pid 活着但双检不过（那是别人的进程）时必须回收后新起：" + JSON.stringify(rp));
+  assert.strictEqual(rp.claimed, false, "⑥ 双检没过却被认领上了：" + JSON.stringify(rp));
+  assert.ok(alive(victim.pid),
+    "⑥ 回收陈旧握手文件时把那个 pid 的进程杀了 —— 能走到这条路的进程恰恰是「活着但认证不过」的，pid 复用场景下那是**别人的**进程"
+    + "（一期踩过宽匹配杀进程的坑）。回收只许把 gateway.json 挪走：" + JSON.stringify(rp));
+  pass(`⑥ 陈旧 pid → 回收 + 新起（${r1.pid} → ${r4.pid}），再次 stopAndWait 停干净：${stop2.message}；`
+    + `两次停机子进程退出码全 0、shutdown-done drained:true/forced:false（共 ${codes.length} 次）；`
+    + `reap-stale 点名 ${rp.beforePid} 且那个无辜进程仍活着（${victim.pid}）`);
+
+  // ===== ⑥b portFreed 必须能说「不」（评审 I1：它是 Task 7 互锁唯一出口的那一半判据）=====
+  // 场景按评审点名的那条造：pid 已死（⑥ 刚停掉的 r4），端口却被**另一个进程**占着。
+  // 修法前这里恒为 true（port 恒 0 → 三元短路），也就是说这条闸自我实现、不可能红。
+  const busy = net.createServer();
+  await new Promise((r) => busy.listen(BUSY_PORT, "127.0.0.1", r));
+  fs.writeFileSync(gw.gatewayFile(), JSON.stringify({
+    pid: r4.pid, pipe: String.raw`\\.\pipe\agenthub-gw-already-dead-${process.pid}`, token: "f".repeat(48),
+    port: BUSY_PORT, version: util.appVersion(), startedAt: Date.now(), secretBackend: "plain-dev",
+  }), "utf8");
+  assert.ok(!alive(r4.pid), "⑥b 前提不成立：那个 pid 必须已经死了（否则测的不是「进程没了但端口还在」）");
+  const stopBusy = await gw.stopAndWait({ timeoutMs: 2000 });
+  busy.close();
+  assert.strictEqual(stopBusy.stopped, true, "⑥b 前提不成立：pid 已死却报 stopped:false：" + JSON.stringify(stopBusy));
+  assert.strictEqual(stopBusy.portFreed, false,
+    "⑥b pid 已死、端口 " + BUSY_PORT + " 明显还被本次测试自己起的那个 listener 占着，stopAndWait 却报 portFreed:true —— "
+    + "这条判据自我实现（Number(cur.port) 恒 0），Task 7 的装更互锁拿它当唯一出口就是拿一个真没有的判据放行：" + JSON.stringify(stopBusy));
+  assert.match(String(stopBusy.message), /仍被占用/, "⑥b 端口没释放时 message 必须说清楚：" + stopBusy.message);
+  pass(`⑥b portFreed 有牙：pid ${r4.pid} 已死 + 端口 ${BUSY_PORT} 被别的进程占着 → portFreed=false（「${stopBusy.message}」）`);
 
   // ===== ⑦ EADDRINUSE 的占用者判定（规格 §七.5：占用者是常驻网关时不许再报「请更换端口」）=====
   // 用一个真的监听把端口占住，再从本进程调 server.start()：
@@ -598,6 +879,34 @@ fs.writeFileSync(path.join(d,"names.txt"), fs.readdirSync(path.join(d,"AgentHub"
   holder.close();
   tSrv.close();
   pass(`⑦ EADDRINUSE 分得开：gateway.json 端口一致且双检通过 → {ok:true,claimed:true}；端口对不上 → 「${other.message}」`);
+
+  // ===== ⑦-b 端到端接管（评审 I3）：一台**真子进程**在监听，第二个进程调 proxy_start =====
+  // 上面 ⑦ 测的是**判定函数**（手写 port + 一个 net.createServer()）；简报 Step 6 针对的场景是
+  // 「真常驻网关占着端口时 proxy_start 不报错」，那条链在 I1 落地前根本走不到（port 恒 0 → 第一道门恒假）。
+  const toSandbox = sandboxDir("takeover");
+  fs.mkdirSync(toSandbox, { recursive: true });
+  const toReport = path.join(work, "takeover.json");
+  const toRun = await spawnFixture("gw-takeover.cjs", [BE, toReport, String(TAKEOVER_PORT)], {
+    APPDATA: toSandbox, AGENT_SKILLS_HOME: path.join(work, "hub-takeover"),
+  }).done;
+  assert.strictEqual(toRun.code, 0, "⑦-b 端到端接管夹具跑挂了：" + toRun.out + toRun.err);
+  const to = JSON.parse(fs.readFileSync(toReport, "utf8"));
+  assert.strictEqual(Number(to.startedPort), TAKEOVER_PORT, "⑦-b 前提不成立：那台真子进程没在监听：" + JSON.stringify(to));
+  assert.strictEqual(Number(to.diskPort), TAKEOVER_PORT,
+    "⑦-b 真子进程没把监听端口回写进 gateway.json（评审 I1）→ probeResidentGateway 的第一道门 Number(cur.port)===port 恒不成立，"
+    + "整条接管分支在生产形态不可能走到：" + JSON.stringify(to));
+  assert.strictEqual(to.take && to.take.ok, true,
+    "⑦-b 端口被**真常驻网关**占着时 proxy_start 不许报错（简报 Step 6 的端到端场景）：" + JSON.stringify(to.take));
+  assert.strictEqual(to.take.claimed, true, "⑦-b 必须回 claimed:true，否则调用方会以为是自己起了监听：" + JSON.stringify(to.take));
+  assert.strictEqual(to.localRunning, false,
+    "⑦-b claimed 之后本进程其实什么都没监听（server.status().running 必须 false，这就是「接管 ≠ 本机监听」的形式）：" + JSON.stringify(to));
+  assert.strictEqual(to.restoreOnLaunch, false,
+    "⑦-b claimed 分支把 rememberRunning(true) 算成了本机监听（评审 I3）：配置里记下「网关开着」而本进程什么都没监听，"
+    + "下次开机或别的进程据此判断就是谎报的恢复语义：" + JSON.stringify(to));
+  assert.strictEqual(to.stop.stopped, true, "⑦-b 收尾没停掉那台真子进程：" + JSON.stringify(to.stop));
+  assert.strictEqual(to.stop.drained, true, "⑦-b 真监听状态下的停机结论没排干净、或压根没回给父进程：" + JSON.stringify(to.stop));
+  pass(`⑦-b 端到端接管成立：真子进程监听 ${to.startedPort} 且 port 已回写盘 → 第二个进程 proxy_start 得 {ok:true,claimed:true}、`
+    + `本机 running=false、restoreOnLaunch 仍 ${to.restoreOnLaunch}；停机 drained=${to.stop.drained} forced=${to.stop.forced}`);
 
   // ===== ⑧ 收尾卫生核对（探针三件套 + 第五条）=====
   assert.strictEqual(realBaseline(), realBefore,
