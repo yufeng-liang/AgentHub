@@ -20,6 +20,7 @@
 - **不改 `extraResources`、不改 `resources/sqlcipher` 归属**（规格 §十）。本计划新增的是 `build.extraFiles`（装到安装根目录，与 `extraResources` 不同键），Task 6 里用产物实测证明它没顺手改掉 `extraResources`。
 - **43 条 `proxy_*` 命令名全部保留**，`src/api/ipc.ts` 与 `electron/preload.cjs:109-153` 的 `ALLOWED_COMMANDS` 零改动（AGENTS.md 第四节：漏登记 → 「未授权的 IPC 命令」且界面卡在假死态）。
 - **探针卫生四件套**（规格 §八 + 二期新增）：临时 userData **不等于隔离**；`AGENT_SKILLS_HOME=<临时目录>`；网关端口改到非 9527；收尾核对 HKCU Run 值列表未变。**二期新增第五条：任何「asar 内可 require / electron 不可得」类断言必须从中立 cwd（`%TEMP%`）起跑**——在仓库目录里 `require("electron")` 会命中 devDependency 的 `node_modules/electron/index.js` 而返回一个字符串路径，把假绿当真绿。
+- **子进程入口必须留在 `app.asar` 内**（Task 3 的 `electron/gateway.cjs` 与 Task 6 的启动器都不得把它挪到 `extraResources` 或 asar 外）。理由不是打包习惯而是安全判据：`secretbox.packaged()` 就是 `__dirname.includes("app.asar")`，入口一旦跑出 asar，打包版会被判成开发态 → `plain-dev` → **凭据明文落盘**，正是 §5.3 那道闸门要堵的洞。Task 6 的启动器断言里必须包含「入口路径含 `app.asar`」。
 - **绝不终止用户自己的实例**（本机装在 `H:\AgentHub`，监听 9527）。打包前只清 `release\win-unpacked` 下自起实例；清理脚本的可选 kill 参数为空时必须等价于「只列不杀」。
 - **不得把真实 `%APPDATA%\AgentHub` 的库/配置拷进仓库，不得打印凭据内容**（连密文前缀之外的部分也不行）。本计划里凡是读真实 `stats.db` 的步骤都只读**长度与头 8 字节**做形态判定。
 - 用户可见文字用中文；代码注释用中文；commit message 用中文，格式 `<type>: <描述>`。
