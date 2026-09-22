@@ -20,7 +20,8 @@ const ccswitch = require("./ccswitch.cjs");
 const zip = require("../zip.cjs");
 const secretbox = require("./secretbox.cjs");
 
-// shell 只在 4 条「留主进程」的命令里用到（openExternal / openPath）。
+// shell 只在 3 条「留主进程」的命令里用到：proxy_oauth_begin 的 openExternal，
+// proxy_open_rules_dir / proxy_open_data_dir 的 openPath。
 // 顶层 require("electron") 会让整张依赖图在纯 Node 子进程里加载不了（Task 0 实测唯一 FAIL 点），
 // 故惰性取 + 拿不到时明确抛错，而不是让子进程 require 到一半炸掉。
 function getShell() {
