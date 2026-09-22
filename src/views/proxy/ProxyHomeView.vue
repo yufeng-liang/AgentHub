@@ -11,16 +11,37 @@ const st = ref<ProxyGatewayStatus | null>(null);
 const recent = ref<ProxyUsageRow[]>([]);
 const busy = ref(false);
 const err = ref("");
+// 后台网关起不来的显式错误态（Task 5 §七.1）：转发体回 {ok:false, message:"后台网关未能启动：…"}，
+// 此时绝不能把状态对象当 gatewayStatus 塞进 st 让页面停在假死的空态——单独亮错误卡 + 重试按钮
+const gwErr = ref("");
 let offEvent: (() => void) | undefined;
 let pollTimer: ReturnType<typeof setInterval> | undefined;
 
 async function refresh() {
   try {
-    st.value = await api.proxyStatus();
+    const s = await api.proxyStatus();
+    if (s && (s as { ok?: boolean }).ok === false) {
+      gwErr.value = (s as { message?: string }).message || "后台网关未能启动";
+      err.value = "";
+      return;
+    }
+    st.value = s;
     recent.value = await api.proxyRecent(8);
     err.value = "";
+    gwErr.value = "";
   } catch (e) {
     err.value = String((e as Error).message || e);
+  }
+}
+
+/** 重试启动：转发体在子进程不在时会对任意命令先拉起网关，重发一次 status 即完成拉起 */
+async function retryGateway() {
+  if (busy.value) return;
+  busy.value = true;
+  try {
+    await refresh();
+  } finally {
+    busy.value = false;
   }
 }
 
@@ -148,6 +169,12 @@ onUnmounted(() => {
 <template>
   <section class="page">
     <div class="page-body">
+      <div v-if="gwErr" class="card err-card">
+        <div class="err-row">
+          <div class="set-desc err-text">{{ gwErr }}</div>
+          <button class="btn btn-primary" :disabled="busy" @click="retryGateway">{{ busy ? "重试中…" : "重试启动" }}</button>
+        </div>
+      </div>
       <div v-if="err" class="card err-card">
         <div class="set-desc err-text">{{ err }}</div>
       </div>
@@ -335,6 +362,13 @@ onUnmounted(() => {
 }
 .err-text {
   color: var(--err, #e05555);
+}
+/* 网关起不来的错误态：文案 + 重试按钮同行，按钮不许被文案挤下去 */
+.err-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  justify-content: space-between;
 }
 
 /* ===== 快速上手 ===== */
