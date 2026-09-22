@@ -137,6 +137,8 @@
 
 依据：`index.cjs` 注册的 43 条 `proxy_*` 全部是「窗口打开时才需要」（`ProxyHomeView` 的 5s 轮询等）；后台自动路径（请求转发、`credits.startScheduler` 30min 自续、`checkinAutoTick` 60s、`rules.cjs:269` 的 chokidar 热加载）**不经任何 IPC**，可整体下沉。
 
+**子进程形态已实测钉死（2026-09-22，`tmp/gateway-probe/phase2-runtime-probes.md`）**：`ELECTRON_RUN_AS_NODE=1 <安装目录>\AgentHub.exe <...>\resources\app.asar\electron\gateway.cjs` —— 该角色下 asar 虚拟 FS 完整可用（`fs`/`require`/asar 内模块的裸依赖 `express`/`chokidar` 全通，把 asar 内路径当主入口也能跑，负对照不存在的文件确实报错），`node:sqlite` 是内置的 Node 22.16（无 flag），koffi 原生模块就在 asar 里且能真调 Win32。**系统 Node 看不见 asar，所以子进程必须用打包 exe 自己**；也不需要 `asarUnpack` 或改 `extraResources`。整条依赖图逐个 require 的**唯一 FAIL 点是 `index.cjs:7` 的顶层 `const { shell } = require("electron")`** —— 惰性化即可，不是重构。附带：纯 Node 下 `config.cjs:28` 的 `safeStorage` 与 `index.cjs:233` 的 `vaultOk()` 双双降级，这正是 §5.3 那道「拒写明文」闸门必须在子进程上线前落地的原因。
+
 ### 5.2 命令通道：Windows named pipe
 
 43 条 `ipcMain.handle` 的**名字全部保留**，实现体换成 `gw.call(cmd, args)` 转发 → `src/api/ipc.ts` 与 `preload.cjs` 白名单零改动（规避 AGENTS.md 第四节的「漏登记→未授权 IPC」坑）。
@@ -155,6 +157,8 @@
 
 子进程内自带 v10 解密：koffi `Crypt32!CryptUnprotectData` 解 `Local State` 的 283 B `DPAPI`+wrapped key → 剥前缀得 AES-256 主密钥 → `node:crypto` AES-256-GCM 按 `v10` + 12 B nonce 解业务值。**对存量密文 100% 兼容**（同一套方案），无需迁移。
 
+> **2026-09-22 实测确认（原为推断，现已核实）**：真实 `stats.db` 的 `keys.key_enc` / `accounts.token_enc` / `accounts.refresh_enc` 三类密文 base64 解码后头三字节都是 ASCII `v10`（`763130…`）；`%APPDATA%\AgentHub\Local State` 的 `os_crypt.encrypted_key` 长 **283 B**、头五字节是 ASCII `DPAPI`。所以这条链成立，Electron 35 在 Windows 上用的就是 Chromium os_crypt 而非裸 DPAPI —— 原先只写「同一套方案」是推断，且很容易误判成「`safeStorage` 就是 DPAPI，直接 `CryptUnprotectData` 一步到位」（那样解出来的是错的东西）。koffi 在纯 Node 角色 + asar 内加载实测可用（`CryptProtectData`/`CryptUnprotectData` 真往返一致，无需 `asarUnpack`）。**全仓 `grep encrypted_key\|Local State\|v10` 零命中，没有任何现成实现可复用，这是净新增模块。**
+
 不能走「主进程 RPC 回填」：热路径上每次 chat completion 至少 4 次解密调用（`server.cjs:644` → `settings()`(`index.cjs:83`) → `config.loadConfig()` → `decryptSecret` ×2，加 `server.cjs:89` `store.accountSecrets` ×2），逐次跨进程往返直接劣化 TTFT；且与「主 App 可整体退出」自相矛盾。
 
 配套闸门：
@@ -166,7 +170,8 @@
 
 - `stats.db` 由子进程**独占**：主进程不再 require 网关 store（现状 `ipc.cjs:472` → `proxy.register` 会把整张依赖图包括 `store.cjs` 拉进主进程）。
 - WAL：`store.cjs:128-129` 只设 `journal_mode=WAL` + `busy_timeout=5000`，全仓无 `wal_checkpoint`，`store.close()`(`:551`) **无任何调用点**（`proxy.shutdown()` `index.cjs:177-182` 只停 server）。实测本机 WAL 已 1.59 MB 且自 16:41 起零次 checkpoint。补：退出路径调 `close()`、运行期周期性 `PRAGMA wal_checkpoint(TRUNCATE)`。`busy_timeout=5000` 在双进程争锁时会卡转发 5 秒，故必须单一写者。
-- `config.json` 唯一属主 = 主进程。子进程只读配置 + 通过管道请求写。`config.cjs:370` 用固定 `.tmp` 名，跨进程 rename 会互踩，临时文件名加 pid。
+- `config.json` 唯一属主 = 主进程。子进程只读配置 + 通过管道请求写。`config.cjs:372`（一期落地后行号，原写 `:370`）用固定 `.tmp` 名，跨进程 rename 会互踩，临时文件名加 pid。**同病实测共四处**，只改 `config.cjs` 会漏三处：`hub.cjs:39`（`~/.agent_skills/manifest.json`）、`sync-config.cjs:475`、`sync.cjs:185`，其中前两处落在**两个安装共享**的 `~/.agent_skills`，互踩面比 `config.json` 更大。
+- 除 `config.json` 外还有四个数据文件要定写主（实测清单）：`proxyDir()/catalog.json`(`index.cjs:483`)、`rules` 的默认值与补键迁移(`rules.cjs:233/:244`)、`proxyDir()/sync-state.json`(`poolsync.cjs:77`)、`proxyDir()/pool-tombstones.json`(`poolsync.cjs:310`) —— 全部归子进程独占。**规格原来漏了一条反向跨界写**：`ipc.cjs:176` 的 `webdav_shared_save` 在主进程里直接 `require("./proxy/poolsync.cjs").onSharedPasswordMaybeChanged()`，那是从主进程写子进程独占的 `sync-state.json`；双拓扑下必须走管道，否则 §5.4 第一条从后门漏掉。
 - `rules/*.json` 由子进程只读监听（`rules.cjs:269` chokidar）；写规则仍走主进程 `config` 域。
 
 ### 5.5 生命周期、认领与自启
@@ -181,11 +186,13 @@
 
 ### 5.6 自动更新互锁
 
-`updater.cjs:268-287 triggerInstall` → `main.cjs:362-373` 的 `before-quit` 只调本进程 `proxy.shutdown()`(`index.cjs:181`)，够不到子进程：9527 仍被占、`AgentHub.exe` 映像仍被锁，NSIS 覆盖安装会失败或挂住（AGENTS.md 记录过 electron-builder 撞文件锁卡 10 分钟）。改为：停子进程 → 用 `server.stopAsync()`(`server.cjs:713-726`) 语义确认端口释放 → 才 `quitAndInstall`；停不下来要报错给用户而不是静默卡住。
+`updater.cjs:270-289 triggerInstall` → `main.cjs:399-416`（一期落地后行号，原写 `:362-373`）的 `before-quit` 只调本进程 `proxy.shutdown()`(`index.cjs:177-182`，**同步四行，内部 `server.stop()` 连监听释放都不等**；实测全仓 `store.close()` 零调用点)，够不到子进程：9527 仍被占、`AgentHub.exe` 映像仍被锁，NSIS 覆盖安装会失败或挂住（AGENTS.md 记录过 electron-builder 撞文件锁卡 10 分钟）。改为：停子进程 → 用 `server.stopAsync()`(`server.cjs:713-726`) 语义确认端口释放 → 才 `quitAndInstall`；停不下来要报错给用户而不是静默卡住。**入口有三条**都要收敛到同一实现：`main.cjs:407`（装更）、`:415`（普通退出）、`ipc.cjs:120`（`install_update` 短路，它走的是 `quitAndInstall` 内部触发的 quit，所以早先那版只写了前两条会漏）。
 
 ### 5.7 归属划分（留主进程的四条）
 
-`proxy_account_import_file`（`index.cjs:412-420` 文件框）、`proxy_open_rules_dir`(`:514`)、`proxy_open_data_dir`(`:519`)、`proxy_oauth_begin` 的 `shell.openExternal`(`:391`)。其余 39 条纯转发。
+`proxy_account_import_file`（`index.cjs:410-422` 文件框）、`proxy_open_rules_dir`(`:516`)、`proxy_open_data_dir`(`:520`)、`proxy_oauth_begin` 的 `shell.openExternal`(`:391`)。其余 39 条纯转发。
+
+> **2026-09-22 实测更正**：逐条把 43 个处理体的 electron 依赖扫过之后，「四条」实为 **6 条** —— 上面这段漏了 `proxy_status`(`:257`) 与 `proxy_vault_status`(`:524`)，两者都经 `vaultOk()`(`:233-240`) 读 `require("electron").safeStorage`，纯 Node 子进程里恒 `false`，会把保险状态误报给界面。本规格 §5.3 自己早已把 safeStorage 列为阻塞项，却没同步到这条归属表，属自相矛盾。二期计划（`plans/2026-09-22-gateway-lite-mode-phase2.md` Task 1/5）把 `vaultOk()` 改读凭据后端探测结果后，这 2 条回到可转发，最终定案是 **4 条真 UI 依赖 + 3 条薄包装（`proxy_start`/`stop`/`restart` 的 `restoreOnLaunch` 写权留主进程）+ 36 条纯转发 + 1 条新增子命令 `proxy_account_import_blob`**。
 
 `ccswitch.cjs` 与 `ideswitch.cjs` 本身是纯文件/SQLite 写，不需要 UI，跟网关走；但 `ccswitch.cjs:342-344` 注册条目时的端口回落读 `config.proxy.port`，双拓扑下真实监听端口在子进程 → 必须改从子进程状态取，否则注册进 CC Switch 的 `base_url` 指向死端口。
 
@@ -226,7 +233,7 @@
 | 一期体积 | 核 `dist/assets/` 分块字节数（不用构建退出码代替产物检查）；目标见 §4.3 |
 | 一期耗时 | CDP 实测「建窗 → 可交互」（AGENTS.md 第三节流程）；探针 `tmp/gateway-probe/memtree.ps1` 可复用 |
 | 一期内存 | 关窗前后采 `PrivateMemorySize64`，对齐 **§4.1 更正后的判据**（相对降幅 + main 单列）。**不要**对齐 §三——那张表是合成探针，量的是 Electron 不是本应用（教训见 §一 表下说明） |
-| 探针卫生（一期 Task 7 暴露，二期必须遵守） | 用临时 userData 起打包版实例**并不等于隔离**：`hubDir()` 按 `os.homedir()` 解析，仍会读写共享中央仓库 `~/.agent_skills`；packaged 且非便携的实例每次启动都调 `applyAutoStart`，`autoStart` 默认 false 时会把**用户自己的**开机自启 Run 项删掉。故探针三件套：`AGENT_SKILLS_HOME=<临时目录>`（或临时 config 里 `watch.enabled:false`）+ 网关端口改到非 9527（9527 归用户实例，拿它的应答当本构建的证据是错的）+ 收尾核对 HKCU Run 值列表未变。一期四个探针脚本在 gitignored 的 `tmp/gateway-probe/`，二期复用时**四个一起**提到 `tools/`，别只提 `.cjs`（会留下对 `memtree.ps1` 的悬空引用）。另注意 `proxy.boot()` 里的 `discovery.cjs:34,37,347` 会读**真实本机登录文件**（CodeBuddy/Trae 的本地 auth），临时 userData 挡不住它——一期那次隔离实例 `/v1/models` 能列出 `trae` 的模型就是这个原因（只读，discovery/adapter 侧无写入调用；但报告写「号池为空」时必须同时说明这点），二期把 discovery 下沉到子进程时要一并处理 |
+| 探针卫生（一期 Task 7 暴露，二期必须遵守） | 用临时 userData 起打包版实例**并不等于隔离**：`hubDir()` 按 `os.homedir()` 解析，仍会读写共享中央仓库 `~/.agent_skills`；packaged 且非便携的实例每次启动都调 `applyAutoStart`，`autoStart` 默认 false 时会把**用户自己的**开机自启 Run 项删掉。故探针三件套：`AGENT_SKILLS_HOME=<临时目录>`（或临时 config 里 `watch.enabled:false`）+ 网关端口改到非 9527（9527 归用户实例，拿它的应答当本构建的证据是错的）+ 收尾核对 HKCU Run 值列表未变。一期四个探针脚本在 gitignored 的 `tmp/gateway-probe/`，二期复用时**四个一起**提到 `tools/`，别只提 `.cjs`（会留下对 `memtree.ps1` 的悬空引用）。另注意 `proxy.boot()` 里的 `discovery.cjs:34,37,347` 会读**真实本机登录文件**（CodeBuddy/Trae 的本地 auth），临时 userData 挡不住它——一期那次隔离实例 `/v1/models` 能列出 `trae` 的模型就是这个原因（只读，discovery/adapter 侧无写入调用；但报告写「号池为空」时必须同时说明这点），二期把 discovery 下沉到子进程时要一并处理。**二期新增第五条：凡「asar 内可 require / electron 不可得」类断言必须从中立 cwd（`%TEMP%` 下）起跑** —— 在仓库目录里跑时 `require("electron")` 会命中 devDependency 的 `node_modules/electron/index.js` 并返回一个 exe 路径**字符串**，于是"没有 Electron 绑定"的断言假绿（本次实测先踩了一次） |
 | 按需注册静默坏掉 | 新增 CDP 冒烟：6 个 chunk 落点页各截一次 DOM，断言图表 canvas 存在、`el-date-picker` 面板月份为中文、图例已渲染 |
 | 图标子集 | 纯静态比对：`src` 用到的类名 ∪ 后端 `toolIcon()` 下发集合 ⊆ 生成的子集 CSS |
 | 二期 | 矩阵：安装版/便携版 × 常驻开关 × 升级装更。验「主 App 退出后 9527 仍通」「重开认领不起第二个进程」「WAL 不再单调增长」「装更前子进程已停」 |
@@ -260,6 +267,7 @@
 4. 关窗即销毁 + `launchHidden` + 两处 dialog 兜底 + 设置项。
 
 **二期**（阻塞项按依赖排序，任一不通不得继续）：
+0. 下沉前置：`index.cjs:7` 顶层 `require("electron")` 惰性化 + `poolsync` 的 `app.getVersion()` 收口（实测它是整条依赖图唯一的纯 Node 加载阻塞点），并补一道「中立 cwd 下逐个 require 网关依赖图」的闸，防止后续改动把 electron 依赖再漏回去。
 1. 凭据自带解密 + 拒写明文闸门。
 2. 写权归属（`stats.db` 独占、`config.json` 单属主、WAL checkpoint、`store.close()` 调用点）。
 3. 生命周期基座（`gateway.json` + 认领双检 + 看门狗 + 日志 + liveness/readiness 拆分 + 启动器 `.cmd` + 便携版禁用）。
