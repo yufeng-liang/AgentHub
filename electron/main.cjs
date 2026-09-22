@@ -15,6 +15,9 @@ const usagedb = require("./backend/db.cjs");
 const usagesync = require("./backend/sync.cjs");
 // 反代网关模块：本地 OpenAI 兼容服务（默认 127.0.0.1:9527），托盘常驻期间持续提供 API
 const proxy = require("./backend/proxy/index.cjs");
+// 二期 Task 3：网关子进程监督器（spawn / 认领 / 管道转发 / 事件回流）。
+// 日志由它自己经 gateway-log 落 proxyDir()/logs/gateway.log，主进程不再另开一份写点。
+const gatewayClient = require("./backend/gateway-client.cjs");
 const usageScheduler = require("./backend/usage-scheduler.cjs");
 
 const DEV_URL = process.env.VITE_DEV_SERVER_URL || "http://localhost:1420";
@@ -376,6 +379,24 @@ if (!gotLock) {
     usagesync.setOnFinish(notifyUsageSync);
     // 反代网关：规则热加载 + 额度定时刷新 + 按配置自启网关服务（服务独立于窗口存续）
     proxy.boot();
+    // 二期 Task 3：子进程生命周期基座（spawn / 认领 / 事件回流）落位。
+    // 但**默认不起子进程**：43 条命令此刻仍在主进程里跑（Task 5 才把出口换成管道转发），现在就起
+    // 等于给 stats.db 添第二个句柄持有者——子进程 store.open() 会跑 90 天 GC 写盘，双进程争锁时
+    // busy_timeout=5000 会把用户的网关请求卡 5 秒（规格 §5.4 点名要避免的正是这个）。
+    // 这条 opt-in 只给「按同一条装配路径真跑子进程」的验证用；Task 5 落地转发时连同本判断一起删除。
+    if (process.env.AGENTHUB_GATEWAY_CHILD === "1") {
+      // 不 await：whenReady 回调保持同步（现在这条链上没有任何东西等它）。
+      // 成败都由 gateway-client 自己写进 proxyDir()/logs/gateway.log，这里只兜住未收口的 Promise。
+      gatewayClient.start({ persistent: boot.schedule.persistentGateway }).catch((e) => {
+        console.error("网关子进程启动失败：" + String((e && e.message) || e));
+      });
+    }
+    // 子进程回流的代理事件扇给所有窗口（与 events.cjs 一期语义一致：无窗口时直接丢弃）
+    gatewayClient.onEvent((payload) => {
+      for (const win of BrowserWindow.getAllWindows()) {
+        if (!win.isDestroyed()) win.webContents.send("app:event", payload);
+      }
+    });
     // 启动即进托盘：首帧不建窗，GPU 侧连建窗残留都不产生（一期打包版实测私有 166.05 MB / GPU 32.2，
     // 对比「建过再销毁」的 215.47 MB，再省 49.42 MB）。
     // minimizeToTray 关时不生效 —— 那种配置下关窗就是退出，不该留一个没有界面的进程

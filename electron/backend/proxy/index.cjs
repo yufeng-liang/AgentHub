@@ -97,6 +97,9 @@ function settings() {
 }
 
 let booted = false;
+// 子进程角色开关：attachGatewayMode() 置真。它改的是两件事——事件出口换管道（events.setSink）、
+// boot() 不再按 restoreOnLaunch 自动 listen（监听决策归主进程）。除此之外本模块零分支。
+let gatewayAttached = false;
 
 // ===== 签到（Trae ug 签到 / WB 双区 daily-checkin / WB AI trial 加油包，参考项目实证端点） =====
 /** 批量签到动作：channel 为空 = 全渠道；accountId 指定 = 单账号（OAuth 登录后自动签到用）。
@@ -174,7 +177,12 @@ function stopCheckinAuto() {
 }
 
 /** 启动装配：规则热加载初始化 + 数据库 + 定时额度刷新 + 按上次的开关状态恢复网关
- *  （restoreOnLaunch 不是「用户偏好」而是「上次退出时网关是开是关」，默认 false → 首次打开是关闭的） */
+ *  （restoreOnLaunch 不是「用户偏好」而是「上次退出时网关是开是关」，默认 false → 首次打开是关闭的）
+ *
+ *  二期（Task 3）：attachGatewayMode() 之后这段自启监听**不再生效**——监听决策归主进程
+ *  （Task 6 会把 restoreOnLaunch 重定义为「本次启动是否让子进程进入监听」）。
+ *  今天子进程走的是 gateway.cjs 自己的装配序（rules.init + store.open + 周期 checkpoint），
+ *  不经 boot()，所以这条开关是给「同一个 index.cjs 被子进程 require」留下的边界声明。 */
 async function boot() {
   if (booted) return;
   booted = true;
@@ -182,20 +190,66 @@ async function boot() {
   store.open();
   credits.startScheduler(() => settings().creditsRefreshMin);
   startCheckinAuto();
-  if (settings().restoreOnLaunch) {
+  if (!gatewayAttached && settings().restoreOnLaunch) {
     server.start(settings).then(() => events.emit({ type: "status" })).catch(() => {});
   }
 }
 
 /** 停机：先让在途监听与定时任务停下，最后才关库句柄（顺序反了会让在途请求写到已关闭的 db 上）。
  *  store.close() 在这里落地 = stats.db 的句柄归属有人收（二期写权归子进程独占，Task 3 把它升级成
- *  gracefulShutdown 并接上 stopAsync / 周期 checkpoint 计时器的停止）。 */
+ *  gracefulShutdown 并接上 stopAsync / 周期 checkpoint 计时器的停止）。
+ *  与下面 gracefulShutdown() 的分工：这条是**主进程退出路径**的同步版——before-quit 不会 await 它，
+ *  所以全程必须同步，否则 store.close() 赶不上进程退出；子进程侧用 await 版。
+ *  Task 7 的装更互锁会把两者收敛到 gateway-client.stopAndWait() 一条实现上。 */
 function shutdown() {
   credits.stopScheduler();
   stopCheckinAuto();
   discovery.cancelOAuth();
   server.stop();
   store.close();
+}
+
+/** 排空在途异步作业的预算上限（ms）。它必须小于 gateway.cjs 那条 Promise.race 的 2 s 上界，
+ *  否则「等干净」永远抢在「必须退」前面拿不到决定权。 */
+const DRAIN_BUDGET_MS = 1000;
+
+/** 子进程侧唯一的优雅停机实现（Task 7 的 gateway_shutdown 命令体复用它，不开第二份）。
+ *  与一期 shutdown() 的三处差别：① server.stop() 换成 await server.stopAsync()——
+ *    stop()（server.cjs 的 stop）连监听释放都不等，跨进程场景下 NSIS 要的是映像解锁 + 端口释放；
+ *  ② store.close() 内含 checkpoint 与周期计时器停止（Task 2 落地了调用点，Task 3 成对收尾计时器）；
+ *  ③ 追加 rules.close() + drainLibuvWork()：热重载 watcher 既 ref 着事件循环，它首扫丢到
+ *    libuv 线程池的 readdir/stat 作业又会在进程已 exit 时被工作线程回报到已关闭的 uv_async_t 上
+ *    （实测 0xC0000409 fastfail，见 rules.close 的注释）。停机的定义因此必须含「在途异步作业落地」。 */
+async function gracefulShutdown() {
+  credits.stopScheduler();
+  stopCheckinAuto();
+  discovery.cancelOAuth();
+  await server.stopAsync();
+  await rules.close();
+  store.close();
+  const drained = await drainLibuvWork();
+  return { ok: true, drained };
+}
+
+/** libuv 线程池上还有没有在途作业（fs 异步请求这类）。getActiveResourcesInfo() 是 Node 18+ 的
+ *  公开 API，它把 handle 与 request 混在同一个数组里返回；request 的名字一律带 "Req"
+ *  （FSReqCallback / GetAddrinfoReq / FileHandleReq），handle 的名字一律是 *Wrap / Timeout /
+ *  Immediate，所以按 "Req" 取的就是「工作线程上还压着的活」。只等 request 不等 handle：
+ *  handle 漏关是本机代码的配置问题，不该拿「给进程续命」来兜。 */
+function pendingLibuvWork() {
+  try { return process.getActiveResourcesInfo().filter((n) => /Req/.test(String(n))).length; }
+  catch { return 0; }   // runtime 不提供这个 API 时不阻塞停机，行为退回修复前
+}
+
+/** 排空在途异步作业，带上界：停不干净也必须让 NSIS 拿到解锁的映像，不许把安装器挂死。
+ *  返回是否在预算内排空（超时只是「没等到」，不是错误）。 */
+async function drainLibuvWork(budgetMs) {
+  const deadline = Date.now() + (Number(budgetMs) > 0 ? Number(budgetMs) : DRAIN_BUDGET_MS);
+  while (pendingLibuvWork() > 0) {
+    if (Date.now() >= deadline) return false;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  return true;
 }
 
 // ===== IPC =====
@@ -271,7 +325,9 @@ function register(ipcMain) {
     const r = await server.start(settings);
     if (r.ok) rememberRunning(true);
     events.emit({ type: "status" });
-    return r.ok ? ok({ port: r.port, already: !!r.already }) : fail(r.message);
+    // claimed：端口其实被**已常驻的网关**占着（server.cjs 的 EADDRINUSE 分支查过 gateway.json 并双检通过），
+    // 此时本进程没有监听，接管状态与端口归属都由认领方维持（Task 6 的认领路径依赖这条不报错）
+    return r.ok ? ok({ port: r.port, already: !!r.already, claimed: !!r.claimed }) : fail(r.message);
   }));
   ipcMain.handle("proxy_stop", handle(() => {
     server.stop();
@@ -558,6 +614,39 @@ function register(ipcMain) {
   ipcMain.handle("proxy_poolsync_cancel", handle(() => poolsync.cancel()));
 }
 
+// ===== 子进程侧的命令出口（二期 Task 3）=====
+
+// 表只在首次用到时构建一次，之后复用模块内缓存（每条命令重建一次 43 个闭包是纯浪费）
+let TABLE = null;
+
+/** 子进程侧：把 register() 的 ipcMain 换成收集器，43 条命令名与实现体一字不动地复用。
+ *  为什么这样而不是重构出 COMMANDS 表：那是 290 行的重排，会掩盖「二期只改出口、不改命令语义」这个契约，
+ *  且 Task 5 的逐字相等闸（dev-gateway-forward-parity-test）就没法拿旧注册当基线。 */
+function dispatchTable() {
+  if (TABLE) return TABLE;
+  const cmds = {};
+  register({ handle: (name, fn) => { cmds[name] = fn; } });
+  TABLE = cmds;
+  return TABLE;
+}
+
+/** 走管道调一条命令。第一个参数是假的 _event：全仓 43 条处理体都不使用 event / event.sender
+ *  （逐条核过；真依赖 UI 的那 4 条靠 getShell() 的惰性 require 抛错，见 §5.7）。 */
+async function dispatch(cmd, args) {
+  const fn = dispatchTable()[cmd];
+  if (!fn) throw new Error("未知命令: " + cmd);
+  return fn({ sender: { send() {} } }, args || {});
+}
+
+/** 子进程装配：把事件出口接到管道广播上（emit 由 gateway.cjs 在 serve() 建成之后给，装配序不是风格）。
+ *  同时让 boot() 不再按 restoreOnLaunch 自动 listen —— 监听决策归主进程（Task 6 的新语义）。 */
+function attachGatewayMode({ emit } = {}) {
+  if (typeof emit !== "function") throw new Error("attachGatewayMode 需要 emit(payload) 函数");
+  gatewayAttached = true;
+  events.setSink(emit);
+}
+
 // gatewayStatus 一并导出：proxy_status 命令走它，Task 1 的闸直接断言 vaultOk 字段，
 // Task 5 的转发化也要按这个名字取（藏在 register 里没法单测）
-module.exports = { boot, shutdown, register, settings, gatewayStatus };
+// dispatchTable/dispatch/attachGatewayMode/gracefulShutdown：二期 Task 3 的子进程入口与管道出口
+module.exports = { boot, shutdown, gracefulShutdown, register, settings, gatewayStatus, dispatchTable, dispatch, attachGatewayMode };
