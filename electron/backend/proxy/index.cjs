@@ -187,11 +187,15 @@ async function boot() {
   }
 }
 
+/** 停机：先让在途监听与定时任务停下，最后才关库句柄（顺序反了会让在途请求写到已关闭的 db 上）。
+ *  store.close() 在这里落地 = stats.db 的句柄归属有人收（二期写权归子进程独占，Task 3 把它升级成
+ *  gracefulShutdown 并接上 stopAsync / 周期 checkpoint 计时器的停止）。 */
 function shutdown() {
   credits.stopScheduler();
   stopCheckinAuto();
   discovery.cancelOAuth();
   server.stop();
+  store.close();
 }
 
 // ===== IPC =====

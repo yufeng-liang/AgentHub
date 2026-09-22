@@ -33,12 +33,19 @@ function loadManifest() {
 
 // manifest 写盘：先写临时文件再原子替换，写一半断电/崩溃不留半个 JSON
 // （同步引擎现在并发下载/上传，台账写盘频率比以前高，半截文件会把整个仓库台账打没）
+// 临时名带 pid：中央仓库 ~/.agent_skills 是两个安装（AgentHub / Agent_skills）共享的目录，
+// 两边同刻写台账时固定名会互相把对方的 .tmp rename 走，落进台账的就是别人的半成品
 function saveManifest(m) {
   m.updatedAt = new Date().toISOString();
   const p = manifestFile();
-  const tmp = p + ".tmp";
-  fs.writeFileSync(tmp, JSON.stringify(m, null, 2), "utf-8");
-  fs.renameSync(tmp, p);
+  const tmp = `${p}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(m, null, 2), "utf-8");
+    fs.renameSync(tmp, p);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* 半成品已不在（多半是被自己 rename 走了） */ }
+    throw e;
+  }
 }
 
 function importSkill(entry) {

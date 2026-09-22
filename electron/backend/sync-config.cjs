@@ -472,9 +472,16 @@ function saveConfig(cfg) {
   const p = configPath();
   const out = { ...cfg, webdav: { ...(cfg.webdav || {}) } };
   if (out.webdav) out.webdav.password = encryptPassword(out.webdav.password);
-  const tmp = p + ".tmp";
-  fs.writeFileSync(tmp, JSON.stringify(out, null, 2), "utf8");
-  fs.renameSync(tmp, p);
+  // 临时名带 pid：数据目录（~/.Dosage_sync 或用户自定义目录）里同时有同步引擎与设置页在写，
+  // 固定名会让两个写入者的 .tmp 互相 rename 踩掉，谁都可能把对方的半成品当最终文件收下
+  const tmp = `${p}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(out, null, 2), "utf8");
+    fs.renameSync(tmp, p);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* 半成品已不在（多半是被自己 rename 走了） */ }
+    throw e;
+  }
 }
 
 

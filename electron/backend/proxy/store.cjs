@@ -114,12 +114,16 @@ const CHANNELS = [
   { id: "raccoon", display: "商汤小浣熊", domain: "xiaohuanxiong.com" },
 ];
 
+/** stats.db 完整路径：open() 与 walBytes() 共用一份解析口径，不留两份真相源 */
+function dbFile() {
+  return path.join(proxyDir(), "stats.db");
+}
+
 /** 打开数据库（幂等）；建表 + WAL + 三渠道种子 + 90 天流水 GC */
 function open() {
   if (db) return db;
   if (!Database) throw new Error("无可用 SQLite 驱动：运行时没有 node:sqlite（Node 22+ 内置）");
-  const file = path.join(proxyDir(), "stats.db");
-  db = new Database(file);
+  db = new Database(dbFile());
   db.exec("PRAGMA journal_mode=WAL;");
   db.exec("PRAGMA busy_timeout=5000;");
   db.exec(SCHEMA);
@@ -574,12 +578,44 @@ function usageView(r) {
   };
 }
 
-/** 关闭数据库句柄（应用退出/热重启时调用；重复调用安全） */
+/** 关闭数据库句柄（应用退出 / 网关停机时调用；重复调用安全）。
+ *  关之前先 checkpoint(TRUNCATE)：正常退出留不下大 WAL，下次开机不用先解一截孤儿日志。 */
 function close() {
   if (db) {
+    checkpoint();
     try { db.close(); } catch { /* 已关 */ }
     db = null;
   }
+}
+
+// ===== WAL 收敛与句柄归属（Task 2） =====
+
+/** WAL 收敛：本机实测 stats.db-wal 曾长到 1.59 MB 且自 16:41 起零次 checkpoint ——
+ *  （Task 2 之前的现状：全仓只有 journal_mode=WAL，没有 wal_checkpoint，close() 更是无人调用。）
+ *  双进程争锁时 busy_timeout=5000 会把转发卡 5 秒，所以二期必须单一写者；这条是第二道保险。
+ *  返回是否真的做成了（库没开 / 被别的连接占着都回 false，不假装成功）。 */
+function checkpoint() {
+  if (!db) return false;
+  try { db.exec("PRAGMA wal_checkpoint(TRUNCATE);"); return true; } catch { return false; }
+}
+
+const CHECKPOINT_MS = 5 * 60 * 1000;
+let ckTimer = null;
+
+/** 周期 checkpoint：二期由常驻网关子进程在启动时挂上（Task 3），返回 stop 函数给停机路径用。
+ *  计时器 unref：它不该给进程续命，空闲时进程要能自己退。 */
+function startCheckpointTimer(ms) {
+  stopCheckpointTimer();
+  ckTimer = setInterval(checkpoint, ms || CHECKPOINT_MS);
+  if (ckTimer.unref) ckTimer.unref();
+  return stopCheckpointTimer;
+}
+
+function stopCheckpointTimer() { if (ckTimer) clearInterval(ckTimer); ckTimer = null; }
+
+/** 当前 -wal 的字节数（没有库 / 没有 WAL 都回 0）；Task 8 用它量 WAL 是否还在单调增长 */
+function walBytes() {
+  try { return fs.statSync(dbFile() + "-wal").size; } catch { return 0; }
 }
 
 /** 模型级冷却负缓存（账号×模型，pool.cjs 写穿）：6004 墙钟可达数小时、11102 封顶 24h，
@@ -607,6 +643,7 @@ module.exports = {
   open, close, proxyDir, dayStr, dayStartMs,
   driver: () => driver,
   decryptFailureCount,
+  checkpoint, startCheckpointTimer, walBytes,   // WAL 收敛与句柄归属（Task 2）；stop 由 startCheckpointTimer 的返回值给出
   CHANNELS,
   channelDisplay: (id) => (CHANNELS.find((c) => c.id === id) || {}).display || String(id),
   createKey, listKeys, findKeyBySecret, updateKey, deleteKey, keyTodayReq,

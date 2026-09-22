@@ -182,9 +182,16 @@ async function packageBackup(cfg) {
   if (fs.existsSync(configFile)) entries.push({ name: "config.json", data: fs.readFileSync(configFile) });
   const zipBuf = zip.createZip(entries);
   const target = path.join(dir, config.BACKUP_FILE);
-  const tmp = target + ".tmp";
-  fs.writeFileSync(tmp, zipBuf);
-  fs.renameSync(tmp, target);
+  // 临时名带 pid：备份目录可被用户自定义（两个安装/多次打包同刻落盘的情况真存在），
+  // 固定名会让两个写入者的 .tmp 互相 rename 踩掉，甚至把对方的半成品当成自己的压缩包收走
+  const tmp = `${target}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, zipBuf);
+    fs.renameSync(tmp, target);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* 半成品已不在（多半是被自己 rename 走了） */ }
+    throw e;
+  }
   log("package", "ok", `备份压缩包已生成：${target}`, `${entries.length} 个文件 · ${(zipBuf.length / 1048576).toFixed(2)} MB`);
   emit({ percent: 55, message: "备份压缩包已生成" });
 }

@@ -367,9 +367,16 @@ function saveConfig(cfg) {
   disk.webdav.password = encryptSecret(disk.webdav.password);
   if (disk.webdavShared) disk.webdavShared = normalizeShared(disk.webdavShared);
   disk.webdavShared.password = encryptSecret(disk.webdavShared.password);
-  const tmp = p + ".tmp";
-  fs.writeFileSync(tmp, JSON.stringify(disk, null, 2), "utf8");
-  fs.renameSync(tmp, p);
+  // 带 pid：二期主进程与常驻网关子进程可能同刻写盘（子进程不写 config.json，但写
+  // sync-state.json / catalog.json 的同族写法在 hub/sync 里），固定名会互相 rename 踩掉。
+  const tmp = `${p}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(disk, null, 2), "utf8");
+    fs.renameSync(tmp, p);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* 半成品已不在（多半是被自己 rename 走了） */ }
+    throw e;
+  }
   return { ok: true, message: "设置保存成功" };
 }
 
