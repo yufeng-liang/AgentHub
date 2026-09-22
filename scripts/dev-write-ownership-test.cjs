@@ -3,7 +3,8 @@
 // 二期把网关搬进独立 Node 子进程之后，**两个进程同时写同一份文件**是这期最容易出隐性数据损坏的地方。
 // 本闸先把写权与句柄收干净：
 //  ① 原子写的临时文件名带 pid —— 主进程与子进程同刻写盘时，固定名会互相 rename 踩掉对方的半成品；
-//  ② 全仓（electron/backend/*.cjs 顶层）凡以 .tmp 收尾的临时文件名都必须拼 process.pid，四个写点一个不许漏；
+//  ② 全仓（electron/backend 及其 proxy/ 子目录，递归）凡「写盘用的固定 .tmp 名」都必须拼 process.pid，已知写点一个不许漏；
+//    判据只认 `.tmp`（或 `.tmp-` 前缀）这种原子写临时名，os.tmpdir()/mkdtemp 派生的临时目录（adapter-* 那几处）不算、不误报；
 //  ③ store.checkpoint() 真能把 stats.db 的 -wal 收敛（本机实测曾长到 1.59 MB 且零次 checkpoint）；
 //  ④ store.close() 不再是「定义了没人调」——proxy.shutdown() 运行期真把句柄关掉、WAL 清零；
 //  ⑤ 主进程对 proxy 域的 require 数不得比基线增加（棘轮，硬零由 Task 5 接管）。
@@ -236,18 +237,30 @@ async function main() {
   assert.deepStrictEqual(residue, [], "原子写残留了 .tmp 半成品：" + residue.join(", "));
   pass("① 收尾：文件是两者之一的完整载荷（marker=" + markerWon + " theme=" + disk.theme + "），.tmp 残留 0");
 
-  // ===== ② 全仓固定 .tmp 名必须清零（四处写点，其中 hub 那处落在两安装共享的 ~/.agent_skills） =====
-  const TMP_LITERAL = /\.tmp(["'`])/;         // 以 .tmp 收尾的字符串字面量 = 原子写的临时文件名（不会命中 os.tmpdir()）
+  // ===== ② 全仓（含 proxy/ 子目录，递归）写盘用的固定 .tmp 名必须拼 pid =====
+  // Task 2 首轮把扫描面写死在 electron/backend 顶层，proxy/ideswitch.cjs:272 的固定名因此漏网——
+  // 这条补口把扫描面递归提到 proxy/**，让它成为同类漏项的守门。
+  // 判据：字符串里出现「.tmp」且后面不接字母 = 原子写的临时文件名，两种口径都覆盖：
+  //   · 命中 config/hub/sync-config/sync 的 `${p}.${pid}.tmp`（`.tmp` 收尾），以及 proxy/ideswitch 的 `${file}.tmp-${pid}`（`.tmp-` 前缀，含 :91 与 :272 两处）；
+  //   · 不误报 os.tmpdir() 派生的临时目录/文件（adapter-* 那几处本就带 pid 或走 mkdtemp）——它们的 `.tmp` 后紧跟 `dir`，被「后不接字母」挡掉；注释行再单独剔除。
+  const TMP_LITERAL = /\.tmp(?![A-Za-z])/;    // .tmp 后不接字母 = 写盘临时名；os.tmpdir() 的 `.tmpdir` 不命中
   const COMMENT = /^\s*(\/\/|\*|\/\*)/;
-  const KNOWN_SITES = ["config.cjs", "hub.cjs", "sync-config.cjs", "sync.cjs"];
+  const KNOWN_SITES = ["config.cjs", "hub.cjs", "sync-config.cjs", "sync.cjs", "proxy/ideswitch.cjs"];
   const hits = [];
-  for (const f of fs.readdirSync(BACKEND).filter((n) => n.endsWith(".cjs"))) {
-    const src = fs.readFileSync(path.join(BACKEND, f), "utf8");
-    src.split(/\r?\n/).forEach((line, i) => {
-      if (COMMENT.test(line) || !TMP_LITERAL.test(line)) return;
-      hits.push({ file: f, line: i + 1, text: line.trim() });
-    });
-  }
+  // 递归走 electron/backend（含 proxy/），文件名统一记成相对 BACKEND 的 posix 路径（config.cjs / proxy/ideswitch.cjs）
+  const walkCjs = (dir, rel) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : 1))) {
+      const abs = path.join(dir, e.name);
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) { walkCjs(abs, r); continue; }
+      if (!e.name.endsWith(".cjs")) continue;
+      fs.readFileSync(abs, "utf8").split(/\r?\n/).forEach((line, i) => {
+        if (COMMENT.test(line) || !TMP_LITERAL.test(line)) return;
+        hits.push({ file: r, line: i + 1, text: line.trim() });
+      });
+    }
+  };
+  walkCjs(BACKEND, "");
   assert.ok(hits.length >= KNOWN_SITES.length,
     `.tmp 写点扫描到 ${hits.length} 处，少于已知的 ${KNOWN_SITES.length} 处 —— 扫描面缩了，这条闸会变成空闸`);
   for (const h of hits) {
@@ -255,9 +268,10 @@ async function main() {
       `固定临时文件名（跨进程会互踩）：electron/backend/${h.file}:${h.line}  ${h.text}`);
   }
   for (const f of KNOWN_SITES) {
-    assert.ok(hits.some((h) => h.file === f), `四个原子写点少了一个（被删或被改成不走 .tmp）：${f}`);
+    assert.ok(hits.some((h) => h.file === f), `已知原子写点少了一个（被删、被改成不走 .tmp，或扫描面没覆盖到它）：${f}`);
   }
-  pass(`② electron/backend/*.cjs 顶层 ${hits.length} 处 .tmp 写盘全部拼 process.pid（四处写点齐）`);
+  const hitFiles = [...new Set(hits.map((h) => h.file))];
+  pass(`② electron/backend 递归（含 proxy/）扫到 ${hits.length} 处 .tmp 写盘（${hitFiles.length} 个文件、${KNOWN_SITES.length} 个已知写点齐），全部拼 process.pid`);
 
   // ===== ③ WAL 真的收敛：checkpoint() / 周期计时器 / walBytes() =====
   const store = require(path.join(BACKEND, "proxy", "store.cjs"));
