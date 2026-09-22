@@ -70,7 +70,8 @@ function dropConnection() {
 /**
  * 双检：kill(pid,0) 只证明 pid 活着，pid 复用会骗过它 → 必须再连一次管道并验 hello/token。
  * 真正的判据在**子进程侧**：token 对不上时服务端直接 destroy 连接，call 拿不到响应 → 这里回 false。
- * （gateway_echo 那一步是第二层：管道被别的实现接走时它也会露馅。本期没有 ack 帧，Task 4 补。）
+ * （gateway_echo 那一步是第二层：管道被别的实现接走时它也会露馅。握手本身没有独立 ack 帧——
+ *  「hello 之后能拿回一条响应」就是 ack，所以这一腿必须在 echo 上真跑一次，不能只看 connect 成功。）
  */
 async function probeAlive(cur) {
   if (!cur || !cur.pid || !pidAlive(cur.pid)) return false;
@@ -84,8 +85,10 @@ async function probeAlive(cur) {
 /**
  * 回收陈旧握手文件。
  * 这里**绝不按 pid 杀进程**：能走到这条路的 pid 恰恰是「活着但认证不过」的——pid 复用场景下那是
- * 别人的进程（一期踩过宽匹配杀进程的坑，见 AGENTS.md 与派发硬约束）。清理只做一件事：把陈旧
- * gateway.json 挪走，让新子进程从干净状态起；真活着又连不上的网关由版本不匹配分支经 token 认证后停。
+ * 别人的进程（一期踩过宽匹配杀进程的坑，见 AGENTS.md 与派发硬约束）。清理只做一件事：**把陈旧的
+ * gateway.json 删掉**（fs.rmSync，force 语义：文件已被别人收走也算回收完成），让新子进程从干净状态起；
+ * 不做改名留档——那份文件里的 token/pid 已经作废，留着只会被下一个 readGatewayFile 误读。
+ * 真活着又连不上的网关由版本不匹配分支经 token 认证后停（start() 的 reclaim-restart 那一支）。
  */
 async function reap(cur) {
   if (!cur) return;

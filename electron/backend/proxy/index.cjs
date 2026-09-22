@@ -210,16 +210,12 @@ function shutdown() {
 }
 
 /** 排空在途异步作业的预算上限（ms）。它与 server.cjs 的 CLOSE_BUDGET_MS、gateway.cjs 的
- *  RESPONSE_FLUSH_MS 一起构成「等干净的三段之和 < gateway.cjs 那条 Promise.race 的 EXIT_CEILING_MS」
+ *  RESPONSE_FLUSH_MS 一起构成「等干净的三段之和 < gateway.cjs 那条唯一硬退计时器的 EXIT_CEILING_MS」
  *  这条不变式（评审 I2②：旧值 1000 + stopAsync 的 1000 已经吃掉整个 2 s 上界，"必须退"总是抢在
- *  "等干净"前面拿到决定权）。四个数字由 scripts/dev-gateway-pipe-test.cjs 的**同一条断言**钉住。 */
+ *  "等干净"前面拿到决定权）。四个数字由 scripts/dev-gateway-pipe-test.cjs 的**同一条断言**钉住，
+ *  合计口径也只有那一条断言在算（CLOSE + DRAIN + FLUSH = 1600 < 2000）——这里不留第二个「预算」导出，
+ *  免得下一位改数的人把少算一段的那个当成真相源。 */
 const DRAIN_BUDGET_MS = 800;
-
-/** 「等干净」的预算合计：等监听释放 + 等在途 libuv 作业。store.close() 是同步 fs（内含 checkpoint），
- *  没法预算，不计入——它只会让总时长变长，不会让 drained/forced 说谎。 */
-function shutdownBudgetMs() {
-  return server.CLOSE_BUDGET_MS + DRAIN_BUDGET_MS;
-}
 
 /** 子进程侧唯一的优雅停机实现（Task 7 的 gateway_shutdown 命令体复用它，不开第二份）。
  *  与一期 shutdown() 的三处差别：① server.stop() 换成 await server.stopAsync()——
@@ -666,5 +662,5 @@ function attachGatewayMode({ emit } = {}) {
 // gatewayStatus 一并导出：proxy_status 命令走它，Task 1 的闸直接断言 vaultOk 字段，
 // Task 5 的转发化也要按这个名字取（藏在 register 里没法单测）
 // dispatchTable/dispatch/attachGatewayMode/gracefulShutdown：二期 Task 3 的子进程入口与管道出口
-// shutdownBudgetMs/DRAIN_BUDGET_MS：停机预算的四个数字之一，供 dev-gateway-pipe-test 断言它们仍复合
-module.exports = { boot, shutdown, gracefulShutdown, shutdownBudgetMs, DRAIN_BUDGET_MS, register, settings, gatewayStatus, dispatchTable, dispatch, attachGatewayMode };
+// DRAIN_BUDGET_MS：停机预算的四个数字之一，供 dev-gateway-pipe-test 断言它们仍复合（合计只在那一条断言里算）
+module.exports = { boot, shutdown, gracefulShutdown, DRAIN_BUDGET_MS, register, settings, gatewayStatus, dispatchTable, dispatch, attachGatewayMode };
