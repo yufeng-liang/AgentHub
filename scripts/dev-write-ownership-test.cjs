@@ -271,6 +271,7 @@ async function main() {
   const KNOWN_SITES = [
     "backend/config.cjs", "backend/hub.cjs", "backend/sync-config.cjs", "backend/sync.cjs",
     "backend/proxy/ideswitch.cjs", "backend/proxy/raccoonAuth.cjs",
+    "gateway.cjs",   // Task 3 新增：gateway.json 握手文件的中转名（子进程写、主进程读，跨进程同刻写是常态）
   ];
   const sites = [];      // 结构判据清单（中转覆盖型原子写）
   const litHits = [];    // 词元副闸命中
@@ -367,6 +368,20 @@ async function main() {
   const afterStop = store.walBytes();
   assert.ok(afterStop > 4096, `stop() 之后 -wal 还是被压回 ${afterStop} B —— 计时器没停，会留一个无人认领的 interval`);
   pass(`③ 周期 checkpoint：计时器把 WAL 压到 ${timerCk} B，stop() 后又涨回 ${afterStop} B`);
+
+  // close() 必须自己成对停表（Task 2 把这条交给 Task 3 的优雅停机，落地方式是 close() 内 stopCheckpointTimer()）。
+  // 为什么不让停机路径自己记得停：startCheckpointTimer 返回的 stop 函数一旦在多层调用里丢手，
+  // 就留下一条打在已关闭句柄上的 interval；close() 是句柄归属的收口点，成对关系只有它能保证。
+  const ckStop = store.startCheckpointTimer(30);
+  assert.strictEqual(typeof ckStop, "function", "③ close 成对判据的前提：startCheckpointTimer 要返回 stop 函数");
+  store.close();                                            // 关句柄，同时应当把刚挂上的计时器一起收
+  rows(500, 2000);                                          // 重新开库写一轮（open() 幂等）
+  assert.ok(store.walBytes() > 4096, "③ close 成对判据的前提不成立：这一轮没把 -wal 撑起来");
+  await sleep(200);                                         // 计时器若还活着（6.7 个周期），WAL 会被压回去
+  const afterClose = store.walBytes();
+  assert.ok(afterClose > 4096,
+    `store.close() 之后 -wal 又被压回 ${afterClose} B —— close() 没成对 stopCheckpointTimer()，留着一条无人认领的 interval`);
+  pass(`③ close() 成对收表：close() 之后再写一轮，200 ms 内 -wal 仍保持 ${afterClose} B（计时器确实随 close 停了）`);
 
   // close() 的语义：先 checkpoint 再关句柄（正常退出留不下大 WAL）。
   // 静态判据只是**第一道**：那条正则靠「列 0 的 }」收口函数体，日后有人把嵌套块写成列 0、或把
