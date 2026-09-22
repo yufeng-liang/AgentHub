@@ -76,6 +76,13 @@ ok("free 组归 free 池（含裸前缀条目，归池看分组不看前缀）",
 ok("pass 组归 pass 池", P(groups, "pass").join(",") === "cline-pass/b");
 ok("recommended/cloud 不归任何池", !P(groups, "pass").includes("openai/x") && !P(groups, "free").includes("cloud/y"));
 
+console.log("scanCline:");
+const discovery = require("../electron/backend/proxy/discovery.cjs");
+os.homedir = () => fakeHome; // Task 2 已造 ~/.cline/data/settings/providers.json 夹具
+const cands = discovery.scanAll().filter((c) => c.channel.startsWith("cline_"));
+os.homedir = () => path.join(fakeHome, "empty");
+ok("扫描出 cline 候选且 uid=external_id", cands.length === 1 && cands[0].uid === "usr-9", cands[0] && cands[0].uid);
+
 // fetchModels 全链路用假 fetch 注入夹具（httpJson 走全局 fetch），不发真实网络请求
 console.log("cline fetchModels（假 fetch 夹具，不发真实网络）:");
 const RECOMMENDED_FIXTURE = {

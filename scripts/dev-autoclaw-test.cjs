@@ -119,6 +119,20 @@ ok("rewriteBody 幂等清理：强制流式/usage/剥内部字段", (() => {
   return b.stream === true && b.stream_options.include_usage === true && !("conversation_id" in b) && !("prompt_cache_key" in b);
 })());
 
+console.log("scanAutoClaw:");
+const discovery = require("../electron/backend/proxy/discovery.cjs");
+// 本机真实 ~/.openclaw-autoclaw/openclaw.json（含 X-Authorization）与 ~/.box-agent/config/auth.json
+// 会漏进扫描结果——扫描期间把 homedir 指到空目录隔离（与 APPDATA 夹具同一思路），测完恢复
+const scanHome = fs.mkdtempSync(path.join(os.tmpdir(), "autoclaw-scan-home-"));
+const realHomeFn = os.homedir;
+os.homedir = () => scanHome;
+process.env.APPDATA = fakeDir;
+const acands = discovery.scanAll().filter((c) => c.channel === "autoclaw");
+ok("扫描出 autoclaw 候选（仅国内渠道）", acands.length === 1 && acands[0].token === "eyJtok" && acands[0].meta.device_id === "dev-1", acands[0]);
+ok("intl 渠道不产生 auth.json 候选（地区门禁，参考项目同款）", discovery.scanAll().some((c) => c.channel === "autoclaw_intl") === false);
+os.homedir = realHomeFn;
+process.env.APPDATA = APPDATA_TMP; // 测完恢复（与上方 readAutoClawAuth 段同一约定）
+
 // —— chat / refresh 全链路：假 fetch 夹具（fetchStream/httpJson 都走全局 fetch），不发真实网络请求 ——
 console.log("autoclaw chat/refresh（假 fetch，不发真实网络）:");
 const realFetch = globalThis.fetch;

@@ -13,6 +13,11 @@
 //                凭据在 auth.accessToken；出现 $wbEncrypted 说明官方已开启加密，如实提示）
 //   Trae SOLO CN 读 %APPDATA%\<App>\User\globalStorage\storage.json，
 //              iCubeAuthInfo 是 ByteCrypto(AES-128-CBC) 信封，按官方算法离线解开取 JWT
+//   Cline       读 ~/.cline/data/settings/providers.json（providers.cline.settings.auth，明文）；
+//              uid 必须用 JWT external_id（usr-…），sub 是 WorkOS user_… 不能用于去重/余额路径
+//   AutoClaw    读 %APPDATA%\AutoClaw\auth.json（Electron safeStorage 密文，离线解密）；
+//              地区门禁：auth.json 无地区标记，只导国内渠道，国际版账号走 OAuth/粘贴；
+//              备来源 ~/.openclaw-autoclaw/openclaw.json（明文 JWT，无 refreshToken → 标注不可刷新）
 "use strict";
 const fs = require("node:fs");
 const os = require("node:os");
@@ -23,6 +28,8 @@ const store = require("./store.cjs");
 const rules = require("./rules.cjs");
 const util = require("./util.cjs");
 const adapters = require("./adapters.cjs");
+const clineAuth = require("./clineAuth.cjs");
+const acCred = require("./autoclawCredentials.cjs");
 
 const OAUTH_PORT = 17388; // 首选回环端口；被占用时退到系统随机端口（授权地址里会带实际端口）
 const OAUTH_TIMEOUT_MS = 180000;
@@ -395,9 +402,66 @@ function raccoonJwtPayload(token) {
   }
 }
 
-/** 全量扫描（本机四渠道候选） */
+// ===== Cline（~/.cline/data/settings/providers.json，明文；协议参考 §1.7） =====
+
+function scanCline() {
+  const cred = clineAuth.readClineDesktopAuth();
+  if (!cred) return [];
+  // uid 必须用 JWT external_id（usr-…），sub 是 WorkOS user_… 不能用于去重/余额路径
+  const uid = clineAuth.clineUid(cred.token, cred.accountId);
+  if (!uid) return [];
+  return [{
+    channel: "cline_free", // 两池同账号同凭证：默认落 free 池，UI 可 channelOverride 改投 pass
+    uid, name: cred.displayName || "Cline 账号",
+    token: cred.token, refreshToken: cred.refreshToken,
+    expiresAt: cred.expiresAt,
+    meta: {},
+    source: "scan", file: "providers.json",
+  }];
+}
+
+// ===== AutoClaw（%APPDATA%/AutoClaw/auth.json，safeStorage 密文；协议参考 §2.7） =====
+// 地区门禁照抄参考项目 local_credentials()：auth.json 无地区标记，只导国内渠道；
+// 国际版账号走 OAuth/粘贴。备来源 openclaw.json 是明文 JWT，无 refreshToken → 标注不可刷新。
+
+function scanAutoClaw() {
+  const out = [];
+  try {
+    const cred = acCred.readAutoClawAuth();
+    if (cred && cred.token) {
+      // util.jwtDecode 返回 {token,uid,exp,payload}，user_id/user_name 声明在 payload（简报直取顶层是笔误，按真实接口修正）
+      const claims = util.jwtDecode(cred.token).payload || {};
+      out.push({
+        channel: "autoclaw",
+        uid: `user-${String(claims.user_id || cred.uid || "")}`,
+        name: String(claims.user_name || cred.name || "AutoClaw 账号"),
+        token: cred.token, refreshToken: cred.refreshToken,
+        expiresAt: cred.expiresAt,
+        meta: cred.deviceId ? { device_id: cred.deviceId } : {},
+        source: "scan", file: "auth.json",
+      });
+    }
+  } catch { /* 解密失败不进候选（UI 走粘贴） */ }
+  try {
+    const alt = acCred.readOpenclawFallback();
+    if (alt && alt.token) {
+      const claims = util.jwtDecode(alt.token).payload || {};
+      out.push({
+        channel: "autoclaw",
+        uid: `user-${String(claims.user_id || "")}`,
+        name: "AutoClaw（openclaw.json，无刷新令牌）",
+        token: alt.token, refreshToken: "", // 无 refreshToken → 刷新链路会如实报「请重新粘贴」
+        expiresAt: Number(claims.exp || 0) * 1000 || 0,
+        meta: {}, source: "scan", file: "openclaw.json",
+      });
+    }
+  } catch { /* 同上 */ }
+  return out;
+}
+
+/** 全量扫描（本机六渠道候选） */
 function scanAll() {
-  return [...scanTrae(), ...scanWorkBuddy(), ...scanRaccoon()];
+  return [...scanTrae(), ...scanWorkBuddy(), ...scanRaccoon(), ...scanCline(), ...scanAutoClaw()];
 }
 
 /** 导入扫描结果入池：同渠道同 uid 已存在则更新凭据（刷新 token），否则新建 */
@@ -1074,6 +1138,8 @@ module.exports = {
   scanAll,
   scanWorkBuddy,
   scanTrae,
+  scanCline,
+  scanAutoClaw,
   importCandidate,
   beginOAuth,
   submitCallbackUrl,
