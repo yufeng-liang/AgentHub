@@ -78,6 +78,9 @@
 //        连接 2 的下一条必须**当场**被拒（业务失败形状：命令从未被派发，重试语义留给调用方）、
 //        服务端在飞峰值不许超总账、既有连接上的在飞命令不受连坐、总账清零后连接 2 立刻可用。
 //  ⑧ 收尾卫生：真实 %APPDATA%\AgentHub\proxy\stats.db 零写入、HKCU Run 项未变。
+//  ⑩ 双入口并发去重（Task 5 刀 2 修复轮，评审 I1）：boot 侧裸调 start() 与转发侧 ensureStarted()
+//     在飞期间撞上必须并成**一次** spawn——互斥长在 start() 本体，所有调用点汇入同一条路径，
+//     第二次调用拿到同一条在飞 promise 的结果（同 pid），而不是并发起第二次 spawn。
 //
 // `--bench` 只跑性能回归（简报 Step 3）：proxy_pool 单次往返的中位数 / p90 / p95 / min / max 必须 < 30 ms，
 // 并给出跨进程那部分开销的归因（同一条命令在子进程内本地执行的耗时、以及空载 gateway_echo 的往返）。
@@ -1678,6 +1681,53 @@ fs.writeFileSync(path.join(d,"names.txt"), fs.readdirSync(path.join(d,"AgentHub"
   srvI.close();
   pass(`⑨i 跨连接总账：连接 1 顶满 ${proto.MAX_TOTAL_PENDING} 条在飞后，连接 2 的下一条 ${Date.now() - tI} ms 内被拒（在飞/上界报得清），`
     + `服务端峰值 ${peakI} ≤ 上界；放行后 ${doneI1.length} 条全部完成、连接 2 立刻恢复可用`);
+
+  // ---- ⑩ 双入口并发去重（Task 5 刀 2 修复轮，评审 I1）----
+  // 生产竞态：boot-start 在飞期间（spawn 慢时可达数秒，Windows AV 扫 exe 是现实场景）渲染层首条
+  // proxy 命令进入 ensureStarted → state().connected 仍 false → 旧代码并发起第二次 start()。
+  // 两个子后果：(a) 双 spawn —— child 模块变量被 #2 覆盖，#1 的 8s connect 超时分支 child.kill()
+  // 杀错孩子，孤儿进程持有 store 句柄（违背 §5.4 的 stats.db 独占不变式）；(b) 握手已落盘走 claimed
+  // 分支 —— 两条连接都注册过 onEvent，每个事件投递两次（oauth-open 会开两个浏览器标签）。
+  // 判据：两条入口在同一事件循环刻内并发进入（正是竞态窗口正中），只许 spawn 一个子进程，
+  // 且两条调用拿到**一致**的结论。claimed 分支的双连接由同一条互斥一并封死：在飞期间任何第二入口
+  // 都只能加入同一条 promise，没有第二次 probe/claim/spawn 的机会。
+  // 「只 spawn 一个」的读数是监督器日志里的 spawned{pid,…} 行（appendFileSync 同步落盘，两边 start()
+  // 返回前必已写完）。**不能**拿返回的 pid 当判据：旧代码两个 start() 的返回值都读模块级 child 变量，
+  // #2 覆盖 #1 后两条调用报的是同一个（被覆盖的）pid——pid 相等恰恰是「杀错孩子」缺陷本身
+  // （实测：不修的代码上 pid 判据假绿，且孤儿连接把事件循环吊住，本闸 420 s 硬超时才收场）。
+  const spawnedLines10 = () => {
+    try { return fs.readFileSync(logFileOf(SANDBOX), "utf8").match(/\bspawned \{[^}]*\}/gm) || []; }
+    catch { return []; }
+  };
+  const before10 = spawnedLines10();
+  fs.rmSync(gw.gatewayFile(), { force: true });          // 回到「首次 boot」的干净态（上文的握手文件是死 pid 的陈货）
+  assert.strictEqual(gw.state().connected, false, "⑩ 前提不成立：上一段的长连接还挂着，双入口根本不会去 start");
+  const bootP = gw.start({ persistent: false });         // main.cjs whenReady 的形态：裸调 start()，不 await
+  const fwdP = gw.ensureStarted();                       // 转发侧入口（ensureStarted），同刻进入 = 竞态窗口
+  const [bootR, fwdR] = await Promise.all([bootP, fwdP]);
+  assert.strictEqual(bootR.ok, true, "⑩ boot 入口 start() 失败：" + (bootR.message || ""));
+  assert.strictEqual(fwdR.ok, true, "⑩ 转发入口 ensureStarted() 失败：" + (fwdR.message || ""));
+  // 新增的 spawned 行按 pid 记入清理名单：红跑时是两个 pid（孤儿一个都不许漏），绿跑时是唯一那个。
+  const fresh10 = spawnedLines10().slice(before10.length);
+  for (const l of fresh10) {
+    const m = /"pid":(\d+)/.exec(l);
+    if (m) knownPids.add(Number(m[1]));
+  }
+  assert.strictEqual(fresh10.length, 1,
+    "⑩ 双入口并发起了 " + fresh10.length + " 个子进程（spawned 日志：" + fresh10.map((l) => l.trim()).join(" | ")
+    + "）：互斥没汇入同一条路径 —— child 模块变量被 #2 覆盖后，#1 的 8s connect 超时分支 child.kill() 杀错孩子，"
+    + "孤儿进程持有 store 句柄（违背 §5.4 的 stats.db 独占不变式）；两条连接各注册一份 onEvent，事件投递翻倍");
+  assert.strictEqual(fwdR.pid, bootR.pid, "⑩ 两条调用拿到的 pid 不一致：" + JSON.stringify({ bootR, fwdR }));
+  assert.strictEqual(fwdR.claimed, bootR.claimed,
+    "⑩ 两条入口拿到的结论不一致（claimed 分叉 = 各自独立走了一遍 start 的判定）：" + JSON.stringify({ bootR, fwdR }));
+  const disk10 = gw.readGatewayFile();
+  assert.ok(disk10 && Number(disk10.pid) === Number(bootR.pid),
+    "⑩ 盘上 gateway.json 的 pid（" + (disk10 && disk10.pid) + "）不是唯一那个子进程（" + bootR.pid
+    + "）：握手文件被第二个子进程改写过 = spawn 了两个");
+  const stop10 = await gw.stopAndWait({ timeoutMs: 8000 });
+  assert.strictEqual(stop10.stopped, true, "⑩ 收尾没停掉那个唯一的子进程：" + stop10.message);
+  pass(`⑩ 双入口并发去重：boot 裸调 start() 与 ensureStarted() 同刻进入，spawned 日志恰 +1 行`
+    + `（pid=${bootR.pid}），两条调用拿到同一结论（claimed=${bootR.claimed}），只 spawn 了一个子进程`);
 
   // ===== ⑧ 收尾卫生核对（探针三件套 + 第五条）=====
   assert.strictEqual(realBaseline(), realBefore,

@@ -104,10 +104,28 @@ async function reap(cur) {
   mirror = null;
 }
 
+// ===== 启动互斥（评审 I1 修复轮）：所有 start() 调用点汇入同一条在飞 promise =====
+// start() 本体没有互斥，双入会各自 spawn 一个子进程抢同一份 gateway.json：
+//  · 双 spawn：child 模块变量被 #2 覆盖，#1 的 8s connect 超时分支 child.kill() 杀错孩子，
+//    孤儿进程持有 store 句柄 —— 违背 §5.4 的 stats.db 独占不变式；
+//  · 双连接：握手已落盘时第二入口走 claimed 分支，两条连接都注册过 onEvent → 事件投递翻倍
+//    （oauth-open 会开两个浏览器标签）。
+// 互斥必须长在 start() 本体而不是某个入口：main.cjs whenReady 的裸调（boot 启动路径）、转发侧的
+// ensureStarted、未来任何新调用点才都汇入同一条路径。在飞期间第二次调用拿到的是**同一条**
+// promise 的结果（同 pid / 同 claimed），不是并发的第二次 spawn。dedup 不看实参：boot 侧传
+// boot.schedule.persistentGateway、转发侧传 persistentFlag()，两者同读 config.json 同一字段，先到者定形。
+// 竞态窗口实测：spawn 慢时可达数秒（Windows AV 扫 exe 是现实场景），渲染层首条 proxy 命令足以撞上。
+let startInflight = null;
+function start(opts) {
+  if (startInflight) return startInflight;
+  startInflight = startOnce(opts).finally(() => { startInflight = null; });
+  return startInflight;
+}
+
 /**
- * 启动或认领网关子进程。返回 { ok, claimed, pid, port, message }。
+ * 启动或认领网关子进程（start() 的本体，单飞保证见上面那层互斥）。返回 { ok, claimed, pid, port, message }。
  */
-async function start({ persistent } = {}) {
+async function startOnce({ persistent } = {}) {
   const cur = readGatewayFile();
   if (cur && (await probeAlive(cur))) {
     if (cur.version !== util.appVersion()) {
@@ -333,14 +351,12 @@ function persistentFlag() {
   }
 }
 
-// 并发去重：5 s 轮询的 proxy_status 与同页其它命令同刻发现「未连接」时，只允许一次 start() 在飞。
-// start() 本身没有互斥，双入会各自 spawn 一个子进程抢同一份 gateway.json —— 必须在入口并成一次。
-let startInflight = null;
+/** 转发侧的启动入口：已连接就直接用，否则并入 start() 的在飞 promise。
+ *  互斥长在 start() 本体（见其上方注释），这里不再自持一份 startInflight——
+ *  那样只护得住转发侧，护不住 main.cjs boot 的裸调（评审 I1 修复轮的教训）。 */
 async function ensureStarted() {
   if (state().connected) return { ok: true };
-  if (startInflight) return startInflight;
-  startInflight = start({ persistent: persistentFlag() }).finally(() => { startInflight = null; });
-  return startInflight;
+  return start({ persistent: persistentFlag() });
 }
 
 /** 纯转发体（36 条命令共用，含 proxy_status / proxy_vault_status 两条规格漏判的）。
@@ -438,6 +454,6 @@ function register(ipcMain) {
 }
 
 module.exports = {
-  start, stopAndWait, state, call, onEvent, register,
+  start, stopAndWait, state, call, onEvent, register, ensureStarted,
   gatewayFile, gatewayScriptPath, readGatewayFile, probeAlive, probeResidentGateway, probePortBusy,
 };

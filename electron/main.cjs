@@ -382,6 +382,8 @@ if (!gotLock) {
     // proxy_start（与用户点开关同一条路径，claimed 守卫等语义完全一致）。Task 6 会把启动器
     // 与自启的时机一并复核，本条保持「应用起来 = 子进程在」的最小不变式。
     // 不 await：whenReady 回调保持同步；成败都由 gateway-client 写进 proxyDir()/logs/gateway.log。
+    // 这条裸调与转发侧 ensureStarted 汇入同一条互斥：在飞去重长在 start() 本体（评审 I1），
+    // boot-start 在飞期间渲染层首条 proxy 命令只会拿到同一条 promise，不会再 spawn 第二个子进程。
     gatewayClient.start({ persistent: boot.schedule.persistentGateway })
       .then((r) => {
         if (!r.ok || !boot.proxy || !boot.proxy.restoreOnLaunch) return;
