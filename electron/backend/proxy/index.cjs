@@ -20,8 +20,9 @@ const ccswitch = require("./ccswitch.cjs");
 const zip = require("../zip.cjs");
 const secretbox = require("./secretbox.cjs");
 
-// shell 只在 3 条「留主进程」的命令里用到：proxy_oauth_begin 的 openExternal，
-// proxy_open_rules_dir / proxy_open_data_dir 的 openPath。
+// getShell 只在 2 条「留主进程」命令的**同名实现体**里被引用：proxy_open_rules_dir /
+// proxy_open_data_dir 的 openPath。这两条在主进程由 gateway-client.cjs 用真 shell 另行实现
+// （UI_LOCAL 四条之二），子进程表里的这份实现体只是命令表完整性的一部分，永远不会被派发到 ——
 // 顶层 require("electron") 会让整张依赖图在纯 Node 子进程里加载不了（Task 0 实测唯一 FAIL 点），
 // 故惰性取 + 拿不到时明确抛错，而不是让子进程 require 到一半炸掉。
 function getShell() {
@@ -312,28 +313,27 @@ function gatewayStatus() {
 // 子进程里没有 electron 绑定 → 恒 false → 网关页误报（见 §5.7 更正：这条命令因此可转发）。
 function vaultOk() { return secretbox.backend() !== "none"; }
 
-/** 记住网关的开关状态：每次启停都写回整体配置的 proxy.restoreOnLaunch，
- *  下次打开应用按它决定是否自动启动（默认 false，即首次打开是关闭的） */
-function rememberRunning(running) {
-  try {
-    const cfg = config.loadConfig();
-    if (cfg.proxy.restoreOnLaunch === running) return;
-    cfg.proxy.restoreOnLaunch = running;
-    config.saveConfig(cfg);
-  } catch {
-    /* 落盘失败不影响本次启停，只影响下次开机是否自动拉起 */
-  }
+// rememberRunning（proxy.restoreOnLaunch 的写权）二期 Task 5 撤出本文件、上移到
+// gateway-client.cjs：启停命令的转发体在主进程，成功后由**主进程**写 config.json。
+// 子进程永不写 config.json —— 那是主进程的写权（Task 2 的写权归属），留在这里就会双写。
+
+/** 子进程侧后台作业（二期 Task 5）：额度定时刷新 + 定时自动签到。
+ *  这两个计时器过去在主进程 boot() 里跑；43 条命令下沉子进程后随实现体一起下沉 ——
+ *  留在主进程就会双跑（同一批号被签到两次、同一批号被刷两次额度），这是 gateway.cjs
+ *  文件头「子进程不跑计时器」那条注释的解除时刻。签到/刷新的实现体本就在本模块
+ *  （checkinBatch / credits），gateway.cjs 装配时调用这里这一个入口，不开第二份实现。 */
+function startBackgroundJobs() {
+  credits.startScheduler(() => settings().creditsRefreshMin);
+  startCheckinAuto();
 }
 
 function register(ipcMain) {
-  // ===== 服务启停 / 状态 =====
+  // ===== 服务启停 / 状态（主进程侧的薄包装见 gateway-client.cjs：转发 + 成功后写 restoreOnLaunch） =====
   ipcMain.handle("proxy_status", handle(() => gatewayStatus()));
   ipcMain.handle("proxy_start", handle(async () => {
     const r = await server.start(settings);
-    // claimed 时**不许**记 restoreOnLaunch=true（评审 I3）：那条分支里本进程连 runtime 都没有，
-    // 端口归那台常驻网关。把它当"本机监听"写进配置，下次开机会据此以为后台已经在跑，
-    // 而接管方的存活与否则没人负责——恢复语义就此说谎。
-    if (r.ok && !r.claimed) rememberRunning(true);
+    // claimed 分支的 restoreOnLaunch 守卫（评审 I3）随写权一起上移到 gateway-client.cjs：
+    // 那条分支里本进程没有监听，配置不能记「本机在监听」，判断依据是响应里的 claimed 字段。
     events.emit({ type: "status" });
     // claimed：端口其实被**已常驻的网关**占着（server.cjs 的 EADDRINUSE 分支查过 gateway.json 并双检通过），
     // 此时本进程没有监听，接管状态与端口归属都由认领方维持（Task 6 的认领路径依赖这条不报错）
@@ -341,18 +341,22 @@ function register(ipcMain) {
   }));
   ipcMain.handle("proxy_stop", handle(() => {
     server.stop();
-    rememberRunning(false);
     events.emit({ type: "status" });
     return ok({});
   }));
   // 改端口后调用：同进程 stop→listen，秒级完成（方案 §6.6）
   ipcMain.handle("proxy_restart", handle(async () => {
-    await server.stopAsync();
+    const st = await server.stopAsync();
+    // 评审裁定（Task 5 刀 2）：stop 没在预算内释放端口（forced=true）时**不盲启**。旧实现无视
+    // forced 继续 start()，那个端口上挂着的正是自己没释放干净的旧监听 —— EADDRINUSE 分支的
+    // probeResidentGateway 还会把它误认成「常驻网关」接管（claimed），看似成功实则无人监听，
+    // 而且主进程会照常把 restoreOnLaunch 记成 true。代价：用户要手动再点一次（预算 1.5 s 内
+    // 端口通常早释放了，forced 本来就是罕见路径），换来「成功必然真在监听」这个不变式。
+    if (st.forced) {
+      events.emit({ type: "status" });
+      return fail("旧监听未能在预算内释放（端口 " + (Number(st.port) || settings().port) + " 仍被占用），请稍后重试");
+    }
     const r = await server.start(settings);
-    // 这里的 restoreOnLaunch 与 proxy_start 不同、**不**排除 claimed：restart 的语义是"用户要它开着"，
-    // 端口被常驻网关接管时该意愿仍然成立（本机没监听，但那台网关在维持）。proxy_start 记的是"本机起了
-    // 监听"这件事的状态，见上面那条 claimed 守卫（两者语义在 Task 6 重定义 restoreOnLaunch 时一并复核）。
-    if (r.ok) rememberRunning(true);
     credits.startScheduler(() => settings().creditsRefreshMin); // 刷新周期一并热生效
     events.emit({ type: "status" });
     return r.ok ? ok({ port: r.port }) : fail(r.message);
@@ -459,6 +463,12 @@ function register(ipcMain) {
     credits.refreshAccount(r.id).catch(() => {});
     return ok({ id: r.id, updated: r.updated });
   }));
+  // oauth_begin 的形状（Task 5）：本进程只创建 OAuth 会话，登录页的打开由**主进程**做 ——
+  // 会话建好、拿到 url 后推 {type:"oauth-open", url} 事件（CRITICAL_EVENTS 成员，背压不丢），
+  // 主进程收到才 shell.openExternal。旧实现在这里直接开浏览器，下沉后拿不到 shell。
+  // 抛错时机说明：beginOAuth 同步抛的错（已有进行中的登录 / 未知渠道 / 小浣熊不支持）在
+  // handle() 里收成 {ok:false, message}，用户立刻看到；旧实现「beginOAuth 成功之后才可能
+  // 因 shell 缺失而抛错」的那条路径随 openExternal 下移而消失（主进程 shell 恒在）。
   ipcMain.handle("proxy_oauth_begin", handle(async ({ channel }) => {
     const ch = adapters.get(channel) ? String(channel) : store.CHANNELS[0].id;
     const r = await discovery.beginOAuth(ch, (result) => {
@@ -469,11 +479,7 @@ function register(ipcMain) {
       }
       events.emit({ type: "oauth-done", channel: ch, ...result });
     });
-    if (r.ok && r.url) {
-      const shell = getShell();
-      if (!shell) throw new Error("该操作需要主进程界面，不能由后台常驻网关执行");
-      await shell.openExternal(r.url);
-    }
+    if (r.ok && r.url) events.emit({ type: "oauth-open", channel: ch, url: r.url });
     return r.ok ? ok({ url: r.url, mode: r.mode }) : fail(r.message);
   }));
   ipcMain.handle("proxy_oauth_cancel", handle(() => ok({ cancelled: discovery.cancelOAuth() })));
@@ -491,26 +497,23 @@ function register(ipcMain) {
     if (invalid) parts.push(`${invalid} 条记录缺 token 忽略`);
     return ok({ ...r, invalid, message: parts.join("，") });
   }));
-  // 从 JSON/ZIP 文件添加：主进程弹文件选择框；zip 读取包内全部 .json 条目合并导入
-  ipcMain.handle("proxy_account_import_file", handle(async ({ channel }) => {
+  // 从 JSON/ZIP 文件添加 · 子进程半段（Task 5 拆两段）：主进程弹框读字节、base64 过管道
+  // 投到这条命令（zip.readZip + importAccounts，即拆分前的 :412-432 主体）。文件选择框在
+  // 纯 Node 子进程里弹不了，字节过管道后实现体留在这一侧——号池写权（store）归子进程独占。
+  // name：原始文件名，zip 判定沿用「按扩展名」（拆分前就是 /\.zip$/i），结果文案也用它。
+  ipcMain.handle("proxy_account_import_blob", handle(({ channel, blob, name }) => {
     const fallback = adapters.get(channel) ? String(channel) : store.CHANNELS[0].id;
-    const { dialog, BrowserWindow } = require("electron");
-    const parent = BrowserWindow.getAllWindows()[0];
-    const opts = {
-      title: "选择账号 JSON / ZIP 文件",
-      properties: ["openFile"],
-      filters: [
-        { name: "账号文件（JSON / ZIP）", extensions: ["json", "zip"] },
-        { name: "所有文件", extensions: ["*"] },
-      ],
-    };
-    const r = await (parent ? dialog.showOpenDialog(parent, opts) : dialog.showOpenDialog(opts));
-    if (r.canceled || !r.filePaths.length) return ok({ canceled: true });
-    const file = r.filePaths[0];
-    const buf = fs.readFileSync(file);
+    const buf = Buffer.from(String(blob || ""), "base64");
+    if (!buf.length) return fail("文件内容为空");
+    const fileName = String(name || "");
     let texts = [];
-    if (/\.zip$/i.test(file)) {
-      const entries = zip.readZip(buf).filter((e) => /\.json$/i.test(e.name));
+    if (/\.zip$/i.test(fileName)) {
+      let entries;
+      try {
+        entries = zip.readZip(buf).filter((e) => /\.json$/i.test(e.name));
+      } catch (e) {
+        return fail("压缩包读取失败：" + String((e && e.message) || e));
+      }
       if (!entries.length) return fail("压缩包里没有 .json 文件");
       texts = entries.map((e) => e.data.toString("utf8"));
     } else {
@@ -534,7 +537,15 @@ function register(ipcMain) {
     const parts = [`成功导入 ${added} 个账号`];
     if (dup) parts.push(`${dup} 个同 UID 已存在跳过`);
     if (invalid) parts.push(`${invalid} 条记录无效忽略`);
-    return ok({ added, dup, invalid, file: path.basename(file), message: parts.join("，") });
+    return ok({ added, dup, invalid, message: parts.join("，") });
+  }));
+  ipcMain.handle("proxy_account_import_file", handle(() =>
+    fail("该命令的文件选择半段只在主进程：子进程表保留这个占位名是为逐字相等闸（④ ⊇ ②）无例外，字节应经 proxy_account_import_blob 投递")));
+  // webdav_shared_save 的反向跨界半段（Task 5）：主进程改了 WebDAV 共享口令后投这条命令，
+  // 在**子进程内**给 sync-state.json 记 keyChangeAt（那份文件归子进程独占，主进程不再直接写）
+  ipcMain.handle("proxy_poolsync_password_changed", handle(() => {
+    poolsync.onSharedPasswordMaybeChanged();
+    return ok({});
   }));
 
   // ===== 模型目录 =====
@@ -662,5 +673,7 @@ function attachGatewayMode({ emit } = {}) {
 // gatewayStatus 一并导出：proxy_status 命令走它，Task 1 的闸直接断言 vaultOk 字段，
 // Task 5 的转发化也要按这个名字取（藏在 register 里没法单测）
 // dispatchTable/dispatch/attachGatewayMode/gracefulShutdown：二期 Task 3 的子进程入口与管道出口
+// startBackgroundJobs：二期 Task 5 的子进程后台作业入口（credits 定时刷新 + 定时自动签到，
+// 过去在主进程 boot() 里，随命令实现体一起下沉；gateway.cjs 装配时调用）
 // DRAIN_BUDGET_MS：停机预算的四个数字之一，供 dev-gateway-pipe-test 断言它们仍复合（合计只在那一条断言里算）
-module.exports = { boot, shutdown, gracefulShutdown, DRAIN_BUDGET_MS, register, settings, gatewayStatus, dispatchTable, dispatch, attachGatewayMode };
+module.exports = { boot, shutdown, gracefulShutdown, DRAIN_BUDGET_MS, register, settings, gatewayStatus, dispatchTable, dispatch, attachGatewayMode, startBackgroundJobs };

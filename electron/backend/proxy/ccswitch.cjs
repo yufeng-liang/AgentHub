@@ -24,7 +24,7 @@
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const config = require("../config.cjs");
+const server = require("./server.cjs");
 
 // 驱动与 store.cjs 一致：Node 22 内置 node:sqlite 优先，better-sqlite3 回退
 let Database = null;
@@ -340,8 +340,10 @@ function register({ appType, apiKey, model, port } = {}) {
   if (!key) return { ok: false, message: "请先选择网关 API Key" };
   if (!mdl) return { ok: false, message: "请填写默认模型" };
   if (!Number.isFinite(port) || port <= 0) {
-    const cfg = config.loadConfig();
-    port = (cfg && cfg.proxy && cfg.proxy.port) || 9527;
+    // 端口回落读**实际监听状态**（Task 5）：本命令的实现体跑在子进程里，可直接读 server；
+    // 旧回落走 config.proxy.port，改过端口没重启（或配置漂移）时注册进 CC Switch 的
+    // base_url 会指向一个没人监听的死端口。
+    port = server.status().port || 9527;
   }
   const p = dbPath();
   if (!fs.existsSync(p)) {

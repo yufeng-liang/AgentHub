@@ -13,9 +13,8 @@ const watch = require("./backend/watch.cjs");
 const usageConfig = require("./backend/sync-config.cjs");
 const usagedb = require("./backend/db.cjs");
 const usagesync = require("./backend/sync.cjs");
-// 反代网关模块：本地 OpenAI 兼容服务（默认 127.0.0.1:9527），托盘常驻期间持续提供 API
-const proxy = require("./backend/proxy/index.cjs");
-// 二期 Task 3：网关子进程监督器（spawn / 认领 / 管道转发 / 事件回流）。
+// 网关子进程监督器（二期）：spawn / 认领 / 管道转发 / 事件回流 / 43 条 proxy_* 命令的注册面
+// （Task 5 起 ipc.cjs 经它注册，主进程不再 require proxy 域 —— stats.db 归子进程独占）。
 // 日志由它自己经 gateway-log 落 proxyDir()/logs/gateway.log，主进程不再另开一份写点。
 const gatewayClient = require("./backend/gateway-client.cjs");
 const usageScheduler = require("./backend/usage-scheduler.cjs");
@@ -377,22 +376,27 @@ if (!gotLock) {
     ipc.register({ ipcMain, app, shell, nativeTheme });
     remotesync.setOnFinish(notifySync);
     usagesync.setOnFinish(notifyUsageSync);
-    // 反代网关：规则热加载 + 额度定时刷新 + 按配置自启网关服务（服务独立于窗口存续）
-    proxy.boot();
-    // 二期 Task 3：子进程生命周期基座（spawn / 认领 / 事件回流）落位。
-    // 但**默认不起子进程**：43 条命令此刻仍在主进程里跑（Task 5 才把出口换成管道转发），现在就起
-    // 等于给 stats.db 添第二个句柄持有者——子进程 store.open() 会跑 90 天 GC 写盘，双进程争锁时
-    // busy_timeout=5000 会把用户的网关请求卡 5 秒（规格 §5.4 点名要避免的正是这个）。
-    // 这条 opt-in 只给「按同一条装配路径真跑子进程」的验证用；Task 5 落地转发时连同本判断一起删除。
-    if (process.env.AGENTHUB_GATEWAY_CHILD === "1") {
-      // 不 await：whenReady 回调保持同步（现在这条链上没有任何东西等它）。
-      // 成败都由 gateway-client 自己写进 proxyDir()/logs/gateway.log，这里只兜住未收口的 Promise。
-      gatewayClient.start({ persistent: boot.schedule.persistentGateway }).catch((e) => {
+    // 网关子进程（Task 5 起为正式启动路径，不再是 opt-in）：43 条命令全部在子进程跑，
+    // 主进程不再 boot() proxy 域（rules/store/credits/checkin 计时器都随实现体下沉，gateway.cjs）。
+    // 这里先 spawn；网关是否进入监听由配置的 restoreOnLaunch 决定 —— start 成功后转发
+    // proxy_start（与用户点开关同一条路径，claimed 守卫等语义完全一致）。Task 6 会把启动器
+    // 与自启的时机一并复核，本条保持「应用起来 = 子进程在」的最小不变式。
+    // 不 await：whenReady 回调保持同步；成败都由 gateway-client 写进 proxyDir()/logs/gateway.log。
+    gatewayClient.start({ persistent: boot.schedule.persistentGateway })
+      .then((r) => {
+        if (!r.ok || !boot.proxy || !boot.proxy.restoreOnLaunch) return;
+        return gatewayClient.call("proxy_start", {}).catch(() => {});
+      })
+      .catch((e) => {
         console.error("网关子进程启动失败：" + String((e && e.message) || e));
       });
-    }
-    // 子进程回流的代理事件扇给所有窗口（与 events.cjs 一期语义一致：无窗口时直接丢弃）
+    // 子进程回流的代理事件扇给所有窗口（与 events.cjs 一期语义一致：无窗口时直接丢弃）。
+    // oauth-open 是唯一要在主进程就地消费的事件：登录页由 shell.openExternal 打开 ——
+    // 会话在子进程（拿不到 shell），事件经管道回来，这里收到才开浏览器（CRITICAL_EVENTS 保投递）。
     gatewayClient.onEvent((payload) => {
+      if (payload && payload.type === "oauth-open" && payload.url) {
+        shell.openExternal(String(payload.url)).catch(() => {});
+      }
       for (const win of BrowserWindow.getAllWindows()) {
         if (!win.isDestroyed()) win.webContents.send("app:event", payload);
       }
@@ -425,15 +429,16 @@ if (!gotLock) {
       scheduler.stop();
       usageScheduler.stop();
       watch.stop();
-      proxy.shutdown();
       updater.triggerInstall();
       return;
     }
+    // Task 5 起主进程不持有网关的任何句柄（store/rules 都在子进程），退出路径无需收口：
+    // 非常驻子进程由看门狗的 parent-exit 分支优雅停机（gateway.cjs gracefulExit，≤5s）；
+    // 常驻子进程按设计 detach 存活（活过主 App，Task 6/7 的停机语义复核点）。
     quitting = true;
     scheduler.stop();
     usageScheduler.stop();
     watch.stop();
-    proxy.shutdown();
   });
 
   app.on("window-all-closed", () => {

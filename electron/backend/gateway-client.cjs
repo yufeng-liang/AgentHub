@@ -1,11 +1,13 @@
-// 网关子进程的主进程侧监督器（二期 Task 3）。
+// 网关子进程的主进程侧监督器（二期 Task 3）+ 主进程注册面（二期 Task 5）。
 //
-// 职责：spawn / 认领 / 看门狗对端（父进程）/ 优雅停机等待 / 命令转发出口 / 事件扇出。
-// 业务逻辑一条都不在这里——43 条命令的实现体仍在 proxy/index.cjs（Task 5 才把出口换成这里的 call()）。
-//
+// 职责：spawn / 认领 / 看门狗对端（父进程）/ 优雅停机等待 / 命令转发出口 / 事件扇出 /
+//       **43 条 proxy_* 命令的 ipcMain 注册面**（36 条纯转发 + 4 条 UI_LOCAL + 3 条薄包装）。
+// 业务实现体一条不在这里——43 条命令的实现体在 proxy/index.cjs，经这里的 call() 走管道下发；
+// 仅有的主进程本地逻辑：UI_LOCAL 四条（dialog/shell 的真 UI 依赖）与薄包装成功后的
+// restoreOnLaunch 写权（config.json 归主进程写，子进程永不写）。
 // 为什么主进程侧只 require store 的 proxyDir()：gateway.json 与日志的路径真相源必须与子进程写的
 // 那一份同源（两份解析 = 早晚漂移成两个文件）。这里不调 store.open()，不建库句柄；
-// §5.4 的「主进程不再 require 网关 store」由 Task 5 的硬零闸收口（本文件的 require 也在它面内）。
+// config.cjs 同理只读写 config.json，不触碰网关 store 的任何数据文件。
 "use strict";
 const crypto = require("node:crypto");
 const fs = require("node:fs");
@@ -14,6 +16,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const store = require("./proxy/store.cjs");
 const util = require("./proxy/util.cjs");
+const config = require("./config.cjs");
 const log = require("./gateway-log.cjs");
 const gatewayPipe = require("./gateway-pipe.cjs");
 const { encode } = require("./gateway-proto.cjs");
@@ -273,7 +276,168 @@ function state() {
   return { ...base, alive: pidAlive(base.pid), connected: !!(conn && conn.connected) };
 }
 
+// ===== 主进程注册面（二期 Task 5）：43 条 proxy_* 命令的 ipcMain 注册 =====
+
+// 逐字相等闸的三个真相源之一（scripts/dev-gateway-forward-parity-test.cjs）：
+// ① preload.cjs ALLOWED_COMMANDS 的 proxy_* 全集 == ② git show main 一期基线 == ③ 这张名单。
+// 名单在此处字面写死而不是从 index.cjs 的 dispatchTable 反推：反推要把整张 proxy 依赖图拉进
+// 主进程（§5.4 白做）。新增命令的工序是 preload + index.cjs 注册体 + 这张名单三处同改，闸会盯住漏改。
+const ALL_PROXY_CMDS = [
+  "proxy_status", "proxy_start", "proxy_stop", "proxy_restart",
+  "proxy_keys_list", "proxy_key_create", "proxy_key_update", "proxy_key_delete",
+  "proxy_pool", "proxy_pool_strategy",
+  "proxy_account_add", "proxy_account_remove", "proxy_account_toggle", "proxy_account_cool_off",
+  "proxy_account_refresh", "proxy_credits_refresh", "proxy_credits_refresh_channel",
+  "proxy_checkin_status", "proxy_checkin_run",
+  "proxy_scan", "proxy_scan_import",
+  "proxy_oauth_begin", "proxy_oauth_cancel", "proxy_oauth_submit_callback",
+  "proxy_account_import_json", "proxy_account_import_file",
+  "proxy_models", "proxy_models_sync",
+  "proxy_ide_switch", "proxy_ide_status",
+  "proxy_stats_overview", "proxy_stats_top", "proxy_stats_detail", "proxy_recent",
+  "proxy_rules_list", "proxy_open_rules_dir", "proxy_open_data_dir", "proxy_vault_status",
+  "proxy_poolsync_status", "proxy_poolsync_run", "proxy_poolsync_cancel",
+  "proxy_ccswitch_status", "proxy_ccswitch_register",
+];
+
+// 4 条真 UI 依赖（规格 §5.7 归属定案）：实现体在本文件，不经管道（dialog/shell 子进程拿不到）。
+// proxy_status / proxy_vault_status 规格漏判、实测可转发：它们的 electron 依赖 vaultOk() 已在
+// Task 1 换成 secretbox.backend()（§偏差 D1）。
+const UI_LOCAL = new Set(["proxy_account_import_file", "proxy_open_rules_dir", "proxy_open_data_dir", "proxy_oauth_begin"]);
+// 3 条薄包装：转发给子进程，成功后由**主进程**写 config.json 的 restoreOnLaunch（写权归主进程）。
+const RUN_WRITE = new Set(["proxy_start", "proxy_stop", "proxy_restart"]);
+// import_file 拆两段的字节上限：管道单帧 8MB（超限即断连，gateway-proto），base64 再膨胀 1/3。
+// 主进程先把门回显式错误，绝不把连接炸掉。账号 JSON/ZIP 常态远小于此。
+const IMPORT_BLOB_MAX = 5 * 1024 * 1024;
+
+/** 记住网关的开关状态（从 index.cjs 上移，Task 5）：每次启停成功都写回 proxy.restoreOnLaunch，
+ *  下次打开应用按它决定是否自动启动（默认 false，即首次打开是关闭的）。落盘失败不影响本次启停。 */
+function rememberRunning(running) {
+  try {
+    const cfg = config.loadConfig();
+    if (cfg.proxy.restoreOnLaunch === running) return;
+    cfg.proxy.restoreOnLaunch = running;
+    config.saveConfig(cfg);
+  } catch {
+    /* 读不到/写不进配置：跳过本次记账 */
+  }
+}
+
+/** 子进程是否常驻（活过主 App）。与一期 main.cjs 的 opt-in 同一真相源：schedule.persistentGateway。 */
+function persistentFlag() {
+  try {
+    const c = config.loadConfig();
+    return !!(c.schedule && c.schedule.persistentGateway);
+  } catch {
+    return false;
+  }
+}
+
+// 并发去重：5 s 轮询的 proxy_status 与同页其它命令同刻发现「未连接」时，只允许一次 start() 在飞。
+// start() 本身没有互斥，双入会各自 spawn 一个子进程抢同一份 gateway.json —— 必须在入口并成一次。
+let startInflight = null;
+async function ensureStarted() {
+  if (state().connected) return { ok: true };
+  if (startInflight) return startInflight;
+  startInflight = start({ persistent: persistentFlag() }).finally(() => { startInflight = null; });
+  return startInflight;
+}
+
+/** 纯转发体（36 条命令共用，含 proxy_status / proxy_vault_status 两条规格漏判的）。
+ *  失败一律收成 {ok:false, message}（与一期 handle() 的形状一致，渲染层不拿 rejected promise）；
+ *  错文保留 notRetried 的「不会自动重放…」后缀供排障，但这里**绝不重发**——非幂等读
+ *  （proxy_pool / proxy_status 派生复活要回写库）与写操作的重放风险见 gateway-pipe.cjs 文件头。 */
+async function forward(cmd, args) {
+  const s = await ensureStarted();
+  if (!s.ok) return { ok: false, message: "后台网关未能启动：" + s.message };  // 不得假死，显式错误
+  try {
+    const res = await call(cmd, args);
+    if (RUN_WRITE.has(cmd) && res && res.ok) {
+      // 评审 I3（从 index.cjs proxy_start 迁来）：claimed 分支本进程没有监听（端口归那台常驻网关），
+      // 不许把「本机在监听」写进配置，否则下次开机按假状态自启。restart 不排除 claimed——
+      // restart 的语义是「用户要它开着」，端口被接管时该意愿仍成立（原 index.cjs 两处的语义差）。
+      if (cmd === "proxy_start" && res.claimed) return res;
+      rememberRunning(cmd !== "proxy_stop");
+    }
+    return res;
+  } catch (e) {
+    return { ok: false, message: String((e && e.message) || e) };
+  }
+}
+
+/** UI_LOCAL · 从 JSON/ZIP 文件添加：主进程弹框 + 读字节，base64 过管道交给子进程半段
+ *  proxy_account_import_blob（zip 解包与入池的实现体在 index.cjs，号池写权归子进程独占）。 */
+async function importFileCmd({ channel } = {}) {
+  const s = await ensureStarted();
+  if (!s.ok) return { ok: false, message: "后台网关未能启动：" + s.message };
+  const { dialog, BrowserWindow } = require("electron");
+  const parent = BrowserWindow.getAllWindows()[0];
+  const opts = {
+    title: "选择账号 JSON / ZIP 文件",
+    properties: ["openFile"],
+    filters: [
+      { name: "账号文件（JSON / ZIP）", extensions: ["json", "zip"] },
+      { name: "所有文件", extensions: ["*"] },
+    ],
+  };
+  const r = await (parent ? dialog.showOpenDialog(parent, opts) : dialog.showOpenDialog(opts));
+  if (r.canceled || !r.filePaths.length) return { ok: true, canceled: true };
+  const file = r.filePaths[0];
+  const buf = fs.readFileSync(file);
+  if (buf.length > IMPORT_BLOB_MAX) {
+    return { ok: false, message: "文件过大（超过 " + Math.floor(IMPORT_BLOB_MAX / 1024 / 1024) + " MB），请拆分后导入" };
+  }
+  const res = await call("proxy_account_import_blob", { channel, blob: buf.toString("base64"), name: path.basename(file) });
+  if (res && res.ok) res.file = path.basename(file);   // 结果文案的文件名：子进程只见字节，原始名由主进程补
+  return res;
+}
+
+/** UI_LOCAL · 打开规则 / 数据目录：路径真值仍以 store.proxyDir() 为源（本文件既有依赖），
+ *  目录内容归子进程 —— 先 ensureStarted 让 rules.init() 真的建过目录，再开，别开出一个空壳路径。 */
+async function openDirCmd(sub) {
+  const s = await ensureStarted();
+  if (!s.ok) return { ok: false, message: "后台网关未能启动：" + s.message };
+  const shell = require("electron").shell;
+  if (!shell) return { ok: false, message: "该操作需要主进程界面，不能由后台常驻网关执行" };
+  const dir = sub === "rules" ? path.join(store.proxyDir(), "rules") : store.proxyDir();
+  fs.mkdirSync(dir, { recursive: true });   // 与 rules.rulesDir() 的「访问即建」口径一致
+  await shell.openPath(dir);
+  return { ok: true };
+}
+
+/** UI_LOCAL · OAuth 登录：命令体只做转发并回传子进程结果（会话建好后的 {type:"oauth-open", url}
+ *  事件由 main.cjs 收到才 shell.openExternal —— 浏览器打开在主进程，会话状态在子进程）。 */
+async function oauthBeginCmd(args) {
+  const s = await ensureStarted();
+  if (!s.ok) return { ok: false, message: "后台网关未能启动：" + s.message };
+  try {
+    return await call("proxy_oauth_begin", args);
+  } catch (e) {
+    return { ok: false, message: String((e && e.message) || e) };
+  }
+}
+
+const UI_LOCAL_IMPL = {
+  proxy_account_import_file: importFileCmd,
+  proxy_open_rules_dir: () => openDirCmd("rules"),
+  proxy_open_data_dir: () => openDirCmd("data"),
+  proxy_oauth_begin: oauthBeginCmd,
+};
+
+/** 注册主进程侧全部 43 条命令（ipc.cjs 唯一的网关注册入口；preload 白名单一字不动的对应面）。 */
+function register(ipcMain) {
+  for (const cmd of ALL_PROXY_CMDS) {
+    const local = UI_LOCAL_IMPL[cmd];
+    ipcMain.handle(cmd, local
+      ? async (_e, args) => {
+          try { return await local(args || {}); }
+          catch (e) { return { ok: false, message: String((e && e.message) || e) }; }
+        }
+      : async (_e, args) => forward(cmd, args || {}));
+  }
+}
+
 module.exports = {
-  start, stopAndWait, state, call, onEvent,
+  start, stopAndWait, state, call, onEvent, register,
   gatewayFile, gatewayScriptPath, readGatewayFile, probeAlive, probeResidentGateway, probePortBusy,
 };
