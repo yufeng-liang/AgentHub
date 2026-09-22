@@ -10,6 +10,9 @@
 //    上界刻意落在**客户端**：pending 这本账本来就记在连接上，而生产里唯一的客户端就是主进程，
 //    于是子进程同刻要处理的命令数被同一个数钉住（闸 ⑨d 两头都量：客户端拒了多少 + 服务端峰值在飞多少）。
 //    被拒的命令一条都没投出去，所以「重复执行写操作」的风险为零，语义与重放不同。
+//    另有服务端**跨连接**总账 proto.MAX_TOTAL_PENDING（Task 5 刀 1，闸 ⑨i）：MAX_PENDING 是每连接的
+//    账，k 条认证连接各 64 = k×64，总账与单连接上界同值，多连接不因 k 放大子进程的在飞堆量；
+//    被总账拒的命令从未被派发，回普通业务失败（不带 notRetried），重试语义交给调用方。
 //  · 不重放：本期**不实现任何自动重试**。实测依据（不是推测）：pool.cjs 的 poolAccounts() 会把
 //    「派生复活」经 store.updateAccount() 回写、effectiveStatus() 在 cooling/exhausted 到期时真落库，
 //    所以 proto.NON_IDEMPOTENT_READS 里那两条「读」都带写副作用；二期没有幂等表，重放一次就是重复执行一次写。
@@ -20,6 +23,13 @@
 //    ack、生产者却是周期性的（credits 调度、poolsync 进度、请求完成），所以 broadcast 在**写之前**看这条
 //    连接发送队列的 writableLength——已越过 highWaterMark 就丢该帧并记 event-frame-dropped，绝不在子进程里
 //    另排一条无界队列（规格 §5.2）。丢帧不判死连接：事件是尽力投递，命令帧走另一条路且各自有 id 与上界。
+//    **关键事件不在丢的行列**（Task 5 刀 1，闸 ⑨g）：proto.CRITICAL_EVENTS（oauth-done / oauth-open，
+//    它们是 oauthWaiting 一类 UI 等待态的唯一出口）绕过丢弃判据照写——丢一帧就是用户可见的永久卡死，
+//    而 oauth 事件是用户驱动的，量级差几个数量级，无界风险可忽略。
+//  · 写帧四态（Task 5 刀 1，闸 ⑨c）：writeFrame 回 "written"/"queued"/"unwritable"/"unencodable"，
+//    「编帧失败（一字节没入队）」与「背压（帧已入队）」分开善后——req 侧编帧失败立即按未投递改判
+//    （命令绝无可能已跑过），res 侧编帧失败补发必可编码的错误响应（命令已真跑完，落在业务失败一类，
+//    不许重试也不许让客户端干等默认超时），两条路径都留 pipe-frame-encode-error。
 //
 // 传输：Windows named pipe，走 net.createServer / net.connect 的 pipe path 形态（`\\.\pipe\…`）。
 // 不开第二个 TCP 端口（规格 §5.2）：不占端口、无防火墙面、随进程消失。
@@ -32,27 +42,23 @@ let SEQ = 0;
 const nextId = () => String(++SEQ);
 
 /**
- * 一行文本写出去。返回值是 **`sock.write()` 的原话**，三态里只有两态是「失败」：
- *  · `true`  —— 帧已被接受且没越过 highWaterMark；
- *  · `false` 且 `sock.writable` 为真 —— **背压**：帧进了这条 socket 自己的发送队列（没丢！），只是越过了
- *    highWaterMark，调用方该停手等 'drain'。把它当「写成功」= 以为能无限往下排（评审 I2 的成因就是这个返回值
- *    被丢掉）；把它当「没写出去」= 误报「未投递」，而命令可能已经在子进程里跑完并落了库；
- *  · `false` 且 `sock.writable` 为假 —— 真没写出去（对端已断 / socket 不可写 / write 抛错）。
- * 静默丢帧是这里最坏的失败形态：调用方拿不到任何信号，命令就只剩「永远不回来」。
+ * 把一帧编出来并写出去。返回**四态**之一（Task 5 刀 1 起不再用布尔把「编不了」压进「写不出去」——
+ * 那两态一字节都没入队，善后是「立即改判」；而「queued」帧已经进了 socket 的发送队列，只能等回执）：
+ *  · "written"     —— 编帧成功且 sock.write() 回 true（未越过 highWaterMark）；
+ *  · "queued"      —— 编帧成功、sock.write() 回 false 但 socket 仍可写（**背压**：帧进了这条 socket
+ *                     自己的发送队列，没丢！调用方该停手等 'drain'。把它当「写成功」= 以为能无限往下排
+ *                    （评审 I2 的成因就是这个返回值被丢掉）；把它当「没写出去」= 误报「未投递」，而命令
+ *                     可能已经在子进程里跑完并落了库）；
+ *  · "unwritable"  —— socket 不可写 / write() 抛错（对端已断）：帧没进队列；
+ *  · "unencodable" —— 载荷连 JSON 都编不了（循环引用 / BigInt 一类编程错）：一字节都没入队，
+ *                     调用方必须**立即**按「未投递 / 未回执」改判并留痕，绝不静默——静默丢帧是这里
+ *                     最坏的失败形态：调用方拿不到任何信号，命令就只剩「永远不回来」。
  */
-function writeText(sock, text) {
-  if (!sock || !sock.writable) return false;
-  try {
-    return sock.write(text);
-  } catch {
-    return false;                 // 对端已断：socket 自己会走 close，调用方只需别再以为投出去了
-  }
-}
-
 function writeFrame(sock, frame) {
   let text;
-  try { text = proto.encode(frame); } catch { return false; }   // 载荷连 JSON 都不了 = 编程错，按「没写出去」处理
-  return writeText(sock, text);
+  try { text = proto.encode(frame); } catch { return "unencodable"; }
+  if (!sock || !sock.writable) return "unwritable";
+  try { return sock.write(text) ? "written" : "queued"; } catch { return "unwritable"; }
 }
 
 /**
@@ -98,6 +104,7 @@ function serve({ token, pipePath, dispatch } = {}) {
   let resolveReady;
   const ready = new Promise((r) => { resolveReady = r; });
   let firstClient = true;
+  let inFlightTotal = 0;              // 跨连接在飞总账：所有已认证连接上「已派发、未回话」的命令数（⑨i）
 
   const server = net.createServer((sock) => {
     let authed = false;
@@ -125,15 +132,39 @@ function serve({ token, pipePath, dispatch } = {}) {
         // 响应帧与事件帧在这里**相反**：背压时照排不误，只有「真没写出去」才留痕。理由是客户端那条 id 正在
         // 等回执，中途丢弃就是「命令真跑了却没回执」的错判；而它不会堆成无界队列——单连接在飞的命令数被
         // 客户端的 MAX_PENDING 钉住（见文件头第三条），这条连接上最多攒 64 帧响应。
-        if (writeFrame(sock, frame) || sock.writable) return;
+        const wf = writeFrame(sock, frame);
+        if (wf === "written" || wf === "queued") return;
+        if (wf === "unencodable") {
+          // 响应体编不出帧（dispatch 返回了循环引用/BigInt 一类）：命令**已经真跑完**（副作用已发生），
+          // 但回执永远出不去。补发一条必可编码的错误响应（message 是纯字符串），让客户端立刻拿到
+          // 确定性失败而不是干等默认超时；错误落在「业务失败」一类（不带 notRetried）——调用方不会
+          // 重试它，「重放 = 重复执行写」的语义不被破坏。留痕，否则排障时这条路径完全不可见。
+          log.line("pipe-frame-encode-error", { k: "res", id, cmd });
+          if (writeFrame(sock, { k: "res", id, ok: false, message: "响应帧编码失败（返回值不可 JSON 序列化），命令已执行：" + cmd }) === "unwritable") {
+            log.line("pipe-frame-dropped", { k: "res", id, cmd, why: "encode-error-reply", peerWritable: false });
+          }
+          return;
+        }
         // 响应帧没写出去 = 客户端那条 id 只能等它自己的默认超时才有结论。留痕，否则排查时只剩
         // 「主进程说子进程不回话」，而子进程日志里连一次派发记录都没有。
         log.line("pipe-frame-dropped", { k: "res", id, cmd, peerWritable: false });
       };
+      // 跨连接在飞总账（Task 5 刀 1 件 5）：MAX_PENDING 是**每连接**的账，k 条认证连接各 64 = k×64，
+      // 规格 §5.2 的目的状语「避免主 App 卡死时子进程堆内存」在多连接下就不成立。总账取与单连接上界
+      // 同值（proto.MAX_TOTAL_PENDING）：多连接不因 k 放大子进程的在飞堆量。被拒的命令**从未被派发**，
+      // 重试语义安全——所以这里回普通业务失败（不带 notRetried），重试与否交给调用方。
+      if (inFlightTotal >= proto.MAX_TOTAL_PENDING) {
+        log.line("pipe-req-rejected", { why: "global-inflight-cap", cmd, inFlight: inFlightTotal, cap: proto.MAX_TOTAL_PENDING });
+        reply({ k: "res", id, ok: false, message: "服务端在飞命令已达全局上界（" + inFlightTotal + " / " + proto.MAX_TOTAL_PENDING + "），命令未受理：" + cmd });
+        return;
+      }
+      inFlightTotal += 1;
       Promise.resolve()
         .then(() => dispatch(cmd, f.args))
-        .then((data) => reply({ k: "res", id, ok: true, data }))
-        .catch((e) => reply({ k: "res", id, ok: false, message: String((e && e.message) || e) }));
+        .then(
+          (data) => { inFlightTotal -= 1; reply({ k: "res", id, ok: true, data }); },
+          (e) => { inFlightTotal -= 1; reply({ k: "res", id, ok: false, message: String((e && e.message) || e) }); }
+        );
     };
     const feed = proto.createParser(onFrame, () => {
       log.line("pipe-overflow", { maxBytes: proto.MAX_FRAME_BYTES });
@@ -167,22 +198,33 @@ function serve({ token, pipePath, dispatch } = {}) {
         // 判死会把同一连接上正在跑的命令帧一起打成「未投递」，那才是真的把事办坏）。闸 ⑨g 两头都钉：
         // 灌 50 MB 只让个位数帧入队 + 逐条留痕，且那条连接随后还能收命令帧。
         broadcast: (frame) => {
+          const type = String((frame && frame.payload && frame.payload.type) || "");
+          const critical = proto.CRITICAL_EVENTS.has(type);
           let text;
-          try { text = proto.encode(frame); } catch { return; }        // 载荷连 JSON 都不了 = 编程错，整条丢掉
+          if (critical) {
+            // 关键事件（CRITICAL_EVENTS：oauthWaiting 一类 UI 等待态的**唯一**出口）绕过丢弃判据：
+            // 丢一帧就是用户可见的永久卡死。无界风险可忽略——oauth 事件是用户驱动的（一次登录流程
+            // 至多几帧），量级与周期性事件源（credits 30 分钟调度、poolsync 进度）差几个数量级。
+            try { text = proto.encode(frame); } catch {
+              log.line("pipe-frame-encode-error", { k: String((frame && frame.k) || ""), type });
+              return;                                    // 载荷连 JSON 都不了 = 编程错，整条丢掉但必须留痕
+            }
+          } else {
+            try { text = proto.encode(frame); } catch { return; }   // 普通事件编不了 = 编程错，整条丢掉
+          }
           for (const c of clients) {
             if (!c.writable) continue;              // 对端已断：close 马上会把它从 clients 里摘掉，不必留痕
             // 背压的判据必须落在**写之前**：sock.write() 回 false 时那一帧已经在队列里了，拿它当
             // 「丢掉这一帧」是句空话（实测那样写时 200 帧 / 50 MB 仍然全部入队，闸 ⑨g 就是这么红的）。
             // 所以这里看的是「这条连接的发送队列是否已经堆到 highWaterMark」——越线即丢，一帧都不进队列。
-            if (c.writableLength >= (c.writableHighWaterMark || 16384)) {
+            if (!critical && c.writableLength >= (c.writableHighWaterMark || 16384)) {
               log.line("event-frame-dropped", {
-                reason: "backpressure", k: String((frame && frame.k) || ""),
-                type: String((frame && frame.payload && frame.payload.type) || ""),
+                reason: "backpressure", k: String((frame && frame.k) || ""), type,
                 bytes: text.length, queued: c.writableLength, peerWritable: true,
               });
               continue;
             }
-            writeText(c, text);                     // 返回 false 只是「这一帧把队列顶过了线」，下一帧会被丢掉
+            try { c.write(text); } catch { /* 对端已断：socket 自己会走 close */ }
           }
         },
         close: () => {
@@ -304,12 +346,18 @@ function connect({ pipePath, token, timeoutMs } = {}) {
             reject2(noRetryError("子进程未在 " + ms + "ms 内应答：" + cmd, cmd));
           }, ms);
           pending.set(id, rec);
-          // 只有「真没写出去」才判未投递。背压（false 且仍 writable）时帧已进 socket 自己的发送队列，
-          // 照常等回执——误判成未投递会让调用方以为命令没跑，而它可能已经在子进程里落了库。
-          if (!writeFrame(sock, { k: "req", id, cmd: String(cmd), args: args || {} }) && !sock.writable) {
+          // 只有「真没写出去」才判未投递。背压（"queued"）时帧已进 socket 自己的发送队列，照常等回执——
+          // 误判成未投递会让调用方以为命令没跑，而它可能已经在子进程里落了库。
+          const wf = writeFrame(sock, { k: "req", id, cmd: String(cmd), args: args || {} });
+          if (wf === "unwritable" || wf === "unencodable") {
+            // 两态的共同点：一字节都没入队，命令绝无可能在子进程里跑过——不存在「已落库却报未投递」
+            // 的误判面，所以立即改判（Task 5 刀 1：旧版借 sock.writable 反推，编帧失败被静默吞掉，
+            // pending 要挂满默认超时才有结论）。两者错文分开报，排障时才分得清是参数烂还是对端断了。
             if (rec.timer) clearTimeout(rec.timer);
             pending.delete(id);
-            reject2(noRetryError("命令帧未能写入管道，未投递：" + cmd, cmd));
+            reject2(noRetryError(wf === "unencodable"
+              ? "命令帧编码失败（参数不可 JSON 序列化），未投递：" + cmd
+              : "命令帧未能写入管道，未投递：" + cmd, cmd));
           }
         }),
         onEvent: (cb) => { eventCbs.add(cb); return () => eventCbs.delete(cb); },
@@ -321,8 +369,8 @@ function connect({ pipePath, token, timeoutMs } = {}) {
   });
 }
 
-// __hooks：只给闸（scripts/dev-gateway-pipe-test.cjs ⑨c）钉「不可写的 socket 上 writeFrame 必须回 false」
-// 这条不变式——它没有别的确定性入口（OS 的断连时序窗口抓不住）。与 secretbox.__selfCheck 同类的测试可见性：
+// __hooks：只给闸（scripts/dev-gateway-pipe-test.cjs ⑨c）钉「writeFrame 四态逐态如约」这条不变式——
+// 它没有别的确定性入口（OS 的断连时序窗口抓不住）。与 secretbox.__selfCheck 同类的测试可见性：
 // 产品路径（gateway.cjs / gateway-client.cjs）一个都不引用它，也不写任何状态。
 // noRetryError 则是**产品路径共用的**错误形状：gateway-client.call() 的「未连接」早退也走它（闸 ⑨h）。
 module.exports = { serve, connect, noRetryError, __hooks: { writeFrame } };
