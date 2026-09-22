@@ -1678,6 +1678,13 @@ function clineErrorStatus(status, errObj) {
   return 502;
 }
 
+/** 远程目录归池：free 组归 free 池、clinePass 组归 pass 池；recommended 走 credit 计费不收、
+ *  clineCloud 实测 403 不收（协议参考 §1.4）。归池看分组不看前缀——free 组混有裸名条目。 */
+function pickClineModels(groups, pool) {
+  const arr = (groups && (pool === "pass" ? groups.clinePass : groups.free)) || [];
+  return arr.map((m) => String((m && m.id) || "")).filter(Boolean);
+}
+
 function makeCline(pool) {
   const channel = pool === "pass" ? "cline_pass" : "cline_free";
   return {
@@ -1693,6 +1700,27 @@ function makeCline(pool) {
       return unionIds([...catalogMap(channel).values()].map((m) => String(m.id)), []);
     },
     modelEntries() { return [...catalogMap(channel).values()].map((m) => ({ client: String(m.id), upstream: String(m.id), entry: m })); },
+
+    /** 拉取官方推荐目录（免鉴权 GET /ai/cline/recommended-models）：按响应分组归池，
+     *  元数据（name/rate/能力/上下文）从静态目录回填，目录缺的条目用 id 兜底；
+     *  拉取失败/空目录返回 ok:false（index.cjs 管道失败不写空，保留旧目录） */
+    async fetchModels(account, secrets) {
+      const r = await httpJson(`${CLINE_BASE}/ai/cline/recommended-models`, { method: "GET", headers: this.headers(secrets) })
+        .catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
+      if (!r.ok) return { ok: false, message: `目录拉取失败（HTTP ${r.status || 0}）${r.message ? " " + r.message : ""}` };
+      const ids = pickClineModels(r.data || {}, pool);
+      if (!ids.length) return { ok: false, message: "目录为空" };
+      const cat = catalogMap(channel);
+      const models = ids.map((id) => {
+        const meta = cat.get(id.toLowerCase());
+        return {
+          id, name: String((meta && meta.name) || id), rate: (meta && meta.rate) ?? null,
+          capabilities: (meta && meta.capabilities) || { images: false, reasoning: true, tools: true },
+          contextLength: Number((meta && meta.contextLength) || 0), maxOutputTokens: Number((meta && meta.maxOutputTokens) || 0),
+        };
+      });
+      return { ok: true, models };
+    },
 
     /** 客户端名 → 上游名：带前缀原样（前缀是计费通道选择器，剥掉 404）；裸名补本池前缀 */
     upstreamFor(clientModel) {
@@ -2144,4 +2172,5 @@ module.exports = {
   makeOpenaiCompat,
   // 测试窥视口（下划线前缀 = 非公共契约）：cline 错误分类的纯函数，dev-cline-test 直测
   _clineErrorStatus: clineErrorStatus,
+  _pickClineModels: pickClineModels,
 };

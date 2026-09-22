@@ -69,5 +69,47 @@ ok("403 原样透传（ENTITLEMENT 是确定性拒绝，不冷却）", E(403, { 
 ok("404 原样透传", E(404) === 404);
 ok("500→502", E(500) === 502);
 
-console.log(`\n${pass} 通过, ${fail} 失败`);
-process.exit(fail ? 1 : 0);
+console.log("cline 目录归池:");
+const P = adapters._pickClineModels;
+const groups = { free: [{ id: "cline-free/a" }, { id: "z-ai/glm-5.3-flash" }], clinePass: [{ id: "cline-pass/b" }], recommended: [{ id: "openai/x" }], clineCloud: [{ id: "cloud/y" }] };
+ok("free 组归 free 池（含裸前缀条目，归池看分组不看前缀）", P(groups, "free").join(",") === "cline-free/a,z-ai/glm-5.3-flash");
+ok("pass 组归 pass 池", P(groups, "pass").join(",") === "cline-pass/b");
+ok("recommended/cloud 不归任何池", !P(groups, "pass").includes("openai/x") && !P(groups, "free").includes("cloud/y"));
+
+// fetchModels 全链路用假 fetch 注入夹具（httpJson 走全局 fetch），不发真实网络请求
+console.log("cline fetchModels（假 fetch 夹具，不发真实网络）:");
+const RECOMMENDED_FIXTURE = {
+  recommended: [{ id: "openai/gpt-x", name: "GPT-X" }],
+  free: [{ id: "cline-free/deepseek-v4.1-flash", name: "DeepSeek V4.1 Flash (免费)" }, { id: "z-ai/glm-5.3-flash", name: "GLM-5.3-Flash (免费)" }],
+  clinePass: [{ id: "cline-pass/kimi-k3", name: "Kimi K3 (ClinePass)" }, { id: "whatever/not-in-catalog", name: "Not In Catalog" }],
+  clineCloud: [{ id: "cloud/y", name: "Cloud Y" }],
+};
+let lastReq = null;
+const realFetch = globalThis.fetch;
+globalThis.fetch = async (url, opts) => { lastReq = { url, opts }; return { ok: true, status: 200, text: async () => JSON.stringify(RECOMMENDED_FIXTURE) }; };
+(async () => {
+  const fmFree = await free.fetchModels({}, { token: "eyJh" });
+  ok("请求 URL 是 recommended-models（单层 v1）", lastReq && lastReq.url === "https://api.cline.bot/api/v1/ai/cline/recommended-models", lastReq && lastReq.url);
+  ok("请求带 Bearer workos: 前缀与 cline-sdk 头", !!lastReq && lastReq.opts.headers.authorization === "Bearer workos:eyJh" && lastReq.opts.headers["x-client-type"] === "cline-sdk");
+  ok("free 池只收 free 组两条（recommended/cloud 不混入）", fmFree.ok === true && fmFree.models.map((m) => m.id).join(",") === "cline-free/deepseek-v4.1-flash,z-ai/glm-5.3-flash", fmFree);
+  const zai = fmFree.models.find((m) => m.id === "z-ai/glm-5.3-flash");
+  ok("目录元数据回填（name/contextLength/capabilities/rate）", !!zai && zai.name === "GLM-5.3-Flash (免费)" && zai.contextLength === 1310720 && zai.capabilities.reasoning === true && zai.rate === null, zai);
+  const fmPass = await passAd.fetchModels({}, { token: "eyJh" });
+  const stranger = fmPass.models.find((m) => m.id === "whatever/not-in-catalog");
+  ok("pass 池收 pass 组（目录缺元数据时兜底 id 名/默认能力/0 上下文）", fmPass.ok === true && fmPass.models.map((m) => m.id).join(",") === "cline-pass/kimi-k3,whatever/not-in-catalog" && stranger.name === "whatever/not-in-catalog" && stranger.contextLength === 0 && stranger.capabilities.images === false && stranger.capabilities.tools === true, { fmPass, stranger });
+
+  globalThis.fetch = async () => ({ ok: false, status: 500, text: async () => "boom" });
+  const fm500 = await free.fetchModels({}, { token: "eyJh" });
+  ok("上游 500 → ok:false 带状态码", fm500.ok === false && /HTTP 500/.test(fm500.message), fm500);
+  globalThis.fetch = async () => { throw new Error("net down"); };
+  const fmNet = await free.fetchModels({}, { token: "eyJh" });
+  ok("网络异常 → ok:false（HTTP 0）", fmNet.ok === false && /HTTP 0/.test(fmNet.message), fmNet);
+  globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => "{}" });
+  const fmEmpty = await free.fetchModels({}, { token: "eyJh" });
+  ok("空目录 → ok:false 目录为空", fmEmpty.ok === false && fmEmpty.message === "目录为空", fmEmpty);
+
+  globalThis.fetch = realFetch;
+})().then(() => {
+  console.log(`\n${pass} 通过, ${fail} 失败`);
+  process.exit(fail ? 1 : 0);
+}).catch((e) => { console.error("测试执行异常:", e); process.exit(1); });

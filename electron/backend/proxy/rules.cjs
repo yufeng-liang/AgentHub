@@ -69,6 +69,29 @@ const DEFAULTS = {
         maxOutputTokens: 80000,
       })),
     },
+    // Cline 双池静态兜底（协议参考 §1.4 FALLBACK_MODELS 逐字移植；rate 未知留 null）：
+    // 免鉴权 recommended-models 接口不可用时保证模型目录开箱即用；拉取成功后整段覆盖对应渠道。
+    // free 组混有裸名条目（z-ai/glm-5.3-flash、poolside/...），归池看响应分组不看前缀
+    cline_free: {
+      syncedAt: 0,
+      models: [
+        { id: "cline-free/deepseek-v4.1-flash", name: "DeepSeek V4.1 Flash (免费)", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0 },
+        { id: "cline-free/muse-spark-1.3-contributor", name: "Muse Spark 1.3 (免费)", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "cline-free/solar-pro4", name: "Solar Pro 4 (免费)", rate: null, capabilities: { images: false, reasoning: false, tools: true }, contextLength: 128000, maxOutputTokens: 0 },
+        { id: "z-ai/glm-5.3-flash", name: "GLM-5.3-Flash (免费)", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1310720, maxOutputTokens: 0 },
+        { id: "poolside/laguna-s-2.1:free", name: "Laguna S 2.1 (免费)", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 262144, maxOutputTokens: 0 },
+      ],
+    },
+    cline_pass: {
+      syncedAt: 0,
+      models: [
+        { id: "cline-pass/glm-5.3", name: "GLM-5.3 (ClinePass)", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "cline-pass/kimi-k3", name: "Kimi K3 (ClinePass)", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 256000, maxOutputTokens: 0 },
+        { id: "cline-pass/deepseek-v4.1-flash", name: "DeepSeek V4.1 Flash (ClinePass)", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0 },
+        { id: "cline-pass/deepseek-v4-pro", name: "DeepSeek V4 Pro (ClinePass)", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 128000, maxOutputTokens: 0 },
+        { id: "cline-pass/qwen3.8-max", name: "Qwen3.8 Max (ClinePass)", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 256000, maxOutputTokens: 0 },
+      ],
+    },
   },
   // Trae function 字段按模型分发（TraeWorkAssistant models_sync.rs 实证：
   // 部分模型仅在 solo_agent 下可用，其余走 solo_work_lite；未命中默认 solo_work_lite）
