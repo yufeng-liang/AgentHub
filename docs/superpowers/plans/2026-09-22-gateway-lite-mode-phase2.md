@@ -225,13 +225,19 @@ process.env.APPDATA = work;                       // config.cjs 纯 Node 退回 
 process.env.AGENT_SKILLS_HOME = path.join(work, "hub");
 
 // 1) 无 Local State、无 safeStorage：打包态判据决定是 plain-dev 还是 none
+//    打包判据是 __dirname.includes("app.asar")（见 Step 2），所以测试**自己造那个路径**：
+//    把 secretbox.cjs 连它 require 的同目录兄弟一起拷进 <tmp>/app.asar/backend/ 再 require 它。
+//    这样测的是生产判据本身，不给产品代码开测试后门。
 function fresh() { for (const k of Object.keys(require.cache)) if (k.includes("secretbox") || k.includes("config.cjs")) delete require.cache[k]; }
-function packagedFlag(v) { Object.defineProperty(process, "resourcesPath", { value: v ? path.join(work, "r") : "H:\\dev", configurable: true }); }
-
-fresh(); packagedFlag(false);
-const sbDev = require(path.join(__dirname, "../electron/backend/proxy/secretbox.cjs"));
-assert.strictEqual(sbDev.backend(), "plain-dev", "开发态无 Local State 应降级明文（保住 tools/proxy-smoke 与既有自测）");
-assert.strictEqual(sbDev.encrypt("abc"), "abc", "plain-dev 下明文照旧");
+function copyInto(parent, rel) {                        // rel 保持相对层级，兄弟 require 才解析得到
+  const dst = path.join(parent, "app.asar", rel);
+  fs.mkdirSync(path.join(dst, "backend/proxy"), { recursive: true });
+  fs.copyFileSync(path.join(__dirname, "../electron/backend/proxy/secretbox.cjs"), path.join(dst, "backend/proxy/secretbox.cjs"));
+  return path.join(dst, "backend/proxy/secretbox.cjs");
+}
+fresh();
+const devCopy = copyInto(path.join(work, "devmode"), "electron");
+assert.strictEqual(require(devCopy).backend(), "plain-dev", "开发态无 Local State 应降级明文（保住 tools/proxy-smoke 与既有自测）");
 
 // 2) 有 Local State：v10 双向自解（自造合成密钥，绝不读真实凭据）
 const { execFileSync } = require("node:child_process");
@@ -244,18 +250,24 @@ fs.writeFileSync(path.join(work, "Local State"), JSON.stringify({
 > **DPAPI 在测试里怎么造**：`CryptProtectData` 的输入不能手写。测试脚本自己在 `work` 目录里用 koffi 调一次 `CryptProtectData` 包出一个真 DPAPI blob（与生产同一入口，测的就是这条链），再 base64 成 `encrypted_key`。若本机 koffi 不可用，测试**跳过并 exit 2 + 打印 `SKIP`**，不得静默通过。断言「解出来的 32 B 与我们放进去的完全一致」而不是「没抛错」。
 
 3) `enc:v1:` 兼容性：`decrypt("enc:v1:" + base64("v10"+nonce+ct+tag))` 能解出我们自造的明文（与 `config.cjs` 的 `ENC_PREFIX` 语义一致）。
-4) **闸门必抛**：
+4) **闸门必抛**（测的是生产判据，不测注入的 flag）：
 
 ```js
-fresh(); packagedFlag(true);                       // __dirname 含 app.asar 的等价模拟见 Step 2 注
-const sb = require(path.join(__dirname, "../electron/backend/proxy/secretbox.cjs"));
+assert.strictEqual(require(devCopy).encrypt("abc"), "abc", "plain-dev 下明文照旧");   // 既有自测的保命语义
+fresh();
+const pkgCopy = copyInto(path.join(work, "pkgmode"), "electron");
+const sb = require(pkgCopy);
+assert.ok(sb.__selfCheck.includes("app.asar"), "拷贝没进 asar 路径，这条断言会假绿");   // 判据自证
 assert.strictEqual(sb.backend(), "none", "打包态 + 无 Local State + 无 safeStorage 必须是 none");
 assert.throws(() => sb.encrypt("token-abc"), /凭据加密/, "打包态无能力时必须拒写，不得静默明文");
 assert.throws(() => sb.assertUsable(), /凭据解密失败/);
 ```
 
+`__selfCheck` 是 `secretbox` 导出的一个只读字符串（值 = `__dirname`），存在的唯一目的是让测试能自证「我确实是从 asar 路径 require 进来的」——它不参与任何生产判断。
+
 5) **未知密文形态不静默**：`assert.throws(() => sb.decrypt("enc:v1:" + Buffer.from("junkjunkjunk").toString("base64"), /未知密文形态/)`；同时 `sb.decrypt("")` 与 `sb.decrypt("plain")` 必须原样返回（存量明文路径不破）。
 6) **同文不同进程可解**：父进程用 `v10` 后端造一条密文，spawn 子进程（`process.execPath -e`，中立 cwd、同一 `work`）解回来，断言字符串相等；反向再跑一次。这才是「对存量密文 100% 兼容、无需迁移」的硬证据，光测「自己加密自己解密」不算（那条只证明 AES-GCM 没写错，不证明与 safeStorage 互解）。
+7) **`vaultOk()` 在四种后端下的取值符合 §5.7 定案**（扫描裁决 T0↔T1 补的断言）：`none`→`false`，`plain-dev`/`v10`/`safeStorage`→`true`。这条是给 Task 5 用的前提 —— `proxy_status`/`proxy_vault_status` 之所以能从「留主进程」退回「可转发」，全靠 `vaultOk()` 不再依赖 electron；没有这条断言，Task 5 的归属表就是建在推测上。用 `index.gatewayStatus()` 直接断言 `vaultOk` 字段，别只测 `secretbox.backend()`。
 
 Run: `node scripts/dev-secretbox-test.cjs` → Expected: FAIL（`Cannot find module ... secretbox.cjs` 或断言 4 不抛）。
 
@@ -428,8 +440,9 @@ git commit -m "feat: 子进程自带 v10 凭据解密 + 打包态拒写明文闸
 //      rulesDir/ 默认值与补键迁移      ← rules.cjs:233 / :244（ensureFiles）
 //      proxyDir()/sync-state.json     ← poolsync.cjs:77（:429 / :470 触发）
 //      proxyDir()/pool-tombstones.json ← poolsync.cjs:310（index.cjs:324 触发）
-//    这四个都归子进程独占；⑤ 与 Task 5 删掉 ipc.cjs:18/:474/:176 是同一件事的两端，
-//    在 Task 2 先落断言是为了让 Task 5 一改完就有闸兜着。
+//    这四个都归子进程独占。**本任务只做棘轮**：断言 `ipc.cjs`/`main.cjs` 里对 proxy 域的 require 数
+//    不得比基线增加（此刻删除还没发生，硬零会一路红到 Task 5，破坏"每任务收尾都可验证"）；
+//    硬零由 Task 5 的 dev-gateway-forward-parity-test 接管，那里才是删除落地的地方。
 ```
 
 Expected 首跑 FAIL：`config.json.tmp` 仍是固定名、`grep -c "store.close()" → 0 命中`。
@@ -491,9 +504,11 @@ git commit -m "fix: 原子写临时名带 pid、WAL 周期 checkpoint 与 store.
 ### Task 3: 生命周期基座（握手 / 认领 / 看门狗 / 日志 / liveness 与 readiness）
 
 **Files:**
-- Create: `electron/gateway.cjs`、`electron/backend/gateway-client.cjs`
+- Create: `electron/gateway.cjs`、`electron/backend/gateway-client.cjs`、`electron/backend/gateway-pipe.cjs`（**最小可用版**：单连接、`serve`/`connect`/`call`/`broadcast` 齐全，不含超时与队列上界）
 - Modify: `electron/backend/proxy/server.cjs:653-657`（`/healthz` 拆语义）、`electron/backend/proxy/index.cjs:163-182`（`boot`/`shutdown` 的角色化改造）、`electron/main.cjs:378`
-- Test: `scripts/dev-gateway-pipe-test.cjs`（本任务先建，Task 4 扩协议断言）
+- Test: `scripts/dev-gateway-pipe-test.cjs`（本任务先建，Task 4 硬化时再补协议组）
+
+> **事前扫描修正 P2**：本任务的 `gateway.cjs` 与 Step 7 的认领断言都要真的跑起一条管道，而完整通道是 Task 4 的交付物 —— 原计划里 Task 3 依赖 Task 4、Task 4 又依赖 Task 3，是死锁。修正为：Task 3 落**最小版** `gateway-pipe.cjs`（够 spawn/认领/事件回流通即可），Task 4 只做硬化（配对乱序、10 s 超时、有界队列、不重放、溢出断开）。
 
 **Interfaces:**
 - Consumes: Task 0 的 `util.appVersion()`、Task 1 的 `secretbox.assertUsable()`、Task 2 的 `store.startCheckpointTimer()`
@@ -719,7 +734,7 @@ function attachGatewayMode({ emit }) {
 
 > 这里**不许**出现 `delete require.cache[...]` 那类清缓存写法：它只会掩盖装配序问题（`dispatchTable` 与 `attachGatewayMode` 的先后）。真实实现只做两件事——`events.setSink(emit)`，以及把 `boot()`（`index.cjs:163-175`）里「按 `restoreOnLaunch` 自动 listen」那段**拿掉**。`dispatchTable()` 复用 `register()`：`register` 内部只是 43 次 `ipcMain.handle(name, handle(fn))`，喂它一个 `{ handle(name, fn) }` 收集器就得到同名表，290 行注册体一字不动（见 §偏差 D6）。
 
-`main.cjs:378` 的 `proxy.boot()` 改为 `gatewayClient.start({ persistent: cfg.schedule.persistentGateway })`，并 `gatewayClient.onEvent(...)` 扇出。
+`main.cjs:378` 的 `proxy.boot()` 改为 `gatewayClient.start({ persistent: cfg.schedule.persistentGateway })`，并 `gatewayClient.onEvent(...)` 扇出。**本任务不动 `restoreOnLaunch` 的语义**（仍是「记住上次退出时网关开没开」）：语义重定义连同注释与文案一起在 Task 6 一次改完，避免两个任务各改一半（扫描裁决 T5↔T6）。
 
 同一步把 `index.cjs:177-182` 的 `shutdown()` 升级为子进程侧唯一的优雅停机实现并导出（Task 7 的 `gateway_shutdown` 命令体复用它，不开第二份）：
 
@@ -938,7 +953,20 @@ set ELECTRON_RUN_AS_NODE=1
 endlocal
 ```
 
-`package.json` 的 `build` 段加 `"extraFiles": [{ "from": "build/gateway-launcher.cmd", "to": "agenthub-gateway.cmd" }]`——**不是 `extraResources`**，Task 6 的产物断言要同时证明 `extraResources`（`resources/sqlcipher`）一字未动。`--persistent` 参数由 `gateway.cjs` 读 `process.argv` 决定 `persistent=true`（stdin 握手仍带 token；自启路径的 token 由 `.cmd` 无法注入，故**自启模式改为子进程自己生成 token 并写 `gateway.json`，主 App 认领时从文件取**——这是对 Task 3「token 只走 stdin」的一处必要例外，必须写进注释与 `§偏差`）。
+`package.json` 的 `build` 段加 `"extraFiles": [{ "from": "build/gateway-launcher.cmd", "to": "agenthub-gateway.cmd" }]`——**不是 `extraResources`**，Task 6 的产物断言要同时证明 `extraResources`（`resources/sqlcipher`）一字未动。
+
+**`--persistent` 的装配分支必须在本步一起改 `electron/gateway.cjs`**（扫描修正 P4：Task 3 的 `main()` 第一行就是 `await readHandshake()`，而自启路径没有父进程写 stdin，照原样会永久挂在读 stdin 上）：
+
+```js
+const argvPersistent = process.argv.includes("--persistent");
+// 自启路径：没有父进程投递 stdin 握手，token 由子进程自己生成并写进 gateway.json（§偏差 D4），
+// 主 App 之后从文件认领；pipePath 也自造。两条路径必须共用同一个 srv/看门狗装配，不复制一份。
+const hs = argvPersistent
+  ? { token: crypto.randomBytes(24).toString("hex"), parentPid: 0, persistent: true, pipePath: null, tokenSource: "file" }
+  : await readHandshake();
+```
+
+`parentPid: 0` 时看门狗跳过父进程探测（否则 `kill(0,0)` 语义不定），只保留 `exe-gone` 那条；`gateway.json` 多写一个 `tokenSource` 字段，Task 8 的报告据此区分两种来历。`dev-gateway-launcher-test.cjs` 的断言 ① 同时要求：`--persistent` 且 stdin 永不关闭的情况下，`gateway.json` 在 8 s 内出现且 `pipe` 字段可连通（这就是 P4 的守门断言）。
 
 - [ ] **Step 4: UI 与默认值**
 
