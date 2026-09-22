@@ -92,6 +92,22 @@ const DEFAULTS = {
         { id: "cline-pass/qwen3.8-max", name: "Qwen3.8 Max (ClinePass)", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 256000, maxOutputTokens: 0 },
       ],
     },
+    // AutoClaw 双区静态兜底（客户端模型选择器现役仅有的两个模型，协议参考 §2.4）；
+    // 拉取 autoclaw-model-config 成功后整段覆盖对应渠道。两地目录一致，各占一节防串区
+    autoclaw: {
+      syncedAt: 0,
+      models: [
+        { id: "glm-5.3", name: "GLM-5.3", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1048576, maxOutputTokens: 307200 },
+        { id: "glm-5.3-flash", name: "GLM-5.3-Flash", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1048576, maxOutputTokens: 131072 },
+      ],
+    },
+    autoclaw_intl: {
+      syncedAt: 0,
+      models: [
+        { id: "glm-5.3", name: "GLM-5.3", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1048576, maxOutputTokens: 307200 },
+        { id: "glm-5.3-flash", name: "GLM-5.3-Flash", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1048576, maxOutputTokens: 131072 },
+      ],
+    },
   },
   // Trae function 字段按模型分发（TraeWorkAssistant models_sync.rs 实证：
   // 部分模型仅在 solo_agent 下可用，其余走 solo_work_lite；未命中默认 solo_work_lite）

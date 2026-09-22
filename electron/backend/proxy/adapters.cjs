@@ -9,6 +9,8 @@ const store = require("./store.cjs");
 const util = require("./util.cjs");
 const raccoonAuth = require("./raccoonAuth.cjs");
 const clineAuth = require("./clineAuth.cjs");
+const acCred = require("./autoclawCredentials.cjs");
+const acPrompt = require("./autoclawPrompt.cjs");
 const aup = require("./protocols/anthropic-up.cjs");
 
 const FIRST_BYTE_MS = 30000; // 首 token 30s 超时判失败。实测成功请求 TTFT P99≈8.7s、最大 20.2s，
@@ -1808,6 +1810,198 @@ function makeCline(pool) {
 const cline_free = makeCline("free");
 const cline_pass = makeCline("pass");
 
+// ===== AutoClaw（智谱，makeAutoClaw(region) 两地区参数化；协议参考 §2） =====
+// 头集合两地逐字相同（参考 region.rs 实测），只换域名；账号 id 前缀 user- / intl-user-。
+const AUTOCLAW_AUTH_APP_ID = "100003";
+const AUTOCLAW_AUTH_APP_KEY = "38d2391985e2369a5fb8227d8e6cd5e5"; // 客户端内嵌指纹
+const AUTOCLAW_REGIONS = {
+  cn: {
+    userapi: "https://autoglm-acceleration-api.zhipuai.cn",
+    upstream: "https://autoglm-acceleration-api.zhipuai.cn/autoclaw-proxy/proxy/autoclaw",
+    catalogUrl: "https://autoglm-acceleration-api.zhipuai.cn/autoclaw-proxy/proxy/autoclaw-model-config", // 目录藏在 /proxy/ 一级，不是对话的 /proxy/autoclaw
+    uidPrefix: "user-",
+  },
+  intl: {
+    userapi: "https://autoglm-api.autoglm.ai",
+    upstream: "https://autoglm-api.autoglm.ai/autoclaw-proxy/proxy/autoclaw",
+    catalogUrl: "https://autoglm-api.autoglm.ai/autoclaw-proxy/proxy/autoclaw-model-config",
+    uidPrefix: "intl-user-",
+  },
+};
+// 静态路由表 = 实际客户端模型选择器当前仅有的两个（协议参考 §2.4；其余条目官方已下架）
+const AUTOCLAW_MODELS = [
+  { id: "glm-5.3", routeId: "zaicoding_glm-5.3", name: "GLM-5.3", contextLength: 1048576, maxOutputTokens: 307200, capabilities: { images: false, reasoning: true, tools: true } },
+  { id: "glm-5.3-flash", routeId: "zai_glm-5.3-flash", name: "GLM-5.3-Flash", contextLength: 1048576, maxOutputTokens: 131072, capabilities: { images: true, reasoning: true, tools: true } },
+];
+const AUTOCLAW_DEFAULT_ROUTE = "zai_auto";
+const AUTOCLAW_ROUTE_RE = /^[a-z][a-z0-9]*_[A-Za-z0-9._:-]{1,127}$/; // 合法路由 id 形态
+
+/** X-Auth-Sign = MD5("{appId}&{秒级时间戳}&{appKey}") 小写 hex（X-Auth-TimeStamp 是秒，别用毫秒） */
+function autoclawSign(ts) {
+  return crypto.createHash("md5").update(`${AUTOCLAW_AUTH_APP_ID}&${ts}&${AUTOCLAW_AUTH_APP_KEY}`).digest("hex");
+}
+
+/** 模型 → 路由 id（协议参考 §2.4 解析顺序）：静态表 → 已带前缀透传 → 合法形态透传 → 兜底 zai_auto */
+function autoclawResolveRoute(model) {
+  const s = String(model || "").trim();
+  const hit = AUTOCLAW_MODELS.find((m) => m.id.toLowerCase() === s.toLowerCase());
+  if (hit) return hit.routeId;
+  if (/^(zai_|zaicoding_)/i.test(s)) return s;
+  if (AUTOCLAW_ROUTE_RE.test(s)) return s;
+  return AUTOCLAW_DEFAULT_ROUTE;
+}
+
+function makeAutoClaw(region) {
+  const cfg = AUTOCLAW_REGIONS[region];
+  const channel = region === "intl" ? "autoclaw_intl" : "autoclaw";
+  return {
+    id: channel,
+    refreshWindowSec: 300, // 临期 5 分钟（对齐官方 DESKTOP_REFRESH_AHEAD_MS，协议参考 §2.3）
+
+    _llmHeaders(token, routeId) {
+      // LLM 域头（协议参考 §2.2 A，逐字）。铁律：认证头是 X-Authorization 不是 Authorization；
+      // 2026-09-22 起 chat 路径禁发 X-Harness-Type: zcode（带上稳定 403 pay-view / 406 空体）
+      return {
+        "content-type": "application/json",
+        accept: "*/*", // 不是 text/event-stream，照抄源实现
+        "x-product": "autoclaw",
+        "x-client-type": "pc",
+        "x-tm": "win", // platformTm：darwin→mac / linux→linux / 其余 win
+        "x-version": "1.17.8", // DESKTOP_APP_VERSION，进兼容路径判定
+        "x-lang": "zh-CN",
+        "x-channel": "official",
+        "x_trace_id": "autoclaw-desktop", // 下划线写法照抄源实现
+        "x-authorization": `Bearer ${token}`,
+        "x-request-id": util.uuid(),
+        "x-request-model": routeId,
+      };
+    },
+
+    _userapiHeaders(token) {
+      // userapi 域头（协议参考 §2.2 B）：保留 X-Harness-Type + 签名头族；authorization 小写、token 空则整条不发
+      const ts = Math.floor(Date.now() / 1000);
+      const h = {
+        "content-type": "application/json",
+        accept: "*/*",
+        "x-product": "autoclaw",
+        "x-client-type": "pc",
+        "x-harness-type": "zcode",
+        "x-tm": "win",
+        "x-lang": "zh-CN",
+        "x-channel": "official",
+        "x-auth-appid": AUTOCLAW_AUTH_APP_ID,
+        "x-auth-timestamp": String(ts),
+        "x-auth-sign": autoclawSign(ts),
+        "x-trace-id": util.uuid(),
+      };
+      if (token) h["authorization"] = `Bearer ${token}`;
+      return h;
+    },
+
+    models() { return AUTOCLAW_MODELS.map((m) => m.id); },
+    modelEntries() { return AUTOCLAW_MODELS.map((m) => ({ client: m.id, upstream: m.id, entry: m })); },
+    upstreamFor(model) { return autoclawResolveRoute(String(model || "").trim()); },
+
+    rewriteBody(model, body) {
+      const out = { ...(body || {}) };
+      const routeId = autoclawResolveRoute(model);
+      const dirHit = AUTOCLAW_MODELS.find((m) => m.routeId === routeId);
+      out.model = dirHit ? dirHit.id : String(model || AUTOCLAW_DEFAULT_ROUTE); // body.model = 剥前缀后的模型 id
+      out.stream = true;
+      if (!out.stream_options || typeof out.stream_options !== "object") out.stream_options = {};
+      out.stream_options.include_usage = true;
+      delete out.conversation_id; delete out.conversationId; delete out.prompt_cache_key;
+      acPrompt.normalizeSystemPrompt(out); // 2026-09-22 白名单闸门（幂等）
+      out._routeId = routeId; // chat 组装时取走放进 X-Request-Model，序列化前 delete
+      return out;
+    },
+
+    async chat({ secrets, model, body, emit }) {
+      const prepared = this.rewriteBody(model, body);
+      const routeId = prepared._routeId || AUTOCLAW_DEFAULT_ROUTE;
+      delete prepared._routeId;
+      const payload = JSON.stringify(prepared);
+      const headers = this._llmHeaders((secrets && secrets.token) || "", routeId);
+      const { resp, cancelTimer } = await fetchStream(`${cfg.upstream}/chat/completions`, { method: "POST", headers, body: payload });
+      const result = { status: 200, planLimit: false };
+      try {
+        await pumpSse(resp, (_event, raw) => {
+          if (raw === "[DONE]") { emit({ type: "finish", reason: "" }); return; }
+          const data = parseJson(raw);
+          if (!data) return;
+          const errObj = data.error || null;
+          if (errObj) {
+            // 401→401 刷新；429→402；其余先过内容拦截三文案再 Fatal 透传（协议参考 §2.6）
+            const msg = String(errObj.message || errObj);
+            const blocked = /blocked by security policy|unapproved channel|illegal api invocation/i.test(msg);
+            const status = Number((errObj && errObj.status) || 0);
+            const s = status === 401 ? 401 : status === 429 ? 402 : blocked ? 502 : (status || 502);
+            if (s === 402) result.planLimit = true;
+            emit({ type: "error", status: s, code: Number(errObj.code) || 0, message: msg.slice(0, 300) });
+            return;
+          }
+          const choice = Array.isArray(data.choices) && data.choices[0];
+          if (choice) {
+            if (choice.delta && Object.keys(choice.delta).length) emit({ type: "delta", delta: choice.delta });
+            if (choice.finish_reason) emit({ type: "finish", reason: choice.finish_reason });
+          }
+          if (data.usage) {
+            emit({ type: "usage", usage: {
+              prompt_tokens: Number(data.usage.prompt_tokens) || 0,
+              completion_tokens: Number(data.usage.completion_tokens) || 0,
+              total_tokens: Number(data.usage.total_tokens) || 0,
+            } });
+          }
+        });
+      } finally { cancelTimer(); }
+      return result;
+    },
+
+    /** 刷新（协议参考 §2.3）：POST {userapi}/userapi/v1/refresh；code 400002 降级 /agent-refresh；
+     *  410000/401 → 401。deviceId：meta.device_id 优先，缺省回落 JWT device_id 声明。
+     *  桌面导入（source=scan）：刷新前重读 auth.json（桌面端重登自动跟上）；成功只更号池行，不回写文件。 */
+    async refreshToken(account, secrets) {
+      let rt = (secrets && secrets.refreshToken) || "";
+      let deviceId = String((account && account.meta && account.meta.device_id) || "");
+      if (!deviceId && secrets && secrets.token) {
+        // util.jwtDecode 返回 {token,uid,exp,payload}，声明在 payload（简报写 .device_id 直取是笔误，按真实接口修正）
+        const claims = util.jwtDecode(secrets.token).payload || {};
+        deviceId = String(claims.device_id || "");
+      }
+      if (account && account.source === "scan") {
+        try {
+          const live = acCred.readAutoClawAuth();
+          if (live && live.refreshToken) rt = live.refreshToken;
+          if (live && live.deviceId && !deviceId) deviceId = live.deviceId;
+        } catch { /* 文件读不了就用号池快照 */ }
+      }
+      if (!rt) return { ok: false, message: "无 refreshToken，请重新粘贴或导入" };
+      const body = JSON.stringify({ refresh_token: rt, source_id: "autoclaw", ...(deviceId ? { device_id: deviceId } : {}) });
+      let r = await httpJson(`${cfg.userapi}/userapi/v1/refresh`, { method: "POST", headers: this._userapiHeaders((secrets && secrets.token) || ""), body })
+        .catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
+      if (r.data && Number(r.data.code) === 400002) {
+        r = await httpJson(`${cfg.userapi}/userapi/v1/agent-refresh`, { method: "POST", headers: this._userapiHeaders((secrets && secrets.token) || ""), body })
+          .catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
+      }
+      const code = Number(r.data && r.data.code);
+      if (code === 410000 || r.status === 401) return { ok: false, expired: true, message: "登录态已过期，请重新登录" };
+      const d = r.data && r.data.data;
+      const token = d && String(d.access_token || "").replace(/^Bearer\s+/i, "");
+      if (!(code === 0 && token)) return { ok: false, message: (r.data && r.data.message) || r.message || `刷新失败 HTTP ${r.status}` };
+      const exp = Number(util.jwtDecode(token).exp) || 0; // 过期按新 token JWT exp 重算（解不出保留 0）
+      return { ok: true, token, refreshToken: String((d && d.refresh_token) || rt), expiresAt: exp > 0 ? exp * 1000 : 0 };
+    },
+
+    /** uid 用地区前缀 + JWT user_id（两地 userId 空间可能撞号，协议参考 §2.8） */
+    async userInfo(token) {
+      const c = util.jwtDecode(token).payload || {}; // 声明在 payload（util.jwtDecode 顶层只有 uid/exp）
+      return { uid: `${cfg.uidPrefix}${String(c.user_id || "")}`, name: String(c.user_name || c.nickname || "AutoClaw 账号") };
+    },
+  };
+}
+const autoclaw = makeAutoClaw("cn");
+const autoclaw_intl = makeAutoClaw("intl");
+
 // ===== 自定义提供商：通用 OpenAI 兼容适配器（按 agents 行动态实例化，一张表行 = 一个上游端点） =====
 
 /** extraBody 深合并：只递归普通对象，数组与标量整体替换。
@@ -2062,9 +2256,9 @@ function compatAdapter(id) {
   return ad;
 }
 
-const ADAPTERS = { trae, workbuddy, workbuddy_ai, raccoon, cline_free, cline_pass };
+const ADAPTERS = { trae, workbuddy, workbuddy_ai, raccoon, cline_free, cline_pass, autoclaw, autoclaw_intl };
 
-/** 渠道 → 适配器：内置 6 家查静态表，未命中再试动态提供商。
+/** 渠道 → 适配器：内置 8 家查静态表，未命中再试动态提供商。
  *  ADAPTERS 本身保持只含内置 —— mergedModels()/modelOwners() 靠这个前提把裸模型名
  *  的归属判定完全留给内置渠道（提供商的模型只以 slug/model 出现），见那里的注释。 */
 function get(channel) {
@@ -2173,4 +2367,7 @@ module.exports = {
   // 测试窥视口（下划线前缀 = 非公共契约）：cline 错误分类的纯函数，dev-cline-test 直测
   _clineErrorStatus: clineErrorStatus,
   _pickClineModels: pickClineModels,
+  // autoclaw 窥视口：签名公式与路由解析纯函数，dev-autoclaw-test 直测
+  _autoclawSign: autoclawSign,
+  _autoclawResolveRoute: autoclawResolveRoute,
 };
