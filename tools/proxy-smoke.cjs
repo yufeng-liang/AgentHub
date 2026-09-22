@@ -17,13 +17,14 @@ async function main() {
   const util = require("../electron/backend/proxy/util.cjs");
   const pool = require("../electron/backend/proxy/pool.cjs");
   const adapters = require("../electron/backend/proxy/adapters.cjs");
+  const qcosy = require("../electron/backend/proxy/qoderCosy.cjs"); // qoder 场景：逆变换还原编码体后与 encodeBody 互拍
   const discovery = require("../electron/backend/proxy/discovery.cjs");
 
   // 1. 数据库 + 种子
   store.open();
   console.log("db driver:", store.driver());
   const builtin = store.listAgents().filter((a) => a.kind === "builtin");
-  assert(builtin.length === store.BUILTIN_CHANNELS.length, "内置渠道种子数 = BUILTIN_CHANNELS 数（4：trae/workbuddy/workbuddy_ai/raccoon）");
+  assert(builtin.length === store.BUILTIN_CHANNELS.length, "内置渠道种子数 = BUILTIN_CHANNELS 数（9：trae/workbuddy/workbuddy_ai/raccoon/cline_free/cline_pass/autoclaw/autoclaw_intl/qoder）");
   assert(store.listProviders().length === 0, "新建库不含自定义提供商：种子只播内置 4 行，提供商一律由用户创建");
   assert(store.channelList().length === store.BUILTIN_CHANNELS.length, "空库的路由视图 = 内置渠道（无提供商可合并）");
 
@@ -238,7 +239,9 @@ async function main() {
 
   // 10. 假上游端到端：换号 / 两种自动切换 / 流式与非流式 / 指纹头完整下发
   const http = require("node:http");
+  // seen.*：各渠道假上游收到的最近请求头；cline* / ac* 额外累积请求体序列（多次尝试需逐次核对）
   const seenHeaders = { trae: null, wb: null };
+  const seen = { clineAuths: [], clineBodies: [], clineRefresh: 0, clineRefreshBody: null, acBodies: [], acIntlBodies: [] };
   const fake = http.createServer((req, res) => {
     const url = req.url || "";
     let reqBody = "";
@@ -285,6 +288,59 @@ async function main() {
           'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"gpt-5","choices":[{"index":0,"delta":{"role":"assistant","content":"WB"},"finish_reason":null}]}\n\n' +
           'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"gpt-5","choices":[{"index":0,"delta":{"content":" ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}\n\n' +
           "data: [DONE]\n\n"
+        );
+        return;
+      }
+      // ===== 新渠道假上游（cline 双池 / autoclaw 双地区 / qoder）：请求经全局 fetch 改写落到本服务 =====
+      if (url.includes("/cline/chat/completions")) {
+        seen.clineAuths.push({ ...req.headers });
+        seen.clineBodies.push(JSON.parse(reqBody));
+        if (String(req.headers.authorization || "").includes("stale-token")) {
+          // 401 语义 = HTTP 状态（协议参考 §1.5 错误体形态：错误在状态码不在 SSE 帧），fetchStream 抛出后走刷新重试链
+          res.writeHead(401, { "content-type": "application/json" });
+          res.end('{"error":"Unauthorized: Please make sure you\'re using the latest version of Cline and re-authenticate your Cline account."}');
+          return;
+        }
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end(
+          'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"deepseek/deepseek-v4.1-flash","choices":[{"index":0,"delta":{"role":"assistant","content":"Cline"},"finish_reason":null}]}\n\n' +
+          'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"deepseek/deepseek-v4.1-flash","choices":[{"index":0,"delta":{"content":" ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}\n\n' +
+          "data: [DONE]\n\n"
+        );
+        return;
+      }
+      if (url.includes("/cline/auth/refresh")) {
+        seen.clineRefresh++;
+        seen.clineRefreshBody = JSON.parse(reqBody);
+        res.writeHead(200, { "content-type": "application/json" });
+        // 响应形态照协议参考 §1.3：accessToken 裸 JWT 形态（不带 workos: 前缀）、expiresAt ISO 字符串
+        res.end(JSON.stringify({ data: { accessToken: "fresh-token", refreshToken: "rt-new", expiresAt: "2030-01-01T00:00:00Z", tokenType: "Bearer" }, success: true }));
+        return;
+      }
+      if (url.includes("/autoclaw/chat/completions") || url.includes("/autoclaw_intl/chat/completions")) {
+        const intl = url.includes("/autoclaw_intl/");
+        if (intl) { seenHeaders.acIntl = req.headers; seen.acIntlBodies.push(JSON.parse(reqBody)); }
+        else { seenHeaders.ac = req.headers; seen.acBodies.push(JSON.parse(reqBody)); }
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end(
+          'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"glm-5.3","choices":[{"index":0,"delta":{"role":"assistant","content":"AC"},"finish_reason":null}]}\n\n' +
+          'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"glm-5.3","choices":[{"index":0,"delta":{"content":" ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}\n\n' +
+          "data: [DONE]\n\n"
+        );
+        return;
+      }
+      if (url.includes("/qoder/") && url.includes("agent_chat_generation")) {
+        seenHeaders.qd = req.headers;
+        seen.qdRawBody = reqBody;
+        // 双层信封 SSE（协议参考 §3.5）：外层 {statusCodeValue:200, body:<内层 JSON 字符串>}，终帧 body 直接是 "[DONE]"。
+        // body 对对象取 JSON 字符串、对字符串原样（否则 [DONE] 会被再包一层引号，适配器的 done 判定永不命中）。
+        // 内容给足 8 字符以上：TagSplitter 留 8 字符防标签半截，短内容会全部滞留到流末 flush，测不到增量出线
+        const qFrame = (inner) => "data: " + JSON.stringify({ statusCodeValue: 200, body: typeof inner === "string" ? inner : JSON.stringify(inner) }) + "\n\n";
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end(
+          qFrame({ choices: [{ index: 0, delta: { role: "assistant", content: "Qoder says hi" } }] }) +
+          qFrame({ choices: [{ index: 0, delta: { content: " ok" }, finish_reason: "stop" }], usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 } }) +
+          qFrame("[DONE]")
         );
         return;
       }
@@ -443,6 +499,131 @@ async function main() {
   assert(JSON.parse(fs.readFileSync(sw.backup, "utf8")).accessToken === "old-token", "备份是旧凭据（可回滚）");
   const swTrae = ideswitch.switchIdeAccount(goodTrae);
   assert(!swTrae.ok && /加密信封/.test(swTrae.message), "Trae 诚实降级提示");
+
+  // ===== 11. 新渠道假上游全链路（cline 双池 / autoclaw 双地区 / qoder）=====
+  // 三家适配器的上游域是 URL 常量（不像 trae/wb 可经 headers.json 注入），与既有场景同一手段的等价替代：
+  // 改写 globalThis.fetch 把上游域改指本地假服务（dev-cline-test 的假 fetch 夹具同款手法），127.0.0.1 直连不受影响
+  const realFetch = globalThis.fetch;
+  const FAKE_HOSTS = {
+    "api.cline.bot": "cline", // chat/auth/refresh 同域，路径原样保留
+    "autoglm-acceleration-api.zhipuai.cn": "autoclaw",
+    "autoglm-api.autoglm.ai": "autoclaw_intl",
+    "api3.qoder.sh": "qoder",
+  };
+  globalThis.fetch = (url, opts) => {
+    const u = new URL(String(url));
+    const seg = FAKE_HOSTS[u.hostname];
+    if (!seg) return realFetch(url, opts);
+    // 取末两级路径做假上游端点名（cline: chat/completions 与 auth/refresh；其余上游单端点）
+    const tail = u.pathname.split("/").filter(Boolean).slice(-2).join("/");
+    return realFetch(`http://127.0.0.1:19530/${seg}/${tail}${u.search}`, opts);
+  };
+
+  // 五渠道各一个号（credit 默认 0 但 creditsAt=0 不参与耗尽判定，池内直接可选）
+  const clineAcc = store.addAccount({ channel: "cline_free", uid: "uc1", name: "Cline旧号", token: "stale-token", refreshToken: "rt-1", source: "paste", expiresAt: Date.now() + 86400000 });
+  const clinePassAcc = store.addAccount({ channel: "cline_pass", uid: "up1", name: "Cline订阅号", token: "pass-token", refreshToken: "prt-1", source: "paste", expiresAt: Date.now() + 86400000 });
+  const acAcc = store.addAccount({ channel: "autoclaw", uid: "user-ac1", name: "AC国内号", token: "ac-cn-token", source: "paste", expiresAt: Date.now() + 86400000 });
+  const acIntlAcc = store.addAccount({ channel: "autoclaw_intl", uid: "intl-user-ac2", name: "AC国际号", token: "ac-intl-token", source: "paste", expiresAt: Date.now() + 86400000 });
+  const qdAcc = store.addAccount({ channel: "qoder", uid: "uq1", name: "Qoder号", token: "qd-token", source: "paste", expiresAt: Date.now() + 86400000 });
+  // route 定向 Key：resolveChannel 对非 auto 路由直接返回 Key 的渠道（glm-5.3 系多渠道共有，靠 Key 钉死目标渠道）
+  const kCline = store.createKey({ name: "自测-cline", route: "cline_free" });
+  const kClinePass = store.createKey({ name: "自测-cline-pass", route: "cline_pass" });
+  const kAc = store.createKey({ name: "自测-autoclaw", route: "autoclaw" });
+  const kAcIntl = store.createKey({ name: "自测-autoclaw-intl", route: "autoclaw_intl" });
+  const kQd = store.createKey({ name: "自测-qoder", route: "qoder" });
+  const callAs = (secret, payload) =>
+    fetch(base2 + "/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer " + secret },
+      body: JSON.stringify(payload),
+    });
+
+  // 11.1 cline：401 → 调度触发 refreshToken 一次 → 同账号重试（新 token）拿正文
+  rr = await callAs(kCline.secret, { model: "cline-free/deepseek-v4.1-flash", stream: true, messages: [{ role: "user", content: "hi" }] });
+  assert(rr.status === 200, "cline 刷新重试后流式 200: " + rr.status);
+  const clineText = await rr.text();
+  assert(clineText.includes('"content":"Cline"') && clineText.includes('"content":" ok"') && clineText.includes("data: [DONE]"), "cline 刷新后正文出线: " + clineText.slice(0, 120));
+  assert(clineText.includes('"total_tokens":6'), "cline usage 透传");
+  assert(seen.clineRefresh === 1, "401 触发 refreshToken 恰一次: " + seen.clineRefresh);
+  assert(seen.clineAuths.length === 2, "401 前后同账号共两次 chat: " + seen.clineAuths.length);
+  assert(seen.clineAuths[0].authorization === "Bearer workos:stale-token", "首次请求带 workos: 前缀旧 token");
+  assert(seen.clineAuths[1].authorization === "Bearer workos:fresh-token", "重试请求已换新 token");
+  assert(seen.clineAuths[0]["x-client-type"] === "cline-sdk", "X-CLIENT-TYPE: cline-sdk（免费池 403 红线）");
+  assert(seen.clineBodies.every((b) => b.model === "cline-free/deepseek-v4.1-flash"), "model 带池前缀原样发上游");
+  assert(seen.clineRefreshBody.grantType === "refresh_token" && seen.clineRefreshBody.refreshToken === "rt-1", "刷新体 camelCase grantType + 旧 refreshToken");
+  const clineSec = store.accountSecrets(store.getAccount(clineAcc));
+  assert(clineSec.token === "workos:fresh-token" && clineSec.refreshToken === "rt-new", "刷新凭据写回号池");
+  assert(store.getAccount(clineAcc).status === "online", "刷新成功账号保持 online（不误判 relogin）");
+  const clineRow = store.recentRequests(1)[0];
+  assert(clineRow.status === 200 && clineRow.channel === "cline_free" && clineRow.accountName === "Cline旧号", "cline 请求记账");
+
+  // 11.2 cline_pass：pass 池前缀透传 + 非流式本地聚合（makeCline 参数化的第二池走同一链路）
+  rr = await callAs(kClinePass.secret, { model: "cline-pass/kimi-k3", stream: false, messages: [{ role: "user", content: "hi" }] });
+  const cpBody = await rr.json();
+  assert(rr.status === 200 && cpBody.choices[0].message.content === "Cline ok", "cline_pass 非流式聚合");
+  assert(cpBody.usage.total_tokens === 6, "cline_pass usage");
+  assert(seen.clineBodies[seen.clineBodies.length - 1].model === "cline-pass/kimi-k3", "pass 池前缀原样");
+
+  // 11.3 autoclaw（CN）：头红线 + system 白名单改写 + SSE 出线
+  rr = await callAs(kAc.secret, { model: "glm-5.3", stream: true, messages: [{ role: "user", content: "hi" }] });
+  assert(rr.status === 200, "autoclaw 流式 200: " + rr.status);
+  const acText = await rr.text();
+  assert(acText.includes('"content":"AC"') && acText.includes('"content":" ok"') && acText.includes("data: [DONE]"), "autoclaw 正文出线: " + acText.slice(0, 120));
+  assert(acText.includes('"total_tokens":5'), "autoclaw usage 透传");
+  assert(seenHeaders.ac && !("x-harness-type" in seenHeaders.ac), "chat 路径禁发 X-Harness-Type（2026-09-22 起 403 红线）");
+  assert(seenHeaders.ac["x-authorization"] === "Bearer ac-cn-token", "认证头是 X-Authorization（非 Authorization）");
+  assert(!("authorization" in seenHeaders.ac), "LLM 域不带 Authorization（防双头）");
+  assert(seenHeaders.ac["x-request-model"] === "zaicoding_glm-5.3", "X-Request-Model 带完整路由 ID");
+  const acBody = seen.acBodies[seen.acBodies.length - 1];
+  assert(acBody.model === "glm-5.3", "body.model 已剥前缀（路由 id 不进 body）");
+  assert(acBody.messages[0].role === "system" && acBody.messages[0].content.startsWith("You are a personal assistant running inside OpenClaw."), "首条 system 以 OpenClaw 身份句开头");
+  assert(acBody.stream === true && acBody.stream_options.include_usage === true, "autoclaw 强制流式+include_usage");
+
+  // 11.4 autoclaw_intl：地区域名路由 + intl 路由 id（makeAutoClaw(region) 参数化的第二地区）
+  rr = await callAs(kAcIntl.secret, { model: "glm-5.3-flash", stream: false, messages: [{ role: "user", content: "hi" }] });
+  const aiBody = await rr.json();
+  assert(rr.status === 200 && aiBody.choices[0].message.content === "AC ok", "autoclaw_intl 非流式聚合");
+  assert(seenHeaders.acIntl && seenHeaders.acIntl["x-authorization"] === "Bearer ac-intl-token", "intl 请求走 intl 域（fetch 改写按 host 分流命中）");
+  assert(seenHeaders.acIntl["x-request-model"] === "zai_glm-5.3-flash", "intl 侧 flash 路由 id");
+  assert(!("x-harness-type" in seenHeaders.acIntl), "intl 同样禁发 X-Harness-Type");
+
+  // 11.5 qoder：COSY 头 + 编码体逆变换还原信封 + 双层信封 SSE 出线
+  rr = await callAs(kQd.secret, { model: "Qwen3.8-Flash", stream: true, messages: [{ role: "user", content: "hi" }] });
+  assert(rr.status === 200, "qoder 流式 200: " + rr.status);
+  const qdText = await rr.text();
+  assert(qdText.includes('"content":"Qoder"') && qdText.includes("data: [DONE]") && !qdText.includes("upstream_error"), "qoder 双层信封解包正文出线: " + qdText.slice(0, 160));
+  assert(qdText.includes('"total_tokens":5'), "qoder usage 透传");
+  // 非流式聚合：全量正文（含流末 flush 的尾段）拼装完整，证明标签状态机 flush 不丢字
+  rr = await callAs(kQd.secret, { model: "Qwen3.8-Flash", stream: false, messages: [{ role: "user", content: "hi" }] });
+  const qdBody = await rr.json();
+  assert(rr.status === 200 && qdBody.choices[0].message.content === "Qoder says hi ok", "qoder 非流式聚合（含 flush 尾段）: " + JSON.stringify(qdBody.choices[0] && qdBody.choices[0].message));
+  assert(/^Bearer COSY\.[A-Za-z0-9+/=]+\.[0-9a-f]{32}$/.test(String(seenHeaders.qd.authorization)), "authorization 是 Bearer COSY.x.y 三段式");
+  assert(seenHeaders.qd["cosy-sigpath"] === "/api/v2/service/pro/sse/agent_chat_generation", "cosy-sigpath 去 /algo 前缀");
+  // 逆变换（encodeBody 三步各自的逆）：'$'→'='、CUSTOM 字母表反查、三段旋转还原（头尾互换的旋转是自逆变换）
+  const qSTD = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const qCUS = "_doRTgHZBKcGVjlvpC,@aFSx#DPuNJme&i*MzLOEn)sUrthbf%Y^w.(kIQyXqWA!";
+  const qRaw = seen.qdRawBody;
+  let qB64 = "";
+  for (const ch of qRaw) {
+    if (ch === "$") { qB64 += "="; continue; }
+    const i = qCUS.indexOf(ch);
+    qB64 += i >= 0 ? qSTD[i] : ch;
+  }
+  const qn = qB64.length, qThird = Math.floor(qn / 3);
+  const decoded = Buffer.from(qB64.slice(qn - qThird) + qB64.slice(qThird, qn - qThird) + qB64.slice(0, qThird), "base64");
+  assert(qcosy.encodeBody(decoded).toString("latin1") === qRaw, "逆变换与 encodeBody 互拍（往返一致）");
+  const qEnv = JSON.parse(decoded.toString("utf8"));
+  assert(qEnv.stream === true && Array.isArray(qEnv.messages) && qEnv.session_id && qEnv.request_id, "还原出合法固定业务信封");
+  assert(qEnv.chat_context.text === "hi" && qEnv.messages.some((m) => m.role === "user" && m.content === "hi"), "信封 messages/chat_context 携带用户文本");
+  // 集成回归（T14 发现的 _key/key 错位 bug）：chat 必须把目录条目的上游 key 带进信封与头，而不是 "undefined"
+  assert(qEnv.model_config.key === "qfmodel", "信封 model_config.key 是上游 key 而非 undefined: " + qEnv.model_config.key);
+  assert(seenHeaders.qd["x-model-key"] === "qfmodel", "x-model-key 是上游 key 而非 undefined: " + seenHeaders.qd["x-model-key"]);
+
+  // 收尾：还原 fetch、清理新渠道数据
+  globalThis.fetch = realFetch;
+  for (const kk of [kCline, kClinePass, kAc, kAcIntl, kQd]) store.deleteKey(kk.id);
+  for (const aa of [clineAcc, clinePassAcc, acAcc, acIntlAcc, qdAcc]) store.removeAccount(aa);
+  console.log("new-provider e2e ok（cline 刷新重试双池 / autoclaw 双地区 / qoder COSY 信封）");
 
   // 收尾：恢复规则文件，关掉假服务
   fs.writeFileSync(headersPath, headersBackup);
