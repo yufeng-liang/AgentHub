@@ -8,6 +8,7 @@ const rules = require("./rules.cjs");
 const store = require("./store.cjs");
 const util = require("./util.cjs");
 const raccoonAuth = require("./raccoonAuth.cjs");
+const clineAuth = require("./clineAuth.cjs");
 const aup = require("./protocols/anthropic-up.cjs");
 
 const FIRST_BYTE_MS = 30000; // 首 token 30s 超时判失败。实测成功请求 TTFT P99≈8.7s、最大 20.2s，
@@ -1655,6 +1656,130 @@ const raccoon = {
   },
 };
 
+// ===== Cline（cline-free / cline-pass 同账号两额度池，makeCline(pool) 参数化；协议参考 §1） =====
+const CLINE_BASE = "https://api.cline.bot/api/v1"; // 只有单层 v1：拼成 /api/v1/v1/... 实测 404，别再补
+const CLINE_HEADERS_BASE = {
+  "content-type": "application/json",
+  accept: "text/event-stream",
+  "x-client-type": "cline-sdk", // 关键：缺它免费池全 403 "only available via Cline product surfaces"；cline-cli 走兼容路径回 500，禁用
+  "user-agent": "Cline/3.0.62",
+  "x-client-version": "3.0.62",
+  "http-referer": "https://cline.bot",
+  "x-title": "Cline",
+};
+
+/** cline 错误 → AgentHub 语义。403 刻意不当限额：ENTITLEMENT/API_REQUEST 是「账号×模型」
+ *  维度的确定性拒绝，换号同样 403，冷却只会把确定失败变成静默跳过——透传让用户看到
+ *  「该订阅/换模型」（协议参考 §1.6）。429→402 走既有「切号+planLimit」链路。 */
+function clineErrorStatus(status, errObj) {
+  if (status === 401) return 401;
+  if (status === 429) return 402;
+  if (status === 403 || status === 404) return status;
+  return 502;
+}
+
+function makeCline(pool) {
+  const channel = pool === "pass" ? "cline_pass" : "cline_free";
+  return {
+    id: channel,
+    refreshWindowSec: 600, // accessToken 1h、临期 10min 主动刷（协议参考 §1.3；语义同 raccoon.refreshWindowSec）
+
+    headers(secrets) {
+      return { ...CLINE_HEADERS_BASE, authorization: `Bearer ${clineAuth.ensureTokenPrefix(secrets && secrets.token)}` };
+    },
+
+    // 目录 id 本身带池前缀（cline-free/xxx），两池天然不重名，mergedModels/modelOwners 零特判
+    models() {
+      return unionIds([...catalogMap(channel).values()].map((m) => String(m.id)), []);
+    },
+    modelEntries() { return [...catalogMap(channel).values()].map((m) => ({ client: String(m.id), upstream: String(m.id), entry: m })); },
+
+    /** 客户端名 → 上游名：带前缀原样（前缀是计费通道选择器，剥掉 404）；裸名补本池前缀 */
+    upstreamFor(clientModel) {
+      const s = String(clientModel || "");
+      return s.startsWith("cline-free/") || s.startsWith("cline-pass/") ? s : `${pool === "pass" ? "cline-pass/" : "cline-free/"}${s}`;
+    },
+
+    rewriteBody(model, body) {
+      const out = { ...(body || {}) };
+      out.model = this.upstreamFor(model);
+      out.stream = true;
+      if (!out.stream_options || typeof out.stream_options !== "object") out.stream_options = {};
+      out.stream_options.include_usage = true;
+      delete out.conversation_id; delete out.conversationId; delete out.prompt_cache_key;
+      return out; // 其余字段完全透传（协议参考 §1.4：上游是标准 OpenAI body）
+    },
+
+    async chat({ secrets, model, body, emit }) {
+      const payload = JSON.stringify(this.rewriteBody(model, body));
+      const { resp, cancelTimer } = await fetchStream(`${CLINE_BASE}/chat/completions`, { method: "POST", headers: this.headers(secrets), body: payload });
+      const result = { status: 200, planLimit: false };
+      try {
+        // stream:true 恒回裸 chat.completion.chunk；上游错误可能以 {"error":"..."} 或 {"error":{...}} 出现（协议参考 §1.5）
+        await pumpSse(resp, (_event, raw) => {
+          if (raw === "[DONE]") { emit({ type: "finish", reason: "" }); return; }
+          const data = parseJson(raw);
+          if (!data) return;
+          if (data.error) {
+            const isObj = typeof data.error === "object" && data.error !== null;
+            const status = clineErrorStatus(Number((isObj && data.error.status) || 0), data.error);
+            if (status === 402) result.planLimit = true;
+            const msg = isObj ? String(data.error.message || "上游错误") : String(data.error);
+            emit({ type: "error", status: status || 502, code: 0, message: msg });
+            return;
+          }
+          const choice = Array.isArray(data.choices) && data.choices[0];
+          if (choice) {
+            if (choice.delta && Object.keys(choice.delta).length) emit({ type: "delta", delta: choice.delta });
+            if (choice.finish_reason) emit({ type: "finish", reason: choice.finish_reason });
+          }
+          if (data.usage) {
+            emit({ type: "usage", usage: {
+              prompt_tokens: Number(data.usage.prompt_tokens) || 0,
+              completion_tokens: Number(data.usage.completion_tokens) || 0,
+              total_tokens: Number(data.usage.total_tokens) || 0,
+            } });
+          }
+        });
+      } finally { cancelTimer(); }
+      return result;
+    },
+
+    /** 刷新（协议参考 §1.3）：grantType 是 camelCase（源实现 @cline/core 就发这个键名，别改 snake_case）。
+     *  刷新前重读桌面端文件取最新 refresh_token（桌面端可能刚刷过并旋转）；成功不回写文件（防互相顶掉）。 */
+    async refreshToken(account, secrets) {
+      let rt = (secrets && secrets.refreshToken) || "";
+      if (account && account.source === "scan") {
+        const live = clineAuth.readClineDesktopAuth();
+        if (live && live.refreshToken && (!account.uid || clineAuth.clineUid(live.token) === account.uid)) rt = live.refreshToken;
+      }
+      if (!rt) return { ok: false, message: "无 refreshToken，请重新登录或粘贴" };
+      const r = await httpJson(`${CLINE_BASE}/auth/refresh`, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({ refreshToken: rt, grantType: "refresh_token" }),
+      }).catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
+      if (r.status === 401 || r.status === 403) return { ok: false, expired: true, message: "登录态已过期，请重新登录" };
+      const d = (r.data && (r.data.data || r.data)) || null;
+      const token = d && d.accessToken;
+      if (!r.ok || !token) {
+        const msg = (r.data && r.data.error && (r.data.error.message || r.data.error)) || r.message || `刷新失败 HTTP ${r.status}`;
+        return { ok: false, message: String(msg).slice(0, 200) };
+      }
+      // 响应的 accessToken 不带 workos: 前缀，统一补；refreshToken 缺失沿用旧值（协议参考 §1.3 三个实测口径）
+      return { ok: true, token: clineAuth.ensureTokenPrefix(token), refreshToken: String(d.refreshToken || rt), expiresAt: clineAuth.clineExpiresAt(d.expiresAt, clineAuth.jwtClaims(token)) };
+    },
+
+    /** uid/昵称本地解码兜底（不依赖网络；余额/订阅查询 v1 不做，见 spec §九） */
+    async userInfo(token) {
+      const c = clineAuth.jwtClaims(token);
+      return { uid: String(c.external_id || ""), name: clineAuth.clineDisplayName(c, c.email) };
+    },
+  };
+}
+const cline_free = makeCline("free");
+const cline_pass = makeCline("pass");
+
 // ===== 自定义提供商：通用 OpenAI 兼容适配器（按 agents 行动态实例化，一张表行 = 一个上游端点） =====
 
 /** extraBody 深合并：只递归普通对象，数组与标量整体替换。
@@ -1909,9 +2034,9 @@ function compatAdapter(id) {
   return ad;
 }
 
-const ADAPTERS = { trae, workbuddy, workbuddy_ai, raccoon };
+const ADAPTERS = { trae, workbuddy, workbuddy_ai, raccoon, cline_free, cline_pass };
 
-/** 渠道 → 适配器：内置 4 家查静态表，未命中再试动态提供商。
+/** 渠道 → 适配器：内置 6 家查静态表，未命中再试动态提供商。
  *  ADAPTERS 本身保持只含内置 —— mergedModels()/modelOwners() 靠这个前提把裸模型名
  *  的归属判定完全留给内置渠道（提供商的模型只以 slug/model 出现），见那里的注释。 */
 function get(channel) {
@@ -2017,4 +2142,6 @@ module.exports = {
   refreshTokenLocked,
   // 提供商管理面要拿一份「尚未落库的表单值」建临时适配器做连通性探测，故导出工厂本身
   makeOpenaiCompat,
+  // 测试窥视口（下划线前缀 = 非公共契约）：cline 错误分类的纯函数，dev-cline-test 直测
+  _clineErrorStatus: clineErrorStatus,
 };

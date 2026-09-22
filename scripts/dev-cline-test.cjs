@@ -27,7 +27,7 @@ console.log("clineExpiresAt:");
 ok("ISO 字符串", clineAuth.clineExpiresAt("2030-01-01T00:00:00Z", {}) === Date.parse("2030-01-01T00:00:00Z"));
 ok("毫秒数字", clineAuth.clineExpiresAt(1893456000000, {}) === 1893456000000);
 const expTok = mkJwt({ exp: 1893456000 });
-ok("JWT exp 秒→毫秒", clineAuth.clineExpiresAt(undefined, JSON.parse(Buffer.from(expTok.replace("workos:","").split(".")[1], "base64url").toString())) > 0 || true);
+ok("JWT exp 秒→毫秒", clineAuth.clineExpiresAt(undefined, JSON.parse(Buffer.from(expTok.replace("workos:","").split(".")[1], "base64url").toString())) === 1893456000000, clineAuth.clineExpiresAt(undefined, JSON.parse(Buffer.from(expTok.replace("workos:","").split(".")[1], "base64url").toString())));
 ok("解不出为 0", clineAuth.clineExpiresAt(undefined, {}) === 0);
 
 console.log("readClineDesktopAuth:");
@@ -47,6 +47,27 @@ os.homedir = realHome;
 ok("读到 token 且带前缀", !!cred && cred.token === "workos:eyJh.eyJi.c", cred);
 ok("displayName 中文姓在前", !!cred && cred.displayName === "张三", cred && cred.displayName);
 ok("未安装返回 null", (() => { const h = os.homedir; os.homedir = () => path.join(fakeHome, "empty"); const r = clineAuth.readClineDesktopAuth(); os.homedir = h; return r === null; })());
+
+console.log("cline 适配器:");
+const adapters = require("../electron/backend/proxy/adapters.cjs");
+const free = adapters.get("cline_free"), passAd = adapters.get("cline_pass");
+ok("两池都已注册", !!free && !!passAd);
+ok("裸名补 free 前缀", free.upstreamFor("deepseek-v4.1-flash") === "cline-free/deepseek-v4.1-flash");
+ok("已带 pass 前缀原样", passAd.upstreamFor("cline-pass/kimi-k3") === "cline-pass/kimi-k3");
+ok("headers 带 X-CLIENT-TYPE: cline-sdk", free.headers({ token: "eyJh" })["x-client-type"] === "cline-sdk");
+ok("headers 带 workos: 前缀 Bearer", free.headers({ token: "eyJh" }).authorization === "Bearer workos:eyJh");
+ok("rewriteBody 强制流式+剥内部字段", (() => {
+  const b = free.rewriteBody("cline-free/deepseek-v4.1-flash", { model: "x", stream: false, conversation_id: "1", messages: [] });
+  return b.stream === true && b.stream_options.include_usage === true && b.conversation_id === undefined && b.model === "cline-free/deepseek-v4.1-flash";
+})());
+
+console.log("cline 错误分类:");
+const E = (s, errObj) => adapters._clineErrorStatus(s, errObj || {});
+ok("401→401 刷新", E(401) === 401);
+ok("429→402 换号", E(429) === 402);
+ok("403 原样透传（ENTITLEMENT 是确定性拒绝，不冷却）", E(403, { error: { code: "ENTITLEMENT_ERROR", message: "not subscribed" } }) === 403);
+ok("404 原样透传", E(404) === 404);
+ok("500→502", E(500) === 502);
 
 console.log(`\n${pass} 通过, ${fail} 失败`);
 process.exit(fail ? 1 : 0);
