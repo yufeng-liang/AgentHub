@@ -392,7 +392,17 @@ const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
-  app.on("second-instance", () => showWindow());
+  // 规格二期认领（Task 9 项 2）：second-instance 此前忽略 argv——「--gateway-start 这类从托盘/
+  // 命令行拉起网关的入口」需要它。决定：本期只补 argv 解析与一条留痕日志，不加新入口——现在的
+  // 网关认领不需要 argv，而新入口涉及命令行 → 网关生命周期的编排，归后续产品决策（简报原文）。
+  app.on("second-instance", (_event, argv) => {
+    const { flags, hasStart } = gatewayClient.parseGatewayArgv(argv);
+    if (flags.length) {
+      console.log(`[second-instance] 网关相关参数 ${flags.join(" ")}`
+        + (hasStart ? "（--gateway-start 已识别；入口编排本期未接，仅留痕）" : ""));
+    }
+    showWindow();
+  });
 
   app.whenReady().then(() => {
     const boot = config.loadConfig();

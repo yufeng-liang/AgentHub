@@ -498,7 +498,20 @@ function register(ipcMain) {
   }
 }
 
+/**
+ * second-instance argv 解析（Task 9 项 2）：从二次拉起实例的命令行里认出网关相关参数。
+ * 现在的网关认领不需要 argv，但 --gateway-start 这类「从托盘/命令行拉起网关」的入口将来需要；
+ * 本期只定契约（纯函数 + 留痕），不接入口编排。放在这里而不是 main.cjs：
+ * main 顶部 require("electron")，纯 Node 自测进不去，两边共用一份实现才不会漂移。
+ */
+function parseGatewayArgv(argv) {
+  const flags = (Array.isArray(argv) ? argv : [])
+    .filter((a) => typeof a === "string" && /^--gateway/i.test(a));
+  return { flags, hasStart: flags.some((f) => f.toLowerCase() === "--gateway-start") };
+}
+
 module.exports = {
   start, stopAndWait, state, call, onEvent, register, ensureStarted,
   gatewayFile, gatewayScriptPath, readGatewayFile, probeAlive, probeResidentGateway, probePortBusy,
+  parseGatewayArgv,
 };

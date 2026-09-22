@@ -148,6 +148,25 @@ async function case1p4() {
   }
 }
 
+// ===== ①-B second-instance argv 解析契约（Task 9 项 2）=====
+// 规格二期认领：二次拉起实例的命令行此前被忽略——「--gateway-start 这类从托盘/命令行拉起
+// 网关的入口」需要它。本期只定解析契约（纯函数）+ 一条留痕日志，不加入口（入口编排归产品决策）。
+// main.cjs 顶部 require("electron")，纯 Node 测试进不去，解析函数必须住在可 require 的
+// gateway-client 里，main.cjs 与本闸共用同一份实现，防两处漂移。
+async function case1b() {
+  const parse = gatewayClient.parseGatewayArgv;
+  assert.strictEqual(typeof parse, "function",
+    "gateway-client 必须导出纯函数 parseGatewayArgv（second-instance 与本闸共用一份解析）");
+  assert.deepStrictEqual(parse(["AgentHub.exe", "--gateway-start", "--hidden"]),
+    { flags: ["--gateway-start"], hasStart: true }, "--gateway-start 必须被认出且 hasStart 置位");
+  assert.deepStrictEqual(parse(["AgentHub.exe", "--other"]),
+    { flags: [], hasStart: false }, "无关参数不得误报");
+  assert.deepStrictEqual(parse(["--GATEWAY-START"]),
+    { flags: ["--GATEWAY-START"], hasStart: true }, "大小写不敏感（Windows 命令行习惯）");
+  assert.deepStrictEqual(parse(undefined), { flags: [], hasStart: false },
+    "argv 缺省（老事件签名/畸形调用）必须安全返回空");
+}
+
 // ===== ② 便携版拒常驻：ok:true + persistent:false + 人话 message，不 spawn、不落 Run 项 =====
 async function case2() {
   process.env.PORTABLE_EXECUTABLE_DIR = work;               // isPortable() 判真（config.cjs 主进程侧那份）
@@ -199,6 +218,7 @@ async function case4() {
 (async () => {
   await runCase("① 启动器内容 + package.json extraFiles 接线（extraResources 一字未动）", case1);
   await runCase("①-P4 守门：--persistent 且 stdin 永不关闭 → gateway.json 8s 内出现且 pipe 可连通", case1p4);
+  await runCase("①-B second-instance argv 解析契约（--gateway-start 识别，本期只解析留痕不动作）", case1b);
   await runCase("② 便携版拒常驻：契约返回 + 不 spawn + 不落 Run 项", case2);
   await runCase("③ applyAutoStart 目标切换：off → 主 App exe，on → agenthub-gateway.cmd", case3);
   await runCase("④ 收尾：HKCU Run 项原样", case4);
