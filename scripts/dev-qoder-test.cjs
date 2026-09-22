@@ -111,6 +111,24 @@ ok("qoder 已注册", !!qAd);
 ok("地区解析：meta.mode=cn → cn", qAd._regionOf({ meta: { mode: "cn" } }) === "cn" && qAd._regionOf({ meta: { mode: "intl" } }) === "global" && qAd._regionOf({}) === "global");
 ok("目录两区并集且 global 优先", qAd.models().includes("Qwen3.8-Flash") && qAd.models().includes("MiniMax-M3"));
 ok("upstreamFor 查 upstreamKey", qAd.upstreamFor("Qwen3.8-Flash") === "qfmodel" && qAd.upstreamFor("Auto") === "auto");
+// 集成回归（smoke 发现的 _key/key 错位）：modelEntries 产物的上游 key 在 _key，chat 消费面读 key——
+// _resolveEntry 归一化后两者必须相等，否则 x-model-key / model_config.key 会发 "undefined"
+ok("_resolveEntry 产物补 key（chat 消费面）", qAd._resolveEntry("Qwen3.8-Flash").key === "qfmodel" && qAd._resolveEntry("Auto").key === "auto");
+
+// catalog 同步分支（评审发现）：fetchModels 写回的 _key/_efforts 必须保留、不被展示 id 覆盖；DEFAULTS 条目无 _key 回落展示 id
+const rules = require("../electron/backend/proxy/rules.cjs");
+const catPath = path.join(rules.rulesDir(), "catalog.json");
+rules.init(); // dev 环境无人调 init，ensureFiles 不会落盘——先落 DEFAULTS 再改夹具
+const cat0 = JSON.parse(fs.readFileSync(catPath, "utf8"));
+cat0.qoder.models.push(
+  { id: "SyncedModel", name: "SyncedModel", rate: 1, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0, _key: "synced-upstream-key", _efforts: ["low", "xhigh"] },
+  { id: "DefaultsOnly", name: "DefaultsOnly", rate: 1, capabilities: { images: false, reasoning: false, tools: true }, contextLength: 200000, maxOutputTokens: 0 }
+);
+fs.writeFileSync(catPath, JSON.stringify(cat0));
+rules.reload("catalog.json");
+ok("catalog 同步 _key 保留（upstreamFor）", qAd.upstreamFor("SyncedModel") === "synced-upstream-key");
+ok("catalog 同步 _key 保留（chat 消费面）", qAd._resolveEntry("SyncedModel").key === "synced-upstream-key" && JSON.stringify(qAd._resolveEntry("SyncedModel")._efforts) === JSON.stringify(["low", "xhigh"]));
+ok("目录条目无 _key 回落展示 id", qAd.upstreamFor("DefaultsOnly") === "DefaultsOnly" && qAd._resolveEntry("DefaultsOnly").key === "DefaultsOnly");
 ok("refreshToken 3 段打包串走 center 刷新路径", typeof qAd.refreshToken === "function");
 
 console.log(`\n${pass} 通过, ${fail} 失败`);

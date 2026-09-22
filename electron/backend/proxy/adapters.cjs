@@ -2217,7 +2217,9 @@ function makeQoder() {
         }
       }
       for (const m of catalogMap("qoder").values()) {
-        if (!seen.has(String(m.id).toLowerCase())) seen.set(String(m.id).toLowerCase(), { client: String(m.id), upstream: String(m.id), entry: { ...m, _key: String(m.id), _efforts: [] } });
+        // fetchModels 写回的 _key/_efforts 是上游真实值，必须保留（覆盖成展示 id 会 400）；DEFAULTS 条目无 _key，回落展示 id
+        const upKey = String(m._key || m.id);
+        if (!seen.has(String(m.id).toLowerCase())) seen.set(String(m.id).toLowerCase(), { client: String(m.id), upstream: upKey, entry: { ...m, _key: upKey, _efforts: (Array.isArray(m._efforts) && m._efforts) || [] } });
       }
       return [...seen.values()];
     },
@@ -2228,7 +2230,8 @@ function makeQoder() {
     _resolveEntry(model) {
       const s = String(model || "").toLowerCase();
       const hit = this.modelEntries().find((x) => x.client.toLowerCase() === s || (x.entry._key || "").toLowerCase() === s);
-      return hit ? hit.entry : null;
+      // 归一化：modelEntries 产物的上游 key 在 _key，chat/qoderBody 消费面读 key——浅拷贝补齐，不动缓存对象
+      return hit ? { ...hit.entry, key: hit.entry._key || hit.entry.key } : null;
     },
 
     rewriteBody(model, body) {
