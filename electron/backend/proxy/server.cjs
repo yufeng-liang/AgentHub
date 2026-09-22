@@ -8,6 +8,7 @@ const store = require("./store.cjs");
 const pool = require("./pool.cjs");
 const adapters = require("./adapters.cjs");
 const provider = require("./provider.cjs");
+const openaiOut = require("./protocols/openai-out.cjs");
 const util = require("./util.cjs");
 const events = require("./events.cjs");
 
@@ -239,11 +240,18 @@ function applyCool(accId, model, cls, message) {
   }
 }
 
-/** chat/completions 主流程（stream 双态共用一套 emit → 出线或聚合） */
-async function handleChat(req, res, settings) {
+/** chat/completions 主流程（stream 双态共用一套 emit → 出线或聚合）
+ *  makeSink 只决定「这一串事件写成什么字节」：OpenAI / Anthropic / Responses 各一个工厂。
+ *  下面的鉴权、别名、回退链、号池换号、冷却决策对所有协议共用同一份代码——
+ *  这是当初定下「内部规范形 = OpenAI chat + emit 词汇不扩」的全部回报。 */
+async function handleChat(req, res, settings, makeSink) {
   const startedAt = Date.now();
   const reqId = util.uuid().replace(/-/g, "").slice(0, 24);
   const body = req.body || {};
+  // wantStream 提前算：sink 要在鉴权之前建（鉴权失败也得按本协议的形状回错）。
+  // body.stream 在此之前不会被改，所以与原先"晚算"完全等价。
+  const wantStream = !!body.stream;
+  const sink = makeSink({ res, reqId, requestedModel: String(body.model || ""), wantStream });
   const usageRow = { ts: startedAt, reqId, keyId: "", keyName: "", channel: "", accountId: "", accountName: "", model: String(body.model || ""), status: 0 };
 
   const record = (extra) => {
@@ -260,34 +268,34 @@ async function handleChat(req, res, settings) {
   const key = secret ? store.findKeyBySecret(secret) : null;
   if (!key) {
     record({ status: 401, error: "invalid_api_key" });
-    return sendError(res, 401, "无效的 API Key", "invalid_request_error", "invalid_api_key");
+    return sink.endErr(401, "无效的 API Key", "invalid_request_error", "invalid_api_key");
   }
   usageRow.keyId = key.id;
   usageRow.keyName = key.name;
   if (!key.enabled) {
     record({ status: 401, error: "key disabled" });
-    return sendError(res, 401, "API Key 已停用", "invalid_request_error", "invalid_api_key");
+    return sink.endErr(401, "API Key 已停用", "invalid_request_error", "invalid_api_key");
   }
   // 日配额（0=不限，次日 00:00 重置）
   if (key.dailyQuota > 0 && store.keyTodayReq(key.id) >= key.dailyQuota) {
     record({ status: 429, error: "daily quota exceeded" });
-    return sendError(res, 429, "该 Key 今日配额已用尽（次日 00:00 重置）", "rate_limit_exceeded", "quota_exceeded");
+    return sink.endErr(429, "该 Key 今日配额已用尽（次日 00:00 重置）", "rate_limit_exceeded", "quota_exceeded");
   }
   // 单 Key 令牌桶限速
   if (!rateLimitOk(key, settings.rateLimitPerMin)) {
     record({ status: 429, error: "rate limited" });
-    return sendError(res, 429, "请求过于频繁（单 Key 限速）", "rate_limit_exceeded", "rate_limited");
+    return sink.endErr(429, "请求过于频繁（单 Key 限速）", "rate_limit_exceeded", "rate_limited");
   }
-  // 参数校验（OpenAI 同构 400）；请求体上限 32MB 由 express.json 把关
+  // 参数校验（本协议同构 400）；请求体上限 32MB 由 express.json 把关
   const bad = util.validateChatBody(body);
   if (bad) {
     record({ status: 400, error: bad });
-    return sendError(res, 400, bad, "invalid_request_error", "invalid_params");
+    return sink.endErr(400, bad, "invalid_request_error", "invalid_params");
   }
   // 上游并发上限（默认 8）
   if (runtime.active >= settings.concurrency) {
     record({ status: 429, error: "concurrency limit" });
-    return sendError(res, 429, "上游并发已满，请稍后重试", "rate_limit_exceeded", "concurrency_limited");
+    return sink.endErr(429, "上游并发已满，请稍后重试", "rate_limit_exceeded", "concurrency_limited");
   }
 
   // ===== Dispatch：Key → 渠道（别名解析 → 模型禁用 → 回退链） =====
@@ -298,7 +306,7 @@ async function handleChat(req, res, settings) {
   const actualModel = aliased && aliased !== requestedModel ? String(aliased) : requestedModel;
   if ((settings.disabledModels || []).includes(actualModel)) {
     record({ status: 400, error: "model disabled" });
-    return sendError(res, 400, `模型 "${actualModel}" 已被禁用（模型目录页可恢复）`, "invalid_request_error", "model_disabled");
+    return sink.endErr(400, `模型 "${actualModel}" 已被禁用（模型目录页可恢复）`, "invalid_request_error", "model_disabled");
   }
   // 模型回退链（多模型自动切换）：请求模型 → 回退模型（单跳防循环）。
   // 触发时机：① 模型不在任何渠道目录（unknown）；② 渠道号池全部不可用（耗尽/冷却）。
@@ -316,9 +324,8 @@ async function handleChat(req, res, settings) {
   if (!resolveChannel(key, actualModel, settings).channel && !fallback) {
     const hint = adapters.mergedModels().map((m) => m.id).join(", ");
     record({ status: 400, error: "unknown model" });
-    return sendError(res, 400, `模型 "${actualModel}" 不在任何渠道目录中。可用模型：${hint}`, "invalid_request_error", "model_not_found");
+    return sink.endErr(400, `模型 "${actualModel}" 不在任何渠道目录中。可用模型：${hint}`, "invalid_request_error", "model_not_found");
   }
-  const wantStream = !!body.stream;
 
   // ===== 出线准备 =====
   // 会话元数据：轮内稳定（参考项目 ChatMeta——一次 user send 内的重试/换号复用同一
@@ -330,128 +337,65 @@ async function handleChat(req, res, settings) {
   runtime.active += 1;
   const rt = runtime; // 捕获引用：stop() 会把 runtime 置 null，finally 里直接碰会 TypeError
   let keepAliveTimer = null;
-  let clientGone = false;
-  // 注意：req 的 close 在请求体读完后就可能触发（Node 18+ 语义），不能用来判客户端断连；
-  // res close 才是响应维度的断开——断连后只停写，上游继续消费至 EOF（保 usage 完整，方案 §2.2）
-  res.on("close", () => { clientGone = true; });
-  const write = (text) => {
-    if (clientGone || res.writableEnded) return;
-    res.write(text);
-  };
   let ttftMs = 0;
   let lastUsage = null;
   let finishReason = "stop";
   let sentDelta = false; // 是否已向客户端出过内容（决定流中错误要不要写进 SSE）
   let streamErr = null;  // 流中 error 事件：出过内容时下发作罢；一条内容都没出过时按失败换号
-  // 思考链合批（仅流式）：上游 reasoning_content 按 1~2 字符切片推流（实测 hy3-preview 140 个增量/轮），
-  // 原样透传会让客户端思考链面板碎成几百段刷屏。攒 ≥24 字符或 ≥120ms 或思考结束才下发，正文内容不受影响
-  let reasoningBuf = "";
-  let reasoningLastFlush = 0;
-  const REASON_BATCH_CHARS = 24;
-  const REASON_BATCH_MS = 120;
-  let agg = new util.Aggregator(reqId, requestedModel);
 
   /**
-   * 每次真实上游请求前重置「单轮尝试独占」的状态。
-   * 这些变量都声明在换号循环与模型回退链之外，不重置就会让上一次尝试的输出混进本次：
-   *  - agg：非流式换号重发时两个账号的正文拼进同一条 content（planLimit 分支曾在 :462
-   *    无条件 continue，完全不查出线状态，是最容易触发的一条路）；
-   *  - reasoningBuf：尾段思考链跨尝试残留，客户端看到上一号的半截思考；
-   *  - sentDelta / ttftMs：残留会让下一次尝试的"是否已出线"判定失真；
-   *  - finishReason / lastUsage：残留会让本次以错误的 stop_reason 或上一号的 usage 收尾。
+   * 每次真实上游请求前重置「单轮尝试独占」的状态：输出侧（Aggregator 与思考链缓冲）归 sink，
+   * 调度侧（出线标志与收尾判据）留在这里。两边都必须重置——只 reset 一半的表现是
+   * 「非流式换号重发时两个账号的正文拼进同一条 content」，或「上一次尝试残留的 sentDelta
+   * 让本次流中错误被误判成已出线、从此放弃换号」。
    * 流式已出线时不允许走到重发（见 planLimit 分支的 wantStream && sentDelta 短路），
-   * 因为已 write 给客户端的半截正文无法撤回，重置也救不回拼接问题。
+   * 因为已写进 socket 的半截正文撤不回来，reset 也救不回拼接问题。
    */
   const resetAttemptState = () => {
-    agg = new util.Aggregator(reqId, requestedModel);
+    sink.resetAttempt();
     sentDelta = false;
     streamErr = null;
     finishReason = "stop";
     lastUsage = null;
-    reasoningBuf = "";
     ttftMs = 0;
   };
 
-  /** 冲刷思考链缓冲（思考结束/出错/收尾时必调，防尾段滞留） */
-  const flushReasoning = () => {
-    if (wantStream && reasoningBuf) {
-      write(util.chunk(reqId, requestedModel, { reasoning_content: reasoningBuf }));
-      reasoningBuf = "";
-    }
-  };
-
+  /** 上游事件 → sink（字节）+ 调度标志。事件词汇对所有协议只有这四种，别在这里加第五种 */
   const emit = (ev) => {
     if (ev.type === "delta") {
-      const d = ev.delta || {};
-      const rc = d.reasoning_content;
-      // 噪声字段（function_call:null / refusal:"" / tool_calls:[] / extra_fields:null / 重复 role）
-      // 必须在此剔除：它们会让下面的"rest 非空即正文"误判，既提前冲刷思考链缓冲
-      // （合批攒不满 → 思考链碎成一词一条），又把无正文的空帧发给客户端造成逐段换行
-      const rest = util.stripEmptyDelta(d);
-      delete rest.reasoning_content;
-      // "已出线"只认客户端与聚合器真正可消费的三类字段（正文/思考/工具调用），
-      // 不用 rest 非空做判据：rest 可能带上游私有的非空扩展字段（如 extra_fields:{}），
-      // 它既进不了 Aggregator，也不该封死 streamErr 的换号路径、把一次空响应记成 200。
-      // 全空噪声帧同样不得置位——否则流中错误被误判为"已输出不可换号"。
-      // 首字延迟与出线标志在此一并置位：噪声帧若计入 ttftMs，既让统计页 TTFT 虚低，
-      // 又会短路 catch 分支的 `sentDelta || ttftMs` 禁令、废掉换号自救的机会。
-      const substantive = util.hasConsumableDelta(d);
-      if (substantive) {
+      // sink 回的是「这帧有没有客户端真正可消费的实质内容」：正文/思考/工具调用三类。
+      // 上游私有的非空扩展字段与全空噪声帧都不算——它们既进不了 Aggregator，
+      // 又不该封死 streamErr 的换号路径，也不该计入统计页的 TTFT
+      if (sink.onDelta(ev.delta)) {
         if (!ttftMs) ttftMs = Date.now() - startedAt;
         sentDelta = true;
       }
-      if (!wantStream) {
-        agg.pushDelta(ev.delta);
-        return;
-      }
-      // 思考链合批：攒批下发；正文/工具调用立即下发前先冲刷思考缓冲（保持先后顺序）
-      if (rc) {
-        reasoningBuf += rc;
-        const now = Date.now();
-        if (reasoningBuf.length >= REASON_BATCH_CHARS || now - reasoningLastFlush >= REASON_BATCH_MS) {
-          flushReasoning();
-          reasoningLastFlush = now;
-        }
-      }
-      if (Object.keys(rest).length) {
-        flushReasoning();
-        write(util.chunk(reqId, requestedModel, rest));
-      }
     } else if (ev.type === "usage") {
       lastUsage = ev.usage;
-      if (!wantStream) agg.usage = ev.usage;
+      sink.onUsage(ev.usage);
     } else if (ev.type === "finish") {
       if (ev.reason) finishReason = ev.reason;
-      if (!wantStream) agg.finishReason = finishReason;
-      flushReasoning(); // 思考结束：尾段全部下发
+      sink.onFinish(finishReason);
     } else if (ev.type === "error") {
-      // 流中错误：注入 OpenAI 错误对象后仍发 [DONE]（幂等兜底，方案 §6.3）。
-      // 但内容尚未开始时错误不下发——交给换号逻辑，换号成功客户端完全无感（防监测：不暴露多账号切换痕迹）。
-      // 无论下没下发都要记账：没出过内容的 error 意味着本次尝试实质失败，不能伪装成 200 空响应
+      // 流中错误：注入错误对象的前提是已经出过内容（已出线就不能再假装无事发生）。
+      // 内容一条都没出时不下发——交给换号逻辑，换号成功客户端完全无感
+      // （防监测：不暴露多账号切换痕迹）。但无论下没下发都要记账：没出过内容的 error
+      // 意味着本次尝试实质失败，不能伪装成 200 空响应
       streamErr = ev;
-      if (wantStream && sentDelta) {
-        flushReasoning();
-        write(`data: ${JSON.stringify(util.openaiError(ev.message, "upstream_error", ev.code || null))}\n\n`);
-      }
+      sink.onStreamError(ev, { sent: sentDelta });
     }
   };
 
   try {
-    if (wantStream) {
-      res.writeHead(200, {
-        "content-type": "text/event-stream; charset=utf-8",
-        "cache-control": "no-cache",
-        "connection": "keep-alive",
-      });
-      write(util.chunk(reqId, requestedModel, { role: "assistant" }));
-    }
-    // 15s keep-alive 注释行（防中间层回收，方案 §2.2 联调坑）；有真实输出时静默。
-    // 清理放在外层 finally：循环体异常（DB 故障等）直接跳走时定时器也必须清，
-    // 不然每 5 秒空转一次还阻止进程退出，随失败请求数累积
+    sink.writeHead();
+    // 静默 15s 补一个保活帧（防中间层回收，方案 §2.2 联调坑）；有真实输出时静默。
+    // 分工：什么时候算静默归调度，静默时写什么字节归 sink（OpenAI 是 `: keep-alive`，
+    // Anthropic 是 event: ping——Claude Code 按字节计时，吃掉 ping 会在长思考时断流）。
+    // 定时器清理放在外层 finally：循环体异常直接跳走时也必须清，
+    // 不然每 5 秒空转一次还挡进程退出，随失败请求数累积
     let lastWrite = Date.now();
-    const rawWrite = write;
     keepAliveTimer = setInterval(() => {
-      if (wantStream && Date.now() - lastWrite >= 15000) rawWrite(": keep-alive\n\n");
+      if (wantStream && Date.now() - lastWrite >= 15000) sink.keepAlive();
     }, 5000);
     const emitTimed = (ev) => {
       lastWrite = Date.now();
@@ -587,20 +531,11 @@ async function handleChat(req, res, settings) {
       // 收尾：末 chunk 附 usage + [DONE]；无 done 事件也兜底结束（方案 §6.3）
       const usage = lastUsage || {
         prompt_tokens: util.estimateTokens(JSON.stringify(body.messages)),
-        completion_tokens: util.estimateTokens(agg.content),
+        completion_tokens: util.estimateTokens(sink.aggregated().content),
         total_tokens: 0,
       };
       if (!usage.total_tokens) usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
-      if (wantStream) {
-        flushReasoning(); // 收尾兜底：finish 事件缺失时尾段思考链不滞留
-        write(util.chunk(reqId, requestedModel, {}, finishReason, usage));
-        write(util.DONE);
-        res.end();
-      } else {
-        agg.finishReason = finishReason;
-        agg.usage = usage;
-        res.json(agg.result());
-      }
+      sink.endOk(finishReason, usage);
       // 成功收尾：清软限流 streak / 凭证失效计数 / 该账号该模型的负缓存
       pool.noteSuccess(usageRow.accountId, usedModel);
       // 上游 usage.credit 实际扣减余额（参考项目 NoteModelCost）：两次定时刷新之间
@@ -627,28 +562,17 @@ async function handleChat(req, res, settings) {
     const st = (lastErr && lastErr.status) || 503;
     const msg = st === 402 ? "该渠道号池积分全部耗尽" : (lastErr && lastErr.message) || "渠道暂不可用（号池无可用账号）";
     if (!wantStream || !ttftMs) {
-      // 还没出过内容，可以正常回错误状态
-      if (wantStream && res.headersSent) {
-        write(`data: ${JSON.stringify(util.openaiError(msg, "upstream_error", null))}\n\n`);
-        write(util.DONE);
-        res.end();
-      } else {
-        sendError(res, st === 401 ? 502 : st, msg, st === 402 ? "rate_limit_exceeded" : "server_error");
-      }
+      // 还没出过内容：流式下若响应头已发出去就得把错误塞进流，非流式还能正常回错误状态码
+      if (wantStream && res.headersSent) sink.endErr(st, msg);
+      else sink.endErr(st === 401 ? 502 : st, msg, st === 402 ? "rate_limit_exceeded" : "server_error");
     } else {
-      write(`data: ${JSON.stringify(util.openaiError(msg, "upstream_error", null))}\n\n`);
-      write(util.DONE);
-      res.end();
+      sink.endErr(st, msg);
     }
     record({ status: st, ttftMs, error: msg.slice(0, 200) });
   } catch (e) {
     const msg = String((e && e.message) || e);
-    if (!res.headersSent) sendError(res, 502, msg, "server_error");
-    else {
-      write(`data: ${JSON.stringify(util.openaiError(msg, "server_error", null))}\n\n`);
-      write(util.DONE);
-      res.end();
-    }
+    // 头已发出就只能把错误写进流（endErr 内部按 headersSent 分流），否则回 502 JSON
+    sink.endErr(502, msg, "server_error");
     record({ status: 502, error: msg.slice(0, 200) });
   } finally {
     if (keepAliveTimer) clearInterval(keepAliveTimer);
@@ -668,7 +592,8 @@ function buildApp(settings) {
   });
   app.use(express.json({ limit: "32mb" })); // 方案 §6.9：单请求体上限 32MB（多模态 base64）
 
-  app.post("/v1/chat/completions", (req, res) => handleChat(req, res, settings()).catch((e) => {
+  // 同一个调度核心，按端点换一套出线字节：③ /v1/messages、⑤ /v1/responses 各带自己的 sink 工厂
+  app.post("/v1/chat/completions", (req, res) => handleChat(req, res, settings(), openaiOut.create).catch((e) => {
     if (!res.headersSent) sendError(res, 500, String((e && e.message) || e), "server_error");
   }));
 
