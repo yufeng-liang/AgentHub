@@ -7,6 +7,7 @@ const crypto = require("node:crypto");
 const store = require("./store.cjs");
 const pool = require("./pool.cjs");
 const adapters = require("./adapters.cjs");
+const provider = require("./provider.cjs");
 const util = require("./util.cjs");
 const events = require("./events.cjs");
 
@@ -50,8 +51,12 @@ function emitRequestThrottled() {
   }, 2000);
 }
 
-/** 渠道选择（方案 §6.2）：单源强制 → per-model 覆盖 → 打分（健康度×余额）/ 指定渠道优先 */
+/** 渠道选择（方案 §6.2）：提供商显式前缀 → 单源强制 → per-model 覆盖 → 打分（健康度×余额）/ 指定渠道优先 */
 function resolveChannel(key, model, settings) {
+  // `slug/model` 前缀直达提供商。这里只交出渠道，不改模型名——上游真名由适配器的 upstreamFor 剥前缀
+  // 再映射，与内置适配器「收到客户端模型名、自己改写」的契约保持一致，调度层不需要知道第二套命名口径。
+  const slug = provider.parseModelRef(model);
+  if (slug) return { channel: slug };
   const owners = adapters.modelOwners(model);
   if (owners.length === 1) return { channel: owners[0] }; // 模型仅存在于单渠道目录 → 强制
   if (key.route !== "auto") return { channel: key.route };
@@ -63,6 +68,9 @@ function resolveChannel(key, model, settings) {
   }
   // 模型不在任何目录：auto 且固定渠道策略时放行指定渠道（透传试错），否则 400 给可用模型提示
   if (settings.routeStrategy === "fixed") return { channel: settings.fixedChannel };
+  // 裸名兜底：没有任何内置渠道拥有该模型时，才允许它唯一命中某个提供商（歧义一律不猜）
+  const sole = settings.allowBareProviderModel === false ? null : provider.findUniqueByBareModel(model);
+  if (sole) return { channel: sole };
   return { channel: null, unknownModel: true };
 }
 
@@ -98,6 +106,8 @@ async function attemptChat(channel, acc, model, body, emit, meta) {
       }
       // 触发计数与冷却交给 catch 侧的 applyCool 统一处理（classifyUpstream → relogin），
       // 这里只如实抛出：是短冷却重试还是判废由计数决定
+      // noRefresh：自定义提供商是 API Key 直连，根本没有刷新链路，别把它的 401 报成"刷新失败"
+      if (r.noRefresh) throw Object.assign(new Error(r.message || "该渠道为 API Key 直连，Key 已失效"), { status: 401 });
       throw Object.assign(new Error("凭证失效且自动刷新失败"), { status: 401 });
     }
     throw e;
@@ -114,11 +124,28 @@ function parseRateResetMs(text) {
   return Number.isFinite(t) && t > Date.now() ? t : 0;
 }
 
+/** 中转站/自建上游的错误分类：只认 HTTP 状态。
+ *  上面那张私有码表（6004 / 11102 / 4008 / 4001 / 11115 / 11101）和「将在 … 重置」中文文案解析，
+ *  是逆向那 4 家生态渠道得来的；套到任意第三方端点上既匹配不上，也可能**误命中**——
+ *  比如某中转站自己的业务码恰好是 6004，就会被当成 Trae 的模型级限流去罚一个好好的 Key。
+ *  kind 一律复用内置档位，applyCool 不需要为自定义渠道加新分支。 */
+function classifyGeneric(e, planLimit) {
+  if (planLimit || (e && e.status === 402)) return { kind: "credit", switchable: true, status: 402 };
+  const st = Number((e && e.status) || 0);
+  if (st === 429) return { kind: "rate", switchable: true, status: 429, resetMs: (e && e.retryAfterMs) || 0 };
+  if (st === 401) return { kind: "relogin", switchable: true, status: 401 };
+  if (st === 404) return { kind: "not_found", switchable: true, status: 404 };
+  if (st === 400) return { kind: "bad_params", switchable: true, status: 400 };
+  return { kind: "server", switchable: true, status: 502 }; // 5xx / 网络 / 超时 / 状态认不出
+}
+
 /** 错误分类（对齐参考项目 handler.applyErrorPolicy 全表 + 参考项目 SOLO 专项）：
  *  决定冷却档位与是否换号。6004 = 模型级限流（罚账号×模型，切模型豁免）；
  *  11102 = 该账号不支持此模型（6h 指数负缓存）；4008 = 模型/账号级限流；4001 = 模型配置问题
- * （不罚号）；11115 prompt 过长（零动作透传）；11101 参数错误（换号不罚号——不同账号模型权限不同） */
-function classifyUpstream(e, planLimit) {
+ * （不罚号）；11115 prompt 过长（零动作透传）；11101 参数错误（换号不罚号——不同账号模型权限不同）
+ *  channel 非内置渠道时改走 classifyGeneric：这套码表对任意中转站不成立，见其注释。 */
+function classifyUpstream(e, planLimit, channel) {
+  if (channel && !store.isBuiltinChannel(channel)) return classifyGeneric(e, planLimit);
   if (planLimit || (e && e.status === 402)) return { kind: "credit", switchable: true, status: 402 };
   const msg = String((e && e.message) || "");
   const code = Number(e && e.code) || 0;
@@ -508,7 +535,7 @@ async function handleChat(req, res, settings) {
               status: streamErr.status || 502,
               code: streamErr.code || 0,
             });
-            applyCool(acc.id, chainModel, classifyUpstream(lastErr, false), lastErr.message);
+            applyCool(acc.id, chainModel, classifyUpstream(lastErr, false, resolved.channel), lastErr.message);
             streamErr = null;
             continue;
           }
@@ -535,7 +562,7 @@ async function handleChat(req, res, settings) {
             fatalErr = e; // 400 参数类等直接透传，不再换号也不回退
             break;
           }
-          const cls = classifyUpstream(e, false);
+          const cls = classifyUpstream(e, false, resolved.channel);
           // 无明示重置时间的 429：上游多为 1~3s 短窗限流，退避 1s 重试一次再落冷却换号
           // （参考项目 RetrySame 语义）；有墙钟/Retry-After 的 429 重试必白费，直接冷却。
           // 单号池场景下这一跳决定 429 是就地消化还是直接抛给客户端
@@ -650,9 +677,9 @@ function buildApp(settings) {
     res.json({ object: "list", data: adapters.mergedModels() });
   });
 
-  // 探活：无健康渠道时 503
+  // 探活：无健康渠道时 503（自定义提供商的 Key 同样是可用凭据，故走合并视图）
   app.get("/healthz", (_req, res) => {
-    const healthy = store.CHANNELS.some((c) => pool.poolSummary(c.id).onlineCount > 0);
+    const healthy = store.channelList().some((c) => pool.poolSummary(c.id).onlineCount > 0);
     res.status(healthy ? 200 : 503).json({ ok: healthy });
   });
 
@@ -666,7 +693,7 @@ function buildApp(settings) {
     res.json({
       uptime: runtime ? Date.now() - runtime.startedAt : 0,
       active: runtime ? runtime.active : 0,
-      channels: store.CHANNELS.map((c) => pool.poolSummary(c.id)),
+      channels: store.channelList().map((c) => pool.poolSummary(c.id)),
       today: store.statsToday(),
     });
   });

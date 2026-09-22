@@ -257,6 +257,32 @@ const PROXY_POOL = [
       { id: "a6", channel: "raccoon", uid: "rc_88213", name: "小浣熊 1 号", status: "online", credits: 9800, creditsAt: ago(12), expiresAt: NOW + 29 * 86400000, coolUntil: 0, coolReason: "", source: "json", lastUsed: ago(9), todayReq: 18, todayTokens: 5200, createdAt: NOW - 3 * 86400000, hasToken: true },
     ],
   },
+  // 自定义提供商在号池页的样子：kind=openai_compat 时余额/到期/签到/切到 IDE 全部不出现
+  {
+    id: "myrelay", display: "我的中转站", domain: "relay.example.com", poolStrategy: "round_robin", kind: "openai_compat", enabled: true,
+    baseUrl: "https://relay.example.com",
+    models: [{ model: "gpt-4o", upstream: "gpt-4o-2024-11-20" }, "deepseek-v3.2"],
+    extraHeaders: {}, extraBody: {}, updatedAt: NOW - 30 * 60000,
+    summary: { channel: "myrelay", totalCredits: 0, accountCount: 2, onlineCount: 2, earliestExpire: 0, expiringSoon: false, todayReq: 96, todayTokens: 21400, lastCreditsAt: 0 },
+    accounts: [
+      { id: "m1", channel: "myrelay", uid: "", name: "Key 1", status: "online", credits: 0, creditsAt: 0, expiresAt: 0, coolUntil: 0, coolReason: "", source: "paste", lastUsed: ago(2), todayReq: 51, todayTokens: 12200, createdAt: NOW - 2 * 86400000, hasToken: true },
+      { id: "m2", channel: "myrelay", uid: "", name: "Key 2", status: "cooling", credits: 0, creditsAt: 0, expiresAt: 0, coolUntil: NOW + 40000, coolReason: "上游限流", source: "paste", lastUsed: ago(6), todayReq: 45, todayTokens: 9200, createdAt: NOW - 2 * 86400000, hasToken: true },
+    ],
+  },
+];
+
+/** 提供商列表的预览态：与 PROXY_POOL 里那条 myrelay 是同一个对象，
+ *  这样「提供商」页与「号池」页在 npm run dev:web 里对得上 */
+const MOCK_PROVIDERS: {
+  id: string; display: string; domain: string; kind: string; enabled: boolean; baseUrl: string;
+  models: unknown[]; extraHeaders: Record<string, string>; extraBody: Record<string, unknown>;
+  updatedAt: number; keyCount: number; onlineCount: number;
+}[] = [
+  {
+    id: "myrelay", display: "我的中转站", domain: "relay.example.com", kind: "openai_compat", enabled: true,
+    baseUrl: "https://relay.example.com", models: [{ model: "gpt-4o", upstream: "gpt-4o-2024-11-20" }, "deepseek-v3.2"],
+    extraHeaders: {}, extraBody: {}, updatedAt: NOW - 30 * 60000, keyCount: 2, onlineCount: 2,
+  },
 ];
 
 const PROXY_USAGE = [
@@ -539,6 +565,41 @@ export const mock = {
         return { ok: true };
       case "proxy_vault_status":
         return { encrypted: true, driver: "node:sqlite", dataDir: "(浏览器预览)" };
+      // ===== 自定义提供商：浏览器预览的内存实现（只演界面，校验与号池都在主进程） =====
+      case "proxy_provider_list":
+        return { ok: true, providers: MOCK_PROVIDERS.map((p) => ({ ...p, models: [...p.models] })) };
+      case "proxy_provider_create": {
+        const id = String(args?.id || "");
+        if (MOCK_PROVIDERS.some((p) => p.id === id)) return { ok: false, message: `标识 "${id}" 已存在` };
+        const p = {
+          id, display: String(args?.display || id), domain: "", kind: "openai_compat", enabled: args?.enabled !== false,
+          baseUrl: String(args?.baseUrl || ""), models: (args?.models as unknown[]) || [],
+          extraHeaders: (args?.extraHeaders as Record<string, string>) || {}, extraBody: (args?.extraBody as Record<string, unknown>) || {},
+          updatedAt: Date.now(), keyCount: ((args?.keys as unknown[]) || []).length, onlineCount: ((args?.keys as unknown[]) || []).length,
+        };
+        MOCK_PROVIDERS.push(p);
+        return { ok: true, provider: p, keyIds: [] };
+      }
+      case "proxy_provider_update": {
+        const p = MOCK_PROVIDERS.find((x) => x.id === args?.id);
+        if (!p) return { ok: false, message: "提供商不存在" };
+        Object.assign(p, args, { updatedAt: Date.now() });
+        return { ok: true, provider: p };
+      }
+      case "proxy_provider_delete": {
+        const i = MOCK_PROVIDERS.findIndex((x) => x.id === args?.id);
+        if (i < 0) return { ok: false, message: "提供商不存在" };
+        MOCK_PROVIDERS.splice(i, 1);
+        return { ok: true };
+      }
+      case "proxy_provider_add_key":
+        return { ok: true, id: "k-" + Date.now() };
+      case "proxy_provider_remove_key":
+        return { ok: true };
+      case "proxy_provider_test":
+        return { ok: false, message: "浏览器预览不代打上游，请在应用内测试" };
+      case "proxy_provider_fetch_models":
+        return { ok: true, models: ["gpt-4o", "gpt-4o-mini", "o3-pro"] };
       case "webdav_shared_get":
         return {
           endpoint: "https://dav.jianguoyun.com/dav",

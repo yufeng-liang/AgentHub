@@ -10,6 +10,7 @@ const store = require("./store.cjs");
 const rules = require("./rules.cjs");
 const pool = require("./pool.cjs");
 const adapters = require("./adapters.cjs");
+const provider = require("./provider.cjs");
 const discovery = require("./discovery.cjs");
 const credits = require("./credits.cjs");
 const server = require("./server.cjs");
@@ -199,10 +200,17 @@ function handle(fn) {
   };
 }
 
-/** 号池全量视图：三渠道聚合 + 账号明细 + 调度策略（号池页数据源） */
+/** 号池页/状态页的渠道列表：内置 4 家 + **全部**自建提供商（含已停用）。
+ *  这里刻意不用 store.channelList()——那是路由视图，只给启用中的；停用的提供商总得在界面上
+ *  看得见才可能被重新打开，从视图里消失等于让用户没法把它恢复。 */
+function poolChannels() {
+  return store.BUILTIN_CHANNELS.map((c) => ({ ...c, kind: "builtin", enabled: true })).concat(store.listProviders());
+}
+
+/** 号池全量视图：各渠道聚合 + 账号明细 + 调度策略（号池页数据源） */
 function poolView() {
   const agents = store.listAgents();
-  return store.CHANNELS.map((c) => {
+  return poolChannels().map((c) => {
     const summary = pool.poolSummary(c.id);
     const accounts = pool.poolAccounts(c.id).map((a) => ({ ...a, modelCool: pool.accountModelCool(a.id) }));
     return {
@@ -223,7 +231,7 @@ function gatewayStatus() {
     bind: s.running ? s.bind : cfg.bind,
     baseUrl: `http://${s.running ? s.bind : cfg.bind}:${s.running ? s.port : cfg.port}/v1`,
     today: store.statsToday(),
-    channels: store.CHANNELS.map((c) => ({ id: c.id, display: c.display, ...pool.poolSummary(c.id) })),
+    channels: poolChannels().map((c) => ({ id: c.id, display: c.display, kind: c.kind, ...pool.poolSummary(c.id) })),
     keyCount: store.listKeys().length,
     vaultOk: vaultOk(),
     dbDriver: store.driver(),
@@ -379,7 +387,9 @@ function register(ipcMain) {
     return ok({ id: r.id, updated: r.updated });
   }));
   ipcMain.handle("proxy_oauth_begin", handle(async ({ channel }) => {
-    const ch = adapters.get(channel) ? String(channel) : store.CHANNELS[0].id;
+    // OAuth 只对内置生态渠道存在：提供商没有授权页可跳，落到兜底渠道会把用户带去登录别人的账号
+    if (!store.isBuiltinChannel(channel) || !adapters.get(channel)) return fail("该渠道不支持 OAuth 登录");
+    const ch = String(channel);
     const r = await discovery.beginOAuth(ch, (result) => {
       if (result.ok) {
         credits.refreshAccount(result.id).catch(() => {});
@@ -397,7 +407,9 @@ function register(ipcMain) {
 
   // ===== 凭据接入：粘贴 JSON / 从 JSON/ZIP 文件添加（批量，字段容忍别名） =====
   ipcMain.handle("proxy_account_import_json", handle(({ channel, json }) => {
-    const fallback = adapters.get(channel) ? String(channel) : store.CHANNELS[0].id;
+    // 生态渠道的凭据包导入；提供商的 Key 走 proxy_provider_add_key（一条一把，没有 JSON 包形态）
+    if (!store.isBuiltinChannel(channel) || !adapters.get(channel)) return fail("该渠道不支持 JSON 导入");
+    const fallback = String(channel);
     const { list, invalid } = parseAccountsJson(json, fallback);
     if (!list.length) return fail(invalid ? `没有可导入的账号（${invalid} 条记录缺 token）` : "没有可导入的账号");
     const r = importAccounts(list);
@@ -408,7 +420,8 @@ function register(ipcMain) {
   }));
   // 从 JSON/ZIP 文件添加：主进程弹文件选择框；zip 读取包内全部 .json 条目合并导入
   ipcMain.handle("proxy_account_import_file", handle(async ({ channel }) => {
-    const fallback = adapters.get(channel) ? String(channel) : store.CHANNELS[0].id;
+    if (!store.isBuiltinChannel(channel) || !adapters.get(channel)) return fail("该渠道不支持文件导入");
+    const fallback = String(channel);
     const { dialog, BrowserWindow } = require("electron");
     const parent = BrowserWindow.getAllWindows()[0];
     const opts = {
@@ -536,6 +549,30 @@ function register(ipcMain) {
     return poolsync.run({ channel: channel ? String(channel) : "" });
   }));
   ipcMain.handle("proxy_poolsync_cancel", handle(() => poolsync.cancel()));
+
+  // ===== 自定义提供商（中转站 / 自建 OpenAI 兼容端点） =====
+  // 校验与规矩都在 provider.cjs；这里只做参数搬运与 ok/fail 形状包装，出错一律 {ok:false,message}
+  // 由前端直接展示（validate 的 message 已带用户可行动的说明，不再另造错误码）。
+  ipcMain.handle("proxy_provider_list", handle(() => ok({ providers: provider.list() })));
+  ipcMain.handle("proxy_provider_create", handle(({ keys, ...input }) => {
+    const r = provider.create(input);
+    if (!r.ok) return r;
+    // 建提供商时顺带把手里几把 Key 一起存：表单一次填完比"先建再逐个加"少三 step。
+    // 逐个走 addKey 是为了让去重与校验规则只有一份。
+    const added = [];
+    for (const k of Array.isArray(keys) ? keys : []) {
+      const a = provider.addKey(r.provider.id, typeof k === "string" ? { key: k } : k);
+      if (a.ok) added.push(a.id);
+    }
+    return ok({ provider: r.provider, keyIds: added });
+  }));
+  ipcMain.handle("proxy_provider_update", handle((input) => provider.update(input.id, input)));
+  ipcMain.handle("proxy_provider_delete", handle(({ id }) => provider.remove(id)));
+  ipcMain.handle("proxy_provider_add_key", handle(({ id, name, key }) => provider.addKey(id, { name, key })));
+  ipcMain.handle("proxy_provider_remove_key", handle(({ accountId }) => provider.removeKey(accountId)));
+  // 探测用「表单里当场填的那把 Key + 地址」，不读号池：既能动未保存的配置试，也不会把号池好 Key 打成冷却
+  ipcMain.handle("proxy_provider_test", handle((input) => provider.probe(input)));
+  ipcMain.handle("proxy_provider_fetch_models", handle(({ id }) => provider.fetchModels(id)));
 }
 
 module.exports = { boot, shutdown, register, settings };

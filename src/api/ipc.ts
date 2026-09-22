@@ -5,8 +5,9 @@ import type {
   ReportRow, ToolRow, TrashRow, UpdateStatus, ProbeRow, RemoveToolPlan,
   WebDavStatus, RemoteDevice, WebDavLog, HubExtraRow, WatchStatus,
   ProxyGatewayStatus, ProxyKeyRow, ProxyChannelView, ProxyAccount, ProxyStatsOverview, ProxyStatsDetail,
-  ProxyUsageRow, ProxyModel, ProxyScanCandidate, ProxyRuleFile, ProxyRoute, ProxyChannelId, ProxyPoolStrategy,
-  ProxyCheckinRow, CcSwitchStatus, CcSwitchRegisterResult, CcSwitchAppType,
+  ProxyUsageRow, ProxyModel, ProxyScanCandidate, ProxyRuleFile, ProxyRoute, ProxyChannelId, ProxyBuiltinChannelId, ProxyPoolStrategy,
+  ProxyCheckinRow, ProxyProvider, ProxyProviderModel, ProxyProviderTestResult,
+  CcSwitchStatus, CcSwitchRegisterResult, CcSwitchAppType,
 } from "../types";
 
 export type {
@@ -14,8 +15,9 @@ export type {
   ReportRow, ToolRow, TrashRow, UpdateStatus, UpdateEvent, ProbeRow, RemoveToolPlan,
   WebDavStatus, RemoteDevice, WebDavLog, WebDavEvent, HubExtraRow, WatchStatus,
   ProxyGatewayStatus, ProxyKeyRow, ProxyChannelView, ProxyAccount, ProxyStatsOverview, ProxyStatsDetail,
-  ProxyUsageRow, ProxyModel, ProxyScanCandidate, ProxyRuleFile, ProxyRoute, ProxyChannelId, ProxyPoolStrategy,
-  ProxyAccountStatus, ProxyEvent, ProxyCheckinRow, CcSwitchStatus, CcSwitchRegisterResult,
+  ProxyUsageRow, ProxyModel, ProxyScanCandidate, ProxyRuleFile, ProxyRoute, ProxyChannelId, ProxyBuiltinChannelId, ProxyPoolStrategy,
+  ProxyAccountStatus, ProxyEvent, ProxyCheckinRow, ProxyProvider, ProxyProviderModel, ProxyProviderTestResult,
+  CcSwitchStatus, CcSwitchRegisterResult,
 } from "../types";
 
 type InvokeFn = (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
@@ -119,7 +121,7 @@ export interface ProxyPoolSyncStatus {
   deviceName: string;
 }
 export const proxyPoolsyncStatus = () => call<ProxyPoolSyncStatus>("proxy_poolsync_status");
-export const proxyPoolsyncRun = (channel?: ProxyChannelId | "") =>
+export const proxyPoolsyncRun = (channel?: ProxyBuiltinChannelId | "") =>
   call<{ ok: boolean; message?: string; summary?: string; pulled?: number; added?: number; updated?: number; removed?: number; skipped?: number; uploaded?: boolean }>(
     "proxy_poolsync_run",
     { channel: channel || "" }
@@ -219,20 +221,22 @@ export const proxyCheckinRun = (opts: { channel?: ProxyChannelId | ""; accountId
 /** 扫描本机已装软件的登录态（凭据不出主进程，只回候选信息） */
 export const proxyScan = () => call<ProxyScanCandidate[]>("proxy_scan");
 /** 导入本机候选；file/uid 用于身份核对（两次扫描之间文件变化时不至于导错账号） */
-export const proxyScanImport = (index: number, channel?: ProxyChannelId, file?: string, uid?: string) =>
+export const proxyScanImport = (index: number, channel?: ProxyBuiltinChannelId, file?: string, uid?: string) =>
   call<{ ok: boolean; id?: string; updated?: boolean; message?: string }>("proxy_scan_import", { index, channel, file, uid });
-/** 拉起对应渠道的官方登录（授权页由主进程 shell.openExternal 打开，结果经 app:event 回流） */
-export const proxyOauthBegin = (channel: ProxyChannelId) =>
+/** 拉起对应渠道的官方登录（授权页由主进程 shell.openExternal 打开，结果经 app:event 回流）。
+ *  下面这几个签名刻意收在 ProxyBuiltinChannelId：OAuth / 本机扫描 / 凭据包导入都是"生态渠道"专属，
+ *  自定义提供商只有一把 API Key，主进程也会明确拒非内置渠道。 */
+export const proxyOauthBegin = (channel: ProxyBuiltinChannelId) =>
   call<{ ok: boolean; url?: string; mode?: string; message?: string }>("proxy_oauth_begin", { channel });
 export const proxyOauthCancel = () => call<{ ok: boolean; cancelled?: boolean }>("proxy_oauth_cancel");
 /** 兜底：浏览器没跳回回环地址时，把地址栏内容整段粘回来完成登录 */
-export const proxyOauthSubmitCallback = (channel: ProxyChannelId, url: string) =>
+export const proxyOauthSubmitCallback = (channel: ProxyBuiltinChannelId, url: string) =>
   call<{ ok: boolean; message?: string }>("proxy_oauth_submit_callback", { channel, url });
 /** 粘贴 JSON 批量添加账号（单个对象 / 数组 / {accounts:[...]}，字段容忍别名） */
-export const proxyAccountImportJson = (channel: ProxyChannelId, json: string) =>
+export const proxyAccountImportJson = (channel: ProxyBuiltinChannelId, json: string) =>
   call<{ ok: boolean; added?: number; dup?: number; invalid?: number; message?: string }>("proxy_account_import_json", { channel, json });
 /** 从 JSON/ZIP 文件添加账号（主进程弹文件选择框；zip 读取包内全部 .json 合并导入） */
-export const proxyAccountImportFile = (channel: ProxyChannelId) =>
+export const proxyAccountImportFile = (channel: ProxyBuiltinChannelId) =>
   call<{ ok: boolean; canceled?: boolean; added?: number; dup?: number; invalid?: number; file?: string; message?: string }>("proxy_account_import_file", { channel });
 
 // ===== 反代网关：模型 / 统计 / 规则 =====
@@ -252,6 +256,42 @@ export const proxyRulesList = () => call<ProxyRuleFile[]>("proxy_rules_list");
 export const proxyOpenRulesDir = () => call<{ ok: boolean }>("proxy_open_rules_dir");
 export const proxyOpenDataDir = () => call<{ ok: boolean }>("proxy_open_data_dir");
 export const proxyVaultStatus = () => call<{ encrypted: boolean; driver: string; dataDir: string }>("proxy_vault_status");
+
+// ===== 反代网关：自定义提供商（中转站 / 自建 OpenAI 兼容端点） =====
+
+/** 创建/更新的入参。id 即路由前缀（`id/model` 里的 id），创建后不可改。
+ *  create 可带 keys（一次填完表单）；update 忽略 keys，Key 走 add/remove 两条命令。 */
+export interface ProxyProviderInput {
+  id: string;
+  display?: string;
+  baseUrl: string;
+  models?: ProxyProviderModel[];
+  extraHeaders?: Record<string, string>;
+  extraBody?: Record<string, unknown>;
+  enabled?: boolean;
+  poolStrategy?: ProxyPoolStrategy;
+  keys?: { name?: string; key: string }[];
+}
+
+export const proxyProviderList = () =>
+  call<{ ok: boolean; providers?: ProxyProvider[]; message?: string }>("proxy_provider_list");
+export const proxyProviderCreate = (input: ProxyProviderInput) =>
+  call<{ ok: boolean; provider?: ProxyProvider; keyIds?: string[]; message?: string }>("proxy_provider_create", input as unknown as Record<string, unknown>);
+export const proxyProviderUpdate = (input: Partial<ProxyProviderInput> & { id: string }) =>
+  call<{ ok: boolean; provider?: ProxyProvider; message?: string }>("proxy_provider_update", input as unknown as Record<string, unknown>);
+export const proxyProviderDelete = (id: string) =>
+  call<{ ok: boolean; message?: string }>("proxy_provider_delete", { id });
+export const proxyProviderAddKey = (id: string, key: string, name?: string) =>
+  call<{ ok: boolean; id?: string; message?: string }>("proxy_provider_add_key", { id, key, name });
+export const proxyProviderRemoveKey = (accountId: string) =>
+  call<{ ok: boolean; message?: string }>("proxy_provider_remove_key", { accountId });
+/** 用表单里当场填的地址 + Key 发一次真实最小请求（会产生上游计费，UI 已提示）。
+ *  key 与 accountId 二选一：编辑态不重填 Key 时按号池账号 id 让主进程自己解密，明文不出主进程。 */
+export const proxyProviderTest = (input: { id?: string; accountId?: string; baseUrl: string; key: string; model: string; extraHeaders?: Record<string, string>; extraBody?: Record<string, unknown> }) =>
+  call<ProxyProviderTestResult>("proxy_provider_test", input as unknown as Record<string, unknown>);
+/** 拉上游 /models：用该提供商号池里的 Key，因此必须先存过一次 Key */
+export const proxyProviderFetchModels = (id: string) =>
+  call<{ ok: boolean; models?: string[]; message?: string }>("proxy_provider_fetch_models", { id });
 
 // ===== 反代网关：生态接入（CC Switch） =====
 export const proxyCcSwitchStatus = () => call<CcSwitchStatus>("proxy_ccswitch_status");

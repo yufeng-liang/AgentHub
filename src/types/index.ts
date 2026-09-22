@@ -289,7 +289,13 @@ export interface ProxyConfig {
 
 // ===== 反代网关：数据结构（跟 electron/backend/proxy/* 返回一一对应） =====
 
-export type ProxyChannelId = "trae" | "workbuddy" | "workbuddy_ai" | "raccoon";
+/** 内置生态渠道：只有这 4 家有 OAuth / 本机扫描 / 签到 / 号池同步这些"生态"概念 */
+export type ProxyBuiltinChannelId = "trae" | "workbuddy" | "workbuddy_ai" | "raccoon";
+/** 渠道 id = 内置 4 家 + 用户自建提供商的 slug。
+ *  自建 slug 是运行期数据，编译期无从枚举，所以这里放宽成普通字符串（同 ProxyRoute 的既有做法），
+ *  保留字面量联合只为了 IDE 补全。**需要"仅内置"约束的地方请用 ProxyBuiltinChannelId。** */
+export type ProxyChannelId = ProxyBuiltinChannelId | (string & {});
+export type ProxyChannelKind = "builtin" | "openai_compat";
 /** Key 路由：auto 或任一渠道 id（渠道后续扩充即为普通字符串，保留字面量仅为补全提示） */
 export type ProxyRoute = "auto" | ProxyChannelId | (string & {});
 export type ProxyAccountStatus = "online" | "cooling" | "exhausted" | "relogin" | "disabled";
@@ -378,9 +384,55 @@ export interface ProxyChannelView {
   id: ProxyChannelId;
   display: string;
   domain: string;
+  kind: ProxyChannelKind;
+  /** 提供商可停用（停用即从路由视图消失）；内置渠道恒 true */
+  enabled?: boolean;
+  /** 仅 openai_compat：已归一化的上游地址（写入侧一次成型，展示与拼接同源） */
+  baseUrl?: string;
   poolStrategy: ProxyPoolStrategy;
   summary: ProxyPoolSummary;
   accounts: ProxyAccount[];
+}
+
+// ===== 自定义提供商（中转站 / 自建 OpenAI 兼容端点） =====
+
+/** models 条目：字符串 = 裸名且上游同名；对象 = 可带客户端可见名与上游真名的别名映射及目录元数据 */
+export type ProxyProviderModel = string | {
+  model: string;
+  /** 上游真实模型名，缺省 = model。`slug/model` 路由时发给上游的是这个 */
+  upstream?: string;
+  name?: string;
+  rate?: number;
+  capabilities?: Record<string, boolean | string | number>;
+  contextLength?: number;
+  maxOutputTokens?: number;
+};
+
+export interface ProxyProvider {
+  /** 路由前缀，创建后不可改（accounts.channel 以它为键） */
+  id: string;
+  display: string;
+  domain: string;
+  kind: ProxyChannelKind;
+  enabled: boolean;
+  baseUrl: string;
+  models: ProxyProviderModel[];
+  extraHeaders: Record<string, string>;
+  extraBody: Record<string, unknown>;
+  updatedAt: number;
+  keyCount?: number;
+  onlineCount?: number;
+}
+
+export interface ProxyProviderTestResult {
+  ok: boolean;
+  message?: string;
+  status?: number;
+  ms?: number;
+  model?: string;
+  sample?: string;
+  finishReason?: string;
+  usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
 }
 
 export interface ProxyGatewayStatus {
@@ -447,7 +499,8 @@ export interface ProxyModel {
 }
 
 export interface ProxyScanCandidate {
-  channel: ProxyChannelId;
+  /** 扫描只认本机那 4 家生态应用的登录文件，自定义提供商没有"本机凭据"可扫 */
+  channel: ProxyBuiltinChannelId;
   uid: string;
   name: string;
   credits?: number;
@@ -564,6 +617,7 @@ export const MODULES: ModuleDef[] = [
     pages: [
       { id: "home", name: "总览" },
       { id: "keys", name: "API Keys" },
+      { id: "providers", name: "提供商" },
       { id: "agents", name: "号池" },
       { id: "models", name: "模型目录" },
       { id: "stats", name: "用量统计" },

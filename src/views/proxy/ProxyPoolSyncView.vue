@@ -4,7 +4,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import * as api from "../../api/ipc";
-import type { ProxyChannelId } from "../../types";
+import type { ProxyBuiltinChannelId } from "../../types";
 import { useAppStore } from "../../stores/app";
 import { channelName } from "./format";
 
@@ -12,10 +12,10 @@ const app = useAppStore();
 const st = ref<api.ProxyPoolSyncStatus | null>(null);
 const err = ref("");
 const runMsg = ref("");
-const targetChannel = ref<ProxyChannelId | "">("");
+const targetChannel = ref<ProxyBuiltinChannelId | "">("");
 let offEvent: (() => void) | undefined;
 
-const CHANNELS: { id: ProxyChannelId | ""; label: string }[] = [
+const CHANNELS: { id: ProxyBuiltinChannelId | ""; label: string }[] = [
   { id: "", label: "全部渠道" },
   { id: "trae", label: "Trae SOLO CN" },
   { id: "workbuddy", label: "WorkBuddy（中国区）" },
