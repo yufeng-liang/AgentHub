@@ -419,9 +419,9 @@ function register(ipcMain) {
       : { status: "disabled" });
     return ok({});
   }));
-  // 重命名账号（自定义备注）：改 name 字段，WebDAV 同步时 LWW 传播到其他设备
-  // （上游 v1.17 带来的命令，三期 Task 1 接线：随 register() 同源进 dispatchTable ⇒ 归子进程，
-  //   号池写权仍单一。name 参与 accountKeyOf 的身份键，重命名的同步后果见 poolsync.cjs:139）
+  // 重命名账号（自定义备注）：只写 name 列，不推进任何参与 LWW 比较的时间戳 ⇒ 已知缺陷（本期不修）：
+  // uid 缺失的号以 name 作身份键（poolsync.accountKeyOf），改名会被下一轮号池同步还原、并在对端按新键多出一条号
+  // （上游 v1.18.0 带来的命令，三期 Task 1 接线：随 register() 同源进 dispatchTable ⇒ 归子进程，号池写权仍单一）
   ipcMain.handle("proxy_account_rename", handle(({ id, name }) => {
     const acc = store.getAccount(id);
     if (!acc) return fail("账号不存在");

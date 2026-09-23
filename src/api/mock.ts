@@ -440,12 +440,13 @@ export const mock = {
       case "proxy_oauth_cancel":
       case "proxy_oauth_submit_callback":
         return { ok: true };
-      // 重命名账号（自定义备注）：改预览池里的 name —— 与 index.cjs 的 name-only patch 同语义，
-      // store.updateAccount 也是 64 字截断，这里跟着一起截
+      // 重命名账号（自定义备注）：改预览池里的 name —— 与真实链路逐字同语义：
+      // index.cjs 注册体先 `String(name || "").trim()`，store.updateAccount 再 `slice(0, 64)`，
+      // 所以预览态也必须「先 trim 后截断」，否则「  我的主力号  」和纯空格名在两边行为不一致
       case "proxy_account_rename": {
         const hit = PROXY_POOL.flatMap((c) => c.accounts).find((a) => a.id === args?.id);
         if (!hit) return { ok: false, message: "账号不存在" };
-        hit.name = String(args?.name ?? "").slice(0, 64);
+        hit.name = String(args?.name || "").trim().slice(0, 64);
         return { ok: true };
       }
       case "proxy_pool":
