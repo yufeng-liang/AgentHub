@@ -28,7 +28,7 @@
 | 泡机 WAL | 50 条 HTTP 失败请求后 **1,388,472 B**，t+3→t+30min 恒定不动 | 二期判据 4 |
 | WAL 微测（纯 Node 直连 store） | 同样 50 条 `insertUsage` 得到 **一字不差的 1,388,472 B**，`checkpoint()` 返回 `true` 并截到 **0**；第二轮 494,432→0 | `tmp/gateway-probe/wal-micro-probe.cjs`（一次性微测，不入库；其结论由 §六 第 2 步的正式闸固化） |
 | 子进程装配 | `electron/gateway.cjs:105` 在 `store.open()` 后**无条件** `startCheckpointTimer()`，`CHECKPOINT_MS=5min` | 代码 |
-| 由此排除/剩下的假设 | 「TRUNCATE 机制缺失」被排除；剩「走 HTTP 的失败请求路径留下未收尾事务或未耗尽语句，使每次 checkpoint 吃 SQLITE_BUSY，而 `checkpoint()` 的 `false` 无人观测」——**这是待证结论，不是事实** | 推理 |
+| 由此排除的假设 | ① 「TRUNCATE 机制缺失」——排除（微测里同一个 `checkpoint()` 把 1,388,472B 截到 0）；② 「失败请求泄漏事务」——**也已排除**：`electron/backend/proxy/*.cjs` 全文无 `BEGIN/COMMIT/ROLLBACK`，且 store 只用 `.all()`/`.get()`（无未耗尽游标）。剩「子进程里 `checkpoint()` 的返回值是 false 还是根本没被调用」二选一，**外部不可观测正是当前缺陷本身**，故 §六 第 1 步先做留痕 | grep 清点 |
 | Electron 自启缺陷 | 35.7.5 的 `setLoginItemSettings({path})` 会吃掉路径反斜杠（实测 `H:\x\y.cmd` 落盘 `H:xy.cmd`），二期已改 reg.exe 直写并真机验证 | 提交 `835dc94` |
 | 装更判据 | NSIS 保留包内 mtime，判"装成了"必须用 ctime；且安装器在应用仍运行时会静默放弃 | 二期批次③ |
 | 打包态隔离 | 主进程 userData 由 Chromium 已知目录决定（APPDATA 环境变量无效），子进程 `ELECTRON_RUN_AS_NODE` 下 `dataDir()` 回退读 APPDATA → 两者必须成对注入 | 二期规格 §八 第六条 |
@@ -87,7 +87,7 @@
 ## 六、WAL 收敛：先留痕，再取证，再修，最后才谈 PRAGMA
 
 1. **留痕先行**：`store.checkpoint()` 的返回值与前后 `walBytes()` 落子进程日志（`log.line("wal-checkpoint", {ok, before, after})`），并把 `walBytes()` 挂进 `proxy_status`（或 `/status`）一个字段。理由：现状是"做没做成没人知道"——注释里写着"不假装成功"，但没人接这个返回值。
-2. **一条预期先红的闸**：`scripts/dev-wal-convergence-test.cjs`（**新文件**，与 `dev-write-ownership-test` 分开——那条测写权，这条测收敛）。步骤：起子进程 → 走真实 HTTP 打 50 条**注定失败**的请求 → 调 `checkpoint()` → 断 WAL ≤64KB 且留痕字段可见。按 §二 微测指向，它现在应该红；红即是三期第一个缺陷的证据。若它直接绿，则冻结另有其因（候选：credits 后台作业的读事务），当场改判并写偏差。
+2. **一条预期先红的闸**（红的是没收敛这件事本身，不再预设它是事务泄漏）：`scripts/dev-wal-convergence-test.cjs`（**新文件**，与 `dev-write-ownership-test` 分开——那条测写权，这条测收敛）。步骤：起子进程 → 走真实 HTTP 打 50 条**注定失败**的请求 → 调 `checkpoint()` → 断 WAL ≤64KB 且留痕字段可见。按 §二 微测指向，它现在应该红；红即是三期第一个缺陷的证据。若它直接绿，则冻结另有其因（候选：credits 后台作业的读事务），当场改判并写偏差。
 3. **修根因，不预先承诺改法**：取决于第 2 步暴露的是"未提交事务"还是"未耗尽语句/未 finalize"，改法是资源收尾进 `finally` 或失败路径显式回滚——写在设计里就是猜，故不写。
 4. **`PRAGMA journal_size_limit=65536` 只作第二道保险**，在 1–3 完成之后再评估。顺序不可反：它能压住 WAL 峰值，但会掩盖事务泄漏这个真问题。
 5. **判据 4 正式改写**为一条可核命题：「50 条失败请求之后，一次 `checkpoint()` 必须把 WAL 截到 ≤64KB」。原「30 分钟额度刷新后 <64KB」里那 30 分钟只是凑时长，不承载判据，**删除**。若第 4 步最终采纳 `journal_size_limit`，再追加第二条「持续写入下 WAL 峰值不越过该上限」——它依附于可选步骤，故不作为本期门槛。
@@ -112,7 +112,7 @@
 ## 九、风险与偏差登记（执行时逐条回写，不留空白）
 
 - **R1 合并后判据数字失效**：上游改了 `server.cjs`（status/healthz）与 `store.cjs`。处置：完成定义第 3 条强制重量。
-- **R2 WAL 假设可能不成立**：§六 第 2 步若直接绿，说明冻结另有其因（`credits` 后台作业读事务、或 `startBackgroundJobs` 里的长读）。处置：按实际证据改 §六 的修复项，不改判据。
+- **R2 WAL 根因未定**：两条主流假设已被 §二 的 grep 与微测排除，剩下「TRUNCATE 返回 false（被挡）」与「计时器压根没跑（unref 后事件循环语义 / store 模块被加载成两份）」两种。处置：留痕先行，再由实现计划的决策表二选一，**不预设改法也不预设判据**。
 - **R3 上游 PRAGMA 与本节 PRAGMA 叠放**：两处不同库不同文件，但要防"连接级设置在两侧被设成互斥值"。处置：合并提交里 grep 双侧全部 `PRAGMA` 并列一次。
 - **R4 默认不弹界面的可发现性**：新装用户可能找不到界面。缓解：托盘菜单已有「显示主界面」，且首次常驻时已有 detach 提示；三期 CDP 走查项包含"托盘图标可见 + 菜单能开界面"。
 
