@@ -132,7 +132,7 @@ node scripts/dev-bundle-check.cjs
 ```
 
 期望：前 13 条 `OK`/全绿；`dev-bundle-check.cjs`（不带 `--check`）只做体积门槛。
-**`dev-gateway-forward-parity-test.cjs` 在这里预期是红的**——上游带来的 `proxy_account_rename` 进了 `proxy/index.cjs` 注册体却没进 preload/`ALL_PROXY_CMDS`，这正是 Task 1 的活。除这一条外任何一条红都必须先修好再往下。
+**本 Task 结束时 14 道闸必须全绿（含 `dev-gateway-forward-parity-test.cjs`）**——Task 0 只解结构冲突，`proxy_account_rename` 的体与白名单都还没进来（那是 Task 1 的活），所以此刻三处仍是自洽的 43 条世界。若本闸在 Task 0 就红，说明 Step 3 的解法把上游新命令的注册体单边并进来了，回到 (a) 规则重解。**其它任何一条红都必须先修好再往下。**
 
 - [ ] **Step 7: 提交合并**
 
@@ -158,13 +158,13 @@ git commit -m "merge: 并入上游 v1.16.2→v1.18.1，proxy 域结构改动保�
 - Consumes：Task 0 的合并结果
 - Produces：`proxy_account_rename` 在子进程 dispatch 表内、`get_dimensions` 在主进程 sync 域；preload 白名单 == 主进程注册面 == 一期基线 ∪ 上游新增，Task 2/7 依赖这条闸是绿的
 
-- [ ] **Step 1: 先看闸怎么红，确认只差对齐、不是缺体**
+- [ ] **Step 1: 确认起点是绿的（Task 0 已把三处留在 43 条自洽态），改测试后才该红**
 
 ```bash
-node scripts/dev-gateway-forward-parity-test.cjs 2>&1 | grep -E "FAIL|多出|缺"
+node scripts/dev-gateway-forward-parity-test.cjs | tail -3
 ```
 
-期望输出形如：`① preload 有基线没有：proxy_account_rename`、`④ 子进程多出来的键都在白名单外：proxy_account_rename`。若报的是「子进程表缺 …」说明上游的体没进 `dispatchTable()`，回到 Task 0 的解冲突规则 (a)。
+期望：绿。做 Step 2 的闸改动后再跑一次，此刻应红在 `④ 子进程表含 proxy_account_rename`（体未进）与 `④ 子进程多出来的键都在白名单内`（`newSubCmds` 加了名但体缺失）——**三处（preload 白名单 / `ALL_PROXY_CMDS` / 子进程注册体）任一漏改，闸都会指名道姓报出来**，这正是这道闸的意义。若第一步就不绿，说明 Task 0 单边并进了上游注册体却没对齐白名单，回 Task 0 规则 (a) 重解，不要在本 Task 顺手修。
 
 - [ ] **Step 2: 扩闸到 44 条（改测试到红，再改实现到绿）**
 
@@ -203,6 +203,20 @@ node scripts/dev-gateway-forward-parity-test.cjs 2>&1 | tail -6   # 期望：仍
 ```js
 ipcMain.handle("get_dimensions", (_e, args) => db.getDimensions(args.dim, args.source));
 ```
+
+④ `electron/backend/proxy/index.cjs` 的 `register()` 里并上游的 `proxy_account_rename` 体（逐字来自 `upstream/main:electron/backend/proxy/index.cjs:336-342`，取上游原文）：
+
+```js
+  // 重命名账号（自定义备注）：改 name 字段，WebDAV 同步时 LWW 传播到其他设备
+  ipcMain.handle("proxy_account_rename", handle(({ id, name }) => {
+    const acc = store.getAccount(id);
+    if (!acc) return fail("账号不存在");
+    store.updateAccount(id, { name: String(name || "").trim() });
+    return ok({});
+  }));
+```
+
+它随 `register()` 同源进 `dispatchTable()` ⇒ 归属自动落子进程；`store.updateAccount` 若在上游是别的名字，以 `store.cjs` 实际导出为准（`grep -n "^function update" electron/backend/proxy/store.cjs`）。
 
 - [ ] **Step 4: 前端出口与 mock 同步（漏了会白屏，不是 lint 错）**
 
@@ -376,11 +390,12 @@ store.startCheckpointTimer((r) => log.line("wal-checkpoint", { ok: r.ok, before:
 `store.cjs:643` 签名改成向后兼容的可选回调（既有 `startCheckpointTimer()` 与 `startCheckpointTimer(ms)` 两种调用必须照常工作）：
 
 ```js
+let ckOnResult = null;                      // 模块级：Task 4 分支 (c) 把注册点搬进 open() 时靠它带上回调
 function startCheckpointTimer(onResult) {
   const ms = typeof onResult === "number" ? onResult : 0;
-  const cb = typeof onResult === "function" ? onResult : null;
+  if (typeof onResult === "function") ckOnResult = onResult;
   stopCheckpointTimer();
-  ckTimer = setInterval(() => { const r = checkpoint(); if (cb) cb(r); }, ms || CHECKPOINT_MS);
+  ckTimer = setInterval(() => { const r = checkpoint(); if (ckOnResult) ckOnResult(r); }, ms || CHECKPOINT_MS);
   if (ckTimer.unref) ckTimer.unref();
   return stopCheckpointTimer;
 }
@@ -469,11 +484,14 @@ node -e "const a=require('./electron/backend/proxy/store.cjs'),b=require('./elec
 若同进程内为同一对象，则问题在 `startCheckpointTimer` 的 `unref`：常驻子进程在**无 HTTP 连接、无管道流量**时的空闲期由 `srvRef`/pipe 保活，但 `ckTimer` 若在 `open()` 之前注册就会被 `stopCheckpointTimer()` 清掉。修法是把注册点收敛到 `open()` 成功后并由 `open()` 幂等重挂（**回调必须一起搬走**，否则 Task 3 的留痕会随这次改动消失）：
 
 ```js
-// store.open() 末尾（:130 两条 PRAGMA 之后）：内部重挂，保留既有回调引用
-if (!ckTimer) ckTimer = setInterval(() => { const r = checkpoint(); if (ckOnResult) ckResult(r); }, CHECKPOINT_MS);
+// store.open() 末尾（:130 两条 PRAGMA 之后）：幂等重挂，沿用模块级 ckOnResult
+if (!ckTimer) {
+  ckTimer = setInterval(() => { const r = checkpoint(); if (ckOnResult) ckOnResult(r); }, CHECKPOINT_MS);
+  if (ckTimer.unref) ckTimer.unref();
+}
 ```
 
-即 `startCheckpointTimer` 与 `open()` 共用一个 `ckTimer` 守卫，`ckOnResult` 存在模块变量里由 `startCheckpointTimer(onResult)` 首次设置。同时删掉 `gateway.cjs:105` 的独立调用，避免两处注册互相 `clearInterval`——改完后 Task 3 的 ① 断言（`lastCheckpoint()` 可读）与 ② 断言都必须仍然成立，否则本次修改即为回退。
+即 `startCheckpointTimer` 与 `open()` 共用一个 `ckTimer` 守卫，回调存在模块变量 `ckOnResult`（Task 3 已建）里、由 `startCheckpointTimer(onResult)` 首次设置。同时把 `gateway.cjs:105` 的调用改为**只传回调不再自己起计时器**（例如 `store.startCheckpointTimer(cb)` 仍在，但因守卫不会重复挂；或删该行并把回调改由 `open()` 前设置——二选一，以「全仓只有一处 setInterval」为准）。改完后 Task 3 的 ①（`lastCheckpoint()` 可读）与 ②（收敛后 ≤64KB）两条断言都必须仍然成立，否则本次修改即为回退。
 
 - [ ] **Step 3: 把选中的分支写成断言补进闸（防回退）**
 
@@ -661,7 +679,7 @@ git commit -m "feat: 设置页应用行为卡 5 行收 4 行——单一「轻�
 - Modify: `docs/superpowers/specs/2026-09-21-gateway-lite-mode-design.md`（§一 表、§5.4/§四 判据 4、§六 语义三处同源）
 - Test: 复用二期矩阵探针（`tmp/gateway-probe/real-batch2-retry.cjs`、`real-batch3-install.cjs`、`real-batch4-matrix.cjs`、`real-batch4-portable.cjs`、`real-batch4-walsoak.cjs`）+ 新入口走查
 
-- [ ] **Step 1:** `npm run build` + §四 列明的 14 道闸 + `node scripts/dev-bundle-check.cjs --check`（合计 15 项）一次连跑，完整输出留档。
+- [ ] **Step 1:** `npm run build` + §四 列明的 14 道闸 + `node scripts/dev-bundle-check.cjs --check`（合计 15 项）一次连跑，完整输出留档。**若 `--check` 因 Task 5/6/7 的入口改动报漂移**：按 Task 2 Step 3 同一手法（删基线重跑两次 `--check`）重录，并**单独提交**，不混进功能提交。
 - [ ] **Step 2:** 重量矩阵四项：常驻 detach 单进程私有内存、关窗销毁 main 自持值、导航 8 样本、WAL 收敛后终值（数字必须来自 1.18.1，**不得复用 76.94 / 130.26**）。
 - [ ] **Step 3:** 真机两条回归：常驻 detach 存活、自启 Run 项目标正确（`electron:pack` 后真装一次，判据用 ctime）。
 - [ ] **Step 4:** 规格回写：§一 换实测终态；§四 判据 4 改写成「50 条失败请求后一次 `checkpoint()` 必须截到 ≤64KB」；§六 轻量模式新入口 + 常驻子行语义 + 代码注释/设置页文案三处同源；§八 追加本期新踩的隔离/判据事实（若有）。
