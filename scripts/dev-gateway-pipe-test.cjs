@@ -77,7 +77,9 @@
 //        每连接的账，k 条认证连接各 64 = k×64。连接 1 顶满 proto.MAX_TOTAL_PENDING 条在飞后，
 //        连接 2 的下一条必须**当场**被拒（业务失败形状：命令从未被派发，重试语义留给调用方）、
 //        服务端在飞峰值不许超总账、既有连接上的在飞命令不受连坐、总账清零后连接 2 立刻可用。
-//  ⑧ 收尾卫生：真实 %APPDATA%\AgentHub\proxy\stats.db 零写入、HKCU Run 项未变。
+//  ⑧ 收尾卫生：真实 %APPDATA%\AgentHub\proxy\stats.db 的 size@mtime 只记录（用户实例每 300 s 写回主库，
+//     round 3 起不断言，见 main() 头注释）、HKCU Run 项未变（有牙断言）、并有一条结构性判据断言
+//     本闸源码里没有对真实库的开库调用。
 //  ⑩ 双入口并发去重（Task 5 刀 2 修复轮，评审 I1）：boot 侧裸调 start() 与转发侧 ensureStarted()
 //     在飞期间撞上必须并成**一次** spawn——互斥长在 start() 本体，所有调用点汇入同一条路径，
 //     第二次调用拿到同一条在飞 promise 的结果（同 pid），而不是并发起第二次 spawn。
@@ -91,8 +93,11 @@
 //  · 端口一律非 9527（这里用 19531 / 19530），9527 归用户自己那台实例；
 //  · 每个沙箱（= 一份 gateway.json）各跑各的场景，互不覆盖彼此的握手文件；
 //  · 收尾只按「本次记下的 pid」精确处理自己起的进程，绝不按进程名宽匹配（一期踩过宽匹配杀到用户实例的坑）；
-//  · 真实 %APPDATA%\AgentHub\proxy\stats.db 只做 stat 比对（size@mtime 未变 = 零写入的直接证据），
-//    不去开它：给用户在跑的实例添一个数据库句柄本身就是副作用。
+//  · 真实 %APPDATA%\AgentHub\proxy\stats.db 只做 `fs.statSync` 记录（**绝不开它**：给用户在跑的
+//    实例添一个数据库句柄本身就是副作用），size@mtime 首尾值在 ⑧ 里如实报出但**不断言**：
+//    用户实例每 300 s 整拍 checkpoint 会写回主库（实测差值恰 300.000 s），拿它做不变断言必然
+//    间歇假红，红的是「用户在用应用」这件正常事。有牙的断言只剩 HKCU Run 那一条（我们自己的
+//    副作用面），另有一条结构性判据断言本闸源码里没有对真实库的开库调用。
 "use strict";
 const assert = require("node:assert");
 const fs = require("node:fs");
@@ -649,6 +654,72 @@ const preBait = () => {
 })().catch((e) => { console.log("READY-THREW " + String((e && e.message) || e)); process.exit(1); });
 `;
 
+/** ===== 结构性判据（round 3 新增，同 WAL 闸）：本闸源码里**不存在**对真实库的开库调用 =====
+ *  为什么要它：⑧ 把真实库的 size@mtime 从「断言」降为「只记录」之后，「我们不写真实库」就只剩
+ *  **构造**在保证（本闸对真实库只 `fs.statSync`）。构造是解释不是证据，所以这里把构造写成断言：
+ *  读本闸自己的源码，剥掉注释后断言没有任何开库调用点落在 `REAL_APPDATA` 的表达面上。
+ *  （同仓 `dev-gateway-forward-parity-test.cjs` 读 preload 源码断言白名单是同一手法。）
+ *  两处实现坑、已就地钉住：
+ *   · 针必须**拼开** —— 本函数自己的源码里一旦出现完整针字面量就会**自我命中**（它读自己，
+ *     探针字符串也一样：它必须由片段拼出，否则源码里就真出现了一处「真实库开库」）。
+ *   · 下界**不用「命中数 > 0」**：本闸源码里本来就只有夹具字符串中的 `store.open()` 一处，
+ *     数量下界会被它撑住 = 弱判据。这里改用**运行时自检**（喂一段合成的
+ *     「真实库开库」文本给同一个检测器，断言它**确实**判红）—— 这是每次跑闸都真跑的负对照，
+ *     与「本文件恰好有几处针」无关，比数针更硬。 */
+function stripComments(src) {
+  // 顺序不能反：先块注释再行注释（行注释里可能出现 `/*` 字样，反之亦然）
+  return src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
+}
+const DB_CTOR = "Database" + "Sync";
+const OPEN_FN = "o" + "pen";
+const SITES_RE = new RegExp(
+  "new\\s+" + DB_CTOR + "\\s*\\(|\\.\\s*" + OPEN_FN + "\\s*\\(|\\b" + OPEN_FN + "Sync\\s*\\(", "g");
+const REAL_TOKEN = "REAL" + "_APPDATA";
+/** 返回剥注释后所有「开库调用点」的 {line, window, text}；真实库面由调用方判 */
+function dbOpenCallSites(src) {
+  const code = stripComments(src);
+  const out = [];
+  SITES_RE.lastIndex = 0;
+  let m;
+  while ((m = SITES_RE.exec(code)) !== null) {
+    const start = Math.max(0, m.index - 160);
+    out.push({
+      line: code.slice(0, m.index).split("\n").length,
+      window: code.slice(start, m.index + 300),
+      text: m[0].trim(),
+    });
+  }
+  return out;
+}
+/** 结构性判据本体：无调用点落在真实库上（且检测器本身有牙 = 非空断言） */
+function assertNoRealDbOpenInSource() {
+  // 先自检检测器：合成三段「对真实库开库」的文本（片段拼出，源码里不出现完整针），必须全被判出。
+  // 它覆盖三种形态的针，任一根被改名都在这里当场报红，不会静悄悄恒真。
+  // ⚠ 探针里 REAL_TOKEN 必须落在**代码**位置、不能落在注释里：注释会被 stripComments 正确剥掉，
+  //   那样探针永远判不出（round 3 第一次跑就是这么红的——错在探针，不在检测器）。
+  const probes = [
+    // 形态一：构造器
+    "function f() { return new " + DB_CTOR + "(path.join(" + REAL_TOKEN + ", 'AgentHub/proxy/stats.db'), { readOnly: true }); }",
+    // 形态二：模块方法 + 真实路径变量
+    "function g() { const p = path.join(" + REAL_TOKEN + ", 'AgentHub/proxy/store.cjs'); const s = require(p); s." + OPEN_FN + "(); }",
+    // 形态三：fs.openSync（跨行写法，验窗口宽度够）
+    "function h() {\n  const fd = fs." + OPEN_FN + "Sync(path.join(\n    " + REAL_TOKEN + ",\n    'AgentHub/proxy/stats.db'\n  ), 'r');\n  return fd;\n}",
+  ];
+  for (const probe of probes) {
+    const hit = dbOpenCallSites(probe).filter((s) => s.window.includes(REAL_TOKEN));
+    assert.ok(hit.length > 0,
+      "⑧ 结构判据失效（检测器无牙 = 空断言）：合成探针 " + JSON.stringify(probe)
+      + " 没被检测器判出（针改名了？）—— 请同步改本条判据的针，不要让它恒真通过");
+  }
+  const self = path.join(__dirname, path.basename(__filename));
+  const sites = dbOpenCallSites(fs.readFileSync(self, "utf8"));
+  const onReal = sites.filter((s) => s.window.includes(REAL_TOKEN));
+  assert.strictEqual(onReal.length, 0,
+    "⑧ 结构判据失败：本闸源码里有开库调用落在真实 %APPDATA% 的表达面上（本闸对真实库只许 fs.statSync）：\n"
+    + onReal.map((s) => "  :" + s.line + "  " + s.text).join("\n"));
+  return sites;
+}
+
 /** 夹具脚本落到临时目录：断言路径与 --bench 路径都要（bench 只需要后两个，但一次写全省得分叉） */
 function writeFixtures() {
   fs.writeFileSync(path.join(work, "gw-parent.cjs"), PARENT_SRC, "utf8");
@@ -665,7 +736,13 @@ function writeFixtures() {
 
 async function main() {
   writeFixtures();
-  // 真实用户库的「零写入」基线：只 stat，不开库
+  // 真实用户库的「零写入」观测面：只 stat，绝不开库。
+  // ⚠ 主库与 -wal 的 size@mtime **都只如实报出、都不断言**（round 3 更正）：用户那台实例每 **300 s 整拍**
+  //   做一次 checkpoint 把 WAL 帧写回主库（控制器独立取证：真实库 size@mtime 跨整拍为
+  //   `946176@… 23:50:02.017644` → `958464@… 23:55:02.017793`，**差值恰 300.000 s**、size 也变），
+  //   本闸整段跑远超 300 s ⇒ 首尾不变断言必然间歇假红，且红的是「用户在用应用」这件正常事。
+  //   「零写入」的保证不在断言里而在**构造**里：本闸对真实库只 `fs.statSync`、从不开库，
+  //   另由 ⑧ 的结构判据 `assertNoRealDbOpenInSource()` 把这条构造写成可证伪的断言。
   const realDbDir = path.join(REAL_APPDATA, "AgentHub", "proxy");
   const statOrZero = (p) => { try { const s = fs.statSync(p); return s.size + "@" + Math.round(s.mtimeMs); } catch { return "absent"; } };
   const realBaseline = () => [statOrZero(path.join(realDbDir, "stats.db")), statOrZero(path.join(realDbDir, "stats.db-wal"))].join("|");
@@ -1730,10 +1807,15 @@ fs.writeFileSync(path.join(d,"names.txt"), fs.readdirSync(path.join(d,"AgentHub"
     + `（pid=${bootR.pid}），两条调用拿到同一结论（claimed=${bootR.claimed}），只 spawn 了一个子进程`);
 
   // ===== ⑧ 收尾卫生核对（探针三件套 + 第五条）=====
-  assert.strictEqual(realBaseline(), realBefore,
-    "⑧ 真实 %APPDATA%\\AgentHub\\proxy\\stats.db 被本次运行写动了（size@mtime 变了）：\n  before " + realBefore + "\n  after  " + realBaseline());
+  // round 3：真实库 size@mtime 降为**只记录**（用户实例每 300 s 整拍写回主库，见 main() 头注释）；
+  // 有牙的断言只剩 HKCU Run 那一条（我们自己的副作用面），不许因为「隔离判据松了」顺手删它。
+  const realAfter = realBaseline();
+  const sites8 = assertNoRealDbOpenInSource();   // 结构判据：本闸源码里没有对真实库的开库调用
   assert.strictEqual(regValue(), regBefore, "⑧ HKCU Run 项被本次运行改动了（探针卫生第五条）");
-  pass("⑧ 收尾：真实 stats.db / -wal 的 size@mtime 未变（零写入直接证据）、HKCU Run 项未变");
+  pass(`⑧ 收尾：HKCU Run 项未变（有牙断言）；真实 stats.db / -wal 的 size@mtime`
+    + ` ${realBefore} → ${realAfter}（用户实例每 300 s 写回，只记录不断言）。`
+    + `结构性判据：本闸源码剥注释后 ${sites8.length} 处开库调用点，**0 处**落在真实 %APPDATA% 表达面上`
+    + `（检测器另经三段合成探针自检 ⇒ 有牙）`);
 }
 
 // ===== --bench：性能回归（简报 Step 3），与断言组互不牵扯，单独一条命令跑 =====
