@@ -284,11 +284,10 @@ function realWalBytes() {
  *     把它们算进来会把判据变成恒假红（brief 明确提醒过滤注释行）。
  *   · 每个**调用点**取「向前 160 字符 + 向后 300 字符」的窗口判 REAL_APPDATA，覆盖跨行写法
  *     （`path.join(\n  REAL_APPDATA, …`）——只按单行判会漏。
- *   · **负对照**（有牙的证明）：剥完注释后必须仍**找得到**调用点。若某天 API 改名或文件被整体重写，
- *     匹配面清零，这条判据就会变成恒真的空断言 —— 那时必须报红要求改闸，而不是静悄悄通过。
- *     所以这里下一条 `sites.length > 0` 的下界断言（当前实测命中 2 处：Leg A 夹具字符串里的
- *     `store.open()` 与 Leg C 的 `new DatabaseSync(LOCK_APPDATA…`，两处都在沙箱内）。
- *     该下界断言**跑得过不算证据**：round 3 实测把它反向后判据变红（见提交说明），确认它有牙。 */
+ *   · **负对照**（有牙的证明）：检测器自己先被喂三段合成探针（三种形态的针各一）并必须判出；
+ *     然后才判本闸源码。这样「针被改名」会当场报红，判据不会静悄悄恒真。源码侧的命中面当前实测
+ *     2 处（Leg A 夹具字符串里的 `store.open()` 与 Leg C 的 `new DatabaseSync(LOCK_APPDATA…`），
+ *     两处都在沙箱内 ⇒ 真实库面 0 处。 */
 function stripComments(src) {
   // 顺序不能反：先块注释再行注释（行注释里可能出现 `/*` 字样，反之亦然）
   return src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
@@ -317,20 +316,28 @@ function dbOpenCallSites(src) {
   }
   return out;
 }
-/** 结构性判据本体：无调用点落在真实库上（且匹配面非空 = 判据有牙） */
+/** 结构性判据本体：无调用点落在真实库上（且检测器本身有牙 = 非空断言） */
 function assertNoRealDbOpenInSource() {
+  // 先自检检测器：合成三段「对真实库开库」的文本（片段拼出，源码里不出现完整针），必须全被判出。
+  // 它覆盖三种形态的针，任一根被改名都在这里当场报红，不会静悄悄恒真。
+  // ⚠ 探针里 REAL_TOKEN 必须落在**代码**位置、不能落在注释里：注释会被 stripComments 正确剥掉，
+  //   那样探针永远判不出（round 3 实测踩到：错在探针，不在检测器）。
+  const probes = [
+    // 形态一：构造器
+    "function f() { return new " + DB_CTOR + "(path.join(" + REAL_TOKEN + ", 'AgentHub/proxy/stats.db'), { readOnly: true }); }",
+    // 形态二：模块方法 + 真实路径变量
+    "function g() { const p = path.join(" + REAL_TOKEN + ", 'AgentHub/proxy/store.cjs'); const s = require(p); s." + OPEN_FN + "(); }",
+    // 形态三：fs.openSync（跨行写法，验窗口宽度够）
+    "function h() {\n  const fd = fs." + OPEN_FN + "Sync(path.join(\n    " + REAL_TOKEN + ",\n    'AgentHub/proxy/stats.db'\n  ), 'r');\n  return fd;\n}",
+  ];
+  for (const probe of probes) {
+    const hit = dbOpenCallSites(probe).filter((s) => s.window.includes(REAL_TOKEN));
+    assert.ok(hit.length > 0,
+      "③ 结构判据失效（检测器无牙 = 空断言）：合成探针 " + JSON.stringify(probe)
+      + " 没被检测器判出（针改名了？）—— 请同步改本条判据的针，不要让它恒真通过");
+  }
   const self = path.join(__dirname, path.basename(__filename));
   const sites = dbOpenCallSites(fs.readFileSync(self, "utf8"));
-  assert.ok(sites.length > 0,
-    "③ 结构判据失效（匹配面为空 = 空断言）：本闸源码剥掉注释后一个开库调用点都找不到 —— "
-    + "要么 API 改名了，要么文件被重写，请改这条判据本身，不要让它静悄悄恒真");
-  // 下界必须**钉在构造器这根针上**，不能只钉总数：Leg A 夹具字符串里还有一处 `.open(`，
-  // 单看总数的话，即使构造器那根针整个改名消失，总数仍 >0 ⇒ 下界恒真（弱化）。所以这里再要求
-  // 「至少命中一处构造器形态」，让「针本身改名/消失」也当场报红（改判据，不许静悄悄恒真）。
-  const ctorRe = new RegExp("new\\s+" + DB_CTOR + "\\s*\\(");
-  assert.ok(sites.some((s) => ctorRe.test(s.text)),
-    "③ 结构判据失效（构造器这根针没命中 = 空断言）：剥注释后找不到任何 `new " + DB_CTOR + "(` 形态，"
-    + "说明被测对象换了开库 API（或本文件被重写）—— 请同步改本条判据的针，不要让它恒真通过");
   const onReal = sites.filter((s) => s.window.includes(REAL_TOKEN));
   assert.strictEqual(onReal.length, 0,
     "③ 结构判据失败：本闸源码里有开库调用落在真实 %APPDATA% 的表达面上（本闸对真实库只许 fs.statSync）：\n"
