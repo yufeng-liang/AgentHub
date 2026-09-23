@@ -386,11 +386,11 @@ function register(ipcMain) {
     credits.refreshAccount(r.id).catch(() => {});
     return ok({ id: r.id, updated: r.updated });
   }));
-  ipcMain.handle("proxy_oauth_begin", handle(async ({ channel }) => {
+  ipcMain.handle("proxy_oauth_begin", handle(async ({ channel, edition, vendor, captchaVerifyParam }) => {
     // OAuth 只对内置生态渠道存在：提供商没有授权页可跳，落到兜底渠道会把用户带去登录别人的账号
     if (!store.isBuiltinChannel(channel) || !adapters.get(channel)) return fail("该渠道不支持 OAuth 登录");
     const ch = String(channel);
-    const r = await discovery.beginOAuth(ch, (result) => {
+    const r = await discovery.beginOAuth(ch, { edition, vendor, captchaVerifyParam }, (result) => {
       if (result.ok) {
         credits.refreshAccount(result.id).catch(() => {});
         // 登录后自动签到一次（参考项目 login.sh / signin 同款：自动签到 + 查积分）
@@ -399,7 +399,8 @@ function register(ipcMain) {
       events.emit({ type: "oauth-done", channel: ch, ...result });
     });
     if (r.ok && r.url) await shell.openExternal(r.url);
-    return r.ok ? ok({ url: r.url, mode: r.mode }) : fail(r.message);
+    // mode=device（cline WorkOS / qoder PKCE 设备流）额外回 userCode 供 UI 展示（Task 13）
+    return r.ok ? ok({ url: r.url, mode: r.mode, userCode: r.userCode || "" }) : fail(r.message);
   }));
   ipcMain.handle("proxy_oauth_cancel", handle(() => ok({ cancelled: discovery.cancelOAuth() })));
   // 浏览器没跳回回环地址时的兜底：把地址栏内容整段粘回来完成登录

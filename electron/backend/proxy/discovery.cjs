@@ -1,11 +1,15 @@
 // 反代网关 · 凭据接入：本机软件导入（首选）→ OAuth 登录（兜底）→ 手动粘贴
 //
-// 三条渠道各自独立的登录方式（参考 cockpit-tools 的实证口径）：
+// 各渠道各自独立的登录方式（参考 cockpit-tools 的实证口径）：
 //   trae        Trae SOLO CN：PKCE(S256) + 本地回环回调 http://127.0.0.1:<port>/authorize
 //               登录主机由官方 GetLoginGuidance 下发（失败才用 www.trae.cn 兜底），
 //               授权地址必须带 auth_from=solo / hide_saas_login / code_challenge，缺一不可
 //   workbuddy   WorkBuddy（中国区）：官方 state 轮询
 //   workbuddy_ai WorkBuddy AI（国际版）：同一套 state 轮询，换上游域
+//   cline_free/cline_pass WorkOS 设备码流（RFC 8628）：authorize/device 发起 → authenticate 轮询
+//              → auth/register 换成带 workos: 前缀的 Cline 会话令牌；两池共用同一条登录流
+//   qoder      PKCE(S256) 设备授权：本地拼授权页（无起始请求）→ deviceToken/poll 2s 轮询
+//              → userinfo 补资料；edition 决定 global / cn 两套上游域
 //
 // 本机导入：
 //   WorkBuddy 读 %LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy*.info
@@ -1078,6 +1082,170 @@ async function fetchWorkBuddyAccount(base, channel, state, token) {
   };
 }
 
+// ===== 设备授权流（cline WorkOS / qoder PKCE，同构「发起→轮询→落库」，无回环端口） =====
+
+/** WorkOS 轮询响应判定（RFC 8628；协议参考 §1.3/第四章 §1） */
+function workosPollVerdict(status, body) {
+  if (status === 200 && body && (body.access_token || body.accessToken)) return "done";
+  const err = body && body.error;
+  if (err === "authorization_pending") return "pending";
+  if (err === "slow_down") return "slow_down";
+  if (err === "expired_token") return "expired";
+  if (err === "access_denied") return "denied";
+  return status >= 200 && status < 300 ? "done" : "pending";
+}
+
+/** qoder 地区归一：""/global/intl → global，cn → cn（协议参考 §3.1） */
+function qoderRegionOfMode(mode) { return String(mode || "").toLowerCase() === "cn" ? "cn" : "global"; }
+
+// cline：POST authorize/device（body 仅 client_id）→ verification_uri_complete 免手输 → 轮询 authenticate
+// → 必做 /auth/register 换 Cline 会话令牌（头带 X-CLIENT-TYPE: cline-sdk）→ 落库
+const CLINE_WORKOS_BASE = "https://api.workos.com";
+const CLINE_WORKOS_CLIENT_ID = "client_01K3A541FN8TA3EPPHTD2325AR"; // 逐字（credentials.rs:69）
+const CLINE_DEVICE_FALLBACK_URL = "https://authkit.cline.bot/device";
+const CLINE_API_BASE = "https://api.cline.bot/api/v1"; // 只有单层 v1（协议参考 §1.1；简报的条件式拼写按裁定改字面量）
+
+async function beginClineOAuth(channel, onDone) {
+  const pool = channel === "cline_pass" ? "pass" : "free";
+  const r = await adapters.httpJson(`${CLINE_WORKOS_BASE}/user_management/authorize/device`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
+    body: `client_id=${encodeURIComponent(CLINE_WORKOS_CLIENT_ID)}`,
+  }).catch((e) => ({ ok: false, status: 0, data: null, message: String(e) }));
+  const d = r.data || {};
+  const deviceCode = d.device_code, userCode = d.user_code;
+  if (!r.ok || !deviceCode) return { ok: false, message: `设备授权发起失败（HTTP ${r.status}）${d.error || ""}` };
+  const url = String(d.verification_uri_complete || d.verification_uri || CLINE_DEVICE_FALLBACK_URL);
+  oauthSession = {
+    mode: "device", channel, url, userCode, server: null, onDone,
+    interval: Math.max(1, Number(d.interval) || 5), slow: 0,
+    deadline: Date.now() + Math.max(OAUTH_TIMEOUT_MS, (Number(d.expires_in) || 300) * 1000),
+    submit: async () => ({ ok: false, message: "设备授权无需粘贴回调地址，请在授权页确认后回到本窗口等待" }),
+  };
+  const poll = async () => {
+    if (!oauthSession || oauthSession.userCode !== userCode) return;
+    if (Date.now() > oauthSession.deadline) { finishOAuth({ ok: false, message: "登录超时" }); return; }
+    const pr = await adapters.httpJson(`${CLINE_WORKOS_BASE}/user_management/authenticate`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
+      body: `grant_type=${encodeURIComponent("urn:ietf:params:oauth:grant-type:device_code")}&device_code=${encodeURIComponent(deviceCode)}&client_id=${encodeURIComponent(CLINE_WORKOS_CLIENT_ID)}`,
+    }).catch(() => null);
+    const verdict = workosPollVerdict(pr && pr.status, pr && pr.data);
+    // 在途请求期间用户可能已取消/改登别的渠道：会话不是原来那个就直接收手，
+    // 别再往 null 上写 slow/timer（与 pollWorkBuddyToken 的 state 复查同款）
+    if (!oauthSession || oauthSession.userCode !== userCode) return;
+    if (verdict === "done") {
+      try {
+        // 必做第四步：WorkOS 身份令牌换 Cline 会话令牌（协议参考 第四章 §1.4，不能省）
+        const reg = await adapters.httpJson(`${CLINE_API_BASE}/auth/register`, {
+          method: "POST",
+          headers: { "content-type": "application/json", accept: "application/json", "x-client-type": "cline-sdk" },
+          body: JSON.stringify({ accessToken: pr.data.access_token, refreshToken: pr.data.refresh_token }),
+        });
+        const rd = reg.data && reg.data.data;
+        if (!reg.ok || !rd || !rd.accessToken) throw new Error(`换会话令牌失败（HTTP ${reg.status}）`);
+        const token = clineAuth.ensureTokenPrefix(rd.accessToken);
+        // 前缀只属于 accessToken（§1.3 口径 1 / §1.7 桌面端样例的 refreshToken 是裸值）：
+        // adapters 的 refreshToken 会把存的原样发给 /auth/refresh，登录来源与扫描来源必须一致
+        const refreshToken = String(rd.refreshToken || pr.data.refresh_token || "");
+        const claims = clineAuth.jwtClaims(token);
+        const uid = clineAuth.clineUid(token, rd.accountId);
+        if (!uid) throw new Error("未取到 Cline 账号标识（JWT external_id 与 accountId 均缺失），请改用「导入本机登录态」或粘贴 token");
+        const id = await saveDiscoveredAccount(channel, {
+          uid, name: clineAuth.clineDisplayName(claims, claims.email),
+          token, refreshToken, expiresAt: clineAuth.clineExpiresAt(rd.expiresAt, claims),
+          meta: {}, source: "oauth",
+        });
+        finishOAuth({ ok: true, id, uid, pool });
+      } catch (e) { finishOAuth({ ok: false, message: String((e && e.message) || e) }); }
+      return;
+    }
+    if (verdict === "expired") { finishOAuth({ ok: false, message: "设备码已过期，请重新发起登录" }); return; }
+    if (verdict === "denied") { finishOAuth({ ok: false, message: "你在授权页拒绝了本次登录" }); return; }
+    if (verdict === "slow_down") oauthSession.slow = Math.min(oauthSession.slow + 1000, 30000); // 间隔 +1s、上限 30s
+    oauthSession.timer = setTimeout(poll, oauthSession.interval * 1000 + oauthSession.slow);
+  };
+  oauthSession.timer = setTimeout(poll, oauthSession.interval * 1000);
+  return { ok: true, url, mode: "device", userCode };
+}
+
+// qoder：无起始请求，本地拼授权页；2s 轮询 poll（202/404 = 继续）→ userinfo 补资料 → 落库 meta.mode
+async function beginQoderOAuth(channel, edition, onDone) {
+  const region = qoderRegionOfMode(edition);
+  const cfg = {
+    global: { webOrigin: "https://qoder.com", openApi: "https://openapi.qoder.sh" },
+    cn: { webOrigin: "https://qoder.com.cn", openApi: "https://openapi.qoder.com.cn" },
+  }[region];
+  const verifier = crypto.randomBytes(32).toString("base64url");
+  const challenge = crypto.createHash("sha256").update(verifier).digest("base64url"); // S256 无填充
+  const machineId = qoderMachineIdOf();
+  const nonce = util.uuid().replace(/-/g, "");
+  const url = `${cfg.webOrigin}/device/selectAccounts?challenge=${encodeURIComponent(challenge)}&challenge_method=S256&machine_id=${encodeURIComponent(machineId)}&nonce=${nonce}`;
+  oauthSession = {
+    mode: "device", channel, url, userCode: "", server: null, onDone, nonce,
+    deadline: Date.now() + OAUTH_TIMEOUT_MS * 2, // qoder 授权页含登录+选账号，给足 6 分钟
+    submit: async () => ({ ok: false, message: "设备授权无需粘贴回调地址，请在授权页选择账号后回到本窗口等待" }),
+  };
+  const poll = async () => {
+    if (!oauthSession || oauthSession.nonce !== nonce) return;
+    if (Date.now() > oauthSession.deadline) { finishOAuth({ ok: false, message: "登录超时" }); return; }
+    const r = await adapters.httpJson(`${cfg.openApi}/api/v1/deviceToken/poll?nonce=${encodeURIComponent(nonce)}&verifier=${encodeURIComponent(verifier)}&challenge_method=S256`, {
+      method: "GET", headers: { "cosy-version": "1.0.1", "cosy-clienttype": "5", "user-agent": "qoder-local-proxy" },
+    }).catch(() => null);
+    if (r && (r.status === 200 || r.status === 201)) {
+      const d = r.data || {};
+      if (d.token && d.refresh_token && !String(d.refresh_token).includes("|")) {
+        try {
+          // 登录后初始请求：userinfo 补 name/email（容忍失败：poll 已带 user_id，协议参考 §2.5）
+          let name = "Qoder 账号", email = "", userId = String(d.user_id || "");
+          const ui = await adapters.httpJson(`${cfg.openApi}/api/v1/userinfo`, {
+            method: "GET", headers: { "cosy-version": "1.0.1", "cosy-clienttype": "5", "user-agent": "qoder-local-proxy", authorization: `Bearer ${d.token}` },
+          }).catch(() => null);
+          if (ui && ui.ok && ui.data) {
+            const info = ui.data.data || ui.data;
+            name = String(info.nickname || info.name || name);
+            email = String(info.email || "");
+            userId = String(info.id || info.user_id || userId);
+          }
+          // 容忍规则（协议参考 §2.5）：poll 已带 user_id 时 userinfo 失败可容忍，否则必须报错——
+          // 空 uid 会跳过同 uid 查找，每次重登堆一个「未命名账号」
+          if (!userId) throw new Error("未取到 Qoder 账号标识（poll 未返回 user_id 且 userinfo 失败），请重新登录");
+          const id = await saveDiscoveredAccount(channel, {
+            uid: userId, name, token: String(d.token),
+            refreshToken: `${String(d.refresh_token)}|${userId}|${machineId}`, // 打包串（协议参考 §3.7）
+            expiresAt: util.toMs(d.expires_at) || Date.now() + 30 * 86400 * 1000, // 毫秒|秒|RFC3339 自动识别（§3.7 credentials.rs:175-182）
+            meta: { mode: region, email, machine_id: machineId, user_id: userId },
+            source: "oauth",
+          });
+          finishOAuth({ ok: true, id, uid: userId });
+        } catch (e) { finishOAuth({ ok: false, message: String((e && e.message) || e) }); }
+        return;
+      }
+    }
+    // 202/404/网络错误 = 还没确认，继续轮（协议参考 §2.3）
+    if (!oauthSession || oauthSession.nonce !== nonce) return; // 在途请求期间已取消/换渠道：不再排期
+    oauthSession.timer = setTimeout(poll, 2000);
+  };
+  oauthSession.timer = setTimeout(poll, 2000);
+  return { ok: true, url, mode: "device", userCode: "" };
+}
+
+/** 登录/导入共用的落库：同渠道同 uid 更新凭据，否则新建（store.addAccount/updateAccount 既有语义） */
+async function saveDiscoveredAccount(channel, { uid, name, token, refreshToken, expiresAt, meta, source }) {
+  const existing = uid ? store.listAccounts(channel).find((a) => a.uid === uid) : null;
+  if (existing) {
+    store.updateAccount(existing.id, { token, refreshToken, expiresAt, meta, status: "online", coolUntil: 0, coolReason: "" });
+    return existing.id;
+  }
+  return store.addAccount({ channel, uid, name, token, refreshToken, source: source || "oauth", expiresAt, meta });
+}
+
+/** qoder 机器标识：与对话侧共用 adapters 的单一实现（同一批候选文件、同一份落盘位置、同一进程内缓存），
+ *  避免两处各写一份读文件逻辑导致机器码漂移。 */
+function qoderMachineIdOf() {
+  return adapters._qoderMachineId();
+}
+
 // ===== 会话收尾 =====
 
 function finishOAuth(result) {
@@ -1097,9 +1265,16 @@ function finishOAuth(result) {
 
 /**
  * 开始 OAuth：按渠道选流程
- * @returns {Promise<{ok:boolean,url?:string,message?:string,mode?:string}>} url 由主进程 shell.openExternal 打开
+ * @param {string} channel 内置渠道 id
+ * @param {{edition?:string, vendor?:string, captchaVerifyParam?:string}|Function} opts
+ *        设备流/回调流的额外入参（qoder 用 edition 选区，autoclaw 国际版在 Task 12 用 captchaVerifyParam）；
+ *        也可直接传回调函数（兼容 Task 11 之前的两参调用）
+ * @param {(result:object)=>void} [onDone] 登录结束回调（成功/失败都回一次）
+ * @returns {Promise<{ok:boolean,url?:string,message?:string,mode?:string,userCode?:string}>} url 由主进程 shell.openExternal 打开
  */
-async function beginOAuth(channel, onDone) {
+async function beginOAuth(channel, opts, onDone) {
+  const o = opts && typeof opts === "object" ? opts : {};
+  const cb = typeof opts === "function" ? opts : onDone; // 兼容旧两参签名
   const ch = String(channel || "trae");
   if (oauthSession) throw new Error("已有进行中的登录，请先完成或取消");
   if (!adapters.get(ch)) throw new Error(`未知渠道 ${ch}`);
@@ -1108,8 +1283,17 @@ async function beginOAuth(channel, onDone) {
     // 明确不支持而非误走其他渠道分支——引导用户用「从 JSON/ZIP 文件」或「粘贴 JSON」导入
     throw new Error("小浣熊暂不支持在应用内直接登录：请在「商汤小浣熊」客户端登录后，用「从本机软件导入」或粘贴 auth.json 内容导入");
   }
-  if (ch === "trae") return beginTraeOAuth(ch, onDone);
-  return beginWorkBuddyOAuth(ch, onDone);
+  if (ch === "autoclaw") {
+    // 国内版官方只有客户端登录（手机号+验证码）+ auth.json 落盘，没有可代收的网页授权
+    throw new Error("AutoClaw（国内）官方没有网页登录：请用「从本机软件导入」（自动读取 %APPDATA%/AutoClaw/auth.json）或粘贴 token");
+  }
+  if (ch === "cline_free" || ch === "cline_pass") return beginClineOAuth(ch, cb);
+  if (ch === "qoder") return beginQoderOAuth(ch, o.edition, cb);
+  // autoclaw 国际版的 OAuth（阿里云风控验证码 + 回调换票）在 Task 12 接入，这里先如实回文案，
+  // 不抛「未知渠道」也不误走 WorkBuddy 轮询
+  if (ch === "autoclaw_intl") return { ok: false, message: "autoclaw 国际版登录在下一任务接入" };
+  if (ch === "trae") return beginTraeOAuth(ch, cb);
+  return beginWorkBuddyOAuth(ch, cb);
 }
 
 /** 手动提交回调地址（浏览器没跳回回环地址时的兜底路径） */
@@ -1148,4 +1332,7 @@ module.exports = {
   OAUTH_PORT,
   wbAuthDir,
   traeStoragePaths,
+  // 测试窥视口（下划线前缀 = 非公共契约）：设备流的轮询判定与地区归一纯函数，dev-cline/dev-qoder-test 直测
+  _workosPollVerdict: workosPollVerdict,
+  _qoderRegionOfMode: qoderRegionOfMode,
 };

@@ -131,5 +131,114 @@ ok("catalog 同步 _key 保留（chat 消费面）", qAd._resolveEntry("SyncedMo
 ok("目录条目无 _key 回落展示 id", qAd.upstreamFor("DefaultsOnly") === "DefaultsOnly" && qAd._resolveEntry("DefaultsOnly").key === "DefaultsOnly");
 ok("refreshToken 3 段打包串走 center 刷新路径", typeof qAd.refreshToken === "function");
 
-console.log(`\n${pass} 通过, ${fail} 失败`);
-process.exit(fail > 0 ? 1 : 0);
+// ===== Task 11：qoder PKCE 设备授权流（假 fetch + 假时钟：不发真实网络、不真等 2s 轮询间隔） =====
+console.log("qoder 登录辅助:");
+const crypto = require("node:crypto");
+const discovery = require("../electron/backend/proxy/discovery.cjs");
+const store = require("../electron/backend/proxy/store.cjs");
+ok("region 归一", discovery._qoderRegionOfMode("cn") === "cn" && discovery._qoderRegionOfMode("intl") === "global" && discovery._qoderRegionOfMode("") === "global");
+
+// 假时钟：setTimeout 只入队，drain() 手动按序触发，2s 间隔一秒都不等；每轮之后新排期的间隔记进
+// pollArms（httpJson 自带的 60s 总超时定时器在同一轮 finally 里就被清掉，不会混进记录）
+const realSetTimeout = global.setTimeout, realClearTimeout = global.clearTimeout;
+let timers = [], pollArms = [], timerSeq = 0;
+global.setTimeout = (fn, ms) => { const t = { id: ++timerSeq, fn, ms }; timers.push(t); return t.id; };
+global.clearTimeout = (id) => { timers = timers.filter((t) => t.id !== id); };
+const drain = async (max = 20) => { let n = 0; while (timers.length && n < max) { n++; await timers.shift().fn(); pollArms.push(timers.length ? timers[0].ms : null); } };
+const resetClock = () => { timers = []; pollArms = []; };
+const restoreClock = () => { global.setTimeout = realSetTimeout; global.clearTimeout = realClearTimeout; timers = []; pollArms = []; };
+
+const resp = (status, obj) => ({ ok: status >= 200 && status < 300, status, text: async () => JSON.stringify(obj) });
+let seen = [], polls = 0, done = null;
+const realFetch = globalThis.fetch;
+
+;(async () => {
+  // 中国区：404 → 202（都算「还没确认」）→ 200 出票
+  resetClock(); seen = []; polls = 0; done = null;
+  const cnScript = [
+    { status: 404, body: { message: "not found" } },
+    { status: 202, body: {} },
+    { status: 200, body: { token: "q-access", refresh_token: "q-rt", user_id: "uid-q-1", expires_at: 1893456000000 } },
+  ];
+  globalThis.fetch = async (url, opts) => {
+    seen.push({ url, opts });
+    if (url.includes("/api/v1/deviceToken/poll")) {
+      const step = cnScript[Math.min(polls, cnScript.length - 1)];
+      polls++;
+      return resp(step.status, step.body);
+    }
+    if (url.includes("/api/v1/userinfo")) return resp(200, { data: { id: "uid-q-1", nickname: "小明", email: "x@q.com" } });
+    return resp(500, { message: "unexpected" });
+  };
+  const r = await discovery.beginOAuth("qoder", { edition: "cn" }, (x) => { done = x; });
+  ok("begin 返回设备流（qoder 无用户码 → userCode 空串），授权页落 cn 域", r.ok === true && r.mode === "device" && r.userCode === "" && /^https:\/\/qoder\.com\.cn\/device\/selectAccounts\?/.test(r.url), r);
+  const authQ = new URL(r.url);
+  ok("授权页参数齐：challenge / challenge_method=S256 / machine_id / nonce", !!authQ.searchParams.get("challenge") && authQ.searchParams.get("challenge_method") === "S256" && !!authQ.searchParams.get("machine_id") && !!authQ.searchParams.get("nonce"), r.url);
+  ok("轮询起始间隔 2s", timers.length === 1 && timers[0].ms === 2000, timers.map((t) => t.ms));
+  await drain();
+  const pol = seen.find((s) => s.url.includes("/deviceToken/poll"));
+  const polQ = new URL(pol.url);
+  ok("轮询命中 cn 区 openapi 域且带 cosy 三件套", pol.url.startsWith("https://openapi.qoder.com.cn/api/v1/deviceToken/poll") && pol.opts.method === "GET" && pol.opts.headers["cosy-version"] === "1.0.1" && pol.opts.headers["cosy-clienttype"] === "5" && pol.opts.headers["user-agent"] === "qoder-local-proxy", pol && pol.opts && pol.opts.headers);
+  ok("PKCE 配对：challenge = base64url(sha256(verifier))，轮询按 nonce+verifier+challenge_method=S256 回传", crypto.createHash("sha256").update(polQ.searchParams.get("verifier")).digest("base64url") === authQ.searchParams.get("challenge") && polQ.searchParams.get("challenge_method") === "S256" && polQ.searchParams.get("nonce") === authQ.searchParams.get("nonce") && authQ.searchParams.get("challenge").length === 43 && !authQ.searchParams.get("challenge").includes("="), { challenge: authQ.searchParams.get("challenge"), verifier: polQ.searchParams.get("verifier") });
+  ok("202/404 继续轮且间隔恒为 2s，出票后不再排期", JSON.stringify(pollArms) === JSON.stringify([2000, 2000, null]), pollArms);
+  ok("登录完成回调 ok:true 且 uid 取 userinfo.id", !!done && done.ok === true && done.uid === "uid-q-1", done);
+  const acc1 = store.listAccounts("qoder").find((a) => a.uid === "uid-q-1");
+  const row1 = store.accountRows("qoder").find((r0) => r0.uid === "uid-q-1");
+  const sec1 = row1 ? store.accountSecrets(row1) : {};
+  ok("落库 qoder：userinfo 补 name/email、token 原样、expires_at 用上游值", !!acc1 && acc1.name === "小明" && sec1.token === "q-access" && acc1.expiresAt === 1893456000000 && acc1.source === "oauth", acc1 && { name: acc1.name, exp: acc1.expiresAt });
+  ok("refreshToken 打包成 <rt>|<user_id>|<machine_id> 三段（§3.7）", sec1.refreshToken === `q-rt|uid-q-1|${authQ.searchParams.get("machine_id")}`, sec1.refreshToken);
+  ok("meta 带 mode/email/machine_id/user_id", !!acc1 && acc1.meta.mode === "cn" && acc1.meta.email === "x@q.com" && acc1.meta.user_id === "uid-q-1" && acc1.meta.machine_id === authQ.searchParams.get("machine_id"), acc1 && acc1.meta);
+
+  // 国际区 + userinfo 失败：poll 已带 user_id，兜底不阻断登录
+  resetClock(); seen = []; polls = 0; done = null;
+  globalThis.fetch = async (url, opts) => {
+    seen.push({ url, opts });
+    if (url.includes("/api/v1/deviceToken/poll")) return resp(200, { token: "q-access2", refresh_token: "q-rt2", user_id: "uid-q-2" });
+    if (url.includes("/api/v1/userinfo")) return resp(500, { message: "boom" });
+    return resp(500, {});
+  };
+  const rg = await discovery.beginOAuth("qoder", { edition: "intl" }, (x) => { done = x; });
+  ok("edition=intl → global 区授权页", rg.ok === true && /^https:\/\/qoder\.com\/device\/selectAccounts\?/.test(rg.url), rg.url);
+  await drain();
+  const acc2 = store.listAccounts("qoder").find((a) => a.uid === "uid-q-2");
+  const row2 = store.accountRows("qoder").find((r0) => r0.uid === "uid-q-2");
+  ok("userinfo 失败仍落库（uid 用 poll 的 user_id、名兜底、到期缺省 now+30 天）", !!acc2 && acc2.name === "Qoder 账号" && acc2.meta.mode === "global" && seen.some((s) => s.url.startsWith("https://openapi.qoder.sh/api/v1/deviceToken/poll")) && row2.expires_at > Date.now() + 29 * 86400 * 1000, acc2 && { name: acc2.name, meta: acc2.meta, exp: row2.expires_at });
+
+  // refresh_token 含 | 判无效（§2.3）→ 不落库、继续轮；取消后不再排期
+  resetClock(); seen = []; polls = 0; done = null;
+  globalThis.fetch = async (url, opts) => {
+    seen.push({ url, opts });
+    return url.includes("/api/v1/deviceToken/poll") ? resp(200, { token: "t", refresh_token: "pat|a|b", user_id: "uid-q-3" }) : resp(500, {});
+  };
+  await discovery.beginOAuth("qoder", {}, (x) => { done = x; });
+  await drain(4);
+  ok("refresh_token 含 | 判无效 → 不落库并继续轮", done === null && pollArms.length === 4 && pollArms.every((ms) => ms === 2000) && !store.listAccounts("qoder").some((a) => a.uid === "uid-q-3"), { done, pollArms });
+  ok("取消登录撤销轮询", discovery.cancelOAuth() === true && timers.length === 0);
+
+  // poll 缺 user_id 且 userinfo 失败 → 必须报错（§2.5 容忍规则）：空 uid 会跳过同 uid 查找，重登就堆「未命名账号」
+  resetClock(); seen = []; polls = 0; done = null;
+  globalThis.fetch = async (url, opts) => {
+    seen.push({ url, opts });
+    return url.includes("/api/v1/deviceToken/poll") ? resp(200, { token: "t", refresh_token: "rt-no-uid" }) : resp(500, {});
+  };
+  await discovery.beginOAuth("qoder", {}, (x) => { done = x; });
+  await drain();
+  ok("poll 缺 user_id 且 userinfo 失败 → 报错且不落空 uid 账号", !!done && done.ok === false && /user_id/.test(done.message) && !store.listAccounts("qoder").some((a) => !a.uid), done);
+
+  // expires_at 秒形态必须认（§3.7 毫秒|秒|RFC3339 自动识别）；此路径 poll 带 user_id，userinfo 失败可容忍
+  resetClock(); seen = []; polls = 0; done = null;
+  globalThis.fetch = async (url, opts) => {
+    seen.push({ url, opts });
+    return url.includes("/api/v1/deviceToken/poll") ? resp(200, { token: "q-access4", refresh_token: "q-rt4", user_id: "uid-q-4", expires_at: 1893456000 }) : resp(500, {});
+  };
+  await discovery.beginOAuth("qoder", {}, (x) => { done = x; });
+  await drain();
+  const row4 = store.accountRows("qoder").find((r0) => r0.uid === "uid-q-4");
+  ok("expires_at 秒形态识别为毫秒且容忍 userinfo 失败", !!done && done.ok === true && !!row4 && row4.expires_at === 1893456000000, { done, exp: row4 && row4.expires_at });
+
+  restoreClock();
+  globalThis.fetch = realFetch;
+})().then(() => {
+  console.log(`\n${pass} 通过, ${fail} 失败`);
+  process.exit(fail > 0 ? 1 : 0);
+}).catch((e) => { console.error("测试执行异常:", e); process.exit(1); });
