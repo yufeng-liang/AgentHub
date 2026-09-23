@@ -9,8 +9,10 @@
 //   ③ 当前主进程注册面：gateway-client.register(收集器) 实际登记的命令名
 //     （= 37 条转发 + 4 条 UI_LOCAL + 3 条薄包装，Task 5 起主进程只从这里注册）
 //   ④ 子进程 dispatchTable() 的键集（命令实现体真正的所在地）
-// 断言：①==②∪上游新增==③ 且 ④ ⊇ ②（子进程可以有多出来的 gateway_* 内建命令与三条内部/新增命令，
-//       但不得少任何 proxy_*）；另钉两条归属结构证据：
+// 断言：①==②∪上游新增==③ 且 ④ ⊇ ②（子进程可以有多出来的 gateway_* 内建命令与 newSubCmds /
+//       upstreamUserCmds 里登记的名，但不得少任何 proxy_*）；② 之外的名不在 ④⊇② 的覆盖面上，
+//       故 upstreamUserCmds 逐条循环生成「体必须在子进程」的成员断言（评审 I-1：不留只加名单的缝隙）。
+//       另钉两条归属结构证据：
 //   · ipc.cjs 不得再直连注册 proxy_*、不得再 require ./proxy/index.cjs（整张依赖图会被一条 require 拉回主进程）
 //   · main.cjs 不得再 require proxy 域（stats.db 子进程独占由此达成）
 //
@@ -68,7 +70,7 @@ try {
   const gatewayClient = require(path.join(ROOT, "electron", "backend", "gateway-client.cjs"));
   if (typeof gatewayClient.register !== "function") {
     check("③ gateway-client.cjs 导出 register(ipcMain)", false,
-      "主进程注册面不在 gateway-client（43 条命令仍由 ipc.cjs 经 proxy.register 直连注册）——Task 5 未落地");
+      "主进程注册面不在 gateway-client（proxy_* 命令仍由 ipc.cjs 经 proxy.register 直连注册）——Task 5 未落地");
   } else {
     const seen = new Map();
     gatewayClient.register({ handle: (name, fn) => { seen.set(name, typeof fn === "function"); } });
@@ -93,30 +95,37 @@ try {
 } catch (e) {
   check("④ dispatchTable() 可在纯 Node 收集", false, String((e && e.message) || e));
 }
-const newSubCmds = ["proxy_account_import_blob", "proxy_poolsync_password_changed", "proxy_account_rename"];
-// 上游 v1.18.0 带来的「用户面」新命令：渲染层真会调用它 ⇒ 必须同时进 preload 白名单与主进程转发面。
-// 与 newSubCmds 的分工：那两条是子进程内部辅助半段（不过 preload，渲染层看不见，只进 ④ 的白名单），
-// proxy_account_rename 则是完整的一条命令面（①③④ 三处都要有它）。
-// ② 的「43 条」计数判据不动（它钉的是「用户已用过的行为」快照本身）；只在**比较**时并入这条新增，
+const newSubCmds = ["proxy_account_import_blob", "proxy_poolsync_password_changed"];
+// 上游 v1.18.0 带来的「用户面」新命令：渲染层真会调用它 ⇒ 必须同时进 preload 白名单（①）、
+// 主进程转发面（③）与子进程实现体（④）。与 newSubCmds 的分工：那两条是子进程内部辅助半段
+// （不过 preload，渲染层看不见，只进 ④ 的白名单），这里每一条则是完整的一条命令面。
+// ② 的「43 条」计数判据不动（它钉的是「用户已用过的行为」快照本身）；只在**比较**时并入这些新增，
 // 等价于把不变式从「① == ②」升级为「① == ② ∪ 上游用户面新增」——归因写在此处与提交信息里。
-const upstreamUserCmds = ["proxy_account_rename"];
+// 评审 I-1：下面的 ④ ⊇ ② 只覆盖一期基线，基线之外的名**靠这里逐条循环生成成员断言**钉住
+// ⇒ 往这个名单里加一条名字，就自动多一条「实现体必须在子进程 dispatchTable()」的红，
+// 不必再手写单条，也不会出现「只加名单、把实现体留在主进程」而四面全绿（§5.4 单一写者被破）。
+const upstreamUserCmds = [
+  { name: "proxy_account_rename", why: "上游 v1.18.0 账号重命名，写号池故必须归子进程" },
+];
+const upstreamUserNames = upstreamUserCmds.map((c) => c.name);
 check("④ 子进程表含 proxy_account_import_blob（import_file 拆两段的子进程半段）",
   subKeys.includes("proxy_account_import_blob"),
   "主进程读完文件字节后没有可投的子命令 —— 文件导入仍是主进程直连实现或整段留在主进程");
 check("④ 子进程表含 proxy_poolsync_password_changed（webdav_shared_save 反向跨界的子进程半段）",
   subKeys.includes("proxy_poolsync_password_changed"),
   "主进程仍在直接 require poolsync 写子进程独占的 sync-state.json");
-check("④ 子进程表含 proxy_account_rename（上游 v1.18.0 账号重命名，写号池故必须归子进程）",
-  subKeys.includes("proxy_account_rename"),
-  "重命名走主进程直连 = stats.db/sync-state.json 出现第二个写者，二期 §5.4 单一写者被破");
+for (const c of upstreamUserCmds) {
+  check(`④ 子进程表含 ${c.name}（${c.why}）`, subKeys.includes(c.name),
+    `${c.name} 的实现体不在子进程 dispatchTable() ⇒ 走主进程直连 = stats.db/sync-state.json 出现第二个写者，二期 §5.4 单一写者被破`);
+}
 const subExtra = diff(nameSet(subKeys), nameSet(fromBaseline));
-const EXTRA_WHITELIST = new Set(["gateway_echo", "gateway_shutdown", ...newSubCmds]);
+const EXTRA_WHITELIST = new Set(["gateway_echo", "gateway_shutdown", ...newSubCmds, ...upstreamUserNames]);
 check("④ 子进程多出来的键都在白名单内（gateway_* 内建 + 内部辅助半段 + 上游用户面新增）",
   subExtra.every((n) => EXTRA_WHITELIST.has(n)),
   "多出白名单外的键：" + subExtra.filter((n) => !EXTRA_WHITELIST.has(n)).join(", "));
 
 console.log("断言：①==②∪上游新增==③ 且 ④ ⊇ ②");
-const fromBaselineUnionUpstream = new Set([...fromBaseline, ...upstreamUserCmds]);
+const fromBaselineUnionUpstream = new Set([...fromBaseline, ...upstreamUserNames]);
 check("① == ② ∪ 上游用户面新增（preload 白名单与「一期基线 ∪ upstreamUserCmds」逐字相等）",
   fromPreload.length === fromBaselineUnionUpstream.size && diff(nameSet(fromPreload), fromBaselineUnionUpstream).length === 0
   && diff(fromBaselineUnionUpstream, nameSet(fromPreload)).length === 0,
