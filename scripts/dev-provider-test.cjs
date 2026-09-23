@@ -175,6 +175,25 @@ ok("删不存在的提供商回 false", provider.remove("relay").ok === false);
 console.log("\n探测的离线校验分支（不发网络请求）:");
 const server = require("../electron/backend/proxy/server.cjs");
 
+console.log("\n渠道选择优先级（钉渠道 vs 单归属强制）:");
+const RS = { routeStrategy: "smart", fixedChannel: "trae", modelOverrides: {} };
+// 回归本分支引入的风险：qoder 目录含 auto/ultimate 这类通用词后，单归属强制若排在钉渠道之前，
+// 钉着 trae 的客户端发 model:"auto" 会被静默改投 qoder（qoder 无号即报错）
+ok("钉渠道优先于单归属（qoder 独有的 auto 也不改投）", server._resolveChannel({ route: "trae" }, "auto", RS).channel === "trae", server._resolveChannel({ route: "trae" }, "auto", RS));
+ok("钉渠道优先于单归属（Qwen3.8-Flash 同理）", server._resolveChannel({ route: "trae" }, "Qwen3.8-Flash", RS).channel === "trae");
+ok("钉渠道时目录外模型仍透传给该渠道（不判未知模型）", (() => {
+  const r = server._resolveChannel({ route: "trae" }, "some-client-only-model", RS);
+  return r.channel === "trae" && !r.unknownModel;
+})(), server._resolveChannel({ route: "trae" }, "some-client-only-model", RS));
+ok("auto 模式下单归属仍直达唯一所有者", server._resolveChannel({ route: "auto" }, "auto", RS).channel === "qoder", server._resolveChannel({ route: "auto" }, "auto", RS));
+ok("提供商前缀排在最前，钉别的渠道也让位", (() => {
+  // 自带夹具：此点之前的清理段已删掉 relay，不能依赖环境里残留的提供商
+  provider.create({ id: "pinslug", baseUrl: "https://pin.test/v1", models: ["m1"] });
+  const ch = server._resolveChannel({ route: "trae" }, "pinslug/m1", RS).channel;
+  provider.remove("pinslug");
+  return ch === "pinslug";
+})());
+
 /** 假 OpenAI 兼容上游：按 Authorization 决定成败，从而**确定性地**验到多 Key 轮转
  *  （比"先 429 再成功"的时序写法可靠——那种要靠重试次数碰）。 */
 function startFakeUpstream(port) {
