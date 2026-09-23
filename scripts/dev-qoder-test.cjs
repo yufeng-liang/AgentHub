@@ -89,6 +89,16 @@ ok("parameters.max_tokens 与 32768 取小", envBody.parameters.max_tokens === 1
 ok("enable_thinking 缺省不发", !("enable_thinking" in envBody.parameters));
 ok("business.name 取最后用户文本前 30 字符", envBody.business.name === "hi");
 
+// 装配面回归：上面手工造的 {key,is_reasoning,is_vl} 形状会掩盖真实形状（key 在 _key、能力在 capabilities）——
+// 用 modelEntries 的产物直接喂信封，三个字段必须都归一化到位（否则真实上游收 "undefined" 与恒 false）
+const envReal = adapters._qoderBody({
+  internal: { messages: [{ role: "user", content: "hi" }], tools: [], max_tokens: 100 },
+  modelEntry: qAd._resolveEntry("Qwen3.8-Flash"),
+  ids, requestId: "rq-2", lastUserText: "hi",
+});
+ok("真实目录条目装配：key/is_reasoning/is_vl 全部归一化", envReal.model_config.key === "qfmodel" && envReal.model_config.is_reasoning === true && envReal.model_config.is_vl === true,
+  envReal.model_config);
+
 // 简报笔误修正：状态机语义是「过滤 thinking 段内容、保留标签外答案」（协议参考 §3.5 拆解 + chat() 集成把
 // splitter 输出直接作为 content 下发），故断言 abcdef 不在输出、答案 after 保留、标签标记被剥
 const sp = new adapters._TagSplitter();

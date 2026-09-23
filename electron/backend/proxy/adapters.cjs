@@ -2230,8 +2230,16 @@ function makeQoder() {
     _resolveEntry(model) {
       const s = String(model || "").toLowerCase();
       const hit = this.modelEntries().find((x) => x.client.toLowerCase() === s || (x.entry._key || "").toLowerCase() === s);
-      // 归一化：modelEntries 产物的上游 key 在 _key，chat/qoderBody 消费面读 key——浅拷贝补齐，不动缓存对象
-      return hit ? { ...hit.entry, key: hit.entry._key || hit.entry.key } : null;
+      if (!hit) return null;
+      // 归一化到 chat/qoderBody 的消费面：目录条目的上游 key 在 _key、能力在 capabilities.{reasoning,images}，
+      // 而消费面读 key/is_reasoning/is_vl——三者不同名，直取会发 "undefined"/恒 false。浅拷贝补齐，不动缓存对象。
+      const cap = hit.entry.capabilities || {};
+      return {
+        ...hit.entry,
+        key: hit.entry._key || hit.entry.key,
+        is_reasoning: hit.entry.is_reasoning ?? !!cap.reasoning,
+        is_vl: hit.entry.is_vl ?? !!cap.images,
+      };
     },
 
     rewriteBody(model, body) {
