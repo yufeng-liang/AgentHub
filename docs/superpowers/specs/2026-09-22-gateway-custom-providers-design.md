@@ -1,7 +1,7 @@
 # 设计：网关多协议入站 + 自定义模型提供商
 
 日期：2026-09-22
-状态：五片已全部实现并过闸，真机验收未做（见 §十）
+状态：五片已全部实现并过闸；真机验收已跑一轮（真中转站 + Claude Code + Codex CLI），结果与它抓出的两条缺陷见 §十
 范围：`feat/gateway-custom-providers`，从 `main@0c09f03` 起，与在制品 `perf/gateway-lite-mode-phase2` 不同树
 
 ---
@@ -84,7 +84,7 @@ TraeWorkAssistant 的实测缺陷是「自定义条目命中内置目录即静�
 
 另设 `proxy.allowBareProviderModel`（默认 true）：裸名无内置归属但唯一命中某 provider 时放行，并在 `usage_requests.error` 记 `bare→slug/model`。歧义（多家都有该裸名）不猜，直接 400。
 
-`base_url` 归一化只在**写入侧**做一次并存规范值：trim → `new URL()` 失败即拒 → 剥尾斜杠 → 剥尾缀 `/v1`、`/v1/chat/completions`、`/v1/messages`（**按后缀长度倒序 + 循环剥**，第一版按顺序首匹配会漏掉 `/v1`，被闸的直接断言抓到）→ 保留 `/api/xxx` 之类挂载路径 → 拒非 http(s)、拒含 userinfo/query。出站只拼 `base + "/chat/completions"` 或 `base + "/messages"`。
+`base_url` 归一化只在**写入侧**做一次并存规范值：trim → `new URL()` 失败即拒 → 剥尾斜杠 → 剥尾缀 `/v1`、`/v1/chat/completions`、`/v1/messages`（**按后缀长度倒序 + 循环剥**，第一版按顺序首匹配会漏掉 `/v1`，被闸的直接断言抓到）→ 保留 `/api/xxx` 之类挂载路径 → 拒非 http(s)、拒含 userinfo/query。出站一律 `base + "/v1/<leaf>"`（`chat/completions` / `messages` / `models`），规则只写在 `adapters.compatUrl()` 一处——存的是根、`/v1` 由出站补，这样用户粘 `https://relay.com` 或 `https://relay.com/v1` 或 `https://relay.com/v1/chat/completions` 三种写法收敛到同一个端点。为什么必须带 `/v1`：真机实测，只拼 leaf 会打到中转站的前端页面（200 + text/html），见 §十。
 
 **连通性探测绝不走 `handleChat`**：直接调 `adapter.chat()`，不经 `pickAccount`、不 `insertUsage`、不 `applyCool`、不写 `lastUsed`，用用户当场输入的那把 Key 而不是池内任何一把。探测绝不能把真号池的一个号打成冷却。
 
@@ -160,13 +160,26 @@ one-api 的 `Type` int 全局枚举 + switch 工厂（桌面端不需要 60 种�
 
 ## 十、真机验收状态
 
-**未做，需要用户在场。** 本机装有 Claude Code 与 Codex CLI，验收动作：
+2026-09-23 用一家真实中转站（只开放 `/v1/messages` 的 Claude 兼容站，实际服务 deepseek 系模型）+ 本机真客户端跑过一轮，网关起在 19999、临时 APPDATA、隔离的 `CLAUDE_CONFIG_DIR` / `CODEX_HOME`，不触碰用户自己的 9527 实例与配置目录。
 
-- Claude Code：`ANTHROPIC_BASE_URL` 指到测试端口，跑单轮对话 + 一次工具调用（`Read` 一个文件）+ 带思考链的模型，全程 `| tee` 存日志。
-- Codex CLI：`codex exec` 一个最小任务，确认 `response.completed` 收束与一次 function_call 回环。
-- 提供商侧：填一家真实中转站（只有用户有 Key）打通 `myprov/gpt-4o`，并接一家只开 `/v1/messages` 的 Claude 中转站验 ④ 的双入口。
+| 路径 | 结果 | 证据 |
+|---|---|---|
+| `/v1/chat/completions` 流式 / 非流式 | 通过 | 200 + 正文与 `reasoning_content` 齐全 |
+| `/v1/messages` 流式 / 非流式 | 通过 | `thinking` + `text` 双块、`stop_reason=end_turn`、usage 有值 |
+| `/v1/responses` 流式 / 非流式 | 通过 | 完整事件序（created → reasoning item → message item → completed），`encrypted_content` 键在 |
+| 裸名路由 `allowBareProviderModel` | 通过 | 裸 `deepseek-v4-flash-0731` 命中提供商 |
+| **Claude Code 真客户端** | 通过 | `claude -p` 单轮返回；**带 Read 工具的两轮回环**读到并复述了标记文件内容 |
+| **Codex CLI 真客户端** | 文本路径通过 | `wire_api="responses"` 直连，正常收束，无 `stream closed before response.completed` |
+| Codex 工具回环 | **部分** | 模型确实连续发出 `cat` / `Get-Content` / `ls` / 写文件等 function_call，Codex 全部解析并进入下一轮（41k tokens 多轮迭代）；但**执行被 Codex 自己的沙箱拦下**（`CODEX_HOME` 在 `%TEMP%` 时它拒绝安装沙箱辅助程序，退成 read-only + approval never）。协议侧无错误，缺的是"一次真执行成功"的最后一格 |
 
-四道闸覆盖的都是假上游，覆盖不到「真实上游的字段形状与我们的假设不符」这一类风险——这是本设计目前最大的未知。
+补这最后一格需要二选一：用你真实的 `~/.codex`（会写它的会话日志），或放开沙箱等级（等于让第三方中转站的模型在你机器上执行命令）。两者都不该我替你决定，所以留着。
+
+**真机一次就抓到两条假上游抓不到的缺陷**（详见 `f453576`）：
+
+1. **出站端点少了 `/v1`**。`base_url` 归一化剥掉 `/v1`，出站却只拼 `/messages` → 打到中转站的前端页面，回 **200 + text/html**（比 404 更难归因）。四道闸都守不住，因为假上游对任意路径都应答，而断言写的是 `path === "/messages"`——照着实现写的断言不可能失败。现在规则收进 `compatUrl()` 一处，闸改为断言协议规定的 `/v1/<leaf>`。
+2. **`fetchModels` 对 Anthropic 形态上游直接拒**，理由是"这类上游没有模型目录接口"——实测这家 `/v1/models` 好好回 4 个模型。改为两种形态都试，真 404 再引导手填。
+
+四道闸覆盖的都是假上游，覆盖不到「真实上游的字段形状与我们的假设不符」这一类风险——上面第 1 条就是它的具体形态：一个 200，内容是 HTML。
 
 ---
 
