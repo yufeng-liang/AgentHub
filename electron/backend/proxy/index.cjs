@@ -419,6 +419,9 @@ function register(ipcMain) {
       : { status: "disabled" });
     return ok({});
   }));
+  // 上游 v1.17.x 的 proxy_account_rename（账号重命名，name 字段走 WebDAV LWW 传播）在本合并里
+  // **故意不并注册体**：它一条命令要同时过「preload 白名单 == 主进程转发面 == 子进程 dispatch 表 ==
+  // parity 基线」四处对齐，那是三期 Task 1 的完整闭环；Task 0 只解结构冲突，收口标准是 parity 闸绿。
   // 手动解除冷却：cooling 账号立即回 online，同时豁免该账号的模型级负缓存
   ipcMain.handle("proxy_account_cool_off", handle(({ id }) => {
     const r = pool.releaseCool(String(id || ""));
