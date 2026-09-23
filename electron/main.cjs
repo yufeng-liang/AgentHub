@@ -13,7 +13,7 @@ const watch = require("./backend/watch.cjs");
 const usageConfig = require("./backend/sync-config.cjs");
 const usagedb = require("./backend/db.cjs");
 const usagesync = require("./backend/sync.cjs");
-// 网关子进程监督器（二期）：spawn / 认领 / 管道转发 / 事件回流 / 43 条 proxy_* 命令的注册面
+// 网关子进程监督器（二期）：spawn / 认领 / 管道转发 / 事件回流 / 全部 proxy_* 命令的注册面
 // （Task 5 起 ipc.cjs 经它注册，主进程不再 require proxy 域 —— stats.db 归子进程独占）。
 // 日志由它自己经 gateway-log 落 proxyDir()/logs/gateway.log，主进程不再另开一份写点。
 const gatewayClient = require("./backend/gateway-client.cjs");
@@ -418,7 +418,7 @@ if (!gotLock) {
     ipc.register({ ipcMain, app, shell, nativeTheme });
     remotesync.setOnFinish(notifySync);
     usagesync.setOnFinish(notifyUsageSync);
-    // 网关子进程（Task 5 起为正式启动路径，不再是 opt-in）：43 条命令全部在子进程跑，
+    // 网关子进程（Task 5 起为正式启动路径，不再是 opt-in）：那张 proxy_* 命令表全部在子进程跑，
     // 主进程不再 boot() proxy 域（rules/store/credits/checkin 计时器都随实现体下沉，gateway.cjs）。
     // 这里先 spawn；监听决策按 restoreOnLaunch 新语义（Task 6 重定义：本次启动时是否让（新建或
     // 认领来的）子进程进入监听状态，不再是「上次退出时网关开没开」）在 start() 成功后落地——

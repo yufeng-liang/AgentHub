@@ -117,7 +117,7 @@ async function main() {
   writeGatewayFile(gatewayRecord);
   const srv = await gatewayPipe.serve({
     token: hs.token, pipePath: hs.pipePath,           // pipePath 由主进程命名并经握手投递（两端必须同一个值）
-    // 两条内建命令不属于那 43 条，故不进 preload 白名单；gateway_echo 供认领双检验 token，
+    // 两条内建命令不属于 proxy_* 命令表，故不进 preload 白名单；gateway_echo 供认领双检验 token，
     // gateway_shutdown 供 Task 7 互锁（它复用 gracefulExit → proxy.gracefulShutdown，不开第二份停机实现）。
     // 其余一律交给网关自己的命令表。
     // 监听状态一变就得回写 gateway.json 的 port（评审 I1）：那一份盘上文件是父进程侧

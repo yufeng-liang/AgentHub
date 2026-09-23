@@ -736,7 +736,7 @@ async function main() {
   assert.ok(/CLAIM pid=\d+ claimed=true/.test(claimOut.out), "① 认领探针没打印 CLAIM 行：" + claimOut.out + claimOut.err);
   pass(`① 跨进程认领：另一个主进程（pid ${cr.pid}）start() → claimed:true、pid 仍是 ${r1.pid}，进程数没增加`);
 
-  // call() 走通子进程那张命令表（dispatch 用鸭子收集器复用 register 的 43 条，名字与实现体都不动）
+  // call() 走通子进程那张命令表（dispatch 用鸭子收集器复用 register 的全部 proxy_* 命令，名字与实现体都不动）
   const vault = await gw.call("proxy_vault_status", {});
   assert.strictEqual(vault.driver, "node:sqlite", "① 子进程里的 SQLite 驱动不是 node:sqlite");
   assert.strictEqual(vault.encrypted, true, "① vaultOk 应为 true（plain-dev 也算有凭据后端，见 §5.7）");

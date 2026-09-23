@@ -15,7 +15,7 @@ const updater = require("./updater.cjs");
 const remotesync = require("./remotesync.cjs");
 const webdav = require("./webdav.cjs");
 const watch = require("./watch.cjs");
-// 网关主进程注册面（Task 5）：43 条 proxy_* 命令 + 子进程转发出口。注意这里 require 的不是
+// 网关主进程注册面（Task 5）：全部 proxy_* 命令 + 子进程转发出口。注意这里 require 的不是
 // proxy 域——一条 require("./proxy/index.cjs") 会把整张依赖图（含 store.cjs 的库句柄路径）拉回主进程，
 // §5.4 的「stats.db 子进程独占」就白做了。主进程对 proxy 域的 require 由
 // scripts/dev-gateway-forward-parity-test.cjs 钉死为零。
@@ -480,7 +480,7 @@ function register(ctx) {
   // ===== 用量同步模块（原「用量记录同步」backend/ipc.cjs，冲突命令已加 sync_ 前缀） =====
   require("./sync-ipc.cjs").registerSync(ctx);
 
-  // ===== 反代网关（Task 5：43 条命令注册面在 gateway-client，实现体经管道在子进程 proxy/index.cjs） =====
+  // ===== 反代网关（Task 5：proxy_* 命令注册面在 gateway-client，实现体经管道在子进程 proxy/index.cjs） =====
   gatewayClient.register(ipcMain);
 }
 
