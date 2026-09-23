@@ -84,6 +84,14 @@ TraeWorkAssistant 的实测缺陷是「自定义条目命中内置目录即静�
 
 另设 `proxy.allowBareProviderModel`（默认 true）：裸名无内置归属但唯一命中某 provider 时放行，并在 `usage_requests.error` 记 `bare→slug/model`。歧义（多家都有该裸名）不猜，直接 400。
 
+**模型别名（2026-09-23 追加）**：条目可带 `aliases[]`，客户端用 `slug/模型名`、`slug/别名` 以及裸名都能命中同一个上游真名——别名是**加法**，不替换原名。三条口径：
+
+1. 别名**不进 `/v1/models`**。列进去等于同一模型出现两行、用量统计被拆成两个模型名；代价是只靠自动发现模型的客户端看不到别名，得手输。
+2. 别名参与防遮蔽校验：撞本提供商内另一个模型/别名 → 保存即拒（说不清该映射到哪个上游真名）；撞内置模型名**不拦**，因为裸名解析内置优先，结构上遮蔽不了。
+3. `findUniqueByBareModel` 自己判内置归属（`modelOwners` 非空即回 null）。原先「裸名内置优先」只靠调用方的顺序兜，而别名让一个提供商能声明任意多个裸名——少一处检查就是静默遮蔽，判据收进函数本身才封得住。
+
+逐模型元数据（`upstream` / `aliases` / `contextLength` / `maxOutputTokens` / `rate` / `capabilities` / `reasoning.supportedEfforts`）的编辑面在提供商抽屉的结构化表格里，`models_json` 是唯一落点；「模型目录」页只管跨渠道的启用/覆盖/全局别名，它的「拉取模型」对提供商 tab 不出现——那条通道写的是 `rules/catalog.json`，混进来会把提供商的模型灌进内置目录。思考档位接 `util.normalizeReasoningEffort`：客户端要的档位上游不支持时按声明降级，而不是原样透传换一个 400。
+
 `base_url` 归一化只在**写入侧**做一次并存规范值：trim → `new URL()` 失败即拒 → 剥尾斜杠 → 剥尾缀 `/v1`、`/v1/chat/completions`、`/v1/messages`（**按后缀长度倒序 + 循环剥**，第一版按顺序首匹配会漏掉 `/v1`，被闸的直接断言抓到）→ 保留 `/api/xxx` 之类挂载路径 → 拒非 http(s)、拒含 userinfo/query。出站一律 `base + "/v1/<leaf>"`（`chat/completions` / `messages` / `models`），规则只写在 `adapters.compatUrl()` 一处——存的是根、`/v1` 由出站补，这样用户粘 `https://relay.com` 或 `https://relay.com/v1` 或 `https://relay.com/v1/chat/completions` 三种写法收敛到同一个端点。为什么必须带 `/v1`：真机实测，只拼 leaf 会打到中转站的前端页面（200 + text/html），见 §十。
 
 **连通性探测绝不走 `handleChat`**：直接调 `adapter.chat()`，不经 `pickAccount`、不 `insertUsage`、不 `applyCool`、不写 `lastUsed`，用用户当场输入的那把 Key 而不是池内任何一把。探测绝不能把真号池的一个号打成冷却。
@@ -131,7 +139,7 @@ sink 接口共 11 个方法，`onDelta` 的返回值就是「有没有实质内�
 
 每片都跑：`npm run build`、`proxy-smoke.cjs`（临时 userData）、`dev-sse-delta-test`、`dev-ccswitch-test`；二期闸在 ② 之后叠加。`tools/proxy-regress.cjs` **不跑**——它在改 `process.env.APPDATA` 之前就 `require("store.cjs")`，会打开用户真实的 `stats.db` 并拿真实登录 token 发线上请求。
 
-本次新增四道闸：`dev-provider-test`（118）、`dev-sink-golden`（13 场景黄金字节 + 基线 JSON）、`dev-anthropic-test`（77）、`dev-responses-test`（55），另加两道变异自证脚本。
+本次新增四道闸：`dev-provider-test`（140，含"前端档位词表与 util.EFFORT_LEVELS 同源"这条跨边界断言——字面量数组漂移不会编译失败）、`dev-sink-golden`（13 场景黄金字节 + 基线 JSON）、`dev-anthropic-test`（77）、`dev-responses-test`（55），另加两道变异自证脚本。
 
 **两起闸自身失效的事故，记下来防重犯：**
 
