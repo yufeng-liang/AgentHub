@@ -397,6 +397,11 @@ export interface ProxyGatewayStatus {
   keyCount: number;
   vaultOk: boolean;
   dbDriver: string;
+  /** 当前 stats.db-wal 的字节数（三期 Task 3：量「WAL 是否还在单调增长」的唯一出口） */
+  walBytes: number;
+  /** 最近一次周期 checkpoint 的观测；从未做过 / 进程刚起时为 null。
+   *  after === before 即「跑了但没截动」，是二期 1,388,472 B 冻结缺陷的判别量。 */
+  lastCheckpoint: { ok: boolean; before: number; after: number; err: string } | null;
 }
 
 export interface ProxyUsageRow {

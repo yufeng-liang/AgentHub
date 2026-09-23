@@ -404,6 +404,9 @@ export const mock = {
           today: { req: 1284, tokens: 312400, successRate: 99.4, ttftAvg: 820 },
           channels: PROXY_POOL.map((c) => ({ id: c.id, display: c.display, ...c.summary })),
           keyCount: PROXY_KEYS.length, vaultOk: true, dbDriver: "node:sqlite",
+          // 预览态给确定性的假值（不模拟真实 WAL 增长）：walBytes 为 0、从未周期 checkpoint 过。
+          // 与真机同形状即可，前端拿它渲染「WAL 观测」一栏不会因字段缺失而崩。
+          walBytes: 0, lastCheckpoint: null,
         };
       case "proxy_start":
         return { ok: true, port: 9527 };

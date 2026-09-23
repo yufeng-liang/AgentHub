@@ -307,6 +307,11 @@ function gatewayStatus() {
     keyCount: store.listKeys().length,
     vaultOk: vaultOk(),
     dbDriver: store.driver(),
+    // WAL 观测出口（三期 Task 3）：walBytes 让「是否还在单调增长」可量化，lastCheckpoint 让
+    // 「上一次周期 checkpoint 跑没跑 / 截动了没有 / 报了什么错」可读。二期结尾那个
+    // 1,388,472 B 冻结缺陷之所以拖了一期，就是这两个量在命令面上一个都不存在。
+    walBytes: store.walBytes(),
+    lastCheckpoint: store.lastCheckpoint(),
   };
 }
 

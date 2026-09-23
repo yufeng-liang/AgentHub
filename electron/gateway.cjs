@@ -102,7 +102,13 @@ async function main() {
   log.line("boot", { version: util.appVersion(), secretBackend: secretbox.backend(), persistent });
   secretbox.assertUsable();                    // 凭据不可用 → 启动期失败，不空号池空转
   rules.init(); store.open();
-  store.startCheckpointTimer();
+  // 周期 checkpoint 的成败必须落子进程日志（三期 Task 3 留痕）：二期的观测缺口正是「跑了没有 /
+  // 跑了为什么没截动」无处可查——TRUNCATE 的成败在旧实现里被压成一个布尔就丢了。回调由装配方
+  // （本文件）注入而不是 store 自己打日志：store 不认识日志层，跨层 require 会把 store 拖进网关
+  // 日志的依赖面。这条 wal-checkpoint 行同时是 Task 4 分支 (c) 的判别证据：**有行=计时器真跑了**，
+  // 无行=压根没跑或进程里存在两份 store。
+  // 归因（D-P3）：仅把既有周期的结果接上日志出口，周期本身与默认间隔一字未动。
+  store.startCheckpointTimer((r) => log.line("wal-checkpoint", { ok: r.ok, before: r.before, after: r.after, err: r.err }));
   // 握手文件必须在**开始 accept 之前**落盘：主进程的 connect 一成功就返回 ok（它只等 socket 建成，
   // 不等这份文件），文件写在 listen 之后就是让父进程读一个还不存在的真相源——实测会随机红
   // （dev-gateway-pipe-test ①「gateway.json 不存在」，磁盘慢的那几次必中）。

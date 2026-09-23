@@ -334,7 +334,12 @@ async function main() {
   assert.strictEqual(typeof store.checkpoint, "function", "store.checkpoint() 未导出（Task 3 的子进程要用）");
   assert.strictEqual(typeof store.startCheckpointTimer, "function", "store.startCheckpointTimer() 未导出");
   assert.strictEqual(typeof store.walBytes, "function", "store.walBytes() 未导出（Task 8 量 WAL 增长要用）");
-  assert.strictEqual(store.checkpoint(), false, "库还没开就 checkpoint 必须回 false，不能假装做了");
+  // 三期 Task 3 把 checkpoint() 的返回值从布尔改成观测结构 {ok,before,after,err} —— 判据的**判别力不变**
+  // （库没开必须不假装成功 / 库开了必须真做成），但消费点从裸返回值改成 `.ok`。这里三处：
+  //   :337 库未开 → ok 必须 false；:350 库已开 → ok 必须 true；:430 close 后 → ok 必须 false。
+  // 为什么不直接 `store.checkpoint()` 比布尔：那条断言在形状变更后会拿对象恒 != false，变成**恒真空断言**
+  // （绿而无意义），比红更危险。故显式取 `.ok`，并顺带把 before/after 写进 ③ 的通过行（Task 3 留痕的旁证）。
+  assert.strictEqual(store.checkpoint().ok, false, "库还没开就 checkpoint 必须 ok:false，不能假装做了");
   store.open();
   const rows = (n, from) => {
     for (let i = 0; i < n; i++) {
@@ -347,10 +352,12 @@ async function main() {
   rows(500, 0);
   const grown = store.walBytes();
   assert.ok(grown > 4096, `-wal 只有 ${grown} B —— WAL 没长起来，下面那条「收敛后 < 4 KB」是空断言`);
-  assert.strictEqual(store.checkpoint(), true, "checkpoint() 在库已开时必须回 true");
+  const ck1 = store.checkpoint();
+  assert.strictEqual(ck1.ok, true, "checkpoint() 在库已开时必须 ok:true");
   const afterCk = store.walBytes();
   assert.ok(afterCk < 4096, `checkpoint() 之后 -wal 仍有 ${afterCk} B（TRUNCATE 没生效）`);
-  pass(`③ 500 行流水把 -wal 撑到 ${grown} B，PRAGMA wal_checkpoint(TRUNCATE) 后 ${afterCk} B`);
+  pass(`③ 500 行流水把 -wal 撑到 ${grown} B，PRAGMA wal_checkpoint(TRUNCATE) 后 ${afterCk} B`
+    + `（checkpoint() 自报 before=${ck1.before} after=${ck1.after}）`);
 
   // 周期计时器：Task 3 的子进程只调这一个，所以它必须自己真能把 WAL 压下去。
   // 这里必须用 await sleep 而不是 nap —— Atomics.wait 会把主线程钉住，setInterval 的回调根本没机会跑。
@@ -427,7 +434,7 @@ async function main() {
   pass(`③ close() 运行期兜底：spy 到 wal_checkpoint 在 db.close() 之前发出（序列 ${seqText}，close 前 -wal ${grownBeforeClose} B）`);
 
   assert.strictEqual(store.walBytes(), 0, "close() 之后 -wal 没被收干净：句柄可能还挂在父进程手里");
-  assert.strictEqual(store.checkpoint(), false, "close() 之后再 checkpoint 必须回 false（句柄确实没了，不是假关）");
+  assert.strictEqual(store.checkpoint().ok, false, "close() 之后再 checkpoint 必须 ok:false（句柄确实没了，不是假关）");
 
   // ===== ④ store.close() 有真实调用点：静态引用 + 运行期真跑到 proxy.shutdown() =====
   const idxSrc = fs.readFileSync(path.join(BACKEND, "proxy", "index.cjs"), "utf8");

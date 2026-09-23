@@ -626,25 +626,70 @@ function close() {
 
 // ===== WAL 收敛与句柄归属（Task 2） =====
 
+/** 最近一次 checkpoint 的观测（三期 Task 3）：{ok,before,after,err}。
+ *  存在的理由：二期结尾留下一个未解缺陷——常驻子进程的 -wal 长到 1,388,472 B 后**冻结不收敛**，
+ *  而 `PRAGMA wal_checkpoint(TRUNCATE)` 的成败在旧实现里被压成一个布尔丢弃掉了，没有任何一处能
+ *  回答「它到底跑没跑 / 跑了为什么没截动 / 报了什么错」。三期的既定顺序是先可观测、再取证、再修，
+ *  所以这里只留痕，**不夹带任何修法**（PASSIVE 退档 / journal_size_limit / 读返回码都归 Task 4）。
+ *  lastCk 本身就是无回调时的兜底出口：既有调用方（close()、write-ownership 闸）不接回调也读得到它。 */
+let lastCk = null;
+
 /** WAL 收敛：本机实测 stats.db-wal 曾长到 1.59 MB 且自 16:41 起零次 checkpoint ——
  *  （Task 2 之前的现状：全仓只有 journal_mode=WAL，没有 wal_checkpoint，close() 更是无人调用。）
  *  双进程争锁时 busy_timeout=5000 会把转发卡 5 秒，所以二期必须单一写者；这条是第二道保险。
- *  返回是否真的做成了（库没开 / 被别的连接占着都回 false，不假装成功）。 */
+ *  返回值（三期 Task 3 改形状）：旧实现回 `false/true`（是否做成了），现在回观测结构
+ *  `{ok,before,after,err}` —— `ok` 就是旧的那个布尔，`before/after` 是本次 checkpoint 前后的
+ *  -wal 字节数（`after===before` 即「跑了但没截动」，这是二期冻结缺陷的关键判别量）。
+ *  ⚠ 形状变更的消费方：`scripts/dev-write-ownership-test.cjs` 里 ③ 那一组曾以
+ *  `strictEqual(store.checkpoint(), false/true)` 消费布尔（三处：库未开 / 库已开 / close 之后），
+ *  已同改判据为该结构的 `.ok`（判别力不变：库没开必须不假装成功、库开了必须真做成）。`close()` 里是弃值调用，不受影响。 */
 function checkpoint() {
-  if (!db) return false;
-  try { db.exec("PRAGMA wal_checkpoint(TRUNCATE);"); return true; } catch { return false; }
+  const before = walBytes();
+  if (!db) { lastCk = { ok: false, before, after: before, err: "db-not-open" }; return lastCk; }
+  try {
+    db.exec("PRAGMA wal_checkpoint(TRUNCATE);");
+    lastCk = { ok: true, before, after: walBytes(), err: "" };
+  } catch (e) {
+    lastCk = { ok: false, before, after: walBytes(), err: String((e && e.message) || e) };
+  }
+  return lastCk;
 }
+
+/** 读最近一次 checkpoint 的观测（从未做过 / 进程刚起时回 null；Task 4 的决策表读它） */
+function lastCheckpoint() { return lastCk; }
 
 const CHECKPOINT_MS = 5 * 60 * 1000;
 let ckTimer = null;
+// 周期 checkpoint 的成败回调：由装配方（gateway.cjs）注入——store 不认识日志层，
+// 回调必须由装配方给，避免跨层 require。Task 4 分支 (c) 若把注册点搬进 open()，靠这个模块级
+// 变量把回调一起带走，否则 Task 3 的留痕会随那次改动消失。
+let ckOnResult = null;
 
 /** 周期 checkpoint：二期由常驻网关子进程在启动时挂上（Task 3），返回 stop 函数给停机路径用。
- *  计时器 unref：它不该给进程续命，空闲时进程要能自己退。 */
-function startCheckpointTimer(ms) {
+ *  计时器 unref：它不该给进程续命，空闲时进程要能自己退。
+ *  签名向后兼容三种调用形态（既有闸 dev-write-ownership-test.cjs 里「周期 checkpoint」那组
+ *  吃的是数字形态 `startCheckpointTimer(30)` 并断言返回 stop 函数）：
+ *   · 无参 `startCheckpointTimer()`      → 用 CHECKPOINT_MS（生产形态，gateway.cjs 走这条）
+ *   · 数字 `startCheckpointTimer(30)`    → 覆盖周期（自测用）
+ *   · 回调 `startCheckpointTimer(fn)`    → 注入成败回调 + 用 CHECKPOINT_MS
+ *  `stopCheckpointTimer()` 的返回值仍是同一个 stop 函数（三种形态都一样），停机路径的契约不变。 */
+function startCheckpointTimer(onResult) {
+  const ms = typeof onResult === "number" ? onResult : 0;
+  if (typeof onResult === "function") ckOnResult = onResult;
   stopCheckpointTimer();
-  ckTimer = setInterval(checkpoint, ms || CHECKPOINT_MS);
+  ckTimer = setInterval(() => { const r = checkpoint(); if (ckOnResult) ckOnResult(r); }, ms || checkpointMs());
   if (ckTimer.unref) ckTimer.unref();
   return stopCheckpointTimer;
+}
+
+/** 周期取值的真相源：生产恒为 CHECKPOINT_MS，只有 AGENTHUB_CHECKPOINT_MS 能覆盖它。
+ *  ⚠ 这是**测试缝**，不是配置项：三期 Task 3 的收敛闸（dev-wal-convergence-test.cjs）要在真子进程里
+ *  观察周期 checkpoint，而 5 min 的自然 tick 会让那条闸跑 5.5 分钟以上。默认值一字未动
+ *  （不设环境变量时行为与二期完全一致），也**没有**留任何「手动触发 checkpoint」的命令面。
+ *  归因（D-P3）：本行是 Task 3 的新增生产代码，为可测试性而生，不改变生产默认行为。 */
+function checkpointMs() {
+  const n = Number(process.env.AGENTHUB_CHECKPOINT_MS);
+  return Number.isFinite(n) && n > 0 ? n : CHECKPOINT_MS;
 }
 
 function stopCheckpointTimer() { if (ckTimer) clearInterval(ckTimer); ckTimer = null; }
@@ -680,7 +725,9 @@ module.exports = {
   driver: () => driver,
   decryptFailureCount,                 // 进程内累计次数（只增不减，诊断/日志用）
   decryptFailureActive,                // 当前仍解不开的条数（/readyz 的 credFail 用它，见函数注释）
-  checkpoint, startCheckpointTimer, walBytes,   // WAL 收敛与句柄归属（Task 2）；stop 由 startCheckpointTimer 的返回值给出
+  // WAL 收敛与句柄归属（Task 2）；stop 由 startCheckpointTimer 的返回值给出。
+  // lastCheckpoint 是三期 Task 3 的留痕出口：checkpoint() 的观测结构（Task 4/9 判据读它）。
+  checkpoint, startCheckpointTimer, walBytes, lastCheckpoint,
   CHANNELS,
   channelDisplay: (id) => (CHANNELS.find((c) => c.id === id) || {}).display || String(id),
   createKey, listKeys, findKeyBySecret, updateKey, deleteKey, keyTodayReq,
