@@ -107,8 +107,21 @@ async function main() {
   // （本文件）注入而不是 store 自己打日志：store 不认识日志层，跨层 require 会把 store 拖进网关
   // 日志的依赖面。这条 wal-checkpoint 行同时是 Task 4 分支 (c) 的判别证据：**有行=计时器真跑了**，
   // 无行=压根没跑或进程里存在两份 store。
-  // 归因（D-P3）：仅把既有周期的结果接上日志出口，周期本身与默认间隔一字未动。
-  store.startCheckpointTimer((r) => log.line("wal-checkpoint", { ok: r.ok, before: r.before, after: r.after, err: r.err }));
+  // 自证（评审 Concern 3）：`AGENTHUB_CHECKPOINT_MS` 这条缝落在本装配的实走路径上，任何能给本
+  // 子进程设 env 的场景都能静默改产线节奏，所以**每条行都带本次生效的间隔** `ms` —— 复盘时只看
+  // 日志就能判断当时生效的是 5 min 默认值还是被覆盖过的值，不必再去猜进程环境。第二参 source
+  // 为 "env" 时另打一行告警性质的 `wal-checkpoint-override`（只在**第一条 tick** 上打一次，
+  // 避免短间隔覆盖时刷屏；它同时证明计时器真的起来了）。
+  // 归因（D-P3）：仅把既有周期的结果与生效间隔接上日志出口，周期本身与默认间隔一字未动。
+  let overrideLogged = false;
+  store.startCheckpointTimer((r, t) => {
+    log.line("wal-checkpoint", { ok: r.ok, before: r.before, after: r.after, err: r.err, ms: t && t.ms });
+    // 覆盖生效（env 被读到且与默认不同）⇒ 留一行可事后追责的告警留痕
+    if (!overrideLogged && t && t.source === "env") {
+      overrideLogged = true;
+      log.line("wal-checkpoint-override", { ms: t.ms, source: t.source });
+    }
+  });
   // 握手文件必须在**开始 accept 之前**落盘：主进程的 connect 一成功就返回 ok（它只等 socket 建成，
   // 不等这份文件），文件写在 listen 之后就是让父进程读一个还不存在的真相源——实测会随机红
   // （dev-gateway-pipe-test ①「gateway.json 不存在」，磁盘慢的那几次必中）。

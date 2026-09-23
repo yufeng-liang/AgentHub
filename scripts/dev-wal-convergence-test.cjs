@@ -5,8 +5,8 @@
 // 本闸就是那个「可观测」的落地 + 一条把缺陷变成可证伪命题的判据。
 //
 // ⚠ 本闸的 ② 在原计划里是「**预期先红**」（简报 Step 4 据此备了 detach 第二腿）。
-//   实测（2026-09-23，本机）**与预期相反**：Leg B（非常驻真子进程）、Leg B′（detached + --persistent +
-//   Electron 运行时）、Leg A（进程内）**三条腿全绿**，二期那种 1,388,472 B 冻结**没有复现**。
+//   实测（2026-09-23，本机）**与预期相反**：对照腿 Leg B（非常驻真子进程）、**判定腿 Leg B′**（detached +
+//   --persistent + Electron 运行时）、Leg A（进程内）**三条腿全绿**，二期那种 1,388,472 B 冻结**没有复现**。
 //   真正的冻结由 **Leg C 的负对照**造出：子进程**外部**持一条读事务不放时，
 //   `wal_checkpoint(TRUNCATE)` 变成 **ok:true 但 after===before**（跑了但没截动），
 //   与二期「t+3→t+30min 恒定不动」的观测**同形**。Leg C 的判据因此写成「**必须红**」：
@@ -14,23 +14,38 @@
 //   这条差异（绿的是闸、红的是负对照）是 Task 3 交给 Task 4 的核心证据，详见 task-3-report.md。
 //
 // ===== 判定腿的选择（简报补充 S1，全局最关键的一条）=====
-// 简报正文的断言片段写成「闸进程内 require store.cjs 直调 checkpoint()/walBytes()」。**这个形态会骗人**：
+// S1 的整个论点：**判定腿必须选在「出缺陷的那个装配」里**。简报正文的断言片段写成
+// 「闸进程内 require store.cjs 直调 checkpoint()/walBytes()」。**这个形态会骗人**：
 // 二期那条 30 秒微探针**正是**纯 Node 进程内跑 `open() → insertUsage() → checkpoint() → walBytes()`，
 // 结果是**收敛成功**（1,388,472 B → 0）；而同一个代码路径在**真常驻子进程**里却冻结不收敛。
-// ⇒ 进程内腿在出缺陷的那个装配里没测，今天极可能直接绿，**绿得毫无意义**。故判定腿分两条：
-//   · **Leg B（判定腿，有决定权）**：与生产同法起**真子进程**（走 gateway-client 正式路径 + 中立 cwd），
-//     对它**自己监听的端口**打真 HTTP（无效 Key ⇒ 401，非 200），再从**子进程外部**观测收敛。
-//     外部观测三面并用（S1 允许三选一，这里三条都留证据、互为佐证）：
-//       (i)   stat 子进程沙箱 APPDATA 下的 `AgentHub/proxy/stats.db-wal`（本闸知道这个路径）
-//       (ii)  读子进程 `logs/gateway.log` 的 `wal-checkpoint` 行（Task 3 的留痕产物）
-//       (iii) 经管道调 `proxy_status` 读 Task 3 新增的 `walBytes` / `lastCheckpoint`
+// ⇒ 进程内腿在出缺陷的那个装配里没测，今天极可能直接绿，**绿得毫无意义**。
+// 二期冻结的现场是「**常驻**（脱离父进程、`--persistent` 自启路径、Electron 运行时）+ 装配后父进程消失」。
+// 按 S1 的原意，判定腿就应当**逐项对齐到这个形态**，即 Leg B′。所以本闸的绿红由 Leg B′ 决定：
+//   · **Leg B′（判定腿，有决定权）**：按生产启动器形态拉起常驻网关（同一 Electron exe +
+//     `ELECTRON_RUN_AS_NODE=1` + `--persistent` + `detached`，cwd = exe 所在目录），对它自己监听的
+//     端口打真 HTTP，再从**子进程外部**观测收敛。它才是「出缺陷的那个装配」，`②` 的绿红只由它给。
+//   · **Leg B（对照腿，无决定权）**：`gw.start({persistent:false})` 的真子进程——**非** detached、
+//     走 stdin 握手路径，与二期缺陷形态**不同装配**。它的结论仍如实输出（若 B 红而 B′ 绿或反之，
+//     那个差异本身是证据），只是不再决定 `②` 的绿红。
+//     （上一轮把它当判定腿是写歪了：S1 要的是「装配最贴近缺陷现场的那条腿」判定，不是「先写好的那条」。）
 //   · **Leg A（附加信息，无决定权）**：另起一个**独立沙箱**的纯 Node 进程做进程内直调对照。
 //     为什么另起进程而不是在闸进程内直接 require：本闸与子进程共用一份 APPDATA，闸进程再开一个 store
 //     连接就是对**同一个 stats.db 的第二条连接**——它会成为 WAL 的读者/写者，把子进程那条 TRUNCATE
 //     挡出 SQLITE_BUSY，于是 ② 会因为「闸自己污染了被测对象」而红，红得没有归因价值。
 //     独立沙箱 + 独立进程 = 进程内形态（与二期微探针同形）且零干扰。
-//     若 Leg A 绿而 Leg B 红，**那本身就是本任务要找的第一手证据**：把 Task 4 的搜索面从
+//     若 Leg A 绿而判定腿红，**那本身就是本任务要找的第一手证据**：把 Task 4 的搜索面从
 //     「checkpoint 机制」收窄到「常驻装配下的差异」。
+// 外部观测三面并用（S1 允许三选一，这里三条都留证据、互为佐证）：
+//   (i)   stat 子进程沙箱 APPDATA 下的 `AgentHub/proxy/stats.db-wal`（本闸知道这个路径）
+//   (ii)  读子进程 `logs/gateway.log` 的 `wal-checkpoint` 行（Task 3 的留痕产物）
+//   (iii) 经管道调 `proxy_status` 读 Task 3 新增的 `walBytes` / `lastCheckpoint`
+//
+// ===== 诚实代价（评审对 §七-1 的补充，写在这里免得后来人误读本闸）=====
+// 本闸实测四条腿全绿、二期那种冻结**今天不可复现**（详见 task-3-report.md）。所以要说清：
+// **这条 ② 对原缺陷的防护力 ≈ 0** —— 它守不住那个 1,388,472 B 冻结（那个状态复现不出来，闸自然拦不住它
+// 回来）。它当前的价值只有两条：**可观测面**（留痕出口 + 首尾采样，以后出问题能看见）与
+// **交给 Task 4 的最小冻结构造**（Leg C：外部持读事务 ⇒ `ok:true` 且 `after===before`）。
+// 不要把它读成「二期那个冻结已经有闸守着了」。
 //
 // ===== ② 的触发时机（简报补充 S2：二选一，本闸选 (乙)）=====
 // 真子进程里**没有**「手动触发一次 checkpoint」的命令面（`store.checkpoint()` 只有 `close()` 与周期
@@ -128,10 +143,12 @@ function statWal(appdata) {
 function readCheckpointLines(appdata) {
   let text = "";
   try { text = fs.readFileSync(logFileOf(appdata), "utf8"); } catch { return []; }
-  return text.split(/\r?\n/).filter((l) => l.includes(" wal-checkpoint"));
+  // 排除 `wal-checkpoint-override`（它字面上含 ` wal-checkpoint` 前缀）：两类行必须分开计数，
+  // 否则「tick 行数」会被自证告警行污染，证据块里也会同一条行出现两次。
+  return text.split(/\r?\n/).filter((l) => l.includes(" wal-checkpoint") && !l.includes(" wal-checkpoint-override"));
 }
 
-/** 把一条 `wal-checkpoint {json}` 日志行解析成 {ok,before,after,err}（解析失败回 null，不假装） */
+/** 把一条 `wal-checkpoint {json}` 日志行解析成 {ok,before,after,err,ms}（解析失败回 null，不假装） */
 function parseCheckpointLine(line) {
   const i = line.indexOf("wal-checkpoint");
   if (i < 0) return null;
@@ -139,8 +156,17 @@ function parseCheckpointLine(line) {
   if (j < 0) return null;
   try {
     const o = JSON.parse(line.slice(j));
-    return { raw: line, ok: o.ok, before: o.before, after: o.after, err: o.err };
+    return { raw: line, ok: o.ok, before: o.before, after: o.after, err: o.err, ms: o.ms };
   } catch { return null; }
+}
+
+/** 读取 `wal-checkpoint-override` 告警留痕行（F3 自证：覆盖生效时才该出现）。
+ *  用 indexOf 而不是正则：行里含 `wal-checkpoint` 前缀，必须是**精确的 override 行**，
+ *  不能把普通 tick 行误算进来（否则这条判据恒真 = 空断言）。 */
+function readOverrideLines(appdata) {
+  let text = "";
+  try { text = fs.readFileSync(logFileOf(appdata), "utf8"); } catch { return []; }
+  return text.split(/\r?\n/).filter((l) => l.includes(" wal-checkpoint-override"));
 }
 
 /** 外部观测 (iii)：经管道读子进程的 proxy_status（Task 3 新增的 walBytes / lastCheckpoint 两个出口） */
@@ -340,6 +366,7 @@ async function runDetachLeg() {
   }
   const wAfterTick = statWal(DETACH_APPDATA).bytes;
   const ckLines = readCheckpointLines(DETACH_APPDATA);
+  const overrideLines = readOverrideLines(DETACH_APPDATA);
 
   console.log("\n===== Leg B′ 第一手证据（生产常驻形态：detached + --persistent + Electron 运行时）=====");
   console.log(`拉起：Electron ${exe}`);
@@ -347,6 +374,9 @@ async function runDetachLeg() {
   console.log("wal-checkpoint 日志行原文：");
   if (ckLines.length) for (const l of ckLines) console.log("    " + l);
   else console.log("    <无 wal-checkpoint 行>");
+  console.log("自证留痕（覆盖生效时的告警行，F3）：");
+  if (overrideLines.length) for (const l of overrideLines) console.log("    " + l);
+  else console.log("    <无 wal-checkpoint-override 行>");
   console.log("外部观测 stat -wal：checkpoint 前 " + wBeforeCk + " B → 后 " + wAfterTick + " B");
   console.log("===========================================================\n");
 
@@ -359,7 +389,7 @@ async function runDetachLeg() {
   assert.ok(!alive(gatewayPid), "Leg B′ 收尾失败：常驻子进程 " + gatewayPid + " 仍在（会留孤儿）");
   note(`Leg B′ 收尾：gateway_shutdown 应答 ${JSON.stringify(sd)}，pid ${gatewayPid} 已消失`);
 
-  return { wBeforeCk, wAfterTick, ckLines, ckLine, converged: wAfterTick <= TARGET, gatewayPid, httpN: n };
+  return { wBeforeCk, wAfterTick, ckLines, ckLine, converged: wAfterTick <= TARGET, gatewayPid, httpN: n, overrideLines };
 }
 
 /** Leg C（负对照，证「本闸的 ② 有牙」）：在子进程**外部**持一条读事务不放，再等 tick。
@@ -372,7 +402,20 @@ async function runDetachLeg() {
  *  「`ok:true` 但 `after === before` ⇒ 分支 (b)」的**可复现构造**。
  *  实验边界（本机逐条跑过，写进报告）：只有**持读事务**能挡住它；空闲的第二连接、读一次就关、
  *  读密集流量（14250 次 SELECT）、两台网关共库、detached+--persistent+Electron 运行时 —— 全部照常收敛。
- *  这条负对照的红是**预期红**，所以判据写成「必须红」：它不参与 ② 的绿红，只证明 ② 有牙。 */
+ *  这条负对照的红是**预期红**，所以判据写成「必须红」：它不参与 ② 的绿红，只证明 ② 有牙。
+ *
+ *  ⚠ 写入循环的形状与 Leg B′ 一致（**先固定 50 条、再按需加码**，评审 Concern 2）：本腿同样跑在
+ *  `AGENTHUB_CHECKPOINT_MS=30000` 的常驻子进程对面，单个 `while (statWal() <= TARGET && n < 1000)`
+ *  会被写入途中的 tick 反复压回 0，于是条件恒真、转到 1000 上界也超不过 TARGET —— 结果这条负对照
+ *  报的是「负对照没有冻结」（假的「本闸造不出冻结」）而不是真冻结，把「判据没牙」误报成「造不出」。
+ *  拆分后「打满 50 条」是确定的，加码只负责把 WAL 稳定推到 TARGET 之上；**持读事务在写入全部结束
+ *  之后才开**（顺序不能反：先持读就没法把 WAL 撑大）。若加码到上界仍不达标 ⇒ 明确报**夹具失效**
+ *  （不是「没冻结」），因为那时连被测形态都没造出来，谈不上判据有没有牙。
+ *
+ *  未申明的耦合面（一并声明，评审同点提出）：持读的那条连接是闸进程的 `node:sqlite`（系统 node），
+ *  被测的是 Electron 内嵌 Node 的 SQLite —— **两个 SQLite 版本共享同一份 WAL 文件**。这是本负对照
+ *  成立的前提（跨版本读快照确实挡住了另一版本的 TRUNCATE，本机实测如此），不是本闸引入的独立性；
+ *  若将来该闸在别的 node 版本下变绿，要先怀疑这个耦合面而不是直接宣布判据失效。 */
 async function runLockedLeg() {
   fs.mkdirSync(path.join(LOCK_APPDATA, "AgentHub"), { recursive: true });
   fs.writeFileSync(path.join(LOCK_APPDATA, "AgentHub", "config.json"),
@@ -394,15 +437,30 @@ async function runLockedLeg() {
   assert.ok((await callViaPipeOn(LOCK_APPDATA, "proxy_start", {})).ok, "Leg C proxy_start 失败");
 
   let n = 0;
-  while (statWal(LOCK_APPDATA).bytes <= TARGET && n < 1000) {
-    await fetch(`http://127.0.0.1:${LOCK_PORT}/v1/chat/completions`, {
+  const postLock = async () => {
+    const r = await fetch(`http://127.0.0.1:${LOCK_PORT}/v1/chat/completions`, {
       method: "POST", headers: { "content-type": "application/json", authorization: "Bearer sk-bad" },
       body: JSON.stringify({ model: "claude-x", messages: [{ role: "user", content: "lock" }] }),
     });
     n++;
-  }
+    if (r.status === 200) throw new Error("Leg C 夹具失效：第 " + n + " 条请求竟然 200（无效 Key 应当 401）");
+  };
+  // 与 Leg B′ 同款拆分：先固定 50 条（确定把库写起来），再加码到 >TARGET。
+  // 为什么不写成一个 while：见 runLockedLeg 的文件头注释（tick 会在写入途中把 WAL 压回 0）。
+  for (let i = 0; i < 50; i++) await postLock();
+  const w50l = statWal(LOCK_APPDATA).bytes;
+  assert.ok(w50l > 0, `Leg C 夹具失效：50 条失败请求后 -wal 为 0，说明本轮没写库`);
+  while (statWal(LOCK_APPDATA).bytes <= TARGET && n < 1000) await postLock();
   const wBeforeCk = statWal(LOCK_APPDATA).bytes;
+  // 与 ② 同一道守卫：没造出 >TARGET 的形态 ⇒ 报**夹具失效**，不是「没冻结」。两件事必须分开报，
+  // 否则前者的失败会被读成后者，把「判据没牙」误报成「本闸造不出冻结」。
+  assert.ok(wBeforeCk > TARGET,
+    `Leg C 夹具失效：加码到 ${n} 条后 -wal 仍只有 ${wBeforeCk} B（未超 ${TARGET} B）—— `
+    + `负对照的**前提形态**都没造出来，此处的「红」不构成对 ② 有牙的证明，请改夹具。`
+    + ` 50 条那一点是 ${w50l} B`);
+  note(`Leg C 写入：50 条后 -wal=${w50l} B，共 ${n} 条后 checkpoint 前 -wal=${wBeforeCk} B（> ${TARGET} B）`);
   // 负对照的核心：**外面**开一条连接，BEGIN 后不提交（持读快照）。这是唯一实测能造出冻结的形态。
+  // 必须在写入**之后**才持读：先持读的话 TRUNCATE 从第一刻就被挡住，WAL 压根撑不到 TARGET。
   const { DatabaseSync } = require("node:sqlite");
   const db2 = new DatabaseSync(path.join(proxyDirOf(LOCK_APPDATA), "stats.db"), { readOnly: true });
   db2.exec("BEGIN;");
@@ -492,6 +550,23 @@ async function main() {
     "① lastCheckpoint 非 null 但形状不对（必须是 {ok,before,after,err}）：" + JSON.stringify(lc0));
   pass(`① 留痕出口可读（经管道 proxy_status）：walBytes=${st0.walBytes} lastCheckpoint=${JSON.stringify(lc0)}`);
 
+  // ===== ①b 缝的自证（F3 选 (甲)）：两极都下断言，而不是只信注释 =====
+  // 「默认值一字未动」这句话必须**可证伪**：把 env 清成空串（等价于不设）时来源必须是 "default"，
+  // 设成有限正数时必须是 "env"。两条一起才是真断言——只测一极等于没测。
+  // 只调纯函数 checkpointMsSource()（只读 env，不开库、不碰 WAL），因此对本沙箱零扰动。
+  const storeMod = require(path.join(BE, "proxy", "store.cjs"));
+  assert.strictEqual(typeof storeMod.checkpointMsSource, "function",
+    "①b store.checkpointMsSource 未导出：F3 的自证面没接出来");
+  const savedEnvMs = process.env.AGENTHUB_CHECKPOINT_MS;
+  process.env.AGENTHUB_CHECKPOINT_MS = "";
+  const srcDefault = storeMod.checkpointMsSource();
+  process.env.AGENTHUB_CHECKPOINT_MS = savedEnvMs;
+  const srcEnv = storeMod.checkpointMsSource();
+  assert.strictEqual(srcDefault, "default",
+    `①b 未设 env 时来源必须是 default（生产默认 5 min 一字未动），实得 ${srcDefault}`);
+  assert.strictEqual(srcEnv, "env", `①b 设了 env=${savedEnvMs} 时来源必须是 env，实得 ${srcEnv}`);
+  pass(`①b 缝自证两极：env 未设 ⇒ "${srcDefault}"（默认 5 min 未被改），env=${savedEnvMs} ⇒ "${srcEnv}"（如实标记被覆盖）`);
+
   // ===== ② 真 HTTP 打 50 条注定失败的请求（无效 Key ⇒ 非 200），随后观测收敛 =====
   // 观测必须来自子进程外部（S1）：这里 (i) stat -wal 与 (iii) proxy_status 两条腿**同时**取，
   // 二者一致才认；不一致本身就是证据，写进报告。
@@ -552,10 +627,11 @@ async function main() {
   console.log("HTTP 实数：" + httpN + " 条（全部非 200）");
   console.log("=======================================================\n");
 
-  // 判定腿（Leg B）：这一条**此刻预期红**。红 = 缺陷复现 = Task 4 的输入，不是本任务的失败。
-  // ⚠ 断言**放到收尾之后**再判（见文件末尾的 ② 判定块）：若在此处直接 assert，Leg A 对照与
-  // stopAndWait 收尾都会被异常跳过——而 S5 要的正是「Leg A 绿而 Leg B 红」这个对比结论，
-  // 且子进程必须经唯一出口停干净（否则留下孤儿常驻进程）。所以这里只**记录**，不判定。
+  // 对照腿（Leg B）：**非** detached + stdin 握手路径，与二期缺陷形态不是同一装配 ⇒ 它**不决定**
+  // `②` 的绿红（判定权在 Leg B′，见文件头「判定腿的选择」）。这一条的结果仍如实输出并与 B′ 对照。
+  // ⚠ 断言**放到收尾之后**再判：若在此处直接 assert，Leg A 对照与 stopAndWait 收尾都会被异常跳过
+  // ——而 S5 要的正是两条腿的对比结论，且子进程必须经唯一出口停干净（否则留下孤儿常驻进程）。
+  // 所以这里只**记录**，不判定。
   const legB = {
     ckLine, ckLines, wBeforeCk, wAfterTick, httpN, target: TARGET,
     hasLine: ckLine !== null,
@@ -563,20 +639,19 @@ async function main() {
     converged: wAfterTick <= TARGET,
   };
 
-  // ===== Leg B′（判定腿的第二形态）：**生产常驻形态**——detached + --persistent + Electron 运行时 =====
-  // 为什么非要有它（简报 Step 4 的明令）：本次 Leg B 直接**绿**了，而二期那台真常驻网关是**冻结**的。
-  // 两者的装配差异有三处，本腿逐一对齐到生产形态，把「绿」的成因逼出来：
-  //   (1) detached：二期那台是启动器/Run 项拉起的孤儿（脱离了主进程的 Job Object），
-  //       Leg B 是闸的子进程（跟着闸的 Job）。这是 S1 点名「冻结只出现在真常驻子进程里」的第一嫌疑。
+  // ===== Leg B′（**判定腿**）：生产常驻形态——detached + --persistent + Electron 运行时 =====
+  // 为什么由它判定（评审 Concern 1 / 简报 S1 原意）：二期冻结的现场就是「常驻（脱离父进程、
+  // 自启路径、Electron 运行时）+ 装配后父进程消失」，而 Leg B 是非 detached、跟着闸的 Job Object、
+  // 走 stdin 握手的**另一种**装配。判定腿必须选在出缺陷的那个装配里，所以是 B′ 而不是 B。
+  // 本腿与生产启动器的三处对齐（逐项）：
+  //   (1) detached：二期那台是启动器/Run 项拉起的孤儿（脱离了主进程的 Job Object）。
   //   (2) --persistent：走 gateway.cjs 的自启路径（token 自造 + tokenSource:"file"），不经 stdin 握手。
   //   (3) Electron 运行时：生产启动器是 `ELECTRON_RUN_AS_NODE=1 AgentHub.exe gateway.cjs --persistent`
   //       —— Node **22.16.0**（Electron 35.7.5 内嵌），而 Leg B 用的是系统 node v26.4.0。
-  //       本机已在两种运行时下各做一次进程内微测（都是 1,388,472 → 0），故此处不复述那份对照，
-  //       只把「真常驻装配」这条腿补上。
   // 观测同样必须在子进程**外部**：本腿不经 gateway-client（那是闸的直连对象），只 stat 沙箱 -wal +
-  // 读日志，跑完用 stopAndWait 经认证管道停干净（唯一出口，不许按 pid 盲杀）。
+  // 读日志 + 经认证管道读 proxy_status；跑完用 gateway_shutdown 停干净（唯一出口，不许按 pid 盲杀）。
   const detachLeg = await runDetachLeg();
-  pass(`Leg B′ 生产常驻形态（detached + --persistent + Electron 运行时）：`
+  pass(`Leg B′ 生产常驻形态（**判定腿**：detached + --persistent + Electron 运行时）：`
     + `checkpoint 前 ${detachLeg.wBeforeCk} B → 后 ${detachLeg.wAfterTick} B，日志行 ${detachLeg.ckLines.length} 条`
     + `（${detachLeg.converged ? "收敛" : "*** 冻结复现 ***"}）`);
 
@@ -595,9 +670,16 @@ async function main() {
   const legaGreen = Number(ml[4]) < Number(ml[3]) && Number(ml[4]) <= TARGET;
   note(`Leg A（进程内直调，独立进程+独立沙箱）driver=${ml[1]} rows=${ml[2]} ${ml[3]} B → ${ml[4]} B`
     + `（自报 ok=${ml[5]} before=${ml[6]} after=${ml[7]} err=${ml[8]}）⇒ 进程内形态 ${legaGreen ? "收敛成功" : "未收敛"}`);
-  if (legaGreen && !legB.converged) {
-    note("★ Leg A 绿而 Leg B 红：与二期实证同形 —— 缺陷**只**出现在真常驻装配里，"
+  // 对照的是**判定腿**（B′）：进程内绿而常驻装配红才是「缺陷只出现在真常驻装配里」这个结论。
+  if (legaGreen && !detachLeg.converged) {
+    note("★ Leg A 绿而**判定腿 B′**红：与二期实证同形 —— 缺陷**只**出现在真常驻装配里，"
       + "不在此形态内。这本身是第一手证据，把 Task 4 的搜索面从「checkpoint 机制」收窄到「常驻装配差异」。");
+  }
+  // 两条子进程腿若结论相左，那个差异本身就是证据（装配差异 = 搜索面），原样报出来。
+  if (legB.converged !== detachLeg.converged) {
+    note(`★ 对照腿 B（非 detached）与判定腿 B′（生产常驻）结论**不一致**：`
+      + `B ${legB.converged ? "收敛" : "冻结"} / B′ ${detachLeg.converged ? "收敛" : "冻结"}`
+      + ` —— 差异应当只来自装配（detached / --persistent / 运行时），这是分派给 Task 4 的第一手线索。`);
   }
 
   pass(`Leg A 对照（附加信息，无决定权）：进程内 ${ml[3]} B → ${ml[4]} B`);
@@ -616,19 +698,32 @@ async function main() {
     + `真实 -wal 当前 ${realWalBytes()} B（用户实例在写，只记录不断言）`);
 
   // ===== ② 的最终判定（放在收尾之后：收尾若失败要先报收尾，且上面所有证据都已落盘/落屏）=====
-  // 判定腿是 Leg B（真子进程 + 真 HTTP + 子进程外部观测），Leg A 的进程内结果**不参与**这里的绿红。
-  // ⚠ 实测结论与简报预期**相反**：Leg B 与 Leg B′ 都**绿**（收敛），二期那种冻结在今天的任何
+  // 判定腿是 **Leg B′**（生产常驻形态：detached + --persistent + Electron 运行时）——理由是二期
+  // 冻结的现场就是那个装配（评审 Concern 1，回复 S1 原意）。**Leg B（非 detached 真子进程）只是对照**，
+  // 它的结果不决定这里的绿红（它的断言仍在上文如实报告，两条腿结论不一致也会单独提示）。
+  // ⚠ 实测结论与简报预期**相反**：判定腿 B′ 与对照腿 B 都**绿**（收敛），二期那种冻结在今天的任何
   //   生产装配里都**没有复现**。真正的冻结由 Leg C 的负对照造出（外部持读事务 ⇒ ok:true 但不截断），
   //   那与二期「1,388,472 B 恒定不动」同形 —— 这条差异是 Task 3 交给 Task 4 的核心证据，详见报告。
-  assert.ok(legB.hasLine || legB.lastCheckpoint,
-    "② 周期 checkpoint 既没落日志行、proxy_status.lastCheckpoint 也仍是 null —— "
-    + "计时器压根没跑（Task 4 分支 (c) 的判别面）；本次日志 wal-checkpoint 行数=" + legB.ckLines.length);
-  assert.ok(legB.converged,
-    `② Leg B 冻结复现：周期 checkpoint 后 -wal 仍 ${legB.wAfterTick} B（> ${legB.target} B）—— 三期判据 4 的本体。`
-    + `\n   子进程外部观测 (i)：checkpoint 前 ${legB.wBeforeCk} B → 后 ${legB.wAfterTick} B`
-    + `\n   子进程外部观测 (ii) 日志行：${legB.ckLine ? legB.ckLine.raw : "<无>"}`
-    + `\n   子进程外部观测 (iii) proxy_status.lastCheckpoint：${JSON.stringify(legB.lastCheckpoint)}`
-    + `\n   本轮真 HTTP ${legB.httpN} 条（全部非 200）。红即缺陷复现，归 Task 4 决策表处置`);
+  assert.ok(detachLeg.ckLine || detachLeg.ckLines.length,
+    "② 判定腿 B′ 没落任何 wal-checkpoint 日志行 —— 常驻装配里的计时器压根没跑"
+    + "（Task 4 分支 (c) 的判别面）；本次日志行数=" + detachLeg.ckLines.length);
+  // F3（甲）：日志必须**自证**本次生效的间隔。判定腿的日志行缺 ms 就说明自证面没生效，
+  // 那时「复盘无法判断当时是 5 min 还是被覆盖过的值」这个 Concern 会原样复现——所以要断言。
+  const msSeen = detachLeg.ckLine && detachLeg.ckLine.ms;
+  assert.ok(Number.isFinite(msSeen) && msSeen > 0,
+    "② 判定腿 B′ 的 wal-checkpoint 行没带生效间隔 ms（F3 自证缺失，事后无法复盘）："
+    + `\n   行原文：${detachLeg.ckLine ? detachLeg.ckLine.raw : "<无>"}`);
+  assert.ok(detachLeg.overrideLines && detachLeg.overrideLines.length === 1,
+    "② 判定腿 B′ 的 env 覆盖没有留下恰好一条 wal-checkpoint-override 告警留痕（F3 自证缺失）："
+    + ` 实得 ${detachLeg.overrideLines ? detachLeg.overrideLines.length : 0} 条`
+    + `\n   全部日志行：${JSON.stringify(detachLeg.ckLines)}`);
+  assert.ok(detachLeg.converged,
+    `② 判定腿 B′ 冻结复现：周期 checkpoint 后 -wal 仍 ${detachLeg.wAfterTick} B（> ${TARGET} B）—— 三期判据 4 的本体。`
+    + `\n   子进程外部观测 (i)：checkpoint 前 ${detachLeg.wBeforeCk} B → 后 ${detachLeg.wAfterTick} B`
+    + `\n   子进程外部观测 (ii) 日志行：${detachLeg.ckLine ? detachLeg.ckLine.raw : "<无>"}`
+    + `\n   子进程外部观测 (iii) 日志行共 ${detachLeg.ckLines.length} 条  HTTP ${detachLeg.httpN} 条（全部非 200）`
+    + `\n   对照腿 B（非 detached）：前 ${legB.wBeforeCk} B → 后 ${legB.wAfterTick} B（${legB.converged ? "收敛" : "冻结"}）`
+    + `\n   红即缺陷复现，归 Task 4 决策表处置`);
 }
 
 main().then(() => {

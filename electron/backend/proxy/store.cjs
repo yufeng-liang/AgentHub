@@ -672,12 +672,21 @@ let ckOnResult = null;
  *   · 无参 `startCheckpointTimer()`      → 用 CHECKPOINT_MS（生产形态，gateway.cjs 走这条）
  *   · 数字 `startCheckpointTimer(30)`    → 覆盖周期（自测用）
  *   · 回调 `startCheckpointTimer(fn)`    → 注入成败回调 + 用 CHECKPOINT_MS
- *  `stopCheckpointTimer()` 的返回值仍是同一个 stop 函数（三种形态都一样），停机路径的契约不变。 */
+ *  `stopCheckpointTimer()` 的返回值仍是同一个 stop 函数（三种形态都一样），停机路径的契约不变。
+ *  回调现在是**双参** `(result, { ms, source })`：第二参是本次生效的间隔与其来源（评审 Concern 3 的
+ *  自证要求），既有单参调用方（gateway.cjs 的 `(r) => …`）多收一个被忽略的参数，不受影响。 */
 function startCheckpointTimer(onResult) {
   const ms = typeof onResult === "number" ? onResult : 0;
   if (typeof onResult === "function") ckOnResult = onResult;
   stopCheckpointTimer();
-  ckTimer = setInterval(() => { const r = checkpoint(); if (ckOnResult) ckOnResult(r); }, ms || checkpointMs());
+  // 生效间隔算一次、闭包持有：tick 里不再重读 env（否则 env 中途被改会让「本次生效值」这一留痕
+  // 变成随读随变的假证词）。`msArg` 是显式数字形参（自测用），留痕里如实标成 "arg" 来源。
+  const msArg = ms || checkpointMs();
+  const src = ms ? "arg" : checkpointMsSource();
+  ckTimer = setInterval(
+    () => { const r = checkpoint(); if (ckOnResult) ckOnResult(r, { ms: msArg, source: src }); },
+    msArg,
+  );
   if (ckTimer.unref) ckTimer.unref();
   return stopCheckpointTimer;
 }
@@ -686,10 +695,25 @@ function startCheckpointTimer(onResult) {
  *  ⚠ 这是**测试缝**，不是配置项：三期 Task 3 的收敛闸（dev-wal-convergence-test.cjs）要在真子进程里
  *  观察周期 checkpoint，而 5 min 的自然 tick 会让那条闸跑 5.5 分钟以上。默认值一字未动
  *  （不设环境变量时行为与二期完全一致），也**没有**留任何「手动触发 checkpoint」的命令面。
- *  归因（D-P3）：本行是 Task 3 的新增生产代码，为可测试性而生，不改变生产默认行为。 */
+ *  归因（D-P3）：本行是 Task 3 的新增生产代码，为可测试性而生，不改变生产默认行为。
+ *
+ *  ⚠ 缝落在**生产实走路径**上（`gateway.cjs` → `startCheckpointTimer(fn)` → 无数字 → 本函数），
+ *  所以任何能给网关子进程设 env 的场景（启动器、自启项、调试）都能静默改产线节奏。评审 Concern 3
+ *  的处置是**让日志自证**而不是假装缝不存在：gateway.cjs 把本函数的返回值写进每一条 `wal-checkpoint`
+ *  行（`ms` 字段），并在覆盖生效时另打一行 `wal-checkpoint-override`。事后复盘只看日志就能判断
+ *  当时生效的是 5 min 默认值还是被覆盖过的值，不需要再去猜进程环境。
+ *  没有选「只在未打包 / test flag 下认 env」那条：判定腿 Leg B′ 用的正是**打包 electron.exe**，
+ *  任何以「是否打包」为闸门的做法都会把它误关（`app.isPackaged` 同理）。 */
 function checkpointMs() {
   const n = Number(process.env.AGENTHUB_CHECKPOINT_MS);
   return Number.isFinite(n) && n > 0 ? n : CHECKPOINT_MS;
+}
+
+/** 本次生效间隔的**来源**（留痕自证用）："env" = 被 AGENTHUB_CHECKPOINT_MS 覆盖，"default" = 生产默认。
+ *  与 checkpointMs() 同读一个环境变量、同一套判别（有限正数才算覆盖），两处口径必须一起改。 */
+function checkpointMsSource() {
+  const n = Number(process.env.AGENTHUB_CHECKPOINT_MS);
+  return Number.isFinite(n) && n > 0 ? "env" : "default";
 }
 
 function stopCheckpointTimer() { if (ckTimer) clearInterval(ckTimer); ckTimer = null; }
@@ -727,7 +751,9 @@ module.exports = {
   decryptFailureActive,                // 当前仍解不开的条数（/readyz 的 credFail 用它，见函数注释）
   // WAL 收敛与句柄归属（Task 2）；stop 由 startCheckpointTimer 的返回值给出。
   // lastCheckpoint 是三期 Task 3 的留痕出口：checkpoint() 的观测结构（Task 4/9 判据读它）。
-  checkpoint, startCheckpointTimer, walBytes, lastCheckpoint,
+  // checkpointMsSource 是缝的自证面（评审 Concern 3）：让闸能对「默认值一字的惰性」与「被覆盖时如实标 env」
+  // 两极都下断言，而不是只信注释。纯函数、无副作用（只读 env，不开库、不碰 WAL）。
+  checkpoint, startCheckpointTimer, walBytes, lastCheckpoint, checkpointMsSource,
   CHANNELS,
   channelDisplay: (id) => (CHANNELS.find((c) => c.id === id) || {}).display || String(id),
   createKey, listKeys, findKeyBySecret, updateKey, deleteKey, keyTodayReq,
