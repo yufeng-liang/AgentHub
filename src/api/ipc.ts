@@ -226,8 +226,21 @@ export const proxyScanImport = (index: number, channel?: ProxyBuiltinChannelId, 
 /** 拉起对应渠道的官方登录（授权页由主进程 shell.openExternal 打开，结果经 app:event 回流）。
  *  下面这几个签名刻意收在 ProxyBuiltinChannelId：OAuth / 本机扫描 / 凭据包导入都是"生态渠道"专属，
  *  自定义提供商只有一把 API Key，主进程也会明确拒非内置渠道。 */
-export const proxyOauthBegin = (channel: ProxyBuiltinChannelId) =>
-  call<{ ok: boolean; url?: string; mode?: string; message?: string }>("proxy_oauth_begin", { channel });
+/** opts 平铺进 args 顶层：后端处理器是从顶层解构 { edition, vendor, captchaVerifyParam } 的。
+ *  返回体按渠道形态分三种：
+ *  - mode = loopback（Trae）/ poll（WorkBuddy 双区）/ device（cline、qoder）/ callback（autoclaw 国际版）
+ *  - device 额外回 userCode（授权页没自动带上时给用户手输）
+ *  - autoclaw_intl 第一跳不回 url，只回 needCaptcha + captcha（滑块配置），拿到滑块参数后二次调用才回 url */
+export const proxyOauthBegin = (channel: ProxyBuiltinChannelId, opts?: { edition?: "intl" | "cn"; vendor?: "zai" | "google"; captchaVerifyParam?: string }) =>
+  call<{
+    ok: boolean;
+    url?: string;
+    mode?: string;
+    userCode?: string;
+    needCaptcha?: boolean;
+    captcha?: { region: string; prefix: string; sceneId: string; supplier: string };
+    message?: string;
+  }>("proxy_oauth_begin", { channel, ...(opts || {}) } as unknown as Record<string, unknown>);
 export const proxyOauthCancel = () => call<{ ok: boolean; cancelled?: boolean }>("proxy_oauth_cancel");
 /** 兜底：浏览器没跳回回环地址时，把地址栏内容整段粘回来完成登录 */
 export const proxyOauthSubmitCallback = (channel: ProxyBuiltinChannelId, url: string) =>

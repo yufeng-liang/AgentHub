@@ -399,8 +399,12 @@ function register(ipcMain) {
       events.emit({ type: "oauth-done", channel: ch, ...result });
     });
     if (r.ok && r.url) await shell.openExternal(r.url);
-    // mode=device（cline WorkOS / qoder PKCE 设备流）额外回 userCode 供 UI 展示（Task 13）
-    return r.ok ? ok({ url: r.url, mode: r.mode, userCode: r.userCode || "" }) : fail(r.message);
+    // mode=device（cline WorkOS / qoder PKCE 设备流）额外回 userCode 供 UI 展示（Task 13）；
+    // needCaptcha/captcha 必须一并透传：autoclaw_intl 第一跳没有 url，只回滑块配置，
+    // 丢了这两个键 UI 就分不清「要滑块」还是「已打开登录页」，会停在假等待态（Task 12 终审 M1）
+    return r.ok
+      ? ok({ url: r.url, mode: r.mode, userCode: r.userCode || "", needCaptcha: !!r.needCaptcha, captcha: r.captcha })
+      : fail(r.message);
   }));
   ipcMain.handle("proxy_oauth_cancel", handle(() => ok({ cancelled: discovery.cancelOAuth() })));
   // 浏览器没跳回回环地址时的兜底：把地址栏内容整段粘回来完成登录

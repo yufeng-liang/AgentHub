@@ -97,8 +97,20 @@ const fileMsg = ref("");
 const fileErr = ref(false);
 const fileBusy = ref(false);
 const oauthWaiting = ref(false);
+// 发起中：请求在途、AutoClaw 国际版正在等滑块结果。与 oauthWaiting 分开是因为
+// 「等滑块」时浏览器还没开，显示「已在浏览器打开登录页」就是骗人；也不该让用户重复点
+const oauthBusy = ref(false);
 const oauthMsg = ref("");
 const oauthMode = ref("");
+const oauthErr = ref(false); // 与等待态共用 oauthMsg 一条消息位，靠它决定是不是红色错误文案
+// 发起序号：取消或重开弹窗时递增，让已经飞出去的结果落地即失效
+let oauthRun = 0;
+// mode=device（cline / qoder）时后端回的验证码：授权页通常已自动带上，留一手给用户手输
+const oauthUserCode = ref("");
+// qoder 国际版 / 中国版是两套域名（登录与调度同源），登录入口就地切换
+const qoderEdition = ref<"intl" | "cn">("intl");
+// AutoClaw 国际版的两个上游：滑块过了之后按这个 vendor 换授权地址
+const aclawVendor = ref<"zai" | "google">("zai");
 // 浏览器没跳回回环地址时的兜底：把地址栏整段粘回来
 const callbackInput = ref("");
 const callbackBusy = ref(false);
@@ -111,11 +123,13 @@ const scanErr = ref(false);
 // 用「渠道:文件」当导入中的行标识：列表在导入过程中会被重新扫描替换，下标引用不稳
 const scanImporting = ref("");
 
-// 添加方式可用性：小浣熊已支持「从本机软件导入」（scanRaccoon 读 ~/.box-agent/config/auth.json）
-// 与文件/粘贴导入；官方登录走客户端深链回调（office-raccoon://auth/callback），应用内无法代收，故只隐藏 OAuth
+// 添加方式可用性：oauth 这一档按渠道门禁，其余三档所有内置渠道都开放
+// · 小浣熊：登录走客户端深链回调（office-raccoon://auth/callback），应用内无法代收，只隐藏 OAuth
+// · AutoClaw 国内版：官方只有客户端手机号+验证码登录，没有可代收的网页授权（主进程 beginOAuth 直接拒）
+// 两者都仍支持「从本机软件导入」（scanRaccoon 读 ~/.box-agent/config/auth.json、scanAutoClaw 读 %APPDATA%/AutoClaw/auth.json）与文件/粘贴导入
 function addTabAllowed(key: AddMethod): boolean {
-  if (addChannel.value === "raccoon") return key !== "oauth";
-  return true;
+  if (key !== "oauth") return true;
+  return addChannel.value !== "raccoon" && addChannel.value !== "autoclaw";
 }
 
 // 渠道允许的添加方式（分段控件按渠道过滤）
@@ -147,7 +161,53 @@ const OAUTH_HELP: Record<string, { title: string; desc: string }> = {
     title: "用「商汤小浣熊」官方授权页登录",
     desc: "小浣熊登录走客户端深链回调（office-raccoon://auth/callback），应用内无法代收。<br />请改用「从本机软件导入」（自动读取 ~/.box-agent/config/auth.json）或「粘贴 JSON」导入 access_token 与 refresh_token。",
   },
+  // ===== 新增五渠道（autoclaw 国内版无网页登录，不出 OAuth 档，故本表无它的条目） =====
+  cline_free: {
+    title: "用 Cline 账号设备授权登录（免费池）",
+    desc: "跳转 Cline 授权页并自动携带验证码，确认后本机自动轮询完成登录。<br />也可改用「从本机软件导入」（读取 ~/.cline 登录态）或「粘贴 JSON」。",
+  },
+  cline_pass: {
+    title: "用 Cline 账号设备授权登录（订阅池）",
+    desc: "与免费池同一账号同一登录流程，只是模型池不同。<br />确认授权后本机自动轮询完成登录。",
+  },
+  autoclaw_intl: {
+    title: "用 AutoClaw 国际版 OAuth 登录",
+    desc: "先完成滑块验证，再跳转 Zai / Google 授权页；登录后自动回到本应用。<br />没有国际版账号也可「粘贴 JSON」导入 token。",
+  },
+  qoder: {
+    title: "用 Qoder 账号设备授权登录",
+    desc: "跳转 Qoder 授权页登录并选择账号，本机每 2 秒轮询自动完成。<br />国际版 / 中国版在下方切换；也可「粘贴 JSON」导入。",
+  },
 };
+
+// 「打开登录页」之后的等待文案：超时窗口按渠道各不相同，写死一个数会把用户钉在假等待里干等——
+// Trae / WorkBuddy 双区 3 分钟，cline 以上游下发的 expires_in 为准（约 5 分钟），
+// qoder 与 AutoClaw 国际版给了双倍（6 分钟：授权页还要登录 + 选账号 / 走上游回调）
+const OAUTH_WAIT_MSG: Record<string, string> = {
+  trae: "已在浏览器打开官方授权页，完成授权后自动回到本应用并入池（3 分钟无响应即超时）…",
+  workbuddy: "已在浏览器打开官方登录页，登录完成后本机自动轮询入池（3 分钟无响应即超时）…",
+  workbuddy_ai: "已在浏览器打开国际版官方登录页，登录完成后本机自动轮询入池（3 分钟无响应即超时）…",
+  cline_free: "已在浏览器打开 Cline 授权页，页面已自动带上验证码，点确认后本机自动轮询入池（有效期以上游下发为准，约 5 分钟）…",
+  cline_pass: "已在浏览器打开 Cline 授权页，页面已自动带上验证码，点确认后本机自动轮询入池（有效期以上游下发为准，约 5 分钟）…",
+  qoder: "已在浏览器打开 Qoder 授权页，登录并选择账号后本机每 2 秒轮询自动入池（6 分钟无响应即超时）…",
+  autoclaw_intl: "已在浏览器打开授权页，完成登录与账号选择后自动回到本应用入池（6 分钟无响应即超时）…",
+};
+const OAUTH_WAIT_DEFAULT = "已在浏览器打开官方登录页，完成授权后自动加入号池…";
+// 滑块阶段的提示（还没开浏览器，绝不能复用上面的「已在浏览器打开」文案）
+const CAPTCHA_WAIT_MSG = "请在弹出的滑块中完成验证，通过后自动打开授权页…";
+
+// 粘贴 JSON 的渠道专属说明：几家新渠道的 token 形态互不相同（前缀、打包串、JWT 声明），
+// 光给一个通用 JSON 示例用户不知道该粘什么。字段口径与主进程 normalizeAccountJson 同源：
+// 它只认 token/accessToken/access_token/jwt + refreshToken + uid，多余的键（如 device_id）会被丢掉，
+// 所以说明里不承诺"把 device_id 一起粘进来"——刷新链路的 device_id 由适配器从 token 声明里解
+const PASTE_HINT: Record<string, string> = {
+  cline_free: "粘贴 WorkOS JWT（不带 workos: 前缀会自动补）与 refresh_token",
+  cline_pass: "粘贴 WorkOS JWT（不带 workos: 前缀会自动补）与 refresh_token —— 与免费池同一套凭据，只是入不同的池",
+  autoclaw: "粘贴 access_token（可带 Bearer 前缀自动剥）与 refresh_token；刷新要用的 device_id 由本应用从 token 声明里解",
+  autoclaw_intl: "粘贴国际版 access_token（可带 Bearer 前缀自动剥）与 refresh_token；刷新要用的 device_id 由本应用从 token 声明里解",
+  qoder: "粘贴 accessToken；refreshToken 粘打包串（oauth刷新令牌|userId|machineId 或 pat|PAT|…|userId|machineId）",
+};
+const pasteHint = computed(() => PASTE_HINT[addChannel.value] || "");
 
 // 粘贴 JSON 的字段示例（placeholder 用，随渠道切换 token 字段名提示）
 const pastePlaceholder = computed(() => {
@@ -379,8 +439,9 @@ function openAdd(ch: ProxyChannelView) {
   }
   // 上面已按 kind 分流，走到这里 ch 必是内置渠道
   addChannel.value = ch.id as ProxyBuiltinChannelId;
-  // raccoon 无应用内 OAuth，默认落到「从本机软件导入」（自动读 ~/.box-agent/config/auth.json）
-  addMethod.value = ch.id === "raccoon" ? "local" : "oauth";
+  // 没有应用内 OAuth 的渠道（raccoon 深链代收不了、autoclaw 国内版官方无网页登录）
+  // 默认落到「从本机软件导入」，否则会停在一个已被隐藏的标签页上
+  addMethod.value = addTabAllowed("oauth") ? "oauth" : "local";
   pasteJson.value = "";
   pasteMsg.value = "";
   pasteErr.value = false;
@@ -388,6 +449,8 @@ function openAdd(ch: ProxyChannelView) {
   fileErr.value = false;
   oauthMsg.value = "";
   oauthMode.value = "";
+  oauthErr.value = false;
+  oauthUserCode.value = "";
   callbackInput.value = "";
   callbackMsg.value = "";
   scanMsg.value = "";
@@ -396,42 +459,186 @@ function openAdd(ch: ProxyChannelView) {
   loadScan(); // 打开即扫描本机，切到「从本机软件导入」时结果已经在了
 }
 
-/** 关弹窗：正在等待 OAuth 回调时一并取消，不留后台悬挂的授权流程 */
+/** 关弹窗：正在等回调 / 等滑块时一并收尾，不留后台悬挂的授权流程与挂起的滑块等待 */
 function closeAdd() {
   addOpen.value = false;
-  if (oauthWaiting.value) cancelOauth();
+  if (oauthWaiting.value || oauthBusy.value) cancelOauth();
 }
 
 function switchMethod(m: AddMethod) {
-  if (oauthWaiting.value) return; // OAuth 等待回调期间不许切走，避免状态丢失
+  // 等待回调与滑块进行中都不许切走：切走会把挂载容器与状态一起丢掉
+  if (oauthWaiting.value || oauthBusy.value) return;
   addMethod.value = m;
   if (m === "local" && !scanList.value.length) loadScan();
 }
 
+/** 渠道专属登录参数：qoder 要区服（两套域名），AutoClaw 国际版要上游 vendor（滑块两跳同值） */
+function oauthOpts(channel: ProxyBuiltinChannelId): { edition?: "intl" | "cn"; vendor?: "zai" | "google" } {
+  if (channel === "qoder") return { edition: qoderEdition.value };
+  if (channel === "autoclaw_intl") return { edition: "intl", vendor: aclawVendor.value };
+  return {};
+}
+
+/** 底栏左侧提示：发起中（含滑块）与等待授权是两回事——后者浏览器才真的开过 */
+const oauthFootHint = computed(() => {
+  if (!oauthBusy.value) return "已在浏览器打开登录页，完成后会自动入池";
+  return addChannel.value === "autoclaw_intl" ? "请在弹出的滑块中完成验证…" : "正在发起登录…";
+});
+const oauthCtaLabel = computed(() => {
+  if (oauthBusy.value) return addChannel.value === "autoclaw_intl" ? "滑块验证中…" : "发起中…";
+  if (oauthWaiting.value) return "等待授权…";
+  return addChannel.value === "autoclaw_intl" ? "滑块验证并打开登录页" : "打开登录页";
+});
+
 async function beginOauth() {
-  if (oauthWaiting.value) return;
-  oauthWaiting.value = true;
-  oauthMsg.value = "已在浏览器打开官方登录页，完成授权后自动加入号池（3 分钟超时）…";
+  if (oauthWaiting.value || oauthBusy.value) return;
+  const run = ++oauthRun; // 发起序号：取消或重开之后，迟到的结果不再往 UI 上写
+  const ch = addChannel.value;
+  oauthBusy.value = true; // 先只标"发起中"：等结果回来确认拿到 url，才谈得上"已在浏览器打开"
+  oauthErr.value = false;
+  oauthMsg.value = "";
+  oauthUserCode.value = "";
   callbackMsg.value = "";
   try {
-    const r = await api.proxyOauthBegin(addChannel.value);
+    const r = ch === "autoclaw_intl" ? await beginAutoClawIntlLogin() : await api.proxyOauthBegin(ch, oauthOpts(ch));
+    if (run !== oauthRun) return;
     if (r.ok === false) {
+      oauthErr.value = true;
       oauthMsg.value = r.message || "无法启动登录";
-      oauthWaiting.value = false;
+      return;
+    }
+    // 没有 url 就不是等待态（滑块拿不到 url 属于异常）：停在这里，别把"已在浏览器打开"演成假等待
+    if (!r.url) {
+      oauthErr.value = true;
+      oauthMsg.value = "未拿到授权地址，请重新发起，或改用「粘贴 JSON」导入凭据";
       return;
     }
     oauthMode.value = r.mode || "";
+    oauthUserCode.value = r.userCode || "";
+    oauthWaiting.value = true;
+    oauthMsg.value = OAUTH_WAIT_MSG[ch] || OAUTH_WAIT_DEFAULT;
   } catch (e) {
+    if (run !== oauthRun) return;
+    oauthErr.value = true;
     oauthMsg.value = String((e as Error).message || e);
-    oauthWaiting.value = false;
+  } finally {
+    if (run === oauthRun) oauthBusy.value = false;
   }
 }
 
+// ===== AutoClaw 国际版：阿里云滑块前置（官方浏览器端 SDK 动态注入，主进程只管滑块参数的两跳） =====
+const ACLAW_SDK = "https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js";
+const ACLAW_CAPTCHA_TIMEOUT_MS = 120000; // 滑块弹出后的等待上限：与参考项目同值 120s
+
+/** 滑块 SDK 挂在 window 上的两个入口：无 npm 包，只能注脚本 + 取全局函数，故就地声明形状 */
+interface AliyunCaptchaWindow {
+  AliyunCaptchaConfig?: { region: string; prefix: string };
+  initAliyunCaptcha?: (opts: {
+    SceneId: string;
+    mode: "popup";
+    element: string;
+    button: string;
+    slideStyle: { width: number; height: number };
+    language: string;
+    captchaVerifyCallback: (param: string) => Promise<{ captchaResult: boolean; bizResult: boolean }>;
+    onBizResultCallback?: (result: boolean) => void;
+    getInstance?: (inst: { hide?: () => void } | null) => void;
+    onError?: (err: unknown) => void;
+  }) => void;
+}
+type OauthBeginResult = Awaited<ReturnType<typeof api.proxyOauthBegin>>;
+
+let aclawInstance: { hide?: () => void } | null = null;
+let aclawCaptchaTimer: number | undefined;
+
+/** AliyunCaptchaConfig 必须先于脚本赋值：SDK 在加载期读它，顺序反了弹窗会一直转圈 */
+async function loadAliyunCaptcha(region: string, prefix: string): Promise<void> {
+  const w = window as unknown as AliyunCaptchaWindow;
+  w.AliyunCaptchaConfig = { region, prefix };
+  if (document.querySelector(`script[src="${ACLAW_SDK}"]`)) return; // 同一弹窗内重复发起时脚本只注一次
+  await new Promise<void>((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = ACLAW_SDK;
+    s.onload = () => resolve();
+    s.onerror = () => reject(new Error("滑块组件加载失败（检查网络/代理），可改用「粘贴 JSON」导入 token"));
+    document.head.appendChild(s);
+  });
+}
+
+/**
+ * 第一跳只回滑块配置、没有 url（后端契约），滑块过了之后带 captchaVerifyParam 二次调用才拿到授权地址。
+ * 结果从 SDK 的验证回调里才成立，所以整段包成一个 promise 交给 beginOauth 收尾
+ */
+async function beginAutoClawIntlLogin(): Promise<OauthBeginResult> {
+  const first = await api.proxyOauthBegin("autoclaw_intl", oauthOpts("autoclaw_intl"));
+  if (!first.needCaptcha) return first; // 上游把滑块关了：这一跳就是最终结果
+  const cfg = first.captcha;
+  if (!cfg) return { ok: false, message: "上游未返回滑块配置，请重新发起或改用「粘贴 JSON」导入" };
+  await loadAliyunCaptcha(cfg.region, cfg.prefix);
+  const w = window as unknown as AliyunCaptchaWindow;
+  if (typeof w.initAliyunCaptcha !== "function") {
+    return { ok: false, message: "滑块组件未就绪（脚本被网络或策略拦下），请检查网络后重试" };
+  }
+  oauthMsg.value = CAPTCHA_WAIT_MSG;
+  return new Promise<OauthBeginResult>((resolve) => {
+    let settled = false;
+    let lastErr = ""; // 滑块可原地重拖，失败先记着，等超时或用户放弃再一次性报出来
+    const finish = (r: OauthBeginResult) => {
+      if (settled) return;
+      settled = true;
+      if (aclawCaptchaTimer) { clearTimeout(aclawCaptchaTimer); aclawCaptchaTimer = undefined; }
+      resolve(r);
+    };
+    // 重复发起前清掉上一次的验证码 DOM：同一容器里 init 两次会叠出两层滑块
+    const mount = document.getElementById("aliyun-captcha-element");
+    if (mount) mount.innerHTML = "";
+    w.initAliyunCaptcha!({
+      SceneId: cfg.sceneId,
+      mode: "popup",
+      element: "#aliyun-captcha-element",
+      button: "#aliyun-captcha-trigger", // popup 模式必须有触发按钮，SDK 只认这个元素的点击，漏了滑块弹不出来
+      slideStyle: { width: 360, height: 40 },
+      language: "cn",
+      captchaVerifyCallback: async (param: string) => {
+        try {
+          const second = await api.proxyOauthBegin("autoclaw_intl", { vendor: aclawVendor.value, captchaVerifyParam: param });
+          if (second.ok) finish(second);
+          else lastErr = second.message || "获取授权地址失败";
+          // 两个 result 都为 true SDK 才收起滑块；失败就留着让用户原地再拖一次
+          return { captchaResult: !!second.ok, bizResult: !!second.ok };
+        } catch (e) {
+          lastErr = String((e as Error).message || e);
+          return { captchaResult: false, bizResult: false };
+        }
+      },
+      onBizResultCallback: () => {}, // SDK 要求的收尾回调：业务结果已由上面的 resolve 路径处理，这里不重复做事
+      getInstance: (inst) => { aclawInstance = inst || null; },
+      onError: (err) => {
+        const code = err && typeof err === "object" ? String((err as { code?: unknown }).code ?? "") : String(err ?? "");
+        finish({ ok: false, message: `滑块组件异常${code ? `（${code}）` : ""}，请重试或改用「粘贴 JSON」导入 token` });
+      },
+    });
+    // 初始化后至少等 2.1s 再点触发按钮，弹层才出得来（参考项目实测的 SDK 时序要求）
+    setTimeout(() => (document.getElementById("aliyun-captcha-trigger") as HTMLButtonElement | null)?.click(), 2100);
+    aclawCaptchaTimer = window.setTimeout(
+      () => finish({ ok: false, message: lastErr || "滑块验证未完成（2 分钟超时或已关闭），请重新发起" }),
+      ACLAW_CAPTCHA_TIMEOUT_MS
+    );
+  });
+}
+
 async function cancelOauth() {
+  oauthRun++; // 进行中的发起视为作废：结果回来也不再改 UI，只把这一次的前端等待收掉
+  if (aclawCaptchaTimer) { clearTimeout(aclawCaptchaTimer); aclawCaptchaTimer = undefined; }
+  aclawInstance?.hide?.();
+  aclawInstance = null;
   await api.proxyOauthCancel().catch(() => {});
+  oauthBusy.value = false;
   oauthWaiting.value = false;
+  oauthErr.value = false;
   oauthMsg.value = "";
   oauthMode.value = "";
+  oauthUserCode.value = "";
 }
 
 /** 兜底：把浏览器地址栏内容整段粘回来完成登录（仅回环模式用得上） */
@@ -652,8 +859,13 @@ onMounted(() => {
     const p = e as { event?: string; type?: string; ok?: boolean; message?: string; channel?: string };
     if (p.event !== "proxy") return;
     if (p.type === "oauth-done") {
+      oauthRun++; // 会话已由后端收尾：还挂着的滑块等待不再二次改写界面
+      if (aclawCaptchaTimer) { clearTimeout(aclawCaptchaTimer); aclawCaptchaTimer = undefined; }
+      oauthBusy.value = false;
       oauthWaiting.value = false;
       oauthMode.value = "";
+      oauthUserCode.value = "";
+      oauthErr.value = !p.ok;
       oauthMsg.value = p.ok ? "登录成功，已加入号池（已自动签到）" : `登录失败：${p.message || ""}`;
       if (p.ok) {
         addOpen.value = false;
@@ -667,6 +879,7 @@ onMounted(() => {
 onUnmounted(() => {
   if (offEvent) offEvent();
   if (nowTimer) clearInterval(nowTimer);
+  if (aclawCaptchaTimer) clearTimeout(aclawCaptchaTimer); // 滑块等待定时器别留到页面销毁之后
 });
 </script>
 
@@ -856,7 +1069,7 @@ onUnmounted(() => {
               v-for="t in METHOD_TABS"
               :key="t.key"
               class="add-tab"
-              :class="{ active: addMethod === t.key, disabled: oauthWaiting && addMethod === 'oauth' && t.key !== 'oauth' }"
+              :class="{ active: addMethod === t.key, disabled: (oauthWaiting || oauthBusy) && addMethod === 'oauth' && t.key !== 'oauth' }"
               @click="switchMethod(t.key)"
             >
               <i class="ph" :class="t.icon"></i>{{ t.label }}
@@ -865,12 +1078,39 @@ onUnmounted(() => {
 
           <!-- 方式内容：各面板共用固定高度，切换时弹窗不跳高度 -->
           <div class="add-body">
-            <!-- OAuth 官方登录（三渠道各自主流形态） -->
+            <!-- OAuth 官方登录（各渠道登录形态不同：回环 / 轮询 / 设备码 / 滑块+回调） -->
             <div v-if="addMethod === 'oauth'" class="add-pane center">
               <div class="add-pane-icon"><i class="ph ph-key"></i></div>
               <div class="add-pane-title">{{ OAUTH_HELP[addChannel]?.title || "用官方登录页登录" }}</div>
               <div class="add-pane-desc" v-html="OAUTH_HELP[addChannel]?.desc || ''"></div>
-              <!-- 回环模式下浏览器没跳回来时的兜底：整段粘贴回调地址 -->
+              <!-- qoder 区服切换：国际版与中国版是两套域名与账号体系，登录参数直接决定回调到哪个 openapi -->
+              <el-radio-group
+                v-if="addChannel === 'qoder'"
+                v-model="qoderEdition"
+                size="small"
+                class="oauth-radio-row"
+                :disabled="oauthWaiting || oauthBusy"
+              >
+                <el-radio-button value="intl">国际版</el-radio-button>
+                <el-radio-button value="cn">中国版</el-radio-button>
+              </el-radio-group>
+              <!-- AutoClaw 国际版的两个上游：滑块通过后按这个 vendor 换授权地址 -->
+              <el-radio-group
+                v-if="addChannel === 'autoclaw_intl'"
+                v-model="aclawVendor"
+                size="small"
+                class="oauth-radio-row"
+                :disabled="oauthWaiting || oauthBusy"
+              >
+                <el-radio-button value="zai">Zai 账号</el-radio-button>
+                <el-radio-button value="google">Google 账号</el-radio-button>
+              </el-radio-group>
+              <!-- 设备码：授权页 URL 一般已自动带上（verification_uri_complete），没带上就照这里手输 -->
+              <div v-if="oauthMode === 'device' && oauthUserCode" class="oauth-code-row">
+                <span>如页面未自动带上验证码，请手动输入：</span>
+                <code class="oauth-user-code">{{ oauthUserCode }}</code>
+              </div>
+              <!-- 回环模式下浏览器没跳回来时的兜底：整段粘贴回调地址（只有 Trae 的 loopback 会话收这个） -->
               <div v-if="oauthMode === 'loopback' && oauthWaiting" class="cb-row">
                 <input v-model="callbackInput" class="input" style="flex: 1" placeholder="浏览器没跳回？把地址栏整段粘到这里" />
                 <button class="btn btn-sm" :disabled="!callbackInput.trim() || callbackBusy" @click="submitCallback">
@@ -878,7 +1118,10 @@ onUnmounted(() => {
                 </button>
               </div>
               <div v-if="callbackMsg" class="add-msg">{{ callbackMsg }}</div>
-              <div v-if="oauthMsg" class="add-msg" :class="{ err: !oauthWaiting && oauthMsg.includes('失败') }">{{ oauthMsg }}</div>
+              <div v-if="oauthMsg" class="add-msg" :class="{ err: oauthErr }">{{ oauthMsg }}</div>
+              <!-- 粘贴窗口被遮挡时 SDK 会把弹层转成内嵌滑块，就地渲染在这行下面 -->
+              <div id="aliyun-captcha-element" class="captcha-mount"></div>
+              <button id="aliyun-captcha-trigger" class="captcha-trigger" type="button" aria-hidden="true" tabindex="-1"></button>
             </div>
 
             <!-- 从本机软件导入：读本机已登录客户端的凭据，零请求入池 -->
@@ -929,6 +1172,7 @@ onUnmounted(() => {
             <!-- 粘贴 JSON -->
             <div v-else class="add-pane paste-pane">
               <div class="paste-label">凭据 JSON</div>
+              <div v-if="pasteHint" class="paste-hint">{{ pasteHint }}</div>
               <textarea
                 v-model="pasteJson"
                 class="input mono paste-area"
@@ -942,18 +1186,18 @@ onUnmounted(() => {
           <!-- 底部操作：左侧状态/提示，右侧按方式给对应主操作 -->
           <footer class="add-foot">
             <span class="add-foot-hint">
-              <template v-if="addMethod === 'oauth' && oauthWaiting"><i class="ph ph-circle-notch"></i>已在浏览器打开登录页，完成后会自动入池</template>
+              <template v-if="addMethod === 'oauth' && (oauthBusy || oauthWaiting)"><i class="ph ph-circle-notch"></i>{{ oauthFootHint }}</template>
               <template v-else-if="addMethod === 'local'">导入后仍可刷新余额、切到 IDE 或停用</template>
               <template v-else>入池后可在下方列表里刷新余额、切到 IDE 或停用</template>
             </span>
-            <button class="btn" @click="closeAdd()">{{ addMethod === "oauth" && oauthWaiting ? "取消登录" : "取消" }}</button>
+            <button class="btn" @click="closeAdd()">{{ addMethod === "oauth" && (oauthBusy || oauthWaiting) ? "取消登录" : "取消" }}</button>
 
             <button
               v-if="addMethod === 'oauth'"
               class="btn btn-cta"
-              :disabled="oauthWaiting"
+              :disabled="oauthWaiting || oauthBusy"
               @click="beginOauth"
-            >{{ oauthWaiting ? "等待授权…" : "打开登录页" }}</button>
+            >{{ oauthCtaLabel }}</button>
             <button
               v-else-if="addMethod === 'file'"
               class="btn btn-cta"
@@ -1417,6 +1661,10 @@ onUnmounted(() => {
   justify-content: center;
   text-align: center;
   gap: 10px;
+  /* 新渠道的 OAuth 面板比旧三档多一两行（区服/上游选择、设备码行、长错误文案），
+     定高面板挤不下时让内容自己滚；safe center 保证首行不被居中裁到看不见 */
+  overflow-y: auto;
+  justify-content: safe center;
 }
 .add-pane-icon {
   width: 42px;
@@ -1575,6 +1823,60 @@ onUnmounted(() => {
   gap: 8px;
   width: 100%;
   max-width: 420px;
+}
+/* OAuth 面板内的渠道专属开关：qoder 区服 / AutoClaw 国际版上游，都是"发起前定一次"的小选择 */
+.oauth-radio-row {
+  margin-top: 2px;
+}
+/* 设备码行：授权页一般自动带上验证码，这里给出可整段选中的读数供手输 */
+.oauth-code-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  max-width: 420px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+.oauth-user-code {
+  padding: 3px 10px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--accent-line);
+  background: var(--accent-dim);
+  color: var(--accent-strong);
+  font-family: var(--font-code);
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  user-select: all;
+}
+/* 阿里云滑块的挂载容器：没 init 过时它是空节点，:empty 让弹窗高度不跳；
+   预置 display:none 反而会让 popup 降级成内嵌形态时看不见滑块，故不用 */
+.captcha-mount {
+  width: 100%;
+  max-width: 360px;
+}
+.captcha-mount:empty {
+  display: none;
+}
+/* popup 模式的触发按钮：SDK 只认这个元素的点击，由代码在 init 后 .click() 驱动，
+   所以留在文档流里（SDK 要能量到位置）但视觉上 1×1 透明、也不接真实点击 */
+.captcha-trigger {
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  overflow: hidden;
+  opacity: 0;
+  pointer-events: none;
+}
+/* 粘贴面板的渠道说明：一行讲清这个渠道该粘哪些字段 */
+.paste-hint {
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-3);
 }
 
 /* 号池同步卡片已移至独立「号池同步」页；此处样式不再使用 */
