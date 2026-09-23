@@ -10,6 +10,9 @@
 //              → auth/register 换成带 workos: 前缀的 Cline 会话令牌；两池共用同一条登录流
 //   qoder      PKCE(S256) 设备授权：本地拼授权页（无起始请求）→ deviceToken/poll 2s 轮询
 //              → userinfo 补资料；edition 决定 global / cn 两套上游域
+//   autoclaw_intl AutoClaw 国际版：只有网页 OAuth（zai / google），前置阿里云风控滑块；
+//              回环回调 http://127.0.0.1:<port>/aclaw-cb/{vendor}/{taskState}，
+//              路径里的 state 只作 CSRF 校验，换码必须用查询串里上游回的 state（双 state）
 //
 // 本机导入：
 //   WorkBuddy 读 %LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy*.info
@@ -1246,6 +1249,134 @@ function qoderMachineIdOf() {
   return adapters._qoderMachineId();
 }
 
+// ===== AutoClaw 国际版 OAuth（协议参考 第四章 §3.2）：三步——
+// ① captcha-config（主进程拉，签名头）→ ② renderer 弹滑块拿 captchaVerifyParam → oauth-url 拿授权页
+// → ③ 系统浏览器登录 302 回环 /aclaw-cb/{vendor}/{taskState}?code&state（上游不校验回调主机）
+// 双 state 陷阱：路径里是本网关任务 state（CSRF 校验），换码必须用查询串里上游回的 state——传错稳定 631001。
+const AUTOCLAW_INTL_USERAPI = "https://autoglm-api.autoglm.ai"; // 与 adapters.cjs 的 AUTOCLAW_REGIONS.intl.userapi 同值，直接字面量写在这里避免跨文件私有引用
+const AUTOCLAW_CALLBACK_PREFIX = "/aclaw-cb/";
+const AUTOCLAW_INTL_OK_PAGE = '<meta charset=utf-8><body style="font-family:system-ui;background:#0b0d0f;color:#44e07f;display:grid;place-items:center;height:100vh">登录成功，已返回网关，可以关闭此页面。</body>';
+
+function autoclawParseCallback(pathname, search) {
+  const rest = String(pathname || "").startsWith(AUTOCLAW_CALLBACK_PREFIX) ? String(pathname).slice(AUTOCLAW_CALLBACK_PREFIX.length) : "";
+  const [vendor, taskState] = rest.split("/");
+  const q = new URLSearchParams(String(search || ""));
+  return { vendor: vendor || "", taskState: taskState || "", code: q.get("code") || "", upstreamState: q.get("state") || "", error: q.get("error") || "" };
+}
+
+function autoclawSignedHeaders(token) {
+  // userapi 域签名头族与 adapters 的 _userapiHeaders 逐字同构（含 x-harness-type: zcode + MD5 签名）。
+  // 复用单一实现而非在本文件再写一份：appId/appKey 与签名公式两处副本迟早漂移（qoderMachineIdOf 同一口径）
+  return adapters.get("autoclaw_intl")._userapiHeaders(token || "");
+}
+
+/**
+ * 本流程专属收尾：只有全局会话仍是本次发起的那一个才交给 finishOAuth 收口；
+ * 用户取消/改登别的渠道之后迟到的回调只关自己的回环服务、不替别人的会话收尾
+ * （规避已知遗留 m4「finishOAuth 不校验会话身份」在这里被复制一份，不动既有 WorkBuddy/Trae 流程）
+ */
+function finishAutoClawIntlOAuth(mine, result) {
+  if (mine && oauthSession === mine) {
+    finishOAuth(result);
+    return;
+  }
+  if (mine && mine.server) {
+    try {
+      mine.server.close();
+    } catch { /* 已关 */ }
+  }
+}
+
+async function beginAutoClawIntlOAuth(channel, opts, onDone) {
+  const userapi = AUTOCLAW_INTL_USERAPI;
+  // 第 0 步：没带 captchaVerifyParam → 回滑块配置（renderer 加载阿里云 SDK 弹滑块，Task 13）
+  if (!opts || !opts.captchaVerifyParam) {
+    const cfg = await adapters.httpJson(`${userapi}/userapi/overseasv1/oauth-captcha-config`, { method: "POST", headers: autoclawSignedHeaders(""), body: "{}" })
+      .catch((e) => ({ ok: false, status: 0, data: null, message: String(e) }));
+    const d = (cfg.data && (cfg.data.data || cfg.data)) || {};
+    if (!cfg.ok || !d.enabled) return { ok: false, message: "上游滑块验证未启用（captcha-config enabled=false）" };
+    return { ok: true, needCaptcha: true, captcha: { region: d.region, prefix: d.prefix, sceneId: d.scene_id, supplier: d.captcha_supplier || "aliyun" } };
+  }
+  const vendor = String(opts.vendor || "");
+  if (vendor !== "zai" && vendor !== "google") return { ok: false, message: "vendor 只支持 zai / google" };
+  // 第 1 步：先起回环回调服务（端口要进 navigate_uri），再换授权地址
+  const taskId = crypto.randomBytes(16).toString("hex"); // 32 位小写 hex（协议参考 §3.2 ③）
+  // session / cur 的声明必须先于 server 创建：listen 与赋值之间打进来的回调会在闭包里读它们，
+  // 用 let 占位把这处 TDZ 窗口关死（读不到时按「非本次发起」拒绝，而不是抛 ReferenceError）
+  let session = null;
+  let cur = null;
+  const server = http.createServer((req, res) => {
+    const u = new URL(req.url || "/", "http://127.0.0.1");
+    if (!u.pathname.startsWith(AUTOCLAW_CALLBACK_PREFIX)) { res.statusCode = 404; res.end("not found"); return; }
+    const parsed = autoclawParseCallback(u.pathname, u.search);
+    if (!session || parsed.taskState !== session.taskId) { res.statusCode = 400; res.end(ERR_PAGE("回调校验不通过（非本次发起的授权回调）")); return; }
+    if (!cur || oauthSession !== cur) { res.statusCode = 200; res.end(ERR_PAGE("登录会话已结束，请返回应用重新发起")); return; }
+    if (!parsed.error && !parsed.code && !parsed.upstreamState) { res.statusCode = 200; res.end(PENDING_PAGE); return; } // 空参探测回调可达性：继续等待，绝不能结束会话（Trae 同款实测坑）
+    if (parsed.error || !parsed.code || !parsed.upstreamState) { res.statusCode = 200; res.end(ERR_PAGE(`授权未完成：${parsed.error || "回调缺参数"}`)); finishAutoClawIntlOAuth(cur, { ok: false, message: `授权未完成：${parsed.error || "回调缺参数"}` }); return; }
+    if (session.settled) { res.statusCode = 200; res.end(AUTOCLAW_INTL_OK_PAGE); return; } // 重复回调幂等回成功页，不再烧一次 code
+    session.settled = true;
+    res.statusCode = 200; res.end(AUTOCLAW_INTL_OK_PAGE);
+    // 第 3 步：换码——state 用查询串里上游回的（双 state 陷阱）；navigate_uri 与 oauth-url 请求逐字相同
+    exchangeAutoClawIntl(userapi, vendor, parsed.code, parsed.upstreamState, session.navigateUri, session.deviceId)
+      .then((cred) => saveDiscoveredAccount(channel, cred).then((id) => ({ id, uid: cred.uid })))
+      .then((r) => finishAutoClawIntlOAuth(cur, { ok: true, id: r.id, uid: r.uid }))
+      .catch((e) => finishAutoClawIntlOAuth(cur, { ok: false, message: String((e && e.message) || e) }));
+  });
+  let loopbackPort = 0;
+  try {
+    loopbackPort = await listenLoopback(server);
+  } catch (e) {
+    try { server.close(); } catch { /* 已关 */ }
+    return { ok: false, message: `回环端口监听失败：${(e && e.message) || e}` }; // 端口没起来就返回，不留半个监听占着 navigate_uri
+  }
+  const deviceId = crypto.randomBytes(32).toString("hex"); // 64hex，两跳同值（协议参考 §3.2 ⑤）
+  const navigateUri = `http://127.0.0.1:${loopbackPort}${AUTOCLAW_CALLBACK_PREFIX}${vendor}/${taskId}`;
+  const r = await adapters.httpJson(`${userapi}/userapi/overseasv1/${vendor}-oauth-url`, {
+    // 超时走 httpJson 的统一 60s：简报原写的 timeout:15000 是死键（httpJson 不读该键），留着会误导排障
+    method: "POST", headers: autoclawSignedHeaders(""),
+    body: JSON.stringify({ source_id: "autoclaw", device_id: deviceId, navigate_uri: navigateUri, ali_captcha_verify_param: String(opts.captchaVerifyParam) }),
+  }).catch((e) => ({ ok: false, status: 0, data: null, message: String(e) }));
+  const dd = (r.data && (r.data.data || r.data)) || {};
+  if (!r.ok || !dd.oauth_url) {
+    try { server.close(); } catch { /* 已关 */ }
+    // 631002 = 缺/坏 captcha 参数；630014 = 风控验证未通过；631001 = 授权码无效（协议参考 §3.2 ③码表）
+    return { ok: false, message: `获取授权地址失败（HTTP ${r.status}）${dd.message || r.message || ""}` };
+  }
+  session = { taskId, navigateUri, deviceId, vendor, settled: false };
+  cur = {
+    mode: "callback", channel, url: String(dd.oauth_url), userCode: "", server, onDone,
+    deadline: Date.now() + OAUTH_TIMEOUT_MS * 2, // 回调是唯一入口（无轮询可判定用户放弃），给足 6 分钟兜底
+    submit: async (pasted) => ({ ok: false, message: "AutoClaw 国际版登录由回调页自动完成，无需粘贴地址" }),
+  };
+  oauthSession = cur;
+  cur.timer = setTimeout(() => finishAutoClawIntlOAuth(cur, { ok: false, message: "登录超时（6 分钟）" }), OAUTH_TIMEOUT_MS * 2);
+  return { ok: true, url: String(dd.oauth_url), mode: "callback" };
+}
+
+/** 换码（协议参考 §3.2 ⑤）：state 传上游回的、navigate_uri 与上一跳逐字相同，device_id 两跳同值 */
+async function exchangeAutoClawIntl(userapi, vendor, code, upstreamState, navigateUri, deviceId) {
+  const r = await adapters.httpJson(`${userapi}/userapi/overseasv1/${vendor}-oauth-login`, {
+    method: "POST", headers: autoclawSignedHeaders(""),
+    body: JSON.stringify({ source_id: "autoclaw", device_id: deviceId, code, state: upstreamState, navigate_uri: navigateUri }),
+  }).catch((e) => { throw new Error(`换码失败：${e.message}`); });
+  const d = (r.data && (r.data.data || r.data)) || {};
+  if (!r.ok || !d.access_token) throw new Error(`换码失败（HTTP ${r.status}）${d.message || ""}`);
+  // util.jwtDecode 返回 {token,uid,exp,payload}：user_id/user_name 声明在 .payload，exp 才在顶层（简报直取顶层是笔误）
+  const dec = util.jwtDecode(String(d.access_token));
+  const claims = dec.payload || {};
+  const numId = String(d.user_id || claims.user_id || "");
+  if (!numId) throw new Error("未取到 AutoClaw 国际版账号标识（响应与 JWT 均无 user_id），请重新登录或改用粘贴 token");
+  return {
+    uid: `intl-user-${numId}`, // 前缀与适配器 userInfo 同源，两地 userId 空间可能撞号
+    name: String(d.user_name || claims.user_name || claims.nickname || "AutoClaw 国际版账号"),
+    token: String(d.access_token).replace(/^Bearer\s+/i, ""),
+    refreshToken: String(d.refresh_token || ""),
+    expiresAt: (Number(dec.exp) || 0) * 1000 || 0,
+    meta: { device_id: deviceId }, // 刷新要用（adapters.refreshToken 优先读 meta.device_id）
+    source: "oauth",
+  };
+}
+
 // ===== 会话收尾 =====
 
 function finishOAuth(result) {
@@ -1267,10 +1398,11 @@ function finishOAuth(result) {
  * 开始 OAuth：按渠道选流程
  * @param {string} channel 内置渠道 id
  * @param {{edition?:string, vendor?:string, captchaVerifyParam?:string}|Function} opts
- *        设备流/回调流的额外入参（qoder 用 edition 选区，autoclaw 国际版在 Task 12 用 captchaVerifyParam）；
+ *        设备流/回调流的额外入参（qoder 用 edition 选区；autoclaw 国际版用 vendor + captchaVerifyParam，
+ *        同一渠道调两次：第一次不带滑块参数只回 {needCaptcha, captcha}，第二次带参数回授权地址）；
  *        也可直接传回调函数（兼容 Task 11 之前的两参调用）
  * @param {(result:object)=>void} [onDone] 登录结束回调（成功/失败都回一次）
- * @returns {Promise<{ok:boolean,url?:string,message?:string,mode?:string,userCode?:string}>} url 由主进程 shell.openExternal 打开
+ * @returns {Promise<{ok:boolean,url?:string,message?:string,mode?:string,userCode?:string,needCaptcha?:boolean,captcha?:object}>} url 由主进程 shell.openExternal 打开
  */
 async function beginOAuth(channel, opts, onDone) {
   const o = opts && typeof opts === "object" ? opts : {};
@@ -1289,9 +1421,8 @@ async function beginOAuth(channel, opts, onDone) {
   }
   if (ch === "cline_free" || ch === "cline_pass") return beginClineOAuth(ch, cb);
   if (ch === "qoder") return beginQoderOAuth(ch, o.edition, cb);
-  // autoclaw 国际版的 OAuth（阿里云风控验证码 + 回调换票）在 Task 12 接入，这里先如实回文案，
-  // 不抛「未知渠道」也不误走 WorkBuddy 轮询
-  if (ch === "autoclaw_intl") return { ok: false, message: "autoclaw 国际版登录在下一任务接入" };
+  // autoclaw 国际版只有网页 OAuth（阿里云滑块前置 + 回环回调换码）；滑块参数由 renderer 两次调用透传
+  if (ch === "autoclaw_intl") return beginAutoClawIntlOAuth(ch, o, cb);
   if (ch === "trae") return beginTraeOAuth(ch, cb);
   return beginWorkBuddyOAuth(ch, cb);
 }
@@ -1335,4 +1466,6 @@ module.exports = {
   // 测试窥视口（下划线前缀 = 非公共契约）：设备流的轮询判定与地区归一纯函数，dev-cline/dev-qoder-test 直测
   _workosPollVerdict: workosPollVerdict,
   _qoderRegionOfMode: qoderRegionOfMode,
+  // autoclaw 国际版回调的双 state 拆解（路径 state ≠ 查询串 state），dev-autoclaw-test 直测
+  _autoclawParseCallback: autoclawParseCallback,
 };

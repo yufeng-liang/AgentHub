@@ -257,9 +257,18 @@ globalThis.fetch = async (url, opts) => { lastReq = { url, opts }; return { ok: 
   })(), done);
 
   console.log("beginOAuth 渠道分派:");
-  ok("autoclaw_intl 本任务未接入（Task 12 接管）", await (async () => {
+  // Task 12 已接管 autoclaw_intl：原「下一任务接入」占位断言改为钉真流程的入口行为——
+  // 第一次调用不带滑块参数只回滑块配置（renderer 据此弹滑块），完整回环回调/换码链在 dev-autoclaw-test.cjs 覆盖
+  ok("autoclaw_intl 首次调用回 needCaptcha + 滑块配置且不留会话", await (async () => {
+    globalThis.fetch = async (url) => (url === "https://autoglm-api.autoglm.ai/userapi/overseasv1/oauth-captcha-config"
+      ? resp(200, { code: 0, message: "ok", data: { enabled: true, region: "cn-hangzhou", prefix: "pfx", scene_id: "sq51tr", captcha_supplier: "aliyun" } })
+      : resp(500, {}));
     const r = await discovery.beginOAuth("autoclaw_intl", {}, () => {});
-    return r.ok === false && r.message === "autoclaw 国际版登录在下一任务接入";
+    return r.ok === true && r.needCaptcha === true && r.captcha.region === "cn-hangzhou" && r.captcha.sceneId === "sq51tr" && r.captcha.supplier === "aliyun" && discovery.cancelOAuth() === false;
+  })(), "autoclaw_intl 入口未接入真流程");
+  ok("autoclaw_intl vendor 白名单（占位文案已被真流程取代，且这一步不打网络）", await (async () => {
+    const r = await discovery.beginOAuth("autoclaw_intl", { vendor: "qq", captchaVerifyParam: "p" }, () => {});
+    return r.ok === false && r.message === "vendor 只支持 zai / google";
   })());
   ok("autoclaw（国内）没有网页登录 → 明确抛错引导导入", await discovery.beginOAuth("autoclaw", { edition: "cn" }, () => {}).then(() => false, (e) => /没有网页登录/.test(e.message)));
   ok("旧两参签名兼容（第二参直接是回调）仍走到分派", await discovery.beginOAuth("raccoon", () => {}).then(() => false, (e) => /小浣熊暂不支持/.test(e.message)));
