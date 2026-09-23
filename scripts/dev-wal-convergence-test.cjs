@@ -406,8 +406,24 @@ async function runDetachLeg() {
  *
  *  ⚠ 写入循环的形状与 Leg B′ 一致（**先固定 50 条、再按需加码**，评审 Concern 2）：本腿同样跑在
  *  `AGENTHUB_CHECKPOINT_MS=30000` 的常驻子进程对面，单个 `while (statWal() <= TARGET && n < 1000)`
- *  会被写入途中的 tick 反复压回 0，于是条件恒真、转到 1000 上界也超不过 TARGET —— 结果这条负对照
- *  报的是「负对照没有冻结」（假的「本闸造不出冻结」）而不是真冻结，把「判据没牙」误报成「造不出」。
+ *  有一个**潜在**缺陷：若某次 tick 恰在写入途中落下、把 WAL 压回 0，且此后每轮写入都被后续 tick 截掉，
+ *  条件就恒真 ⇒ 转到 1000 上界也超不过 TARGET，于是这条负对照会报「负对照没有冻结」
+ *  （假的「本闸造不出冻结」），把「判据没牙」误报成「造不出」。
+ *  **就 Leg C 而言，这条推理描述的是一个未被观测到的潜在假红，不是对已发生假红的纠正**（上一轮的真实
+ *  数据见下；对照 Leg B′ 则真的踩到过一次这个症状——run 3 的 `HTTP 0 条`，见 runDetachLeg 的注释，
+ *  但那与 Leg C 无关，Leg C 从未出现过它）：
+ *  上一轮的单 while 得到的 152,472 B 是**真冻结**——`ok:true` 且 `after === before`，判据当时**确实红了**、
+ *  也确实有牙。而且它比「撑过了 TARGET」还硬：`TARGET = 65,536` 而 152,472 **大于** TARGET，旧写法
+ *  `while (statWal() <= TARGET && …)` 只在 WAL **已超过** TARGET 时才退出 ⇒ 循环能退出这件事本身就是
+ *  「WAL 已撑过 TARGET」的证据。上一轮日志把这一点写得更直白——Leg C 打出的是
+ *  `写入 0 条后 -wal=152472 B`，即那个 while **一次都没跑就退出**了（进入时 WAL 已 152,472 B >
+ *  TARGET），根本不存在「被 tick 压回 0 而超不过」这种事。（同一份日志里 Leg B 自己的沙箱在打请求前
+ *  也报 `walBytes=152472`——那是两条腿各自沙箱里的同一个初值，不是同一份 WAL。）
+ *  拆分 + `wBeforeCk > TARGET` 守卫因此是**针对上述潜在风险的预防性加固**（避免将来写入慢到跨过 tick
+ *  时假报夹具失效），价值在**稳健性**本身，**不是**「修掉了一个假红」——上一轮那个红是真的、有牙的。
+ *  加固后冻结点从 152,472 B 变成 1,388,472 B，机制并不神秘：拆分后的**第一段强制打满 50 条**
+ *  （不再让 while 去决定要不要写），这一步把 WAL 从 152,472 B 推到 1,388,472 B，冻结于是落在
+ *  **与二期实测同量级、同形**的点上——本轮改动的价值在此，不在于「纠正」。
  *  拆分后「打满 50 条」是确定的，加码只负责把 WAL 稳定推到 TARGET 之上；**持读事务在写入全部结束
  *  之后才开**（顺序不能反：先持读就没法把 WAL 撑大）。若加码到上界仍不达标 ⇒ 明确报**夹具失效**
  *  （不是「没冻结」），因为那时连被测形态都没造出来，谈不上判据有没有牙。
@@ -449,7 +465,16 @@ async function runLockedLeg() {
   // 为什么不写成一个 while：见 runLockedLeg 的文件头注释（tick 会在写入途中把 WAL 压回 0）。
   for (let i = 0; i < 50; i++) await postLock();
   const w50l = statWal(LOCK_APPDATA).bytes;
-  assert.ok(w50l > 0, `Leg C 夹具失效：50 条失败请求后 -wal 为 0，说明本轮没写库`);
+  // G3（修复轮 round 2）：**不再对 w50l 下硬断言** —— 它是单次 stat 采样，若那一瞬正好落在周期 tick
+  // 把 WAL 截成 0 之后（30 s 间隔、写入段跨过 tick 时就会发生），「-wal 为 0」其实是夹具**正常**工作的
+  // 表现，硬断言会假报「夹具失效」。这里改用与 tick 无关的判据：50 条都真打出去了（postLock 对任何 200
+  // 直接抛，故循环跑满即 50 条全部非 200）。这条判据**近乎结构性恒真**（能走到这里就必然 n===50），
+  // 所以它只是一句廉价前置检查，**真正**的「本轮确实写了库」由下面**更强**的 `wBeforeCk > TARGET`
+  // 守卫兜住——WAL 撑过 64 KB 只可能来自真实写入，且那条守卫靠写入循环自己驱动，不受单次采样影响。
+  // 未选「短等重采」的理由：重采救不了被 tick 截断的场景（此后没有新写入，再等也回不到 >0），
+  // 它只能缩小 torn-read 的窗口，把主要失效模式原样留下；而加大改动的收益又已被上面那条守卫覆盖。
+  assert.strictEqual(n, 50, `Leg C 夹具失效：只打出去 ${n} 条（不是 50 条），判据的前提不成立`);
+  note(`Leg C 第一段：50 条失败请求已全部打出（全非 200），此刻 -wal=${w50l} B`);
   while (statWal(LOCK_APPDATA).bytes <= TARGET && n < 1000) await postLock();
   const wBeforeCk = statWal(LOCK_APPDATA).bytes;
   // 与 ② 同一道守卫：没造出 >TARGET 的形态 ⇒ 报**夹具失效**，不是「没冻结」。两件事必须分开报，
@@ -617,7 +642,7 @@ async function main() {
   const stAfter = await readProxyStatus();
 
   // —— 证据块（原样写进报告；Task 4 决策表直接吃它）——
-  console.log("\n===== ② 第一手证据（Leg B，真子进程 + 真 HTTP + 子进程外部观测）=====");
+  console.log("\n===== ② 对照腿 Leg B 的证据（非 detached 真子进程 + 真 HTTP + 子进程外部观测）=====");
   console.log("四元组来源 (ii) 日志 wal-checkpoint 行原文：");
   if (ckLines.length) for (const l of ckLines) console.log("    " + l);
   else console.log("    <无 wal-checkpoint 行>");
