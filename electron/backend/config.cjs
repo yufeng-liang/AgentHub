@@ -407,14 +407,31 @@ function setUpdateNotified(version) {
 //  · 关（默认）→ 主 App exe：开机拉起完整应用（不传 path，Electron 默认注册 process.execPath）；
 //  · 开 → 安装根目录的 agenthub-gateway.cmd（package.json extraFiles 落位，与主 exe 同目录）：
 //    开机只拉常驻网关子进程（--persistent，不建窗），主 App 由用户手动打开后认领该网关。
-// 【终审修复】双向注销对称：Windows 下登录项按 path+args 为键注册（electron.d.ts 对
-// setLoginItemSettings 的文档语义——「传了 path 的项」与「不传 path 默认注册 execPath 的项」
-// 是两个独立条目，openAtLogin:false 只注销与入参同键的那一个），换目标**不会**覆盖旧项。
-// 旧实现一次调用换 path 重注册，on→off 后 .cmd 的 Run 项永久残留（用户关掉常驻甚至关掉
-// 自启后开机仍拉常驻网关），off→on 后主 exe 项同理残留。故三条路径都显式双清：
+// 【终审修复】双向注销对称：换目标**不会**覆盖旧项，三条路径都显式双清：
 //  · autoStart=false：两个目标都注销；
 //  · autoStart=true && persistentGateway=false：注册主 exe + 清 .cmd；
 //  · autoStart=true && persistentGateway=true：注册 .cmd + 清主 exe。
+// 【真机批次② 发现】.cmd 目标**不能**走 setLoginItemSettings 带 path：Electron 35.7.5 实测（最小
+// 复现：真路径 H:\x\agenthub-gateway.cmd 注册后 Run 项变 H:xagenthub-gateway.cmd）会把路径里的
+// 反斜杠当转义序列吃掉一级（\r 还被当回车拆出 args），落盘的是坏路径、开机拉不起来。故 .cmd 目标
+// 改经 reg.exe 直写 HKCU Run（主 exe 目标不带 path、不受该 bug 影响，仍走 setLoginItemSettings）。
+const RUN_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+const RUN_VALUE = "AgentHubGatewayCmd";
+// 间接层：launcher 闸把它换成记账器断言入参形状，真注册表一次都不许碰。
+// 默认实现用 System32 绝对路径调 reg.exe——不指望 PATH（有机器缺 System32，concurrently 曾因此起不来）。
+function regExePath() {
+  return path.join(process.env.SystemRoot || "C:\\Windows", "System32", "reg.exe");
+}
+function regExec(args) {
+  return require("node:child_process").spawnSync(regExePath(), args, { stdio: "ignore", windowsHide: true });
+}
+// /d 带内嵌引号：Run 项启动走 CreateProcess 拼命令行，安装路径含空格（如 C:\Program Files\）时没引号会截断
+function addGatewayRunItem(cmdPath) {
+  try { module.exports.regExec(["add", RUN_KEY, "/v", RUN_VALUE, "/t", "REG_SZ", "/d", '"' + cmdPath + '"', "/f"]); } catch { /* 注册失败不拦保存 */ }
+}
+function removeGatewayRunItem() {
+  try { module.exports.regExec(["delete", RUN_KEY, "/v", RUN_VALUE, "/f"]); } catch { /* 注销失败不拦保存 */ }
+}
 function applyAutoStart(cfg) {
   if (isPortable() || !electronApp || process.env.VITE_DEV_SERVER_URL) return;
   try {
@@ -424,15 +441,15 @@ function applyAutoStart(cfg) {
     if (!autoStart) {
       // 关自启：不管上次停在哪一档，两条 Run 项都清干净
       electronApp.setLoginItemSettings({ openAtLogin: false });
-      electronApp.setLoginItemSettings({ openAtLogin: false, path: cmdPath });
+      module.exports.removeGatewayRunItem();
       return;
     }
     if (cfg.schedule && cfg.schedule.persistentGateway) {
-      electronApp.setLoginItemSettings({ openAtLogin: true, path: cmdPath });
+      module.exports.addGatewayRunItem(cmdPath);
       electronApp.setLoginItemSettings({ openAtLogin: false }); // 清主 exe 残留
     } else {
       electronApp.setLoginItemSettings({ openAtLogin: true });
-      electronApp.setLoginItemSettings({ openAtLogin: false, path: cmdPath }); // 清 .cmd 残留
+      module.exports.removeGatewayRunItem(); // 清 .cmd 残留
     }
   } catch { /* 注册失败不拦保存 */ }
 }
@@ -440,5 +457,6 @@ function applyAutoStart(cfg) {
 module.exports = {
   dataDir, configPath, hubDir, ensureHub, loadConfig, saveConfig, defaultConfig,
   getUpdateNotified, setUpdateNotified, isPortable, encryptSecret, decryptSecret, applyAutoStart,
+  RUN_KEY, RUN_VALUE, regExePath, regExec, addGatewayRunItem, removeGatewayRunItem,
   loadSharedWebdav, saveSharedWebdav, maskedSharedWebdav, moduleWebdav, PASSWORD_MASK,
 };

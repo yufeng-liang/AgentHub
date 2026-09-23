@@ -16,10 +16,13 @@
 //     { ok:true, persistent:false, message:"便携版不支持后台常驻" }，且不 spawn 子进程（gateway.json
 //     不出现）、不落任何 Run 项（applyAutoStart 的便携版早退 + start 本身不注册，两路合起来零注册）。
 //  ③ applyAutoStart 的注册目标随 schedule.persistentGateway 切换：off → 主 App exe（不传 path，
-//     Electron 默认 execPath）、on → 安装根目录 agenthub-gateway.cmd、关闭自启 → openAtLogin:false 注销。
-//     【终审修复】Windows 下 Run 项按 path+args 为键（electron.d.ts setLoginItemSettings 文档语义：
-//     传 path 与不传 path 是两个独立条目），换目标不会覆盖旧项——所以三档都是「注册/注销本档目标
-//     + 显式清另一目标」两次调用，双向对称防双残留。
+//     Electron 默认 execPath）、on → 安装根目录 agenthub-gateway.cmd、关闭自启 → 注销。
+//     【真机批次② 发现】Windows 下 Electron 35.7.5 的 setLoginItemSettings 带 path 参数注册时，
+//     路径里的反斜杠被当转义序列吃掉一级（\r 还会被当回车拆出 args），落盘的 Run 项是坏路径，
+//     开机根本拉不起来（最小复现：真路径 H:\a\b.cmd 注册后变 H:ab.cmd）。所以 .cmd 目标**不走**
+//     Electron API，改经 reg.exe 直接写 HKCU Run（导出 addGatewayRunItem / removeGatewayRunItem，
+//     内部经 regExec 间接层——闸里换成记账器，真注册表一次都不许碰）；主 exe 目标不带 path、
+//     不受该 bug 影响，仍走 setLoginItemSettings。三档对称不变：注册/注销本档目标 + 显式清另一目标。
 //     用注入 require.cache 的 mock electron 断言 setLoginItemSettings 入参，**绝不真改本机注册表**；
 //     收尾再按既有闸（dev-gateway-pipe-test ⑧）的 regValue() 手法核对 HKCU Run 原样。
 //
@@ -177,9 +180,14 @@ async function case2() {
   // 让「gateway.json 不存在 = 没起子进程」这条判据只反映 start() 自己的行为。
   try { fs.rmSync(gatewayClient.gatewayFile(), { force: true }); } catch { /* 已不在 */ }
   try {
-    // ②-a 便携版 applyAutoStart 早退：注册调用一次都不许发生（不落 Run 项）
+    // ②-a 便携版 applyAutoStart 早退：注册调用一次都不许发生（不落 Run 项，Electron 与 reg.exe 两路都算）
+    const regCalls2 = [];
+    const realRegExec = config.regExec;
+    config.regExec = (args) => { regCalls2.push(args.slice()); return { status: 0 }; };
     config.applyAutoStart({ schedule: { autoStart: true, persistentGateway: true } });
+    config.regExec = realRegExec;
     assert.strictEqual(loginCalls.length, 0, "便携版 applyAutoStart 不得调用 setLoginItemSettings（不落 Run 项）");
+    assert.strictEqual(regCalls2.length, 0, "便携版 applyAutoStart 不得调 reg.exe 写 Run 项");
     // ②-b start({persistent:true}) 拒常驻：返回契约逐字段钉死
     const r = await gatewayClient.start({ persistent: true });
     assert.strictEqual(r.ok, true, "拒常驻对调用方不算失败（ok 必须为 true）");
@@ -194,26 +202,37 @@ async function case2() {
   }
 }
 
-// ===== ③ applyAutoStart 注册目标随 persistentGateway 切换（mock 入参断言，绝不真改注册表） =====
-// 【终审修复】双向对称：每一档都恰好两次调用——本档目标置位 + 另一目标显式清掉。
-// Windows 的 HKCU Run 项按 path+args 为键，换目标不清旧项 = 双残留（.cmd 与主 exe 并存），
-// 所以旧版「一次调用换 path 重注册」的断言序列整体作废，改按下面的六次调用逐条钉死。
+// ===== ③ applyAutoStart 注册目标随 persistentGateway 切换（记账断言，绝不真改注册表） =====
+// 【真机批次② 发现】.cmd 目标改走 reg.exe 直写（Electron 35 setLoginItemSettings 带 path 会把
+// 反斜杠当转义吃掉，落盘坏路径）——本用例把 regExec 换成记账器，逐档钉死「Electron 调用 + reg 调用」
+// 的对称序列；主 exe 目标不带 path 仍走 setLoginItemSettings（标准路径，无 bug）。
 async function case3() {
   loginCalls.length = 0;
   const expectedCmd = path.join(path.dirname(process.execPath), "agenthub-gateway.cmd");
-  // off 档（自启开、常驻关）→ 注册主 App exe + 清 .cmd 残留
-  config.applyAutoStart({ schedule: { autoStart: true, persistentGateway: false } });
-  assert.deepStrictEqual(loginCalls[0], { openAtLogin: true }, "off 档第 1 调：注册主 App exe（不得带 path，path 一旦传入目标就换了）");
-  assert.deepStrictEqual(loginCalls[1], { openAtLogin: false, path: expectedCmd }, "off 档第 2 调：显式清 .cmd（上次常驻档留下的 Run 项不 supervise 会永久残留）");
-  // on 档（自启开、常驻开）→ 注册 .cmd + 清主 exe 残留
-  config.applyAutoStart({ schedule: { autoStart: true, persistentGateway: true } });
-  assert.deepStrictEqual(loginCalls[2], { openAtLogin: true, path: expectedCmd }, "on 档第 1 调：注册安装根目录 agenthub-gateway.cmd");
-  assert.deepStrictEqual(loginCalls[3], { openAtLogin: false }, "on 档第 2 调：显式清主 exe（off 档留下的 Run 项必须一并注销）");
-  // 关闭自启 → 两个目标都注销（不管上次停在哪一档，两条 Run 项都得清干净）
-  config.applyAutoStart({ schedule: { autoStart: false, persistentGateway: true } });
-  assert.deepStrictEqual(loginCalls[4], { openAtLogin: false }, "关自启第 1 调：注销主 exe 目标");
-  assert.deepStrictEqual(loginCalls[5], { openAtLogin: false, path: expectedCmd }, "关自启第 2 调：注销 .cmd 目标（只清一边 = 另一边开机仍拉起）");
-  assert.strictEqual(loginCalls.length, 6, "三次保存恰好六次注册调用（每档 2 次：置位本档目标 + 清另一目标），没有多也没有少");
+  const realRegExec = config.regExec;
+  const regCalls = [];
+  config.regExec = (args) => { regCalls.push(args.slice()); return { status: 0 }; };
+  try {
+    // off 档（自启开、常驻关）→ 注册主 App exe + 清 .cmd 残留
+    config.applyAutoStart({ schedule: { autoStart: true, persistentGateway: false } });
+    assert.deepStrictEqual(loginCalls[0], { openAtLogin: true }, "off 档 Electron 调：注册主 App exe（不得带 path，path 一旦传入会被 35.7.5 的转义 bug 吃掉）");
+    assert.deepStrictEqual(regCalls[0], ["delete", config.RUN_KEY, "/v", config.RUN_VALUE, "/f"], "off 档 reg 调：删 .cmd 的 Run 项（上次常驻档残留不 supervise 会永久留着）");
+    // on 档（自启开、常驻开）→ reg.exe 写 .cmd + 清主 exe 残留
+    config.applyAutoStart({ schedule: { autoStart: true, persistentGateway: true } });
+    assert.deepStrictEqual(regCalls[1], ["add", config.RUN_KEY, "/v", config.RUN_VALUE, "/t", "REG_SZ", "/d", '"' + expectedCmd + '"', "/f"],
+      "on 档 reg 调：把安装根目录 agenthub-gateway.cmd 写进 HKCU Run（/d 带内嵌引号，安装路径含空格也成立）");
+    assert.deepStrictEqual(loginCalls[1], { openAtLogin: false }, "on 档 Electron 调：显式清主 exe（off 档留下的 Run 项必须一并注销）");
+    // 关闭自启 → 两个目标都注销（不管上次停在哪一档）
+    config.applyAutoStart({ schedule: { autoStart: false, persistentGateway: true } });
+    assert.deepStrictEqual(loginCalls[2], { openAtLogin: false }, "关自启 Electron 调：注销主 exe 目标");
+    assert.deepStrictEqual(regCalls[2], ["delete", config.RUN_KEY, "/v", config.RUN_VALUE, "/f"], "关自启 reg 调：删 .cmd 的 Run 项（只清一边 = 另一边开机仍拉起）");
+    assert.strictEqual(loginCalls.length, 3, "三档恰好三次 Electron 调用（每档 1 次，只管主 exe 目标）");
+    assert.strictEqual(regCalls.length, 3, "三档恰好三次 reg 调用（.cmd 目标的注册/注销全走 reg.exe）");
+  } finally {
+    config.regExec = realRegExec;
+  }
+  // regExePath 默认实现必须是真 reg.exe 绝对路径（不能指望 PATH——本机环境曾缺 System32）
+  assert.ok(/[Ss]ystem32[\\/]reg\.exe$/.test(config.regExePath()), "regExePath 必须返回 System32\reg.exe 绝对路径");
 }
 
 // ===== ④ 收尾卫生：HKCU Run 项原样（沿用既有闸的 regValue() 手法） =====
