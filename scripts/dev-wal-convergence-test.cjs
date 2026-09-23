@@ -68,7 +68,9 @@
 //  · 端口 **19532**（本闸专属归属，钉死在此）：19530/31 归 pipe 闸、19534-19538 归 pipe 闸各用例、
 //    19541/42/43 归 interlock 闸，9527 归用户自己那台实例，一律不碰；
 //  · 只杀自己 spawn 的进程（句柄记录 + finally 兜底），绝不按进程名宽匹配；
-//  · 收尾只做只读比对：真实 %APPDATA%\AgentHub\proxy\stats.db 与 -wal 的 size@mtime、HKCU Run 快照。
+//  · 收尾对真实库只**只读记录**（`fs.statSync` 的 size@mtime，`-wal` 与主库都不断言 —— 主库由用户实例
+//    每 300 s 写回，见 `realStatsSnapshot()` 注释），另有 HKCU Run 快照一条**有牙断言**（我们自己的副作用面）；
+//    并有一条结构性判据断言本闸源码里没有对真实库的开库调用。
 "use strict";
 const assert = require("node:assert");
 const fs = require("node:fs");
@@ -244,9 +246,21 @@ function runKeySnapshot() {
 }
 
 /** 真实 stats.db / -wal 的 size@mtime（只 stat，**绝不开库**：给用户在跑的实例添句柄本身就是副作用）。
- *  ⚠ 只对 **stats.db 主库**做「首尾一致」断言：真实 `-wal` 由**用户自己那台实例**（本机实测 4 个
- *  AgentHub 进程在跑）持续写入，实测 60 s 内自 576832 → 580952 B 单调变化——拿它做不变断言必然假红，
- *  而且红的是「用户在用应用」这件正常事，不是隔离失败。`-wal` 只如实记录、不断言。 */
+ *
+ *  ⚠ 主库与 `-wal` **都只如实记录、都不断言**（round 3 更正）——两者理由同源：真实 `%APPDATA%\AgentHub`
+ *  下的库由**用户自己那台实例**写，本闸不该、也无权把那件事判成失败。
+ *   · `-wal`：本机实测 60 s 内自 576832 → 580952 B 单调变化（round 2 已按此降为只记录）。
+ *   · **主库**：round 2 曾对主库做「首尾一致」断言，那是**间歇假红**。控制器独立取证（只读采样真实
+ *     `stats.db` 的 size@mtime，跨一个整拍）：
+ *       `23:50:02.017644200  946176 B`
+ *       `23:55:02.017793100  958464 B`   ← 差值恰 **300.000 s**，size 也变了
+ *     即用户实例每 **300 s 整拍**做一次 checkpoint，把 WAL 帧写回主库。本闸整段跑 ~2.5 min，
+ *     跨过整拍的概率约一半 ⇒ 那条断言必然间歇红，且红的是「用户在用应用」这件正常事，不是隔离失败。
+ *
+ *  「我们不写真实库」这件事的保证**不在**上面这条会随用户使用而红的断言里，而在**构造**里：
+ *  本闸对真实库**只做 `fs.statSync`、从不开库**（见文件头卫生约束与下一句声明），
+ *  所以「零写入」是由代码形状决定的，不是抽样抽出来的。round 3 另加一条**结构性判据**
+ *  （③ 段的 `assertNoRealDbOpenInSource`）把这条构造从注释升级为可证伪的断言。 */
 function realStatsSnapshot() {
   const f = path.join(REAL_APPDATA, "AgentHub", "proxy", "stats.db");
   const snap = (p) => { try { const s = fs.statSync(p); return s.size + "@" + Math.round(s.mtimeMs); } catch { return "missing"; } };
@@ -256,6 +270,72 @@ function realStatsSnapshot() {
 /** 真实 -wal 的当前值（只记录，不断言——见 realStatsSnapshot 的注释） */
 function realWalBytes() {
   try { return fs.statSync(path.join(REAL_APPDATA, "AgentHub", "proxy", "stats.db-wal")).size; } catch { return -1; }
+}
+
+/** ===== 结构性判据（round 3 新增）：本闸源码里**不存在**对真实库的开库调用 =====
+ *  为什么要有它（brief H1 第 5 点）：主库断言降级为「只记录」之后，「我们不写真实库」这件事就只剩
+ *  **构造**在保证（本闸对真实库只 `fs.statSync`）。构造是解释，不是证据；把主库那条运行时抽样断言删掉
+ *  会让这条保证在闸里**无面可查**。所以这里把构造本身写成断言：读自己的源码，断言没有任何
+ *  `new DatabaseSync(` / `open(` 落在 `REAL_APPDATA` 的表达面上——同仓 `dev-gateway-forward-parity-test.cjs`
+ *  读 preload 源码断言白名单是同一手法（把「我们没做」从抽样升级为结构）。
+ *
+ *  实现要点（免得后来人改坏）：
+ *   · **先剥注释**（行注释 + 块注释）：本文件的注释里大量出现 `open()`、`DatabaseSync` 这些字样，
+ *     把它们算进来会把判据变成恒假红（brief 明确提醒过滤注释行）。
+ *   · 每个**调用点**取「向前 160 字符 + 向后 300 字符」的窗口判 REAL_APPDATA，覆盖跨行写法
+ *     （`path.join(\n  REAL_APPDATA, …`）——只按单行判会漏。
+ *   · **负对照**（有牙的证明）：剥完注释后必须仍**找得到**调用点。若某天 API 改名或文件被整体重写，
+ *     匹配面清零，这条判据就会变成恒真的空断言 —— 那时必须报红要求改闸，而不是静悄悄通过。
+ *     所以这里下一条 `sites.length > 0` 的下界断言（当前实测命中 2 处：Leg A 夹具字符串里的
+ *     `store.open()` 与 Leg C 的 `new DatabaseSync(LOCK_APPDATA…`，两处都在沙箱内）。
+ *     该下界断言**跑得过不算证据**：round 3 实测把它反向后判据变红（见提交说明），确认它有牙。 */
+function stripComments(src) {
+  // 顺序不能反：先块注释再行注释（行注释里可能出现 `/*` 字样，反之亦然）
+  return src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
+}
+/** 调用点识别（**针必须拼开**）：本函数自己的源码里一旦出现完整的针字面量，判据会**自我命中**
+ *  （实测踩到：它读自己、又在自己身上匹配到 `…DatabaseSync(` 与 `REAL_APPDATA` ⇒ 恒假红）。
+ *  所以针由片段拼出，本文件里任何地方都不出现完整针。 */
+const DB_CTOR = "Database" + "Sync";
+const OPEN_FN = "o" + "pen";
+const SITES_RE = new RegExp(
+  "new\\s+" + DB_CTOR + "\\s*\\(|\\.\\s*" + OPEN_FN + "\\s*\\(|\\b" + OPEN_FN + "Sync\\s*\\(", "g");
+const REAL_TOKEN = "REAL" + "_APPDATA";
+/** 返回剥注释后所有「开库调用点」的 {line, window, text}；真实库面由调用方判 */
+function dbOpenCallSites(src) {
+  const code = stripComments(src);
+  const out = [];
+  SITES_RE.lastIndex = 0;
+  let m;
+  while ((m = SITES_RE.exec(code)) !== null) {
+    const start = Math.max(0, m.index - 160);
+    out.push({
+      line: code.slice(0, m.index).split("\n").length,
+      window: code.slice(start, m.index + 300),
+      text: m[0].trim(),
+    });
+  }
+  return out;
+}
+/** 结构性判据本体：无调用点落在真实库上（且匹配面非空 = 判据有牙） */
+function assertNoRealDbOpenInSource() {
+  const self = path.join(__dirname, path.basename(__filename));
+  const sites = dbOpenCallSites(fs.readFileSync(self, "utf8"));
+  assert.ok(sites.length > 0,
+    "③ 结构判据失效（匹配面为空 = 空断言）：本闸源码剥掉注释后一个开库调用点都找不到 —— "
+    + "要么 API 改名了，要么文件被重写，请改这条判据本身，不要让它静悄悄恒真");
+  // 下界必须**钉在构造器这根针上**，不能只钉总数：Leg A 夹具字符串里还有一处 `.open(`，
+  // 单看总数的话，即使构造器那根针整个改名消失，总数仍 >0 ⇒ 下界恒真（弱化）。所以这里再要求
+  // 「至少命中一处构造器形态」，让「针本身改名/消失」也当场报红（改判据，不许静悄悄恒真）。
+  const ctorRe = new RegExp("new\\s+" + DB_CTOR + "\\s*\\(");
+  assert.ok(sites.some((s) => ctorRe.test(s.text)),
+    "③ 结构判据失效（构造器这根针没命中 = 空断言）：剥注释后找不到任何 `new " + DB_CTOR + "(` 形态，"
+    + "说明被测对象换了开库 API（或本文件被重写）—— 请同步改本条判据的针，不要让它恒真通过");
+  const onReal = sites.filter((s) => s.window.includes(REAL_TOKEN));
+  assert.strictEqual(onReal.length, 0,
+    "③ 结构判据失败：本闸源码里有开库调用落在真实 %APPDATA% 的表达面上（本闸对真实库只许 fs.statSync）：\n"
+    + onReal.map((s) => "  :" + s.line + "  " + s.text).join("\n"));
+  return sites;
 }
 
 /** Leg B′ 夹具：按**生产启动器**的形态拉起网关常驻子进程，并让它开始监听。
@@ -709,18 +789,25 @@ async function main() {
 
   pass(`Leg A 对照（附加信息，无决定权）：进程内 ${ml[3]} B → ${ml[4]} B`);
 
-  // ===== ③ 收尾：唯一出口停干净 + 只读比对未变 =====
+  // ===== ③ 收尾：唯一出口停干净 + 只读记录（round 3：不再断言真实库未变）=====
   const stop = await gw.stopAndWait({ timeoutMs: 8000 });
   assert.strictEqual(stop.stopped, true, "③ 收尾 stopAndWait 没停掉子进程：" + JSON.stringify(stop));
   assert.ok(!alive(childPid), "③ stopAndWait 报 stopped:true 但 pid " + childPid + " 还在（谎报）");
   pass(`③ 收尾：stopAndWait 停干净（stopped=${stop.stopped} portFreed=${stop.portFreed} drained=${stop.drained}）`);
 
-  assert.strictEqual(realStatsSnapshot(), realStatsBefore,
-    "③ 真实 %APPDATA%\\AgentHub\\proxy\\stats.db 被改动了（隔离失败）：\n  before " + realStatsBefore
-    + "\n  after  " + realStatsSnapshot());
+  // 有牙的断言只剩这一条：**我们自己的副作用面**（本闸不该碰自启项），首尾必须一致。
+  // 它断言的是本闸的行为，不随用户使用而变，所以留着；不许因为「隔离判据松了」顺手删它。
   assert.strictEqual(runKeySnapshot(), runBefore, "③ HKCU Run 自启项被改动了（本闸不该碰自启）");
-  pass("③ 隔离：真实 stats.db 的 size@mtime 与 HKCU Run 快照首尾一致（零副作用）；"
-    + `真实 -wal 当前 ${realWalBytes()} B（用户实例在写，只记录不断言）`);
+  // 真实库 size@mtime：**只记录**。主库那条「首尾一致」断言已在 round 3 删掉——用户实例每 300 s 整拍
+  // checkpoint 回写主库（实测差值恰 300.000 s），本闸跑 ~2.5 min 约一半概率跨过整拍 ⇒ 必然间歇假红，
+  // 红的是「用户在用应用」这件正常事。理由与实测数字见 realStatsSnapshot() 的注释。
+  const realStatsAfter = realStatsSnapshot();
+  const realWalAfter = realWalBytes();
+  const sites = assertNoRealDbOpenInSource();   // 结构判据：本闸源码里没有对真实库的开库调用
+  pass(`③ 隔离（零副作用）：HKCU Run 快照首尾一致（有牙断言）；真实 stats.db ${realStatsBefore} → ${realStatsAfter}`
+    + `（用户实例每 300 s 写回，只记录不断言）；真实 -wal 当前 ${realWalAfter} B（同上）。`
+    + `结构性判据：本闸源码剥注释后 ${sites.length} 处开库调用点，**0 处**落在真实 %APPDATA% 表达面上`
+    + `（对真实库只有 fs.statSync ⇒「不写」由构造保证）`);
 
   // ===== ② 的最终判定（放在收尾之后：收尾若失败要先报收尾，且上面所有证据都已落盘/落屏）=====
   // 判定腿是 **Leg B′**（生产常驻形态：detached + --persistent + Electron 运行时）——理由是二期
