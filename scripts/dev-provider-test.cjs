@@ -305,6 +305,57 @@ const call = async (base, secret, model, stream) => {
   fake.close();
   provider.remove("myprov");
 
+  // ===== 能力缺失的三条出口（终审 F3 / F4）：走真实 IPC handler，测的就是按钮真正打到的那个函数 =====
+  // index.cjs 顶层 require("electron") 只为拿 shell，纯 node 下把该模块预置成空导出即可加载；
+  // register(ipcMain) 是入参注入，用假 ipcMain 收 handler，不碰任何真实 IPC。
+  console.log("\n签到 / 额度 / 目录三项能力门禁:");
+  const electronPath = require.resolve("electron");
+  require.cache[electronPath] = { id: electronPath, filename: electronPath, loaded: true, exports: {} };
+  const ipc = new Map();
+  require("../electron/backend/proxy/index.cjs").register({ handle: (name, fn) => ipc.set(name, fn) });
+  const callIpc = (name, args) => ipc.get(name)(null, args || {});
+  ok("handler 注册齐（proxy_checkin_run / proxy_models_sync 都在）", ipc.has("proxy_checkin_run") && ipc.has("proxy_models_sync"), [...ipc.keys()].length);
+
+  store.addAccount({ channel: "qoder", uid: "q-uid", name: "Qoder 号", token: "eyJqb2lk", refreshToken: "", source: "paste" });
+  store.addAccount({ channel: "raccoon", uid: "rc-uid", name: "小浣熊号", token: "eyJyY24", refreshToken: "", source: "paste" });
+  const realFetch2 = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: false, status: 500, text: async () => '{"code":500,"message":"boom"}' });
+
+  const ckQoder = await callIpc("proxy_checkin_run", { channel: "qoder", action: "checkin" });
+  ok("qoder 无签到方法 → 批量签到回结构化 unavailable，不是 TypeError", (() => {
+    const row = (ckQoder.rows || [])[0] || {};
+    return ckQoder.ok === true && ckQoder.total === 1 && row.ok === true && row.unavailable === true
+      && row.channel === "qoder" && /该渠道没有签到/.test(row.message || "") && !/is not a function|TypeError/.test(row.message || "");
+  })(), ckQoder);
+  const stQoder = await callIpc("proxy_checkin_status", { channel: "qoder" });
+  ok("status 动作同样不抛（缺 checkinStatus 也按 unavailable 收口）", (() => {
+    const row = (stQoder.rows || [])[0] || {};
+    return stQoder.ok === true && row.unavailable === true && !/is not a function|TypeError/.test(row.message || "");
+  })(), stQoder);
+  const ckRaccoon = await callIpc("proxy_checkin_run", { channel: "raccoon", action: "checkin" });
+  ok("有签到能力的渠道不被守卫误伤（照常打到适配器）", (() => {
+    const row = (ckRaccoon.rows || [])[0] || {};
+    return ckRaccoon.ok === true && !row.unavailable && !/该渠道没有签到/.test(row.message || "");
+  })(), ckRaccoon);
+
+  const syncAclaw = await callIpc("proxy_models_sync", { channel: "autoclaw" });
+  ok("autoclaw 有适配器但无 fetchModels → 说「模型目录为内置」，不谎报未知渠道",
+    syncAclaw.ok === false && /模型目录为内置，不支持同步/.test(syncAclaw.message || "") && !/未知渠道/.test(syncAclaw.message || ""), syncAclaw);
+  const syncBogus = await callIpc("proxy_models_sync", { channel: "no-such-channel" });
+  ok("真·未知渠道仍报未知渠道", syncBogus.ok === false && /未知渠道/.test(syncBogus.message || ""), syncBogus);
+  const syncTrae = await callIpc("proxy_models_sync", { channel: "trae" });
+  ok("有 fetchModels 的渠道照常进后续判断（不被能力门禁挡掉）",
+    syncTrae.ok === false && /无可用账号/.test(syncTrae.message || ""), syncTrae);
+
+  const rcQoder = await credits.refreshChannel("qoder");
+  ok("内置渠道无额度接口 → 文案说清「不提供额度查询」，不扣 API Key 的帽子",
+    rcQoder.ok === false && /不提供额度查询/.test(rcQoder.message || "") && !/API Key/.test(rcQoder.message || ""), rcQoder);
+  const qoderRow = store.accountRows("qoder")[0];
+  const raQoder = await credits.refreshAccount(qoderRow.id).then(() => null, (e) => String(e.message));
+  ok("单账号刷新同样按渠道类别说文案", /不提供额度查询/.test(raQoder || "") && !/API Key/.test(raQoder || ""), raQoder);
+
+  globalThis.fetch = realFetch2;
+
   console.log(`\n${pass} passed, ${fail} failed`);
   store.close();
   process.exit(fail ? 1 : 0);

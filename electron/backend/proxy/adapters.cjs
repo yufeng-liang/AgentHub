@@ -1857,6 +1857,15 @@ function autoclawResolveRoute(model) {
 function makeAutoClaw(region) {
   const cfg = AUTOCLAW_REGIONS[region];
   const channel = region === "intl" ? "autoclaw_intl" : "autoclaw";
+
+  /** 桌面文件里的 token → 号池 uid 口径（地区前缀 + JWT user_id，与 userInfo / scanAutoClaw 同源）。
+   *  解不出（不是 JWT / 缺 user_id）返回空串，调用方据此判「认不出身份」——宁可不采用文件值。 */
+  function autoclawFileUid(token) {
+    const c = util.jwtDecode(token).payload || {};
+    const id = String(c.user_id || "");
+    return id ? `${cfg.uidPrefix}${id}` : "";
+  }
+
   return {
     id: channel,
     refreshWindowSec: 300, // 临期 5 分钟（对齐官方 DESKTOP_REFRESH_AHEAD_MS，协议参考 §2.3）
@@ -1914,6 +1923,19 @@ function makeAutoClaw(region) {
       if (!out.stream_options || typeof out.stream_options !== "object") out.stream_options = {};
       out.stream_options.include_usage = true;
       delete out.conversation_id; delete out.conversationId; delete out.prompt_cache_key;
+      // normalizeSystemPrompt 是**就地**改写（改 m.content、往 messages 头部 unshift），而 out 只是
+      // body 的浅拷——messages 数组和每条消息对象都还与调用方共享。server.cjs 的模型回退 + 换号循环
+      // 复用同一个 body，autoclaw 失败后落到 cline/qoder/trae 时，客户端正文里已经被人塞进 OpenClaw
+      // 身份前缀、外来身份句也已被改写，入站 token 估算同样吃这份脏正文。故归一前先把 messages 拷一层。
+      // 只拷到「消息对象 + content 为数组时的 part 对象」这一层：数组元素里没有更深的可变结构，
+      // 图片 base64 是字符串（值语义），不必递归。
+      if (Array.isArray(out.messages)) {
+        out.messages = out.messages.map((m) => {
+          if (!m || typeof m !== "object") return m;
+          if (!Array.isArray(m.content)) return { ...m };
+          return { ...m, content: m.content.map((p) => (p && typeof p === "object" ? { ...p } : p)) };
+        });
+      }
       acPrompt.normalizeSystemPrompt(out); // 2026-09-22 白名单闸门（幂等）
       out._routeId = routeId; // chat 组装时取走放进 X-Request-Model，序列化前 delete
       return out;
@@ -1974,8 +1996,13 @@ function makeAutoClaw(region) {
       if (account && account.source === "scan") {
         try {
           const live = acCred.readAutoClawAuth();
-          if (live && live.refreshToken) rt = live.refreshToken;
-          if (live && live.deviceId && !deviceId) deviceId = live.deviceId;
+          // 身份比对（cline 的 refreshToken 同款，见上方 makeCline）：桌面端换账号登录后 auth.json 里
+          // 是**新账号**的凭据，无条件采用就会拿新账号的 refresh_token 去刷新旧账号那一行——
+          // 上游不报 401，直接把新账号的额度刷进旧行，号池从此错位。认不出身份（uid 解不出/不一致）
+          // 就整份文件值都不采用，继续用号池快照。
+          const sameIdentity = !!live && (!account.uid || autoclawFileUid(live.token) === String(account.uid));
+          if (live && live.refreshToken && sameIdentity) rt = live.refreshToken;
+          if (live && live.deviceId && !deviceId && sameIdentity) deviceId = live.deviceId;
         } catch { /* 文件读不了就用号池快照 */ }
       }
       if (!rt) return { ok: false, message: "无 refreshToken，请重新粘贴或导入" };

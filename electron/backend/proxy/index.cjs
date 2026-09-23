@@ -110,9 +110,16 @@ async function checkinBatch({ channel, accountId, action }) {
       const secrets = store.accountSecrets(store.getAccount(acc.id));
       try {
         let r;
-        if (useAct === "status") r = await ad.checkinStatus(acc, secrets);
-        else if (useAct === "checkin") r = await ad.checkin(acc, secrets);
-        else r = typeof ad.trial === "function" ? await ad.trial(acc, secrets) : { ok: false, message: "该渠道没有加油包" };
+        // 能力门禁：新渠道（cline_free/cline_pass/autoclaw/autoclaw_intl/qoder）官方就没有签到体系，
+        // 适配器根本不定义这两个方法。缺守卫就是 "ad.checkin is not a function" 这句英文 TypeError
+        // 原样进结果行、直出到前端。判据与下方 trial 一致（typeof === "function"）；缺能力按既有约定回
+        // ok:true + unavailable:true（同 adapters 的 1001 分支）——前端 checkinTagCls 先判 !r.ok 就红，
+        // 用 ok:false 会把「这渠道没签到」渲染成「这个号签到失败」。
+        if (useAct === "status") {
+          r = typeof ad.checkinStatus === "function" ? await ad.checkinStatus(acc, secrets) : { ok: true, unavailable: true, checkedIn: false, message: "该渠道没有签到状态可查" };
+        } else if (useAct === "checkin") {
+          r = typeof ad.checkin === "function" ? await ad.checkin(acc, secrets) : { ok: true, unavailable: true, checkedIn: false, message: "该渠道没有签到" };
+        } else r = typeof ad.trial === "function" ? await ad.trial(acc, secrets) : { ok: false, message: "该渠道没有加油包" };
         rows.push({ accountId: acc.id, channel: acc.channel, name: acc.name, uid: acc.uid, ok: !!r.ok, ...r });
         // 签到成功（且不是幂等/不可用）后顺手刷新余额，让号池立刻看到新积分
         if (useAct !== "status" && r.ok && !r.unavailable && !r.already) {
@@ -487,7 +494,12 @@ function register(ipcMain) {
   ipcMain.handle("proxy_models_sync", handle(async ({ channel }) => {
     const ch = String(channel || "");
     const adapter = adapters.get(ch);
-    if (!adapter || typeof adapter.fetchModels !== "function") return fail(`未知渠道 "${ch}"`);
+    if (!adapter) return fail(`未知渠道 "${ch}"`);
+    // 适配器在、只是不提供 fetchModels：AutoClaw 的模型目录就是内置静态表（官方目录端点无人调用），
+    // 这时报「未知渠道」是谎报——渠道明明存在，用户会以为号池配坏了。按渠道类别说清缺的是哪个能力。
+    if (typeof adapter.fetchModels !== "function") {
+      return fail(store.isBuiltinChannel(ch) ? "该渠道模型目录为内置，不支持同步" : `自定义提供商 "${ch}" 不支持模型目录同步`);
+    }
     const acc = pool.poolAccounts(ch).find((a) => a.status === "online" && a.hasToken);
     if (!acc) return fail(`${store.channelDisplay(ch)}号池无可用账号，无法拉取模型目录`);
     const secrets = store.accountSecrets(store.getAccount(acc.id));
@@ -580,4 +592,6 @@ function register(ipcMain) {
   ipcMain.handle("proxy_provider_fetch_models", handle(({ id }) => provider.fetchModels(id)));
 }
 
-module.exports = { boot, shutdown, register, settings };
+// checkinBatch 一并导出：给 scripts/dev-provider-test.cjs 直测「渠道缺签到能力」这条门禁
+// （proxy_checkin_run / proxy_checkin_status 两个 IPC handler 只是它的包装，不必为了测试拉起 Electron）
+module.exports = { boot, shutdown, register, settings, checkinBatch };

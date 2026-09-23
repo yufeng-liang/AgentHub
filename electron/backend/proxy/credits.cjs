@@ -18,13 +18,20 @@ function creditsCapable(channel) {
   return !!(ad && typeof ad.queryCredits === "function");
 }
 
+/** 无额度查询能力时的文案，按渠道类别分开说：
+ *  「API Key 直连、无余额概念」只对自定义提供商成立，把它扣到 Cline/AutoClaw/Qoder 这类内置渠道身上
+ *  是错的（它们是官方订阅额度，上游压根没有对外余额接口）。两条刷新入口共用，别各写一份。 */
+function noCreditsMessage(channel) {
+  return store.isBuiltinChannel(channel) ? "该渠道不提供额度查询（官方无对外余额接口）" : "该渠道为 API Key 直连，无余额概念";
+}
+
 /** 单账号额度刷新：成功回写余额缓存 + credits_history 日快照 */
 async function refreshAccount(id) {
   const acc = store.getAccount(id);
   if (!acc) throw new Error("账号不存在");
   const adapter = adapters.get(acc.channel);
   if (!adapter) throw new Error(`未知渠道 ${acc.channel}`);
-  if (!creditsCapable(acc.channel)) throw new Error("该渠道为 API Key 直连，无余额概念");
+  if (!creditsCapable(acc.channel)) throw new Error(noCreditsMessage(acc.channel));
   let secrets = store.accountSecrets(acc);
   if (!secrets.token) throw new Error("该账号没有凭据");
 
@@ -96,7 +103,7 @@ async function refreshAccount(id) {
 /** 单渠道逐账号批量刷新（号池页「刷新当前渠道」用），每渠道并发 ≤2；单账号失败不影响其余 */
 async function refreshChannel(channel) {
   if (refreshing) return { ok: false, message: "刷新进行中" };
-  if (!creditsCapable(channel)) return { ok: false, message: "该渠道为 API Key 直连，无余额概念" };
+  if (!creditsCapable(channel)) return { ok: false, message: noCreditsMessage(channel) };
   refreshing = true;
   try {
     const ids = store

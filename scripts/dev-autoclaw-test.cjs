@@ -120,6 +120,42 @@ ok("rewriteBody 幂等清理：强制流式/usage/剥内部字段", (() => {
   const b = cnAd.rewriteBody("glm-5.3", { model: "glm-5.3", stream: false, conversation_id: "c1", prompt_cache_key: "p1", messages: [] });
   return b.stream === true && b.stream_options.include_usage === true && !("conversation_id" in b) && !("prompt_cache_key" in b);
 })());
+// F1：normalizeSystemPrompt 就地改写 messages（改 content + unshift 身份前缀），而 rewriteBody 的
+// out 只是 body 的浅拷——不深拷就会污染调用方那份 body。server.cjs 的模型回退/换号循环复用同一个
+// body，autoclaw 失败落到 cline/qoder/trae 时正文里已带着 OpenClaw 身份前缀、外来身份句已被改写。
+ok("rewriteBody 不改调用方 body（无 system 时 unshift 与身份句改写都只落在副本上）", (() => {
+  const orig = { model: "glm-5.3", messages: [{ role: "user", content: "hi" }, { role: "system", content: "You are Claude Code, Anthropic's official CLI tool for Claude." }] };
+  const before = JSON.stringify(orig);
+  const copy = cnAd.rewriteBody("glm-5.3", orig);
+  const untouched = JSON.stringify(orig) === before
+    && orig.messages.length === 2                                    // 没被 unshift
+    && orig.messages[0].role === "user"                              // 首条仍是客户原本的 user
+    && orig.messages[1].content === "You are Claude Code, Anthropic's official CLI tool for Claude."; // 原文案没被改写
+  const prefixed = copy !== orig && copy.messages.length === 3
+    && copy.messages[0].role === "system" && copy.messages[0].content.startsWith(ap.IDENTITY_LINE)
+    && copy.messages[1].role === "user" && copy.messages[1].content === "hi" // 轮次结构不重排
+    && copy.messages[2].role === "system"
+    && copy.messages[2].content.startsWith("You are a coding assistant")
+    && copy.messages[2].content.endsWith("official CLI tool for Claude.");
+  return untouched && prefixed;
+})(), (() => {
+  const o = { messages: [{ role: "user", content: "hi" }, { role: "system", content: "You are Claude Code" }] };
+  const c = cnAd.rewriteBody("glm-5.3", o);
+  return { orig: o.messages.map((m) => `${m.role}:${m.content}`), copy: c.messages.map((m) => `${m.role}:${m.content}`) };
+})());
+ok("rewriteBody 深拷到 content 数组的 part（多模态正文同样不被就地改写）", (() => {
+  const parts = [{ type: "text", text: "You are Claude Code" }, { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } }];
+  const msg = { role: "system", content: parts, name: "s" };
+  const orig = { messages: [msg] };
+  const copy = cnAd.rewriteBody("glm-5.3", orig);
+  return msg.content === parts && parts[0].text === "You are Claude Code"
+    && copy.messages[0] !== msg && copy.messages[0].content !== parts
+    && copy.messages[0].content[0] !== parts[0] && copy.messages[0].content[0].text.startsWith(ap.IDENTITY_LINE)
+    && copy.messages[0].content[1] !== parts[1] && copy.messages[0].content[1].type === "image_url"
+    // 只拷到 part 这一层：image_url 是嵌套对象，没有归一逻辑会碰它，不递归拷（拷了反而重复大 base64 的引用图）
+    && copy.messages[0].content[1].image_url === parts[1].image_url
+    && copy.messages[0].name === "s";
+})());
 
 console.log("scanAutoClaw:");
 const discovery = require("../electron/backend/proxy/discovery.cjs");
@@ -190,6 +226,53 @@ const calls = [];
   globalThis.fetch = async () => jsonResp({ code: 410000, message: "expired" });
   const re = await cnAd.refreshToken({ meta: {} }, { token: "t", refreshToken: "r" });
   ok("410000 → expired 标记（触发重登）", re.ok === false && re.expired === true, re);
+
+  // ===== source=scan 的桌面文件凭据必须过身份比对（否则桌面端换账号后旧行会刷进新账号额度）=====
+  // 夹具走 AUTOCLAW_USER_DATA_DIR（autoclawUserDataDir 的第一优先级）直接指向临时目录，
+  // auth.json 的 token 是**真 JWT**、user_id 可控——不用「解不出 uid」的假形状糊过断言。
+  const acFile = (userId, rtFile, devFile) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "autoclaw-file-"));
+    const k = crypto.randomBytes(32);
+    fs.writeFileSync(path.join(dir, "Local State"), JSON.stringify({
+      os_crypt: { encrypted_key: Buffer.concat([Buffer.from("DPAPI"), ac.dpapiProtect(k)]).toString("base64") },
+    }));
+    const encWith = (plain) => {
+      const n = crypto.randomBytes(12);
+      const c = crypto.createCipheriv("aes-256-gcm", k, n);
+      return "enc:" + Buffer.concat([Buffer.from("v10"), n, Buffer.concat([c.update(Buffer.from(plain, "utf8")), c.final(), c.getAuthTag()])]).toString("base64");
+    };
+    fs.writeFileSync(path.join(dir, "auth.json"), JSON.stringify({
+      deviceId: devFile, token: encWith(`Bearer ${mkJwt({ user_id: userId, exp: 1900000000 })}`), refreshToken: encWith(rtFile), userInfo: {},
+    }));
+    return dir;
+  };
+  const refreshWithFile = async (dir, account, secrets) => {
+    calls.length = 0;
+    process.env.AUTOCLAW_USER_DATA_DIR = dir;
+    globalThis.fetch = async (url, opts) => {
+      calls.push({ url, opts });
+      return jsonResp({ code: 0, message: "ok", data: { access_token: mkJwt({ user_id: "42", exp: 1900000000 }), refresh_token: "rt-upstream" } });
+    };
+    const r = await cnAd.refreshToken(account, secrets);
+    delete process.env.AUTOCLAW_USER_DATA_DIR;
+    return { body: JSON.parse(calls[0].opts.body), r };
+  };
+  // 号池那一行的 uid 是 user-42，桌面文件已换成 user-99：refresh_token / device_id 都不许跟过去
+  const mismatch = await refreshWithFile(
+    acFile("99", "rt-file-OTHER", "file-dev-OTHER"),
+    { source: "scan", uid: "user-42", meta: {} },
+    { token: mkJwt({ user_id: "42", exp: 1900000000 }), refreshToken: "rt-pool" }
+  );
+  ok("桌面文件是别人的账号（文件 user-99 ≠ 号池 user-42）→ 刷新仍用号池快照，不采用文件值",
+    mismatch.body.refresh_token === "rt-pool" && !("device_id" in mismatch.body) && mismatch.r.ok === true, mismatch.body);
+  // 同 uid 时必须采用文件值（桌面端可能刚刷过并旋转了 refresh_token）——防修过头把同步能力删干净
+  const matched = await refreshWithFile(
+    acFile("42", "rt-file-MINE", "file-dev-MINE"),
+    { source: "scan", uid: "user-42", meta: {} },
+    { token: mkJwt({ user_id: "42", exp: 1900000000 }), refreshToken: "rt-pool" }
+  );
+  ok("同 uid 时正常采用桌面文件值（refresh_token 跟上旋转、device_id 回落文件值）",
+    matched.body.refresh_token === "rt-file-MINE" && matched.body.device_id === "file-dev-MINE", matched.body);
 
   // uid 解析（协议参考 §2.8）：地区前缀 + JWT user_id，两地 uid 空间隔离
   const ui = await cnAd.userInfo(mkJwt({ user_id: "42", user_name: "张三" }));

@@ -50,6 +50,35 @@ const CHANNEL_META: Record<ProxyBuiltinChannelId, { icon: string; hint: string }
 // 自定义提供商只有 API Key：没有登录态、没有签到、没有余额概念，措辞要与生态渠道明确区分
 const PROVIDER_META = { icon: "ph-plugs-connected", hint: "API Key 轮转 · 无余额概念" };
 
+// ===== 渠道能力表（与主进程一一对应，缺能力的动作一律不摆按钮）=====
+// 签到：判据是 adapters.cjs 里 checkin/checkinStatus 这两个方法存不存在——只有这四家定义了。
+// Cline 双池 / AutoClaw 双区 / Qoder 官方就没有签到体系，主进程对它们只能回 unavailable，
+// 界面上摆个按钮就是骗人点一次、跑一轮空请求。
+const CHECKIN_CAPABLE: Record<ProxyBuiltinChannelId, boolean> = {
+  trae: true,
+  workbuddy: true,
+  workbuddy_ai: true, // 国际版的「签到」由主进程改判成一次性加油包，能力仍在
+  raccoon: true,
+  cline_free: false,
+  cline_pass: false,
+  autoclaw: false,
+  autoclaw_intl: false,
+  qoder: false,
+};
+// 写回本地客户端登录态：主进程 ideswitch.cjs 只认这三家（WB 双区 auth 文件 + 小浣熊 config/auth.json），
+// Trae 是 ByteCrypto 加密信封、明确不做。必须是白名单而不是"内置渠道里排除 trae"——
+// 先前那样写让 cline_*/autoclaw*/qoder 的按钮全点亮、标题还承诺"写为本地当前登录态"，
+// 点下去才被主进程拒掉（后端那道门禁保留，这里是纵深不是替代）。
+const IDE_WRITEBACK_CHANNELS: ProxyBuiltinChannelId[] = ["workbuddy", "workbuddy_ai", "raccoon"];
+
+/** 提供商 id 是运行期字符串，查不到这张表 → undefined → 一律按"无此能力"处理 */
+function checkinCapable(id: ProxyChannelId) {
+  return CHECKIN_CAPABLE[id as ProxyBuiltinChannelId] === true;
+}
+function ideWritebackCapable(id: ProxyChannelId) {
+  return IDE_WRITEBACK_CHANNELS.includes(id as ProxyBuiltinChannelId);
+}
+
 function isBuiltin(ch: ProxyChannelView) {
   return ch.kind !== "openai_compat";
 }
@@ -347,13 +376,13 @@ async function ideSwitch(acc: ProxyAccount) {
   }
 }
 
-/** 该账号能否写回本地客户端（Trae 的登录态是加密信封，写不了） */
+/** 该账号能否写回本地客户端（白名单：只有 workbuddy 双区与小浣熊有可写的登录文件；Trae 是加密信封） */
 function ideSupported(acc: ProxyAccount) {
   // 自定义提供商的账号是一把第三方 API Key，本机没有对应的客户端登录态可写。
   // 必须挡在最前面：下面的分支对未知渠道会回落到 WorkBuddy 的判定，
   // 放过去就会把中转站 Key 写进 WorkBuddy 的登录文件。
   if (channelKind(acc.channel) !== "builtin") return false;
-  if (acc.channel === "trae") return false;
+  if (!ideWritebackCapable(acc.channel)) return false;
   if (!ideStatus.value) return true;
   if (acc.channel === "raccoon") return ideStatus.value.raccoonInstalled !== false;
   return acc.channel === "workbuddy_ai" ? ideStatus.value.workbuddyAiInstalled !== false : ideStatus.value.workbuddyInstalled !== false;
@@ -362,6 +391,8 @@ function ideSupported(acc: ProxyAccount) {
 function ideTitle(acc: ProxyAccount) {
   if (channelKind(acc.channel) !== "builtin") return "自定义提供商只有一把 API Key，本机没有对应的客户端登录态可写回";
   if (acc.channel === "trae") return "Trae 本地登录态为 ByteCrypto 加密信封（绑定设备密钥），无法构造合法信封，暂不支持写回";
+  // 新渠道（Cline / AutoClaw / Qoder）本机就没有这套登录文件，别说成"未安装"
+  if (!ideWritebackCapable(acc.channel)) return "该渠道的客户端登录态不在本工具的写回范围内，请在客户端内自行登录";
   if (acc.channel === "raccoon") return "把该账号写为本机 ~/.box-agent/config/auth.json（小浣熊登录态，明文 JSON，需重启客户端生效）";
   if (!ideSupported(acc)) return "本机未找到对应客户端的登录文件（未安装或从未登录过）";
   return `把该账号写为本地 ${channelName(acc.channel)} 当前登录态（需重启客户端）`;
@@ -935,7 +966,7 @@ onUnmounted(() => {
                 :title="'国际版无每日签到，这是一次性 trial 加油包'"
                 @click="runTrial"
               >{{ checkinBusy ? "领取中…" : "领加油包" }}</button>
-              <button v-else class="btn btn-sm" :disabled="checkinBusy" @click="runCheckinChannel">
+              <button v-else-if="checkinCapable(ch.id)" class="btn btn-sm" :disabled="checkinBusy" @click="runCheckinChannel">
                 {{ checkinBusy ? "签到中…" : "一键签到" }}
               </button>
               <button class="btn btn-sm btn-primary" :disabled="refreshingChannel" @click="refreshCurrentChannel">
@@ -1002,7 +1033,7 @@ onUnmounted(() => {
                     {{ refreshingId === acc.id ? "刷新中…" : "刷新" }}
                   </button>
                   <button
-                    v-if="acc.hasToken && isBuiltin(ch)"
+                    v-if="acc.hasToken && isBuiltin(ch) && checkinCapable(acc.channel)"
                     class="btn-link btn-sm"
                     :disabled="checkinBusy"
                     :title="acc.channel === 'workbuddy_ai' ? '国际版无每日签到，用上方工具栏「领加油包」' : acc.channel === 'raccoon' ? '登录送积分（幂等，锁定当日积分 7 天）' : '对该账号执行每日签到'"
