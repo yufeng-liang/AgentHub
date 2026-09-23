@@ -17,7 +17,8 @@
 | 现状 | 关窗只 `hide()` | **321.5 MB** | 真实 app 关窗后实测（另一次独立读数 315.9 MB） |
 | 一期后 | 关窗即销毁窗口 | **215.47 MB** | Task 7 真实打包版实测（无窗 3 进程，40 s 落定 5 次采样一字不差；相对开着窗的 424.86 省 209.39 MB / −49.3%） |
 | 一期后（可选） | 启动即不建窗 | **166.05 MB** | Task 7 真实打包版实测（n=3，GPU 仅 32.2 MB，无建窗残留） |
-| 二期后 | 主 App 退出，网关独立常驻 | **33.2 MB（探针值，二期实测终态待真机批次回填）** | 探针实测 electron.exe-as-node；真实 app 的实测终态回填锚点：`tmp/gateway-probe/phase2-acceptance.md` §1 矩阵「安装版 × persistentGateway=on」格（判据 2，≤80 MB）＋本行 |
+| 二期后 | 主 App 退出，网关独立常驻 | **76.94 MB** | 真机批次实测终态（2026-09-23，安装版 × persistentGateway=on：杀掉主进程后只剩 1 个 `AgentHub.exe`，`PrivateMemorySize64` 76.94 MB，`/healthz` 200、`/readyz` 503=空号池真值）。同批交叉验证：关窗销毁格里的网关子进程 74.22 MB 同量级。**探针值 33.2 MB 已被真实值取代**——33.2 量的是裸 electron.exe-as-node，差的那 43 MB 是本应用的 express + 两个 SQLite + rules/号池模块 |
+| 二期后（main 侧） | 网关搬出主进程后主进程地板价 | **130.26 MB（未达 ≤60 目标）** | 真机批次判据 1 实测：窗口销毁回收的是 renderer 47.90 MB 整块 + 一部分 GPU 页（206.51→137.94），**main 自己几乎不动**（开窗 131.43 / 关窗 130.26，与一期 main 126.84 同值）。结论更正：§一 表下那句「+27.7 MB 在 main」指的是**模块驻留**，但它们在 main 私有集里占比很小——把网关/两个 SQLite/rules 搬进子进程**换不来 main 腰斩**，真正的收益在「常驻那一格 76.94」而不是 main。判据 1 的 60 MB 目标据此判废（未改数，按实测留档） |
 
 > **这张表在 Task 7 之前被污染过一次，此处是更正后的版本**：原先「一期后 175.4 MB / 136.0 MB」两行引的是 §三那支**合成探针**（只建一个 `BrowserWindow` 的裸 Electron app，`tmp/gateway-probe/raw-window-longsettle.jsonl`）的数字，不是本应用的地板价。真实打包版无窗是 215.47，比合成探针的 176.94 高 38.5 MB，其中 **+27.7 MB 在 main**（反代网关 express、两个 SQLite、watch 快照器、两个调度器、配置与号池模块常驻）——这条有独立旁证：对用户自己那份实例做只读枚举得 `main:125.98`，与本构建关窗后的 `main:126.84` 同值，即**这块驻留与窗口无关，关窗路径回收不了它**。教训：探针量的是 Electron，不是 AgentHub，凡引探针数字进验收判据必须标注来源。
 
@@ -129,6 +130,16 @@
 ## 五、二期设计：网关下沉独立进程
 
 **二期继承的一期未达项（Task 7 实测带来，写死在这里免得丢）**：把无窗常驻从 215.47 MB 拉进原定的 150–200 MB 区间。靶子是 main 那 **126.84 MB**（与窗口无关，关窗回收不动；用户自己那份实例只读枚举同为 125.98 MB），二期把网关 express + 两个 SQLite + `credits`/`rules` 热路径下沉到子进程之后，必须重量这块并给出拆解，而不是沿用 §三 探针的 `99.17 → 91.06`（那是 Electron 的数，不是本应用的）。同一次量测要顺带回答一期留下的一个单点观测：一轮完整逐页导航后 main 从 121.32 涨到 147.10 MB（顾虑：会不会随使用继续爬）。
+
+> **二期真机批次收口（2026-09-23，逐条对账，未达项按实测留档不为过门改判据）**：
+> ① 区间目标**达成且超越**——`persistentGateway=on` 下主 App 退出后只剩 1 个进程 **76.94 MB**（原区间 150–200 MB）；
+> ② 靶子 `main 126.84` 的拆解结论是**搬不动**：网关与两个 SQLite 下沉后 main 自持私有内存仍为 130.26 MB（开窗 131.43 / 关窗销毁后 130.26），
+>    回收量全在 renderer（47.90 → 0）与 GPU 页；「≤60 MB」这条判据按实测判废（§一 表「二期后（main 侧）」行留了完整归因）；
+> ③ 一期的 121.32 → 147.10 单点**不是持续爬升**：8 样本序列 `129.01, 136.40, 141.31, 134.88, 136.25, 135.29, 132.92, 132.10`，
+>    峰值在第 3 站、末值低于峰值 9.2 MB，后三站连续回落；
+> ④ WAL「停止单调增长」达成（50 次请求后 1,388,472 B 在 t+3→t+30min 恒定不动），但 §5.4 的 64 KB 绝对值未达成：
+>    子进程每 5 分钟挂 `PRAGMA wal_checkpoint(TRUNCATE)` 却一次都没截下去，而 `store.checkpoint()` 的布尔返回值无人观测，
+>    外部无法区分「没执行」与「执行了被挡」——三期两条：给 checkpoint 加成功/失败计数留痕；评估 `PRAGMA journal_size_limit=65536`。
 
 ### 5.1 进程切分线
 
@@ -243,7 +254,7 @@
 | 一期体积 | 核 `dist/assets/` 分块字节数（不用构建退出码代替产物检查）；目标见 §4.3 |
 | 一期耗时 | CDP 实测「建窗 → 可交互」（AGENTS.md 第三节流程）；探针 `tools/memtree.ps1` 可复用（Task 8 自 `tmp/gateway-probe/` 提级入库） |
 | 一期内存 | 关窗前后采 `PrivateMemorySize64`，对齐 **§4.1 更正后的判据**（相对降幅 + main 单列）。**不要**对齐 §三——那张表是合成探针，量的是 Electron 不是本应用（教训见 §一 表下说明） |
-| 探针卫生（一期 Task 7 暴露，二期必须遵守） | 用临时 userData 起打包版实例**并不等于隔离**：`hubDir()` 按 `os.homedir()` 解析，仍会读写共享中央仓库 `~/.agent_skills`；packaged 且非便携的实例每次启动都调 `applyAutoStart`，`autoStart` 默认 false 时会把**用户自己的**开机自启 Run 项删掉。故探针三件套：`AGENT_SKILLS_HOME=<临时目录>`（或临时 config 里 `watch.enabled:false`）+ 网关端口改到非 9527（9527 归用户实例，拿它的应答当本构建的证据是错的）+ 收尾核对 HKCU Run 值列表未变。一期四个探针脚本原在 gitignored 的 `tmp/gateway-probe/`，**Task 8 已四个一起提级到 `tools/`**（`phase1-browser-pass` / `cascade-verify2` / `run-human-checks4` / `tray-reopen-watch`，连带依赖的 `memtree.ps1`、`close-window.ps1`、`list-and-clean.ps1`，不留悬空引用），`AGENT_SKILLS_HOME` 与 `applyAutoStart` 两个副作用的集中中和点在 `tools/probe-hygiene.cjs`（三件套在任何产品代码 require 之前指进临时目录 + HKCU Run 快照、退出时发现被改自动原样恢复；`list-and-clean.ps1` 的 kill 参数为空严格等价「只列不杀」，一期实测 `$null -ne ''` 为真曾把全部实例杀掉，已修并留注释）。另注意 `proxy.boot()` 里的 `discovery.cjs:34,37,347` 会读**真实本机登录文件**（CodeBuddy/Trae 的本地 auth），临时 userData 挡不住它——一期那次隔离实例 `/v1/models` 能列出 `trae` 的模型就是这个原因（只读，discovery/adapter 侧无写入调用；但报告写「号池为空」时必须同时说明这点），二期把 discovery 下沉到子进程时要一并处理。**二期新增第五条：凡「asar 内可 require / electron 不可得」类断言必须从中立 cwd（`%TEMP%` 下）起跑** —— 在仓库目录里跑时 `require("electron")` 会命中 devDependency 的 `node_modules/electron/index.js` 并返回一个 exe 路径**字符串**，于是"没有 Electron 绑定"的断言假绿（本次实测先踩了一次） |
+| 探针卫生（一期 Task 7 暴露，二期必须遵守） | 用临时 userData 起打包版实例**并不等于隔离**：`hubDir()` 按 `os.homedir()` 解析，仍会读写共享中央仓库 `~/.agent_skills`；packaged 且非便携的实例每次启动都调 `applyAutoStart`，`autoStart` 默认 false 时会把**用户自己的**开机自启 Run 项删掉。故探针三件套：`AGENT_SKILLS_HOME=<临时目录>`（或临时 config 里 `watch.enabled:false`）+ 网关端口改到非 9527（9527 归用户实例，拿它的应答当本构建的证据是错的）+ 收尾核对 HKCU Run 值列表未变。一期四个探针脚本原在 gitignored 的 `tmp/gateway-probe/`，**Task 8 已四个一起提级到 `tools/`**（`phase1-browser-pass` / `cascade-verify2` / `run-human-checks4` / `tray-reopen-watch`，连带依赖的 `memtree.ps1`、`close-window.ps1`、`list-and-clean.ps1`，不留悬空引用），`AGENT_SKILLS_HOME` 与 `applyAutoStart` 两个副作用的集中中和点在 `tools/probe-hygiene.cjs`（三件套在任何产品代码 require 之前指进临时目录 + HKCU Run 快照、退出时发现被改自动原样恢复；`list-and-clean.ps1` 的 kill 参数为空严格等价「只列不杀」，一期实测 `$null -ne ''` 为真曾把全部实例杀掉，已修并留注释）。另注意 `proxy.boot()` 里的 `discovery.cjs:34,37,347` 会读**真实本机登录文件**（CodeBuddy/Trae 的本地 auth），临时 userData 挡不住它——一期那次隔离实例 `/v1/models` 能列出 `trae` 的模型就是这个原因（只读，discovery/adapter 侧无写入调用；但报告写「号池为空」时必须同时说明这点），二期把 discovery 下沉到子进程时要一并处理。**二期新增第五条：凡「asar 内可 require / electron 不可得」类断言必须从中立 cwd（`%TEMP%` 下）起跑** —— 在仓库目录里跑时 `require("electron")` 会命中 devDependency 的 `node_modules/electron/index.js` 并返回一个 exe 路径**字符串**，于是"没有 Electron 绑定"的断言假绿（本次实测先踩了一次）。**真机批次②补第六条（打包态隔离的硬事实）**：打包版主进程的 `userData` 由 Chromium 已知目录决定，**只设 `APPDATA` 环境变量对它无效**（`config.cjs:50` 走 `app.getPath("userData")`），实测首轮因此把探针的 `save_config` 写进了用户真实 `config.json`；而网关子进程在 `ELECTRON_RUN_AS_NODE` 下 `electronApp=null`，`dataDir()` 回退读 `process.env.APPDATA`。所以要真隔离一个打包实例，**两个变量必须成对注入且方向不同**：主进程侧要么显式 `app.setPath("userData", …)`（探针用 `AGENTHUB_USER_DATA` 测试钩子，不入库），子进程侧设 `APPDATA`——只设其中一个就会出现「主进程读临时目录、子进程写真实 `%APPDATA%\AgentHub`」的分家，`gateway.json`/`stats.db` 落进用户真实目录（本批次前几轮踩过，用户 `config.json` 三开关全程未受影响，`stats.db` 曾被测试流量写过几行） |
 | 按需注册静默坏掉 | 新增 CDP 冒烟：6 个 chunk 落点页各截一次 DOM，断言图表 canvas 存在、`el-date-picker` 面板月份为中文、图例已渲染 |
 | 图标子集 | 纯静态比对：`src` 用到的类名 ∪ 后端 `toolIcon()` 下发集合 ⊆ 生成的子集 CSS |
 | 二期 | 矩阵：安装版/便携版 × 常驻开关 × 升级装更。验「主 App 退出后 9527 仍通」「重开认领不起第二个进程」「WAL 不再单调增长」「装更前子进程已停」 |
