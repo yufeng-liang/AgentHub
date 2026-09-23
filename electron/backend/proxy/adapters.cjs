@@ -1699,14 +1699,18 @@ function statusFromCompatError(errObj, data) {
   return 502;
 }
 
-/** Anthropic 形态上游的端点：归一化后的 base 只补 /messages（与 openai 通路同一条约定） */
-function aupUrl(base) {
-  return `${base}/messages`;
+/** 出站端点统一在这里拼：`base_url` 存的是**不含 /v1 的根**（归一化侧保证），所以 /v1 必须由这里补。
+ *  真机实测（2026-09-23，一家只开 /v1/messages 的中转站）：只拼 leaf 会打到它的前端页面——
+ *  回 200 + text/html，比 404 更难归因。Anthropic 生态里 `base + "/v1/messages"` 是唯一约定
+ *  （Claude Code 对 ANTHROPIC_BASE_URL 也这么拼），OpenAI 兼容站的挂载点同样是 /v1。
+ *  规则只写这一处：换协议只换 leaf。 */
+function compatUrl(base, leaf) {
+  return `${base}/v1/${leaf}`;
 }
 
 function makeOpenaiCompat(row) {
   const entries = compatModelEntries(row);
-  const chatUrl = `${row.baseUrl}/chat/completions`;
+  const chatUrl = compatUrl(row.baseUrl, "chat/completions");
   const upstreamByClient = new Map(entries.map((e) => [e.client.toLowerCase(), e.upstream]));
   return {
     /** 提供商没有 rules/headers.json 那套 UA/指纹伪装：头 = 标准 JSON + Bearer + 用户自定义覆盖 */
@@ -1737,11 +1741,22 @@ function makeOpenaiCompat(row) {
       return entries;
     },
 
-    /** 拉上游自己的清单（GET {base}/models）：中转站大多支持，失败如实回错，由 UI 引导手填 */
+    /** 拉上游自己的清单（GET {base}/v1/models）：中转站大多支持（真机实测连只开 /v1/messages
+     *  的 Claude 中转站也开了它），失败如实回错，由 UI 引导手填。
+     *  Anthropic 形态的站认 x-api-key，别发 Bearer。 */
     async fetchModels(secrets) {
-      const r = await httpJson(`${row.baseUrl}/models`, { method: "GET", headers: this.headers(secrets) })
+      const headers = row.kind === "anthropic_messages"
+        ? { "x-api-key": String(secrets && secrets.token || ""), "anthropic-version": "2023-06-01" }
+        : this.headers(secrets);
+      const r = await httpJson(compatUrl(row.baseUrl, "models"), { method: "GET", headers })
         .catch((e) => ({ ok: false, status: 0, data: null, text: String((e && e.message) || e) }));
-      if (!r.ok) return { ok: false, message: `HTTP ${r.status || 0} ${(r.text || "").slice(0, 200)}` };
+      if (!r.ok) {
+        return {
+          ok: false,
+          message: `HTTP ${r.status || 0} ${(r.text || "").slice(0, 200)}` +
+            (r.status === 404 ? "（该上游没有模型目录接口，请在模型清单里手填）" : ""),
+        };
+      }
       const list = (r.data && (Array.isArray(r.data) ? r.data : r.data.data)) || [];
       const models = list.map((m) => String((m && (m.id ?? m.model ?? m.name)) || "")).filter(Boolean);
       return { ok: true, models };
@@ -1827,7 +1842,7 @@ function makeOpenaiCompat(row) {
       const headers = { "content-type": "application/json", accept: "application/json", "anthropic-version": "2023-06-01" };
       for (const [k, v] of Object.entries(row.extraHeaders || {})) headers[k] = String(v);
       headers["x-api-key"] = secrets.token || "";
-      const { resp, cancelTimer } = await fetchStream(aupUrl(row.baseUrl), { method: "POST", headers, body: JSON.stringify(payloadObj) });
+      const { resp, cancelTimer } = await fetchStream(compatUrl(row.baseUrl, "messages"), { method: "POST", headers, body: JSON.stringify(payloadObj) });
       const result = { status: 200, planLimit: false };
       // type 表认不出的形状交给通用关键词表；而"欠费"无论上游把 type 写成什么都必须认出来——
       // 只有 402 会走「切号 + planLimit」这条既有链路，落到 400/502 就是把坏 Key 当好 Key 反复打。

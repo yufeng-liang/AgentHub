@@ -392,7 +392,7 @@ onMounted(refresh);
           <div class="set-row">
             <div class="set-info">
               <div class="set-name">上游地址</div>
-              <div class="set-desc">填到版本前缀为止，如 https://relay.example.com/v1；保存时会自动去掉尾部的 /v1 与 /chat/completions</div>
+              <div class="set-desc">填到版本前缀为止，如 https://relay.example.com/v1；保存时去掉尾部的 /v1 与端点名，请求时由网关按上游协议补回 /v1/chat/completions 或 /v1/messages</div>
             </div>
             <input v-model="form.baseUrl" class="input mono" style="width: 300px" placeholder="https://relay.example.com/v1" />
           </div>

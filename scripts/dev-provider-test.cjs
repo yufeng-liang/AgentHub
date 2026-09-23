@@ -184,6 +184,13 @@ function startFakeUpstream(port) {
     let raw = "";
     req.on("data", (c) => (raw += c));
     req.on("end", () => {
+      // 模型目录接口（fetchModels 走 GET）：真机实测中转站普遍提供，闸里也得有它一条形状
+      if (req.method === "GET") {
+        seen.push({ auth: String(req.headers.authorization || ""), model: "(list)", stream: null, path: req.url });
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end('{"object":"list","data":[{"id":"gpt-4o"},{"id":"gpt-4o-mini"}]}');
+        return;
+      }
       const body = JSON.parse(raw || "{}");
       seen.push({ auth: String(req.headers.authorization || ""), model: body.model, stream: body.stream, path: req.url });
       // delta 必须以 JSON 对象入帧：写成 ${对象} 会被插值成 "[object Object]"，
@@ -259,8 +266,12 @@ const call = async (base, secret, model, stream) => {
   ok("客户端看到的 model 仍是请求值（契约不变）", t1.includes('"model":"myprov/gpt-4o"'), t1.slice(0, 200));
   ok("上游收到的 model 已剥前缀并映射别名", seen[0] && seen[0].model === "gpt-4o-2024-11-20", seen[0]);
   ok("上游被强制流式", seen[0] && seen[0].stream === true, seen[0]);
-  ok("端点拼在归一化后的 base 上", seen[0] && seen[0].path === "/chat/completions", seen[0] && seen[0].path);
+  ok("端点是 base + /v1/chat/completions（base 存根、/v1 由出站补，真机实测过）", seen[0] && seen[0].path === "/v1/chat/completions", seen[0] && seen[0].path);
   ok("鉴权头取号池里的 Key", /^Bearer sk-key-/.test((seen[0] || {}).auth || ""), seen[0]);
+
+  const fm = await provider.fetchModels("myprov");
+  ok("拉上游模型清单走 /v1/models", fm.ok === true && JSON.stringify(fm.models) === '["gpt-4o","gpt-4o-mini"]', fm);
+  ok("清单请求带的是号池 Key 的 Bearer", (seen[seen.length - 1] || {}).path === "/v1/models" && /^Bearer sk-key-/.test((seen[seen.length - 1] || {}).auth || ""), seen[seen.length - 1]);
 
   // 第一把 Key 被上游 429：应就地换第二把并成功，客户端完全无感（防多号切换痕迹）
   const k1 = store.accountRows("myprov").find((r) => config.decryptSecret(r.token_enc) === "sk-key-one");

@@ -312,13 +312,14 @@ async function probe({ id, accountId, baseUrl, key, model, kind, extraHeaders, e
   return { ok: true, ms, model: target, sample: sample.slice(0, 200), finishReason, usage };
 }
 
-/** 拉上游自己的模型清单：用号池里第一把可用 Key（与探测不同，这里没有"当场输入"的 Key）。 */
+/** 拉上游自己的模型清单：用号池里第一把可用 Key（与探测不同，这里没有"当场输入"的 Key）。
+ *  两种上游形态都试：真机实测，连只开放 /v1/messages 的 Claude 中转站也提供 /v1/models；
+ *  真没有的会拿到 404，adapter 回「请手填」，不必在这里替上游预判并拒掉有能力的那批。 */
 function fetchModels(id) {
   const provider = store.getProvider(id);
   if (!provider) return Promise.resolve({ ok: false, message: `提供商 "${id}" 不存在` });
   const row = store.accountRows(id).find((r) => r.status !== "disabled" && r.token_enc);
   if (!row) return Promise.resolve({ ok: false, message: "该提供商还没有可用 Key，先添加一把" });
-  if (provider.kind === "anthropic_messages") return Promise.resolve({ ok: false, message: "Anthropic 形态上游没有 /models 目录接口，请在模型清单里手填" });
   const adapter = adapters.makeOpenaiCompat({ ...provider, models: [] });
   return adapter.fetchModels({ token: config.decryptSecret(row.token_enc) || "", refreshToken: "" });
 }

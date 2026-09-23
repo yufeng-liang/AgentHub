@@ -309,6 +309,12 @@ const chatPost = (body) => post("/v1/chat/completions", body, "", { authorizatio
     let raw = "";
     req.on("data", (c) => (raw += c));
     req.on("end", () => {
+      if (req.method === "GET") {
+        // 真机实测：只开放 /v1/messages 的 Claude 中转站也提供 /v1/models，所以这条不能拒
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end('{"data":[{"id":"claude-x","type":"model"},{"id":"claude-y","type":"model"}]}');
+        return;
+      }
       seenA.push({ path: req.url, auth: req.headers["x-api-key"], ver: req.headers["anthropic-version"], body: JSON.parse(raw || "{}") });
       aUpStream(res);
     });
@@ -327,7 +333,7 @@ const chatPost = (body) => post("/v1/chat/completions", body, "", { authorizatio
   });
   const oaText = oa.text;
   ok("OpenAI 客户端打通 Anthropic 上游（200）", oa.status === 200, oa.status);
-  ok("出站是 /v1/messages + x-api-key + anthropic-version", seenA[0].path === "/messages" && seenA[0].auth === "sk-anthropic-up" && !!seenA[0].ver, seenA[0] && [seenA[0].path, seenA[0].auth, seenA[0].ver]);
+  ok("出站端点是 base + /v1/messages（真机实测：只拼 /messages 会打到中转站的前端页面）", seenA[0].path === "/v1/messages" && seenA[0].auth === "sk-anthropic-up" && !!seenA[0].ver, seenA[0] && [seenA[0].path, seenA[0].auth, seenA[0].ver]);
   ok("上游请求带默认 max_tokens", seenA[0].body.max_tokens === 4096, seenA[0].body.max_tokens);
   ok("上游收到的是改写后的合法工具名", seenA[0].body.tools[0].name === "browser_use", seenA[0].body.tools && seenA[0].body.tools[0].name);
   ok("text_delta → delta.content 拼出全文", /上游说/.test(oaText) && /你好/.test(oaText), oaText.slice(0, 300));
@@ -341,7 +347,7 @@ const chatPost = (body) => post("/v1/chat/completions", body, "", { authorizatio
   const clf = parseSse(cl.text);
   ok("Claude Code 入口 → Anthropic 上游 → Messages 事件全链路", clf[0].data.type === "message_start" && clf[clf.length - 1].data.type === "message_stop" && types(clf).filter((t) => t === "message_start").length === 1, types(clf));
   const fm = await provider.fetchModels("clauderelay");
-  ok("Anthropic 形态上游不假装支持 /models", fm.ok === false && /手填/.test(fm.message || ""), fm);
+  ok("Anthropic 形态上游也拉得到模型清单（真机实测这类站开了 /v1/models）", fm.ok === true && JSON.stringify(fm.models) === '["claude-x","claude-y"]', fm);
 
   // 中转站无视 stream:true、直接回一整个 JSON 对象：SSE 扫描器一条事件都收不到，
   // 没有 content-type 兜底的话客户端会拿到一个 200 空响应（chatOpenai 通路同有一条，两边都要有）
