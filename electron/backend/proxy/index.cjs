@@ -419,9 +419,15 @@ function register(ipcMain) {
       : { status: "disabled" });
     return ok({});
   }));
-  // 上游 v1.17.x 的 proxy_account_rename（账号重命名，name 字段走 WebDAV LWW 传播）在本合并里
-  // **故意不并注册体**：它一条命令要同时过「preload 白名单 == 主进程转发面 == 子进程 dispatch 表 ==
-  // parity 基线」四处对齐，那是三期 Task 1 的完整闭环；Task 0 只解结构冲突，收口标准是 parity 闸绿。
+  // 重命名账号（自定义备注）：改 name 字段，WebDAV 同步时 LWW 传播到其他设备
+  // （上游 v1.17 带来的命令，三期 Task 1 接线：随 register() 同源进 dispatchTable ⇒ 归子进程，
+  //   号池写权仍单一。name 参与 accountKeyOf 的身份键，重命名的同步后果见 poolsync.cjs:139）
+  ipcMain.handle("proxy_account_rename", handle(({ id, name }) => {
+    const acc = store.getAccount(id);
+    if (!acc) return fail("账号不存在");
+    store.updateAccount(id, { name: String(name || "").trim() });
+    return ok({});
+  }));
   // 手动解除冷却：cooling 账号立即回 online，同时豁免该账号的模型级负缓存
   ipcMain.handle("proxy_account_cool_off", handle(({ id }) => {
     const r = pool.releaseCool(String(id || ""));
@@ -644,10 +650,10 @@ function register(ipcMain) {
 
 // ===== 子进程侧的命令出口（二期 Task 3）=====
 
-// 表只在首次用到时构建一次，之后复用模块内缓存（每条命令重建一次 43 个闭包是纯浪费）
+// 表只在首次用到时构建一次，之后复用模块内缓存（每条命令重建一次全部闭包是纯浪费）
 let TABLE = null;
 
-/** 子进程侧：把 register() 的 ipcMain 换成收集器，43 条命令名与实现体一字不动地复用。
+/** 子进程侧：把 register() 的 ipcMain 换成收集器，register() 里每条命令名与实现体一字不动地复用。
  *  为什么这样而不是重构出 COMMANDS 表：那是 290 行的重排，会掩盖「二期只改出口、不改命令语义」这个契约，
  *  且 Task 5 的逐字相等闸（dev-gateway-forward-parity-test）就没法拿旧注册当基线。 */
 function dispatchTable() {
@@ -658,7 +664,7 @@ function dispatchTable() {
   return TABLE;
 }
 
-/** 走管道调一条命令。第一个参数是假的 _event：全仓 43 条处理体都不使用 event / event.sender
+/** 走管道调一条命令。第一个参数是假的 _event：全仓每条处理体都不使用 event / event.sender
  *  （逐条核过；真依赖 UI 的那 4 条靠 getShell() 的惰性 require 抛错，见 §5.7）。 */
 async function dispatch(cmd, args) {
   const fn = dispatchTable()[cmd];

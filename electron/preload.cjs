@@ -120,8 +120,9 @@ const ALLOWED_COMMANDS = new Set([
   "proxy_account_add",
   "proxy_account_remove",
   "proxy_account_toggle",
-  // proxy_account_rename 是上游 v1.17 带来的新命令，本任务故意不登记：它要一次过「preload 白名单
-  // == 主进程转发面 == 子进程 dispatch 表 == parity 基线」四处对齐，归三期 Task 1 的完整闭环。
+  // 上游 v1.17 带来的账号重命名：三期 Task 1 过完「preload 白名单 == 主进程转发面 == 子进程
+  // dispatch 表」三处对齐（闸：scripts/dev-gateway-forward-parity-test.cjs）。
+  "proxy_account_rename",
   "proxy_account_cool_off",
   "proxy_account_refresh",
   "proxy_credits_refresh",

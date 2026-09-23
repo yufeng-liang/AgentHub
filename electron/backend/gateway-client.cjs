@@ -1,8 +1,8 @@
 // 网关子进程的主进程侧监督器（二期 Task 3）+ 主进程注册面（二期 Task 5）。
 //
 // 职责：spawn / 认领 / 看门狗对端（父进程）/ 优雅停机等待 / 命令转发出口 / 事件扇出 /
-//       **43 条 proxy_* 命令的 ipcMain 注册面**（36 条纯转发 + 4 条 UI_LOCAL + 3 条薄包装）。
-// 业务实现体一条不在这里——43 条命令的实现体在 proxy/index.cjs，经这里的 call() 走管道下发；
+//       **全部 proxy_* 命令的 ipcMain 注册面**（44 条：37 条纯转发 + 4 条 UI_LOCAL + 3 条薄包装）。
+// 业务实现体一条不在这里——这些命令的实现体在 proxy/index.cjs，经这里的 call() 走管道下发；
 // 仅有的主进程本地逻辑：UI_LOCAL 四条（dialog/shell 的真 UI 依赖）与薄包装成功后的
 // restoreOnLaunch 写权（config.json 归主进程写，子进程永不写）。
 // 为什么主进程侧只 require store 的 proxyDir()：gateway.json 与日志的路径真相源必须与子进程写的
@@ -339,17 +339,18 @@ function state() {
   return { ...base, alive: pidAlive(base.pid), connected: !!(conn && conn.connected) };
 }
 
-// ===== 主进程注册面（二期 Task 5）：43 条 proxy_* 命令的 ipcMain 注册 =====
+// ===== 主进程注册面（二期 Task 5）：全部 proxy_* 命令的 ipcMain 注册（现 44 条） =====
 
 // 逐字相等闸的三个真相源之一（scripts/dev-gateway-forward-parity-test.cjs）：
-// ① preload.cjs ALLOWED_COMMANDS 的 proxy_* 全集 == ② git show main 一期基线 == ③ 这张名单。
+// ① preload.cjs ALLOWED_COMMANDS 的 proxy_* 全集 == ② git show main 一期基线 ∪ 上游用户面新增
+// == ③ 这张名单。
 // 名单在此处字面写死而不是从 index.cjs 的 dispatchTable 反推：反推要把整张 proxy 依赖图拉进
 // 主进程（§5.4 白做）。新增命令的工序是 preload + index.cjs 注册体 + 这张名单三处同改，闸会盯住漏改。
 const ALL_PROXY_CMDS = [
   "proxy_status", "proxy_start", "proxy_stop", "proxy_restart",
   "proxy_keys_list", "proxy_key_create", "proxy_key_update", "proxy_key_delete",
   "proxy_pool", "proxy_pool_strategy",
-  "proxy_account_add", "proxy_account_remove", "proxy_account_toggle", "proxy_account_cool_off",
+  "proxy_account_add", "proxy_account_remove", "proxy_account_toggle", "proxy_account_rename", "proxy_account_cool_off",
   "proxy_account_refresh", "proxy_credits_refresh", "proxy_credits_refresh_channel",
   "proxy_checkin_status", "proxy_checkin_run",
   "proxy_scan", "proxy_scan_import",
@@ -485,7 +486,7 @@ const UI_LOCAL_IMPL = {
   proxy_oauth_begin: oauthBeginCmd,
 };
 
-/** 注册主进程侧全部 43 条命令（ipc.cjs 唯一的网关注册入口；preload 白名单一字不动的对应面）。 */
+/** 注册主进程侧全部 proxy_* 命令（ipc.cjs 唯一的网关注册入口；与 preload 白名单一字不差的对应面）。 */
 function register(ipcMain) {
   for (const cmd of ALL_PROXY_CMDS) {
     const local = UI_LOCAL_IMPL[cmd];

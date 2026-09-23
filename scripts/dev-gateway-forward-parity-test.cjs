@@ -4,10 +4,12 @@
 // 所以四个来源必须逐字相等，不允许可用别名词形（逐字，不是集合同构的宽容比较之外再加拼写）：
 //   ① preload.cjs 的 ALLOWED_COMMANDS 里 proxy_* 全集（渲染层唯一入口）
 //   ② 一期基线：git show main:electron/backend/proxy/index.cjs 里的 43 个 ipcMain.handle 名
+//     （三期 Task 1 起另记「上游用户面新增」upstreamUserCmds：基线计数判据仍是 43 不变，
+//       但 ① 的比较对象是 ②∪upstreamUserCmds —— 渲染层新调用的命令必须同时过白名单与转发面）
 //   ③ 当前主进程注册面：gateway-client.register(收集器) 实际登记的命令名
-//     （= 36 条转发 + 4 条 UI_LOCAL + 3 条薄包装，Task 5 起主进程只从这里注册）
+//     （= 37 条转发 + 4 条 UI_LOCAL + 3 条薄包装，Task 5 起主进程只从这里注册）
 //   ④ 子进程 dispatchTable() 的键集（命令实现体真正的所在地）
-// 断言：①==②==③ 且 ④ ⊇ ②（子进程可以有多出来的 gateway_* 内建命令与两条内部辅助命令，
+// 断言：①==②∪上游新增==③ 且 ④ ⊇ ②（子进程可以有多出来的 gateway_* 内建命令与三条内部/新增命令，
 //       但不得少任何 proxy_*）；另钉两条归属结构证据：
 //   · ipc.cjs 不得再直连注册 proxy_*、不得再 require ./proxy/index.cjs（整张依赖图会被一条 require 拉回主进程）
 //   · main.cjs 不得再 require proxy 域（stats.db 子进程独占由此达成）
@@ -91,25 +93,35 @@ try {
 } catch (e) {
   check("④ dispatchTable() 可在纯 Node 收集", false, String((e && e.message) || e));
 }
-const newSubCmds = ["proxy_account_import_blob", "proxy_poolsync_password_changed"];
+const newSubCmds = ["proxy_account_import_blob", "proxy_poolsync_password_changed", "proxy_account_rename"];
+// 上游 v1.18.0 带来的「用户面」新命令：渲染层真会调用它 ⇒ 必须同时进 preload 白名单与主进程转发面。
+// 与 newSubCmds 的分工：那两条是子进程内部辅助半段（不过 preload，渲染层看不见，只进 ④ 的白名单），
+// proxy_account_rename 则是完整的一条命令面（①③④ 三处都要有它）。
+// ② 的「43 条」计数判据不动（它钉的是「用户已用过的行为」快照本身）；只在**比较**时并入这条新增，
+// 等价于把不变式从「① == ②」升级为「① == ② ∪ 上游用户面新增」——归因写在此处与提交信息里。
+const upstreamUserCmds = ["proxy_account_rename"];
 check("④ 子进程表含 proxy_account_import_blob（import_file 拆两段的子进程半段）",
   subKeys.includes("proxy_account_import_blob"),
   "主进程读完文件字节后没有可投的子命令 —— 文件导入仍是主进程直连实现或整段留在主进程");
 check("④ 子进程表含 proxy_poolsync_password_changed（webdav_shared_save 反向跨界的子进程半段）",
   subKeys.includes("proxy_poolsync_password_changed"),
   "主进程仍在直接 require poolsync 写子进程独占的 sync-state.json");
+check("④ 子进程表含 proxy_account_rename（上游 v1.18.0 账号重命名，写号池故必须归子进程）",
+  subKeys.includes("proxy_account_rename"),
+  "重命名走主进程直连 = stats.db/sync-state.json 出现第二个写者，二期 §5.4 单一写者被破");
 const subExtra = diff(nameSet(subKeys), nameSet(fromBaseline));
 const EXTRA_WHITELIST = new Set(["gateway_echo", "gateway_shutdown", ...newSubCmds]);
-check("④ 子进程多出来的键都在白名单内（gateway_* 内建 + 两条内部辅助命令）",
+check("④ 子进程多出来的键都在白名单内（gateway_* 内建 + 内部辅助半段 + 上游用户面新增）",
   subExtra.every((n) => EXTRA_WHITELIST.has(n)),
   "多出白名单外的键：" + subExtra.filter((n) => !EXTRA_WHITELIST.has(n)).join(", "));
 
-console.log("断言：①==②==③ 且 ④ ⊇ ②");
-check("① == ②（preload 白名单与一期基线逐字相等）",
-  fromPreload.length === fromBaseline.length && diff(nameSet(fromPreload), nameSet(fromBaseline)).length === 0
-  && diff(nameSet(fromBaseline), nameSet(fromPreload)).length === 0,
-  "preload 有基线没有：" + diff(nameSet(fromPreload), nameSet(fromBaseline)).join(", ")
-  + "；基线有 preload 没有：" + diff(nameSet(fromBaseline), nameSet(fromPreload)).join(", "));
+console.log("断言：①==②∪上游新增==③ 且 ④ ⊇ ②");
+const fromBaselineUnionUpstream = new Set([...fromBaseline, ...upstreamUserCmds]);
+check("① == ② ∪ 上游用户面新增（preload 白名单与「一期基线 ∪ upstreamUserCmds」逐字相等）",
+  fromPreload.length === fromBaselineUnionUpstream.size && diff(nameSet(fromPreload), fromBaselineUnionUpstream).length === 0
+  && diff(fromBaselineUnionUpstream, nameSet(fromPreload)).length === 0,
+  "preload 有基线没有：" + diff(nameSet(fromPreload), fromBaselineUnionUpstream).join(", ")
+  + "；基线/上游新增有 preload 没有：" + diff(fromBaselineUnionUpstream, nameSet(fromPreload)).join(", "));
 check("① == ③（主进程注册面与渲染层白名单逐字相等）", mainRegistered
   && fromPreload.length === fromMain.length
   && diff(nameSet(fromPreload), nameSet(fromMain)).length === 0
@@ -148,4 +160,4 @@ if (failures.length) {
   console.log(`FAIL 代理命令名逐字相等闸未过（${failures.length} 条红）：\n  - ` + failures.join("\n  - "));
   process.exit(1);
 }
-console.log("OK 代理命令名四处逐字相等（①preload == ②main基线 == ③主进程注册面，④子进程表 ⊇ ②）+ 归属结构证据齐");
+console.log("OK 代理命令名四处逐字相等（①preload == ②main基线∪上游用户面新增 == ③主进程注册面，④子进程表 ⊇ ②）+ 归属结构证据齐");
