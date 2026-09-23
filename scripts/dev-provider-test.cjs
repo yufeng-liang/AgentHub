@@ -118,6 +118,62 @@ store.deleteProvider("bad2");
 const h = adapters.get("relay").headers({ token: "sk-abc" });
 ok("鉴权头由 Key 生成", h.authorization === "Bearer sk-abc", h);
 
+console.log("\n模型别名与思考档位（逐模型元数据）:");
+provider.update("relay", {
+  models: [{
+    model: "gpt-4o", upstream: "gpt-4o-2024-11-20", aliases: ["4o", "gpt4o-fast"],
+    reasoning: { supportedEfforts: ["medium", "high"], defaultEffort: "high" },
+    contextLength: 128000, maxOutputTokens: 4096,
+  }, "glm-4.6"],
+});
+const ad2 = adapters.get("relay");
+ok("别名（带前缀）解析到同一上游真名", ad2.upstreamFor("relay/4o") === "gpt-4o-2024-11-20", ad2.upstreamFor("relay/4o"));
+ok("别名（裸名）同样解析", ad2.upstreamFor("4o") === "gpt-4o-2024-11-20", ad2.upstreamFor("4o"));
+ok("原名仍是入口（别名是加法不是替换）", ad2.upstreamFor("relay/gpt-4o") === "gpt-4o-2024-11-20");
+ok("别名不进 /v1/models，原名进", (() => {
+  const ids = adapters.mergedModels().map((m) => m.id);
+  return ids.includes("relay/gpt-4o") && !ids.includes("relay/4o") && !ids.includes("relay/gpt4o-fast");
+})(), adapters.mergedModels().map((m) => m.id).filter((x) => x.startsWith("relay/")));
+ok("裸别名唯一命中该提供商", provider.findUniqueByBareModel("4o") === "relay", provider.findUniqueByBareModel("4o"));
+ok("别名不遮蔽内置同名模型（裸名仍归内置）", (() => {
+  // 内置模型名从目录里现取，不硬编码：catalog.json 是会被 proxy_models_sync 覆盖的规则文件
+  const builtinName = (adapters.mergedModels().find((m) => (m.sources || []).length && !m.id.includes("/")) || {}).id;
+  if (!builtinName) return false;
+  provider.update("relay", { models: [{ model: "gpt-4o", aliases: [builtinName] }] });
+  return adapters.modelOwners(builtinName).length > 0 && provider.findUniqueByBareModel(builtinName) === null;
+})(), adapters.mergedModels().slice(0, 3).map((m) => m.id));
+provider.update("relay", {
+  models: [{ model: "gpt-4o", upstream: "gpt-4o-2024-11-20", aliases: ["4o"], reasoning: { supportedEfforts: ["medium", "high"], defaultEffort: "high" } }],
+});
+const adAlias = adapters.get("relay");
+ok("档位不在支持集时按模型声明降级", adAlias.rewriteBody("relay/4o", { model: "relay/4o", messages: [], reasoning_effort: "low" }).reasoning_effort === "medium", adAlias.rewriteBody("relay/4o", { model: "relay/4o", messages: [], reasoning_effort: "low" }).reasoning_effort);
+ok("档位已在支持集内则原样透传", adAlias.rewriteBody("relay/4o", { model: "relay/4o", messages: [], reasoning_effort: "high" }).reasoning_effort === "high");
+ok("没声明档位的模型不被动 effort", adAlias.rewriteBody("relay/glm-4.6", { model: "relay/glm-4.6", messages: [], reasoning_effort: "low" }).reasoning_effort === "low");
+ok("元数据带进目录展示", (() => {
+  provider.update("relay", { models: [{ model: "gpt-4o", contextLength: 128000, maxOutputTokens: 4096, capabilities: { images: true } }] });
+  const m = adapters.mergedModels().find((x) => x.id === "relay/gpt-4o") || {};
+  return m.contextLength === 128000 && m.maxOutputTokens === 4096 && m.capabilities.images === true;
+})(), adapters.mergedModels().find((x) => x.id === "relay/gpt-4o"));
+ok("别名撞本提供商另一个模型被拒", !provider.update("relay", { models: [{ model: "a1" }, { model: "b1", aliases: ["a1"] }] }).ok, provider.update("relay", { models: [{ model: "a1" }, { model: "b1", aliases: ["a1"] }] }).message);
+ok("两个模型共用同一别名也被拒", !provider.update("relay", { models: [{ model: "a1", aliases: ["x"] }, { model: "b1", aliases: ["x"] }] }).ok);
+ok("别名含 / 被拒", !provider.update("relay", { models: [{ model: "a1", aliases: ["a/b"] }] }).ok);
+ok("别名等于模型名（含大小写差异）被静默丢弃", (() => {
+  const r = provider.update("relay", { models: [{ model: "a1", aliases: ["A1", "a1 "] }] });
+  const m = ((r.provider && r.provider.models) || []).find((x) => x.model === "a1") || {};
+  return r.ok === true && !m.aliases;
+})(), JSON.stringify(((provider.update("relay", { models: [{ model: "a1", aliases: ["A1", "a1 "] }] }).provider || {}).models) || []));
+ok("trim 后的合法别名保留（空串与自身才算重复）", (() => {
+  const r = provider.update("relay", { models: [{ model: "a1", aliases: [" ok ", ""] }] });
+  const m = ((r.provider && r.provider.models) || []).find((x) => x.model === "a1") || {};
+  return JSON.stringify(m.aliases) === '["ok"]';
+})(), JSON.stringify(((provider.update("relay", { models: [{ model: "a1", aliases: [" ok ", ""] }] }).provider || {}).models) || []));
+ok("非法档位词被丢掉而不是存进去", (() => {
+  const r = provider.update("relay", { models: [{ model: "a1", reasoning: { supportedEfforts: ["turbo", "high"], defaultEffort: "turbo" } }] });
+  const m = (r.provider && r.provider.models || []).find((x) => x.model === "a1") || {};
+  return JSON.stringify((m.reasoning || {}).supportedEfforts) === '["high"]' && !m.reasoning.defaultEffort;
+})(), JSON.stringify(((((provider.update("relay", { models: [{ model: "a1", reasoning: { supportedEfforts: ["turbo", "high"], defaultEffort: "turbo" } }] })).provider) || {}).models) || []));
+provider.update("relay", { models: [{ model: "gpt-4o", upstream: "gpt-4o-2024-11-20" }, "glm-4.6"] });
+
 console.log("\n适配器缺省项（号池语义不被污染的前提）:");
 ok("不定义 queryCredits", typeof adapters.get("relay").queryCredits !== "undefined" ? false : true, typeof adapters.get("relay").queryCredits);
 ok("内置渠道仍查得到适配器", !!adapters.get("raccoon") && !!adapters.get("trae"));
@@ -246,7 +302,7 @@ const call = async (base, secret, model, stream) => {
   const UP = 19532;
   const GW = 19531;
   const { fake, seen } = await startFakeUpstream(UP);
-  const created = provider.create({ id: "myprov", baseUrl: `http://127.0.0.1:${UP}/v1`, display: "假中转", models: [{ model: "gpt-4o", upstream: "gpt-4o-2024-11-20" }] });
+  const created = provider.create({ id: "myprov", baseUrl: `http://127.0.0.1:${UP}/v1`, display: "假中转", models: [{ model: "gpt-4o", upstream: "gpt-4o-2024-11-20" }, { model: "gpt-4o-mini", upstream: "gpt-4o-mini-2024-07-18", aliases: ["4o-mini"] }] });
   ok("提供商创建成功", created.ok === true, created);
   provider.addKey("myprov", { name: "限速的那把", key: "sk-key-one" });
   provider.addKey("myprov", { name: "好的那把", key: "sk-key-two" });
@@ -305,6 +361,15 @@ const call = async (base, secret, model, stream) => {
   const models = await (await fetch(base + "/v1/models")).json();
   ok("/v1/models 列出 myprov/gpt-4o", models.data.some((m) => m.id === "myprov/gpt-4o"));
   ok("/v1/models 不列裸 gpt-4o", !models.data.some((m) => m.id === "gpt-4o"));
+  ok("/v1/models 不列别名", !models.data.some((m) => /mini-alias/.test(m.id)), models.data.map((m) => m.id).filter((x) => x.startsWith("myprov/")));
+
+  // 别名走完整链路：客户端用别名 → 前缀路由命中 → 上游收到的是该条目的真名。
+  // 只测 upstreamFor 的单测守不住这条，因为路由与映射分处两个模块。
+  const beforeA = seen.length;
+  const rA = await call(base, gwKey.secret, "myprov/4o-mini", false);
+  const mineA = seen.slice(beforeA);
+  ok("客户端用别名请求成功", rA.status === 200, [rA.status, rA.text.slice(0, 160)]);
+  ok("别名请求转成上游真名", mineA.some((x) => x.model === "gpt-4o-mini-2024-07-18"), mineA.map((x) => x.model));
 
   const usage = store.statsDetail({ page: 1, pageSize: 50, channel: "myprov" });
   ok("流水按渠道可查", usage.total >= 4, usage.total);

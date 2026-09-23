@@ -481,6 +481,13 @@ function register(ipcMain) {
   // 拉取失败不写空——保留旧目录，面板报错由用户重试
   ipcMain.handle("proxy_models_sync", handle(async ({ channel }) => {
     const ch = String(channel || "");
+    // 只服务内置渠道：它的落点是 rules/catalog.json（内置渠道的元数据本来就在里面），
+    // 提供商的清单归 models_json、由提供商页自己拉。放过来会把提供商的模型写进内置目录，
+    // 而且内置适配器签名是 fetchModels(account, secrets)、compat 是 fetchModels(secrets)，
+    // 这里统一按内置签名调用，提供商渠道会拿到一个 undefined 的 Key——两条都是静默错。
+    if (!store.isBuiltinChannel(ch)) {
+      return fail("自定义提供商的模型清单请在「提供商」页的模型列表里拉取与勾选");
+    }
     const adapter = adapters.get(ch);
     if (!adapter || typeof adapter.fetchModels !== "function") return fail(`未知渠道 "${ch}"`);
     const acc = pool.poolAccounts(ch).find((a) => a.status === "online" && a.hasToken);

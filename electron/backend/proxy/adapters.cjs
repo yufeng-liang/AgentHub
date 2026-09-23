@@ -1711,7 +1711,25 @@ function compatUrl(base, leaf) {
 function makeOpenaiCompat(row) {
   const entries = compatModelEntries(row);
   const chatUrl = compatUrl(row.baseUrl, "chat/completions");
-  const upstreamByClient = new Map(entries.map((e) => [e.client.toLowerCase(), e.upstream]));
+  // 客户端名 → 上游真名 / → 条目。别名与模型名同等参与解析（别名不进 /v1/models，
+  // 但客户端拿它发请求必须能命中），所以两张表都要把 aliases 铺进去。
+  const upstreamByClient = new Map();
+  const entryByClient = new Map();
+  for (const e of entries) {
+    upstreamByClient.set(e.client.toLowerCase(), e.upstream);
+    entryByClient.set(e.client.toLowerCase(), e);
+    for (const a of (e.entry && Array.isArray(e.entry.aliases) ? e.entry.aliases : [])) {
+      const k = String(a || "").toLowerCase();
+      if (!k) continue;
+      upstreamByClient.set(k, e.upstream);
+      entryByClient.set(k, e);
+    }
+  }
+  /** 剥掉自家的 `slug/` 前缀（那是路由信息，上游听不懂） */
+  const stripPrefix = (clientModel) => {
+    const s = String(clientModel || "");
+    return s.slice(0, row.id.length + 1).toLowerCase() === `${row.id}/`.toLowerCase() ? s.slice(row.id.length + 1) : s;
+  };
   return {
     /** 提供商没有 rules/headers.json 那套 UA/指纹伪装：头 = 标准 JSON + Bearer + 用户自定义覆盖 */
     headers(secrets) {
@@ -1724,13 +1742,17 @@ function makeOpenaiCompat(row) {
       return h;
     },
 
-    /** 客户端模型名 → 上游真名：先剥自家的 `slug/` 前缀（那是路由信息，上游听不懂），
-     *  再查条目配的 upstream 别名。目录外模型原样透传：用户显式点名了提供商，而中转站实际开放的
+    /** 客户端模型名 → 上游真名：先剥自家的 `slug/` 前缀，再查条目配的 upstream（模型名与别名同表）。
+     *  目录外模型原样透传：用户显式点名了提供商，而中转站实际开放的
      *  模型常常领先于它的清单（内置渠道同款"透传试错"语义）。 */
     upstreamFor(clientModel) {
-      let s = String(clientModel || "");
-      if (s.slice(0, row.id.length + 1).toLowerCase() === `${row.id}/`.toLowerCase()) s = s.slice(row.id.length + 1);
+      const s = stripPrefix(clientModel);
       return upstreamByClient.get(s.toLowerCase()) || s;
+    },
+
+    /** 客户端模型名（或别名）→ 该条目的元数据；查不到回 null，调用方按"无目录元数据"处理 */
+    entryFor(clientModel) {
+      return entryByClient.get(stripPrefix(clientModel).toLowerCase()) || null;
     },
 
     models() {
@@ -1768,6 +1790,10 @@ function makeOpenaiCompat(row) {
       out.stream = true; // 一律流式打上游，非流式由 server 侧 Aggregator 本地聚合（见 chat() 注释）
       if (!isPlainObj(out.stream_options)) out.stream_options = {};
       out.stream_options.include_usage = true;
+      // 思考档位按该模型声明的支持集降级（与内置渠道同一个 util，档位词表也同源）：
+      // 客户端要 low 而上游只有 medium/high 时，透传过去是一个 400，降级才可用
+      const entry = this.entryFor(model);
+      util.normalizeReasoningEffort(out, entry && entry.entry && entry.entry.reasoning);
       // 网关自己注入的内部字段，上游不认（raccoon 同款剔除清单）
       delete out.conversation_id;
       delete out.conversationId;

@@ -145,6 +145,8 @@ function injectThinking(obj, defaultEffort) {
 }
 
 const EFFORT_RANK = { off: 0, minimal: 1, low: 2, medium: 3, high: 4, xhigh: 5, max: 6 };
+// 档位词表的唯一出处：提供商侧配置要校验用户填的档位，必须用同一份而不是再抄一个字面量数组
+const EFFORT_LEVELS = Object.keys(EFFORT_RANK);
 
 /** reasoning_effort 档位降级（参考项目 normalizeReasoningEffort）：模型目录声明 supportedEfforts
  *  时按其收敛——请求档不在支持集则降到 ≤ 请求档的最高支持档；支持档全高于请求档取最低档。 */
@@ -370,6 +372,6 @@ function estimateTokens(text) {
 module.exports = {
   uuid, traceId, jwtDecode, dig, toMs,
   isCompleteJson, parseRetryAfterHeaders, stableConvId, promptCacheKey,
-  isDeepSeekModel, injectThinking, normalizeReasoningEffort, backfillReasoningContent,
+  isDeepSeekModel, injectThinking, normalizeReasoningEffort, backfillReasoningContent, EFFORT_LEVELS,
   SseScanner, stripEmptyDelta, hasConsumableDelta, chunk, DONE, Aggregator, openaiError, validateChatBody, estimateTokens,
 };
