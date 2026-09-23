@@ -78,7 +78,7 @@ cat /d/merge-conflicts.txt
 
 统一判据：**功能体在网关子进程侧的一律保留我们的结构，上游的实现内容往里并；主进程侧读用的以 upstream 为准。**
 
-**禁止** `git checkout --ours/--theirs <file>` 这类整文件取一侧的捷径——Task 0 实际执行时证实：`adapters.cjs`（上游 +95 会话头修复）、`discovery.cjs`（上游 +106）会被这种命令**整片丢掉**，而多数文件 Git 已能正确自动合并。逐个文件按下面规则解，解完必须自证：
+**禁止** `git checkout --ours/--theirs <file>` 这类整文件取一侧的捷径——Task 0 实际执行时证实：无冲突的文件上跑它等于用一侧**整片覆盖**另一侧（`--theirs` 丢我们那侧、`--ours` 丢上游那侧），而多数文件 Git 已能正确自动合并。逐个文件按下面规则解，解完必须自证：
 
 - **(a) proxy 域两侧都改**（`proxy/index.cjs`、`server.cjs`、`store.cjs`、`pool.cjs`、`util.cjs`、`ccswitch.cjs`、`poolsync.cjs`）：保留我们的注册结构，把上游的实现体并进来。上游新命令的**注册体不在本 Task 接线**（`proxy_account_rename` 归 Task 1 一次改齐三处）；若自动合并把它塞进了 `index.cjs`，删掉并留一行注释说明「Task 1 接线」，否则 parity 闸必红。
 - **(b) `electron/backend/config.cjs`：六个 hunk 全部取我们的**（上游那六处是 secretbox 回退、schedule 缺三字段、原子写回退、`applyAutoStart` 旧版）。自证用 `git diff <BASE> HEAD -- electron/backend/config.cjs` 应为**空**，再跑 `node scripts/dev-write-ownership-test.cjs`（它钉原子写与句柄归属）。
