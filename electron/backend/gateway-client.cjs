@@ -405,7 +405,7 @@ async function ensureStarted() {
   return start({ persistent: persistentFlag() });
 }
 
-/** 纯转发体（36 条命令共用，含 proxy_status / proxy_vault_status 两条规格漏判的）。
+/** 纯转发体（除 UI_LOCAL 与薄包装外的命令共用，含 proxy_status / proxy_vault_status 两条规格漏判的）。
  *  失败一律收成 {ok:false, message}（与一期 handle() 的形状一致，渲染层不拿 rejected promise）；
  *  错文保留 notRetried 的「不会自动重放…」后缀供排障，但这里**绝不重发**——非幂等读
  *  （proxy_pool / proxy_status 派生复活要回写库）与写操作的重放风险见 gateway-pipe.cjs 文件头。 */
