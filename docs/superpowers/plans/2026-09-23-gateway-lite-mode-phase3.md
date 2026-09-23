@@ -78,23 +78,20 @@ cat /d/merge-conflicts.txt
 
 统一判据：**功能体在网关子进程侧的一律保留我们的结构，上游的实现内容往里并；主进程侧读用的以 upstream 为准。**
 
-```bash
-# (a) proxy 域：上游的 handler 体改动落在 register()/dispatchTable() 同一份实现里，
-#     我们的改动是「把注册面挪进 gateway-client」的结构改动 → 结构留我们的、体留上游的。
-git checkout --theirs electron/backend/proxy/adapters.cjs electron/backend/proxy/discovery.cjs
-git checkout --ours   electron/backend/proxy/index.cjs   # 再手工把上游新增体并进来（Task 1 完成对齐）
-# (b) 两侧都改、且我们改得更深的：手工逐 hunk，保我们的架构 + 并上游的新增
-#     store.cjs(+21/−123)、server.cjs(+12/−67)、config.cjs(+26/−81)、preload.cjs(+2)、package.json(+3/−17)
-# (c) 其余按 git status 提示逐个解
-```
+**禁止** `git checkout --ours/--theirs <file>` 这类整文件取一侧的捷径——Task 0 实际执行时证实：`adapters.cjs`（上游 +95 会话头修复）、`discovery.cjs`（上游 +106）会被这种命令**整片丢掉**，而多数文件 Git 已能正确自动合并。逐个文件按下面规则解，解完必须自证：
 
-`electron/backend/config.cjs` 的 6 个 hunk 全部**取我们的**（规格 §四 表已注：上游那 6 处分别是 secretbox 回退、schedule 缺三字段、原子写回退、`applyAutoStart` 旧版），解完必须能查到这些标记还在：
+- **(a) proxy 域两侧都改**（`proxy/index.cjs`、`server.cjs`、`store.cjs`、`pool.cjs`、`util.cjs`、`ccswitch.cjs`、`poolsync.cjs`）：保留我们的注册结构，把上游的实现体并进来。上游新命令的**注册体不在本 Task 接线**（`proxy_account_rename` 归 Task 1 一次改齐三处）；若自动合并把它塞进了 `index.cjs`，删掉并留一行注释说明「Task 1 接线」，否则 parity 闸必红。
+- **(b) `electron/backend/config.cjs`：六个 hunk 全部取我们的**（上游那六处是 secretbox 回退、schedule 缺三字段、原子写回退、`applyAutoStart` 旧版）。自证用 `git diff <BASE> HEAD -- electron/backend/config.cjs` 应为**空**，再跑 `node scripts/dev-write-ownership-test.cjs`（它钉原子写与句柄归属）。
+- **(c) 上游独有、我们未碰**（`adapters.cjs`、`discovery.cjs`、`db.cjs`、`adapter-mimo*`、`Heatmap.vue` 等）：取自动合并结果，不手工干预。
+- **(d) `package.json`**：版本与 deps 取上游，我们的 `build.extraFiles` / `allowScripts` 块保留。
+
+解完逐条自证（替代原 grep 字面量计数，那条在本仓恒为 0——我们的原子写用模板字面量 `` `${p}.${process.pid}.tmp` ``，不是 `"-" + process.pid`）：
 
 ```bash
-grep -c "secretbox\|decryptSecretLenient\|RUN_KEY\|regExePath\|p + \"-\" + process.pid" electron/backend/config.cjs
+git diff c3f8538 HEAD -- electron/backend/config.cjs | wc -l      # 期望 0
+grep -c "RUN_KEY\|regExePath\|secretbox\|decryptSecretLenient" electron/backend/config.cjs   # 期望 ≥4
+node scripts/dev-gateway-forward-parity-test.cjs | tail -2        # 期望 OK（三处仍自洽在 43 条）
 ```
-
-期望：≥ 5（任一为 0 就说明那个 hunk 被上游版本盖掉了）。
 
 - [ ] **Step 4: 确认「两侧都往 PRAGMA 伸手」没叠成互斥（规格 R3）**
 
