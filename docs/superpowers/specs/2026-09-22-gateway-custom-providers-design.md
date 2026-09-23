@@ -169,10 +169,13 @@ one-api 的 `Type` int 全局枚举 + switch 工厂（桌面端不需要 60 种�
 | `/v1/responses` 流式 / 非流式 | 通过 | 完整事件序（created → reasoning item → message item → completed），`encrypted_content` 键在 |
 | 裸名路由 `allowBareProviderModel` | 通过 | 裸 `deepseek-v4-flash-0731` 命中提供商 |
 | **Claude Code 真客户端** | 通过 | `claude -p` 单轮返回；**带 Read 工具的两轮回环**读到并复述了标记文件内容 |
-| **Codex CLI 真客户端** | 文本路径通过 | `wire_api="responses"` 直连，正常收束，无 `stream closed before response.completed` |
-| Codex 工具回环 | **部分** | 模型确实连续发出 `cat` / `Get-Content` / `ls` / 写文件等 function_call，Codex 全部解析并进入下一轮（41k tokens 多轮迭代）；但**执行被 Codex 自己的沙箱拦下**（`CODEX_HOME` 在 `%TEMP%` 时它拒绝安装沙箱辅助程序，退成 read-only + approval never）。协议侧无错误，缺的是"一次真执行成功"的最后一格 |
+| **Codex CLI 真客户端** | 通过 | `wire_api="responses"` 直连，正常收束，无 `stream closed before response.completed` |
+| Codex 工具回环 | 通过 | 模型发出 `echo … > 文件` 的 function_call，Codex 真执行（退出码 0），`function_call_output` 回投后模型复述结果，32k tokens 多轮 |
 
-补这最后一格需要二选一：用你真实的 `~/.codex`（会写它的会话日志），或放开沙箱等级（等于让第三方中转站的模型在你机器上执行命令）。两者都不该我替你决定，所以留着。
+Codex 这一格第一次跑没成：`CODEX_HOME` 放在 `%TEMP%` 时它拒绝安装沙箱辅助程序，退成 read-only +
+approval never，所有 exec 被**它自己的策略**拦下（协议侧无错，模型连发 `cat`/`Get-Content`/`ls` 都被拒）。
+改用真实 `~/.codex`（经用户同意；只写它的会话历史，`config.toml` 未动，参数全走 `-c` 覆盖）后即通过。
+探针文件跑完已删。
 
 **真机一次就抓到两条假上游抓不到的缺陷**（详见 `f453576`）：
 
