@@ -16,7 +16,13 @@ const filter = ref("");
 const activeTab = ref(""); // "" = 全部
 
 // 渠道候选 = 号池当前渠道（渠道后续扩充时自动跟进，不写死）
-const channels = ref<{ id: string; display: string }[]>([]);
+// kind 决定这一页能对它做什么：内置渠道的元数据在 rules/catalog.json（本页可拉取），
+// 自定义提供商的清单在 agents.models_json（只有「提供商」页能编辑）
+const channels = ref<{ id: string; display: string; kind?: string }[]>([]);
+// 正向判内置，缺 kind 视为内置（浏览器预览的 mock 数据就没带这个字段）
+const isBuiltinChannel = (c: { kind?: string }) => !c.kind || c.kind === "builtin";
+const builtinChannels = computed(() => channels.value.filter(isBuiltinChannel));
+const activeIsBuiltin = computed(() => !activeTab.value || isBuiltinChannel(channels.value.find((c) => c.id === activeTab.value) || {}));
 const CHANNEL_OPTIONS = computed<{ value: "" | ProxyChannelId; label: string }[]>(() => [
   { value: "", label: "自动（打分）" },
   ...channels.value.map((c) => ({ value: c.id as ProxyChannelId, label: c.display })),
@@ -122,16 +128,19 @@ async function syncCatalog(channel: string) {
   }
 }
 
-/** 全部渠道并发拉取：逐渠道汇总结果，部分失败不拖垮整体 */
+/** 内置渠道并发拉取：逐渠道汇总结果，部分失败不拖垮整体。
+ *  刻意不含自定义提供商——它们的清单由「提供商」页写进 models_json，
+ *  这条通道落的是 rules/catalog.json，混在一起会把提供商的模型灌进内置目录。 */
 async function syncAll() {
   if (syncing.value) return;
   syncing.value = "__all__";
+  const targets = builtinChannels.value;
   try {
-    const results = await Promise.all(channels.value.map((c) => api.proxyModelsSync(c.id).catch((e) => ({ ok: false as const, message: String((e as Error).message || e) }))));
+    const results = await Promise.all(targets.map((c) => api.proxyModelsSync(c.id).catch((e) => ({ ok: false as const, message: String((e as Error).message || e) }))));
     const okParts: string[] = [];
     const failParts: string[] = [];
     results.forEach((r, i) => {
-      const name = channelName(channels.value[i].id);
+      const name = channelName(targets[i].id);
       if (r && r.ok !== false) okParts.push(`${name} ${r.count ?? 0} 个`);
       else failParts.push(`${name}：${(r && r.message) || "失败"}`);
     });
@@ -174,9 +183,10 @@ onMounted(refresh);
             <input v-model="filter" class="search-input" placeholder="搜索模型" spellcheck="false" />
             <button v-if="filter" class="search-clear" title="清空搜索" @click.prevent="filter = ''"><i class="ph ph-x"></i></button>
           </label>
-          <button v-if="activeTab" class="btn btn-cta" :disabled="!!syncing" @click="syncCatalog(activeTab)">
+          <button v-if="activeTab && activeIsBuiltin" class="btn btn-cta" :disabled="!!syncing" @click="syncCatalog(activeTab)">
             <i class="ph ph-cloud-arrow-down"></i>{{ syncing === activeTab ? "拉取中…" : "拉取模型" }}
           </button>
+          <span v-else-if="activeTab" class="set-desc tab-hint">自定义提供商的模型清单请在「提供商」页编辑（这一页只管启用/别名/覆盖）</span>
           <button v-else class="btn btn-cta" :disabled="!!syncing" @click="syncAll">
             <i class="ph ph-cloud-arrow-down"></i>{{ syncing === "__all__" ? "拉取中…" : "全部拉取" }}
           </button>
@@ -337,6 +347,11 @@ onMounted(refresh);
   outline-offset: 1px;
 }
 /* 搜索框：图标 + 无框输入 + 快捷清空；聚焦时整框点亮主色并给图标染色 */
+/* 提供商 tab 上不放拉取按钮：它的清单归「提供商」页，这里只给一句去处 */
+.tab-hint {
+  align-self: center;
+  color: var(--text-3);
+}
 .search-box {
   display: inline-flex;
   align-items: center;

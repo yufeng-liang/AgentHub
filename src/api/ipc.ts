@@ -288,8 +288,10 @@ export const proxyProviderAddKey = (id: string, key: string, name?: string) =>
 export const proxyProviderRemoveKey = (accountId: string) =>
   call<{ ok: boolean; message?: string }>("proxy_provider_remove_key", { accountId });
 /** 用表单里当场填的地址 + Key 发一次真实最小请求（会产生上游计费，UI 已提示）。
- *  key 与 accountId 二选一：编辑态不重填 Key 时按号池账号 id 让主进程自己解密，明文不出主进程。 */
-export const proxyProviderTest = (input: { id?: string; accountId?: string; baseUrl: string; key: string; model: string; extraHeaders?: Record<string, string>; extraBody?: Record<string, unknown> }) =>
+ *  key 与 accountId 二选一：编辑态不重填 Key 时按号池账号 id 让主进程自己解密，明文不出主进程。
+ *  kind 决定探的是 /v1/chat/completions 还是 /v1/messages——不传就按 OpenAI 形态探，
+ *  对 Anthropic 形态的站会得到一个"看起来不通"的假失败。 */
+export const proxyProviderTest = (input: { id?: string; accountId?: string; baseUrl: string; key: string; model: string; kind?: ProxyProviderKind; extraHeaders?: Record<string, string>; extraBody?: Record<string, unknown> }) =>
   call<ProxyProviderTestResult>("proxy_provider_test", input as unknown as Record<string, unknown>);
 /** 拉上游 /models：用该提供商号池里的 Key，因此必须先存过一次 Key */
 export const proxyProviderFetchModels = (id: string) =>

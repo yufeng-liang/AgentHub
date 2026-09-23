@@ -596,8 +596,16 @@ export const mock = {
         return { ok: true, id: "k-" + Date.now() };
       case "proxy_provider_remove_key":
         return { ok: true };
-      case "proxy_provider_test":
-        return { ok: false, message: "浏览器预览不代打上游，请在应用内测试" };
+      case "proxy_provider_test": {
+        // 浏览器预览不代打上游，但要能演出两种结果态：清单里有的模型算"可用"，其余回失败文案，
+        // 否则逐行测试这条 UI 在 dev:web 里永远只能看到一种样子
+        const m = String(args?.model || "");
+        const known = MOCK_PROVIDERS.find((p) => p.id === args?.id);
+        const inList = (known?.models || []).some((x) => (typeof x === "string" ? x : (x as { model: string }).model) === m);
+        return inList
+          ? { ok: true, ms: 640 + m.length * 7, model: m, sample: "（预览态假响应）收到", finishReason: "stop", usage: { prompt_tokens: 12, completion_tokens: 3, total_tokens: 15 } }
+          : { ok: false, message: "浏览器预览不代打上游，请在应用内测试" };
+      }
       case "proxy_provider_fetch_models":
         return { ok: true, models: ["gpt-4o", "gpt-4o-mini", "o3-pro"] };
       case "webdav_shared_get":

@@ -403,12 +403,19 @@ export type ProxyProviderModel = string | {
   model: string;
   /** 上游真实模型名，缺省 = model。`slug/model` 路由时发给上游的是这个 */
   upstream?: string;
+  /** 额外的可请求名：原名与别名都能命中同一上游模型，但别名不出现在 /v1/models */
+  aliases?: string[];
+  /** 思考档位声明。supportedEfforts 决定客户端要的档位能否原样透传，不支持时按此降级 */
+  reasoning?: { supportedEfforts?: string[]; defaultEffort?: string };
   name?: string;
   rate?: number;
   capabilities?: Record<string, boolean | string | number>;
   contextLength?: number;
   maxOutputTokens?: number;
 };
+
+/** 提供商条目（模型表按对象处理；字符串简写只在读侧兼容，写侧一律展开成对象） */
+export type ProxyProviderModelRow = Exclude<ProxyProviderModel, string>;
 
 export interface ProxyProvider {
   /** 路由前缀，创建后不可改（accounts.channel 以它为键） */

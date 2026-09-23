@@ -12,6 +12,7 @@ const store = require("../electron/backend/proxy/store.cjs");
 const pool = require("../electron/backend/proxy/pool.cjs");
 const adapters = require("../electron/backend/proxy/adapters.cjs");
 const provider = require("../electron/backend/proxy/provider.cjs");
+const util = require("../electron/backend/proxy/util.cjs");
 const credits = require("../electron/backend/proxy/credits.cjs");
 const config = require("../electron/backend/config.cjs");
 
@@ -172,6 +173,15 @@ ok("非法档位词被丢掉而不是存进去", (() => {
   const m = (r.provider && r.provider.models || []).find((x) => x.model === "a1") || {};
   return JSON.stringify((m.reasoning || {}).supportedEfforts) === '["high"]' && !m.reasoning.defaultEffort;
 })(), JSON.stringify(((((provider.update("relay", { models: [{ model: "a1", reasoning: { supportedEfforts: ["turbo", "high"], defaultEffort: "turbo" } }] })).provider) || {}).models) || []));
+// 提供商页的下拉里那份档位表是前端抄的，后端词表改了它不会编译失败——只能靠这条断言拦住
+ok("前端档位词表与 util.EFFORT_LEVELS 同源", (() => {
+  const fs = require("node:fs");
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "src/views/proxy/ProxyProvidersView.vue"), "utf8");
+  const m = /const EFFORT_LEVELS = \[([^\]]*)\]/.exec(src);
+  if (!m) return false;
+  const fe = m[1].split(",").map((x) => String(x).trim().replace(/^["']|["']$/g, "")).filter(Boolean);
+  return JSON.stringify(fe) === JSON.stringify(util.EFFORT_LEVELS);
+})(), util.EFFORT_LEVELS);
 provider.update("relay", { models: [{ model: "gpt-4o", upstream: "gpt-4o-2024-11-20" }, "glm-4.6"] });
 
 console.log("\n适配器缺省项（号池语义不被污染的前提）:");
