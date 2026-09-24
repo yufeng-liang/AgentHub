@@ -275,7 +275,17 @@ function buildTrayMenu() {
       click: () => { usageScheduler.setPaused(!usageScheduler.isPaused()); refreshTrayMenu(); },
     },
     { type: "separator" },
-    { label: "退出", click: () => { quitting = true; app.quit(); } },
+    // stopping 窗口的托盘竞态（Task 7b）：installPhase 非 idle 时点「退出」什么都不做 —— 此刻
+    // quitForInstall 的 stopAndWait 正在飞，再来一次 app.quit() 会并发走第二遍停机路径（托盘这条
+    // 是唯一绕过 before-quit 互锁判定、直接把 quitting 置真的入口）。在飞的收尾会自己把进程退掉。
+    {
+      label: "退出",
+      click: () => {
+        if (installPhase !== "idle") return;
+        quitting = true;
+        app.quit();
+      },
+    },
   );
   return Menu.buildFromTemplate(items);
 }

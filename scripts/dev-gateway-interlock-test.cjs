@@ -15,6 +15,8 @@
 //     quitForInstall/stopAndWait —— before-quit 的装更分支与非托盘退出分支调 quitForInstall()，
 //     ipc.cjs 的 install_update 不许再直连 updater.triggerInstall()（那是绕过停机的短路），updater
 //     必须暴露 requestInstall（只打标记 + app.quit()，把退出交回 before-quit 的唯一停机出口）。
+//     ③-b（Task 7b）stopping 窗口的托盘竞态：installPhase === "stopping" 期间托盘「退出」不得触发
+//     第二次停机 —— 托盘菜单项与 quitForInstall() 的防重入闸两层判据都在场才过。
 //     另加 Step 3 的静态引用：gateway.cjs 的 exe-gone 看门狗必须在场 —— 卸载时 NSIS 不发消息，
 //     它是唯一的卸载保护。**动态判据见 scripts/dev-gateway-pipe-test.cjs ③-c**（常驻 + 真监听 +
 //     exe 映像不在 → 收摊），本闸不复制那份真子进程用例：重复的真子进程测试是维护负债。
@@ -269,6 +271,24 @@ function section(name, fn) {
       "③ main.cjs 里 updater.triggerInstall() 必须只在 quitForInstall 内出现一次（实得 " + trigCount
       + " 次）——before-quit 里直连它就是绕过停机互锁");
 
+    // ③-b（Task 7b）stopping 窗口的托盘竞态：installPhase 处于 stopping（stopAndWait 在飞）期间，
+    // 托盘「退出」不得再触发一次停机。两层都要在场，缺一层这条闸就只是「碰巧成立」：
+    //  · 托盘菜单项自己先看 installPhase（stopping 期间点退出 = 什么都不做，在飞的停机收尾后自然会退出）；
+    //  · quitForInstall 的防重入闸（installPhase !== "idle" 就 return），堵住其它 before-quit 入口。
+    const trayExitIdx = mainSrc.indexOf('label: "退出"');
+    assert.ok(trayExitIdx >= 0, "③-b main.cjs 找不到托盘「退出」菜单项（Tray 模板）");
+    // 取该菜单项那一段（多行对象：label 到下一个 type: "separator" / 右括号为止）
+    const trayExitBlock = mainSrc.slice(trayExitIdx, trayExitIdx + 400);
+    assert.ok(/installPhase/.test(trayExitBlock),
+      "③-b 托盘「退出」的 click 必须先看 installPhase：stopping 期间（stopAndWait 在飞）点它就会与在飞的停机"
+      + "并发走第二遍退出路径（第二次停机）：" + trayExitBlock.split("\n").slice(0, 8).join(" / "));
+    assert.ok(/installPhase\s*!==\s*"idle"/.test(trayExitBlock) && /return/.test(trayExitBlock),
+      "③-b 托盘「退出」的 installPhase 判据必须是「非 idle 就 return」这个形状（别用别的比较写法绕过）："
+      + trayExitBlock.split("\n").slice(0, 8).join(" / "));
+    assert.ok(/if \(installPhase !== "idle"\) return;/.test(qBody),
+      "③-b quitForInstall() 的防重入闸必须是 installPhase !== \"idle\" 就 return（stopping 期间任何"
+      + " before-quit 入口都不许再起一次停机）：" + qBody);
+
     // 入口三（ipc.cjs install_update 短路）：不许直连 triggerInstall，必须经 requestInstall 打标记
     const installLine = ipcSrc.split("\n").find((l) => l.includes('"install_update"'));
     assert.ok(installLine, "③ ipc.cjs 找不到 install_update 注册");
@@ -299,6 +319,8 @@ function section(name, fn) {
     pass("③ 静态断言全过：main.cjs 零 proxy.shutdown()；before-quit 两分支汇入 quitForInstall()"
       + "（内含唯一的 stopAndWait 与 triggerInstall）；install_update 经 requestInstall 不再短路绕过；"
       + "exe-gone 看门狗在场（动态判据见 pipe 闸 ③-c）");
+    pass("③-b stopping 窗口的托盘竞态：托盘「退出」与 quitForInstall() 两处都有 installPhase 判据 —— "
+      + "stopAndWait 在飞期间点托盘退出不会并发走第二遍停机");
   });
 
   const runSnapB = runKeySnapshot();
