@@ -43,6 +43,8 @@
 //        「响应帧先到、事件帧后到」那一半（真代码只有「事件先」这一半），两种顺序都要投递成功。
 //     ⑨c 超时——挂 12 s 的**普通**命令必须在 proto.DEFAULT_TIMEOUT_MS(10 s) 报 timeout（Task 3 的
 //        「默认永不超时 + writeFrame 静默丢帧」组合起来就是永久悬挂，这条是它的对立面）；
+//        ⑨c-2（Task 7a）大载荷调用点自带显式上界：proxy_account_import_blob 的调用点必须传
+//        timeoutMs 且宽于默认——5 MB 上限经 base64 过管道，默认 10 s 下大文件导入会先被判超时；
 //        NO_TIMEOUT_CMDS 三条不被误拒（用 proxy_checkin_run 的桩，不打真上游）；超时后连接仍可用、
 //        迟到的响应帧被丢弃而不是把已判死的 id 复活。writeFrame 四态逐态钉死（Task 5 刀 1）：
 //        "written"/"queued"（背压，帧已进队列）/"unwritable"/"unencodable"——编帧失败（一字节没入队）
@@ -1403,6 +1405,20 @@ fs.writeFileSync(path.join(d,"names.txt"), fs.readdirSync(path.join(d,"AgentHub"
     "⑨c 显式 opts.timeoutMs 必须仍然说了算（收紧与放宽都由调用方定），实得：" + String(tightC && tightC.message));
   const looseC = await connC.call("proxy_will_hang", { hold: 300 }, { timeoutMs: 3000 });
   assert.strictEqual(looseC.never, true, "⑨c 显式放宽到 3 s 后，300 ms 的命令不该被判超时");
+  // ⑨c-2 大载荷调用点必须自带显式上界（Task 7a）：proxy_account_import_blob 的字节上限是
+  // gateway-client.IMPORT_BLOB_MAX(5 MB)，base64 后膨胀 1/3 再过管道——默认 10 s 上界在「本机杀软
+  // 扫大文件 + 子进程解包入池」这种体量下不再是「上界」而是「误判」。这条钉**调用点**：
+  // 显式 timeoutMs 必须存在，且必须比 DEFAULT_TIMEOUT_MS 宽（比默认还紧的显式值等于什么都没改）。
+  const gcSrcText = fs.readFileSync(path.join(BE, "gateway-client.cjs"), "utf8");
+  const blobCallLine = gcSrcText.split("\n").find((l) => l.includes('call("proxy_account_import_blob"'));
+  assert.ok(blobCallLine, "⑨c-2 gateway-client.cjs 里找不到 proxy_account_import_blob 的调用点（import_file 的主进程半段）");
+  const blobTimeout = Number((/timeoutMs:\s*(\d+)/.exec(blobCallLine) || [])[1]);
+  assert.ok(Number.isFinite(blobTimeout) && blobTimeout > 0,
+    "⑨c-2 proxy_account_import_blob 的调用点必须显式传 opts.timeoutMs：5 MB 上限经 base64 后过管道，"
+    + "默认 10 s 上界下大文件导入会先被判超时（命令其实还在子进程里跑）：" + blobCallLine.trim());
+  assert.ok(blobTimeout > proto.DEFAULT_TIMEOUT_MS,
+    "⑨c-2 显式上界 " + blobTimeout + " ms 不大于默认 " + proto.DEFAULT_TIMEOUT_MS + " ms —— 显式值说了算的语义下"
+    + "等于把默认 10 s 原样抄了一遍，大载荷那条路径没被放宽：" + blobCallLine.trim());
   // 丢帧不静默：writeFrame 必须把「写不出去」如实回给调用方。Task 3 的注释写着「命令帧由 pending 超时兜」，
   // 那之前得先知道帧没了——用假 socket 钉这条判据本身，不依赖 OS 的断连时序窗口。
   // Task 5 刀 1 起是**四态**：编帧失败（一字节都没入队）必须与背压（帧已进队列）分开——两态的善后完全不同。

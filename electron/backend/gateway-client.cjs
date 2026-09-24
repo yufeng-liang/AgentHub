@@ -449,7 +449,10 @@ async function importFileCmd({ channel } = {}) {
   if (buf.length > IMPORT_BLOB_MAX) {
     return { ok: false, message: "文件过大（超过 " + Math.floor(IMPORT_BLOB_MAX / 1024 / 1024) + " MB），请拆分后导入" };
   }
-  const res = await call("proxy_account_import_blob", { channel, blob: buf.toString("base64"), name: path.basename(file) });
+  // 显式上界（Task 7a）：5 MB 上限经 base64 膨胀 1/3 后再过管道，子进程还要解包入池。
+  // 默认 10 s 在这条路径上不是「上界」而是「误判」——命令还在子进程里跑，主进程已按 timeout 拒了，
+  // 用户看到的是「导入失败」而号其实进了池。放宽到 30 s（调用点自带，不动 DEFAULT_TIMEOUT_MS）。
+  const res = await call("proxy_account_import_blob", { channel, blob: buf.toString("base64"), name: path.basename(file) }, { timeoutMs: 30000 });
   if (res && res.ok) res.file = path.basename(file);   // 结果文案的文件名：子进程只见字节，原始名由主进程补
   return res;
 }
