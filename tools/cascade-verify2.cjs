@@ -1,6 +1,11 @@
 // 独立复核（不依赖 dev-bundle-check 自己的实现）：懒注入 CSS 是否仍在覆盖 element.css
 // 纯静态比对（只读 dist/ 与 src/，不 spawn 实例），但卫生三件套照走——统一口径，防将来改出副作用
 "use strict";
+
+// 守卫（三期收尾，2026-09-24）：被 require 时零副作用。本仓 5 个脚本曾因缺它而在被 require 时
+// 真把探针跑了一次（Task 5 实现者核验导出面时误触 phase1-browser-pass）。
+// 顶层 return 在 CJS 模块包装函数里合法：作为入口时 require.main === module 照常执行。
+if (require.main !== module) return;
 const hy = require("./probe-hygiene.cjs")("cascade-verify2");
 const fs = require("node:fs");
 const path = require("node:path");

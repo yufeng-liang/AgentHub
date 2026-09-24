@@ -5,6 +5,11 @@
 //   3) 中文 locale、Task 6 两个新开关、窄容器下的卡片头回流
 // 用法：npm run electron:pack 之后 node tools/phase1-browser-pass.cjs
 "use strict";
+
+// 守卫（三期收尾，2026-09-24）：被 require 时零副作用。本仓 5 个脚本曾因缺它而在被 require 时
+// 真把探针跑了一次（Task 5 实现者核验导出面时误触 phase1-browser-pass）。
+// 顶层 return 在 CJS 模块包装函数里合法：作为入口时 require.main === module 照常执行。
+if (require.main !== module) return;
 // 探针卫生（规格 §八）必须先于一切产品代码 require：三件套指临时目录 + HKCU Run 快照兜底
 const hy = require("./probe-hygiene.cjs")("phase1-browser-pass");
 const fs = require("node:fs");

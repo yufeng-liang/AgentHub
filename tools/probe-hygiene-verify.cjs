@@ -12,6 +12,11 @@
 // 安全性：拦截器只在 neg-* 模式下篡改**首次** query 的返回；其余所有 reg 调用真实透传，
 // 而透传分支只有 query 会发生（新代码在不可信基线时不该有任何写删），脚本自身绝不写删注册表。
 "use strict";
+
+// 守卫（三期收尾，2026-09-24）：被 require 时零副作用。本仓 5 个脚本曾因缺它而在被 require 时
+// 真把探针跑了一次（Task 5 实现者核验导出面时误触 phase1-browser-pass）。
+// 顶层 return 在 CJS 模块包装函数里合法：作为入口时 require.main === module 照常执行。
+if (require.main !== module) return;
 const cp = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");

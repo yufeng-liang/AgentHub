@@ -3,6 +3,11 @@
 //   页面 target 数 1 →（点 X）0 + 进程数 4 → 3 →（双击托盘）1 + 进程数回到 4
 // 只等最多 6 分钟，超时也照实打印看到了什么。
 "use strict";
+
+// 守卫（三期收尾，2026-09-24）：被 require 时零副作用。本仓 5 个脚本曾因缺它而在被 require 时
+// 真把探针跑了一次（Task 5 实现者核验导出面时误触 phase1-browser-pass）。
+// 顶层 return 在 CJS 模块包装函数里合法：作为入口时 require.main === module 照常执行。
+if (require.main !== module) return;
 // 探针卫生（规格 §八）先于一切产品代码 require：三件套指临时目录 + HKCU Run 快照兜底
 const hy = require("./probe-hygiene.cjs")("tray-reopen-watch");
 const fs = require("node:fs");

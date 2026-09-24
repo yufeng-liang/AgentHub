@@ -2,6 +2,11 @@
 // build/icon.png + build/icon.ico + build/tray.png + src/assets/logo.png
 // 纯 Node 手搓 PNG 解码/编码/缩放/ICO 打包，运行：node tools/gen-icon.cjs
 "use strict";
+
+// 守卫（三期收尾，2026-09-24）：被 require 时零副作用。本仓 5 个脚本曾因缺它而在被 require 时
+// 真把探针跑了一次（Task 5 实现者核验导出面时误触 phase1-browser-pass）。
+// 顶层 return 在 CJS 模块包装函数里合法：作为入口时 require.main === module 照常执行。
+if (require.main !== module) return;
 const fs = require("node:fs");
 const path = require("node:path");
 const zlib = require("node:zlib");

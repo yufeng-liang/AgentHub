@@ -2,6 +2,11 @@
 // 注意：本脚本附着到 run-human-checks3 已拉起的实例（COPY 目录由 argv 传入），自身不 spawn；
 // 卫生三件套仍照走（防将来有人在这里补 spawn 时忘了隔离）。
 "use strict";
+
+// 守卫（三期收尾，2026-09-24）：被 require 时零副作用。本仓 5 个脚本曾因缺它而在被 require 时
+// 真把探针跑了一次（Task 5 实现者核验导出面时误触 phase1-browser-pass）。
+// 顶层 return 在 CJS 模块包装函数里合法：作为入口时 require.main === module 照常执行。
+if (require.main !== module) return;
 const hy = require("./probe-hygiene.cjs")("run-human-checks4");
 const fs = require("node:fs");
 const path = require("node:path");

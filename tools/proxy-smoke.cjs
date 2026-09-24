@@ -1,6 +1,11 @@
 // 反代网关后端自测脚本（Electron ELECTRON_RUN_AS_NODE 模式跑，拿到 Node 22 + node:sqlite）
 // 用法：ELECTRON_RUN_AS_NODE=1 electron tools/proxy-smoke.cjs <临时数据目录>
 "use strict";
+
+// 守卫（三期收尾，2026-09-24）：被 require 时零副作用。本仓 5 个脚本曾因缺它而在被 require 时
+// 真把探针跑了一次（Task 5 实现者核验导出面时误触 phase1-browser-pass）。
+// 顶层 return 在 CJS 模块包装函数里合法：作为入口时 require.main === module 照常执行。
+if (require.main !== module) return;
 const os = require("node:os");
 const path = require("node:path");
 const fs = require("node:fs");
