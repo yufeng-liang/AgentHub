@@ -318,7 +318,7 @@ onUnmounted(() => {
       <div v-if="!liteMode" class="set-row">
         <div class="set-info">
           <div class="set-name">主 App 退出后网关继续常驻</div>
-          <div class="set-desc">{{ isPortable ? "便携版不支持后台常驻（临时解压副本退出即失效）" : "主 App 退出后网关继续常驻（便携版不支持；开机自启需在上方打开）" }}</div>
+          <div class="set-desc">{{ isPortable ? "便携版不支持后台常驻（临时解压副本退出即失效）" : "主 App 退出后网关继续常驻，额度刷新与自动签到随它一起留在后台跑（便携版不支持）" }}</div>
         </div>
         <el-switch v-model="app.config.schedule.persistentGateway" :disabled="isPortable" @change="toggleAppBehavior" />
       </div>
@@ -333,7 +333,7 @@ onUnmounted(() => {
       <div v-if="liteMode" class="set-row set-row-sub">
         <div class="set-info">
           <div class="set-name">主 App 退出后网关继续常驻</div>
-          <div class="set-desc">{{ isPortable ? "便携版不支持后台常驻（临时解压副本退出即失效）" : "主 App 退出后网关继续常驻（便携版不支持；开机自启需在上方打开）" }}</div>
+          <div class="set-desc">{{ isPortable ? "便携版不支持后台常驻（临时解压副本退出即失效）" : "主 App 退出后网关继续常驻，额度刷新与自动签到随它一起留在后台跑（便携版不支持）" }}</div>
         </div>
         <el-switch v-model="app.config.schedule.persistentGateway" :disabled="isPortable" @change="toggleAppBehavior" />
       </div>
