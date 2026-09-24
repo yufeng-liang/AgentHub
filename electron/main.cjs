@@ -275,13 +275,18 @@ function buildTrayMenu() {
       click: () => { usageScheduler.setPaused(!usageScheduler.isPaused()); refreshTrayMenu(); },
     },
     { type: "separator" },
-    // stopping 窗口的托盘竞态（Task 7b）：installPhase 非 idle 时点「退出」什么都不做 —— 此刻
-    // quitForInstall 的 stopAndWait 正在飞，再来一次 app.quit() 会并发走第二遍停机路径（托盘这条
-    // 是唯一绕过 before-quit 互锁判定、直接把 quitting 置真的入口）。在飞的收尾会自己把进程退掉。
+    // stopping 窗口的托盘竞态（Task 7b）：**只在 stopAndWait 在飞（stopping）时**点「退出」什么都不做 ——
+    // 此刻 quitForInstall 的停机正在飞，再来一次 app.quit() 会并发走第二遍停机路径（托盘这条是唯一
+    // 绕过 before-quit 互锁判定、直接把 quitting 置真的入口）。在飞的收尾会自己把进程退掉。
+    // ⚠ 判据只能是 `=== "stopping"`，**不能**写 `!== "idle"`（终审修复，2026-09-24）：installPhase 到
+    // `stopped` 后**永不复位**（updater.cjs 从不碰它），而 `stopped` 的语义是「已停干净、放行续跑」——
+    // 装更被拦时 triggerInstall 10s 后复位、onUpdateError 只改状态**不退出进程**，于是应用继续活着而
+    // installPhase 永远停在 stopped ⇒ 用 `!== "idle"` 会把托盘「退出」永久堵死，用户再也退不掉。
+    // 与 before-quit 的互锁判据（`installPhase !== "stopped"`，即 stopped 时放行）保持同一套语义。
     {
       label: "退出",
       click: () => {
-        if (installPhase !== "idle") return;
+        if (installPhase === "stopping") return;
         quitting = true;
         app.quit();
       },

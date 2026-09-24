@@ -275,6 +275,10 @@ function section(name, fn) {
     // 托盘「退出」不得再触发一次停机。两层都要在场，缺一层这条闸就只是「碰巧成立」：
     //  · 托盘菜单项自己先看 installPhase（stopping 期间点退出 = 什么都不做，在飞的停机收尾后自然会退出）；
     //  · quitForInstall 的防重入闸（installPhase !== "idle" 就 return），堵住其它 before-quit 入口。
+    // ⚠ 终审修复（2026-09-24）：托盘那条**必须**是 `=== "stopping"`，不能是 `!== "idle"`。
+    //   installPhase 到 `stopped` 后永不复位，而 stopped = 「已停干净、放行续跑」；装更被拦时进程继续活着
+    //   且 installPhase 永远停在 stopped ⇒ `!== "idle"` 会把托盘「退出」**永久堵死**（用户退不掉应用）。
+    //   所以这里**双向**钉：形状必须是 `=== "stopping"`，且**不得**出现 `!== "idle"` 这个写法。
     const trayExitIdx = mainSrc.indexOf('label: "退出"');
     assert.ok(trayExitIdx >= 0, "③-b main.cjs 找不到托盘「退出」菜单项（Tray 模板）");
     // 取该菜单项那一段（多行对象：label 到下一个 type: "separator" / 右括号为止）
@@ -282,12 +286,22 @@ function section(name, fn) {
     assert.ok(/installPhase/.test(trayExitBlock),
       "③-b 托盘「退出」的 click 必须先看 installPhase：stopping 期间（stopAndWait 在飞）点它就会与在飞的停机"
       + "并发走第二遍退出路径（第二次停机）：" + trayExitBlock.split("\n").slice(0, 8).join(" / "));
-    assert.ok(/installPhase\s*!==\s*"idle"/.test(trayExitBlock) && /return/.test(trayExitBlock),
-      "③-b 托盘「退出」的 installPhase 判据必须是「非 idle 就 return」这个形状（别用别的比较写法绕过）："
+    assert.ok(/installPhase\s*===\s*"stopping"/.test(trayExitBlock) && /return/.test(trayExitBlock),
+      "③-b 托盘「退出」的 installPhase 判据必须是「仅 stopping 就 return」这个形状（===\"stopping\"）："
+      + trayExitBlock.split("\n").slice(0, 8).join(" / "));
+    assert.ok(!/installPhase\s*!==\s*"idle"/.test(trayExitBlock),
+      "③-b 托盘「退出」**不得**用 `installPhase !== \"idle\"`：installPhase 到 stopped 后永不复位，而"
+      + " stopped 的语义是「已停干净、放行续跑」（装更被拦时进程继续活着且阶段永远停在 stopped）⇒"
+      + " 这个写法会把托盘「退出」永久堵死，用户再也退不掉应用。应写 `=== \"stopping\"`："
       + trayExitBlock.split("\n").slice(0, 8).join(" / "));
     assert.ok(/if \(installPhase !== "idle"\) return;/.test(qBody),
       "③-b quitForInstall() 的防重入闸必须是 installPhase !== \"idle\" 就 return（stopping 期间任何"
       + " before-quit 入口都不许再起一次停机）：" + qBody);
+    // ③-b-2 与 before-quit 的判据语义一致（终审修复）：stopped 是**放行**态，互锁判据必须是
+    // `!== "stopped"`；若哪天被改成 `!== "idle"`，装更被拦后主窗口也会退不掉。
+    assert.ok(/installPhase\s*!==\s*"stopped"/.test(mainSrc),
+      "③-b-2 before-quit 的互锁判据必须是 `installPhase !== \"stopped\"`（stopped = 已停干净、放行续跑）；"
+      + "改成 `!== \"idle\"` 会在装更被拦后把退出流程也堵死");
 
     // 入口三（ipc.cjs install_update 短路）：不许直连 triggerInstall，必须经 requestInstall 打标记
     const installLine = ipcSrc.split("\n").find((l) => l.includes('"install_update"'));
