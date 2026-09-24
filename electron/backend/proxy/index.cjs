@@ -97,9 +97,9 @@ function settings() {
   return config.loadConfig().proxy;
 }
 
-let booted = false;
-// 子进程角色开关：attachGatewayMode() 置真。它改的是两件事——事件出口换管道（events.setSink）、
-// boot() 不再按 restoreOnLaunch 自动 listen（监听决策归主进程）。除此之外本模块零分支。
+// 子进程角色开关：attachGatewayMode() 置真——事件出口换管道（events.setSink）。
+// 监听决策归主进程（主进程 start() 成功后按 restoreOnLaunch 发 proxy_start / proxy_status），
+// 本模块自身不按 restoreOnLaunch 自动 listen。
 let gatewayAttached = false;
 
 // ===== 签到（Trae ug 签到 / WB 双区 daily-checkin / WB AI trial 加油包，参考项目实证端点） =====
@@ -175,26 +175,6 @@ function startCheckinAuto() {
 function stopCheckinAuto() {
   if (checkinTimer) clearInterval(checkinTimer);
   checkinTimer = null;
-}
-
-/** 启动装配：规则热加载初始化 + 数据库 + 定时额度刷新 + 按监听意愿恢复网关
- *  （restoreOnLaunch 已按 Task 6 重定义：本次启动时是否让（新建或认领来的）子进程进入监听状态，
- *  不再是「上次退出时网关开没开」；默认 false → 首次打开网关是停的）
- *
- *  二期（Task 3）：attachGatewayMode() 之后这段自启监听**不再生效**——监听决策归主进程，
- *  主进程 start() 成功后按 restoreOnLaunch 发一次 proxy_start 或只发 proxy_status（main.cjs）。
- *  今天子进程走的是 gateway.cjs 自己的装配序（rules.init + store.open + 周期 checkpoint），
- *  不经 boot()，所以这条开关是给「同一个 index.cjs 被子进程 require」留下的边界声明。 */
-async function boot() {
-  if (booted) return;
-  booted = true;
-  rules.init();
-  store.open();
-  credits.startScheduler(() => settings().creditsRefreshMin);
-  startCheckinAuto();
-  if (!gatewayAttached && settings().restoreOnLaunch) {
-    server.start(settings).then(() => events.emit({ type: "status" })).catch(() => {});
-  }
 }
 
 /** 停机：先让在途监听与定时任务停下，最后才关库句柄（顺序反了会让在途请求写到已关闭的 db 上）。
@@ -324,7 +304,7 @@ function vaultOk() { return secretbox.backend() !== "none"; }
 // 子进程永不写 config.json —— 那是主进程的写权（Task 2 的写权归属），留在这里就会双写。
 
 /** 子进程侧后台作业（二期 Task 5）：额度定时刷新 + 定时自动签到。
- *  这两个计时器过去在主进程 boot() 里跑；43 条命令下沉子进程后随实现体一起下沉 ——
+ *  这两个计时器过去在主进程跑；43 条命令下沉子进程后随实现体一起下沉 ——
  *  留在主进程就会双跑（同一批号被签到两次、同一批号被刷两次额度），这是 gateway.cjs
  *  文件头「子进程不跑计时器」那条注释的解除时刻。签到/刷新的实现体本就在本模块
  *  （checkinBatch / credits），gateway.cjs 装配时调用这里这一个入口，不开第二份实现。 */
@@ -678,7 +658,7 @@ async function dispatch(cmd, args) {
 }
 
 /** 子进程装配：把事件出口接到管道广播上（emit 由 gateway.cjs 在 serve() 建成之后给，装配序不是风格）。
- *  同时让 boot() 不再按 restoreOnLaunch 自动 listen —— 监听决策归主进程（Task 6 的新语义）。 */
+ *  置上网关角色后本模块不再按 restoreOnLaunch 自动 listen —— 监听决策归主进程（Task 6 的新语义）。 */
 function attachGatewayMode({ emit } = {}) {
   if (typeof emit !== "function") throw new Error("attachGatewayMode 需要 emit(payload) 函数");
   gatewayAttached = true;
@@ -689,6 +669,6 @@ function attachGatewayMode({ emit } = {}) {
 // Task 5 的转发化也要按这个名字取（藏在 register 里没法单测）
 // dispatchTable/dispatch/attachGatewayMode/gracefulShutdown：二期 Task 3 的子进程入口与管道出口
 // startBackgroundJobs：二期 Task 5 的子进程后台作业入口（credits 定时刷新 + 定时自动签到，
-// 过去在主进程 boot() 里，随命令实现体一起下沉；gateway.cjs 装配时调用）
+// 随命令实现体一起下沉；gateway.cjs 装配时调用）
 // DRAIN_BUDGET_MS：停机预算的四个数字之一，供 dev-gateway-pipe-test 断言它们仍复合（合计只在那一条断言里算）
-module.exports = { boot, shutdown, gracefulShutdown, DRAIN_BUDGET_MS, register, settings, gatewayStatus, dispatchTable, dispatch, attachGatewayMode, startBackgroundJobs };
+module.exports = { shutdown, gracefulShutdown, DRAIN_BUDGET_MS, register, settings, gatewayStatus, dispatchTable, dispatch, attachGatewayMode, startBackgroundJobs };

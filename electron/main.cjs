@@ -429,7 +429,7 @@ if (!gotLock) {
     remotesync.setOnFinish(notifySync);
     usagesync.setOnFinish(notifyUsageSync);
     // 网关子进程（Task 5 起为正式启动路径，不再是 opt-in）：那张 proxy_* 命令表全部在子进程跑，
-    // 主进程不再 boot() proxy 域（rules/store/credits/checkin 计时器都随实现体下沉，gateway.cjs）。
+    // 主进程不再装配 proxy 域（rules/store/credits/checkin 计时器都随实现体下沉，gateway.cjs）。
     // 这里先 spawn；监听决策按 restoreOnLaunch 新语义（Task 6 重定义：本次启动时是否让（新建或
     // 认领来的）子进程进入监听状态，不再是「上次退出时网关开没开」）在 start() 成功后落地——
     // true → 转发一次 proxy_start（与用户点开关同一条路径，claimed 守卫等语义完全一致）；

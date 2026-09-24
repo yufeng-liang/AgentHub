@@ -5,7 +5,7 @@
 // 所以本文件的任何断言都必须能容忍两种打包态；测试从中立 cwd 起（探针卫生第五条）。
 //
 // 职责边界：只做装配与生命周期，**不含业务逻辑**（业务全在 proxy/index.cjs 那张命令表里）。
-// 与一期 boot() 的装配序差别：这里 rules.init + store.open + 周期 checkpoint + 后台作业
+// 与一期主进程装配序的差别：这里 rules.init + store.open + 周期 checkpoint + 后台作业
 // （Task 5 起：credits 定时刷新与定时签到随命令实现体下沉到这里，startBackgroundJobs），
 // **不 listen**——监听决策归主进程，主进程经 proxy_start/proxy_stop 转发体驱动。
 // 入口有两种来历（Task 6，共用下面同一个装配，不复制一份）：
@@ -154,7 +154,7 @@ async function main() {
   // sink 必须在 srv 建好之后注入（否则子进程启动早期 events.emit 无处可写）——这是装配序，不是风格
   proxy.attachGatewayMode({ emit: (payload) => srv.broadcast({ k: "evt", payload }) });
   // 后台作业随命令实现体一起下沉（Task 5）：credits 定时刷新 + 定时自动签到过去在主进程
-  // boot() 里跑；43 条命令转发化之后主进程不再 require proxy 域，这两个计时器留在主进程
+  // 里跑；43 条命令转发化之后主进程不再 require proxy 域，这两个计时器留在主进程
   // 就会消失、跑在子进程就会双跑 —— 现在归子进程一份，且只有这一份。
   proxy.startBackgroundJobs();
   startWatchdog(hs.parentPid);
