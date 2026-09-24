@@ -120,7 +120,7 @@ function defaultConfig() {
     schedule: {
       minimizeToTray: true, // 关窗缩到托盘
       liteOnClose: true,    // 关窗即销毁窗口回收 UI 内存（重开需重新加载首屏）
-      launchHidden: false,  // 启动不建窗，直接进托盘
+      launchHidden: true,   // 启动不建窗（三期：并入「轻量模式」，默认开）
       autoStart: false,     // 开机自启（便携版无效）
       persistentGateway: false, // 主 App 退出后网关子进程继续常驻（便携版不支持；自启注册目标随它切换）
       hourly: false,        // 每小时自动同步

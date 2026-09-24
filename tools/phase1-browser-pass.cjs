@@ -24,6 +24,8 @@ function writeUserDataConfig(dir) {
     JSON.stringify(
       {
         theme: "dark",
+        // 本探针测「建窗 → 销毁」路径，必须真的建出窗口，故显式钉 launchHidden:false，
+        // 不随产品默认值漂移（三期默认已改 true，若省掉这行被测对象会悄悄变成「开机不建窗」却仍然绿）
         schedule: { minimizeToTray: true, liteOnClose: true, launchHidden: false },
         proxy: { port: GW_PORT, bind: "127.0.0.1" },
       },
