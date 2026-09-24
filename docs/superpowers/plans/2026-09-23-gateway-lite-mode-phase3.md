@@ -18,7 +18,7 @@
 - **不新增任何 npm 依赖**，不引入 vitest/jest 等测试框架；前端行为验证走 CDP 真机走查。
 - **不发布 Release、不改发布链路**：`package.json` 的 `build.publish[].owner/repo`、`.github/workflows/release.yml`、`electron/backend/updater.cjs:8` 的 `GITHUB_REPO_URL`、`electron/backend/proxy/ccswitch.cjs` 的 `website_url`、`src/components/config/ConfigProxySection.vue:383` 五处保持指向上游，三期一律不碰。
 - 探针卫生（规格 §八）：`APPDATA` + `AGENT_SKILLS_HOME` + `CCSWITCH_DB_PATH` 指进临时目录，且**必须早于任何产品代码 require**；打包实例额外需要 `AGENTHUB_USER_DATA`（主进程 userData，靠 asar 测试钩子）与 `APPDATA`（子进程回退）**成对注入**；探针端口一律用 `1953x`，**9527 归用户自己的实例**；收尾核对 HKCU Run 快照与真实 `stats.db` 未变。
-- 打包/装机前置：先 `taskkill /F /IM AgentHub.exe /T`（含 `%TEMP%` 便携解压子进程），electron-builder 会被自己产物目录里的实例锁死；**用户自己安装的实例（`H:\AgentHub`）不在此列**，只在被授权的真机装更步骤里动。
+- 打包/装机前置：先关掉**自己产物目录里**的实例（`release\win-unpacked\` 下那个），electron-builder 会被它锁死。**绝不要用 `taskkill /F /IM AgentHub.exe /T`**——那条按镜像名宽杀会连坐打死**用户自己装的 `H:\AgentHub` 实例**（本机常态是 4 个进程在跑）。正确做法：先 `tasklist` 按 pid 认领、或按 `--user-data-dir`/`--remote-debugging-port` 认出自己的进程再精确清理（同 `scripts/dev-first-paint-check.cjs:161` 的既有纪律）。三期 Task 4 已实测这条宽杀的破坏性：它会连坐打死常驻网关子进程（详见规格 §六 第 6 条与 `task-4-report.md`）。
 - `release/win-unpacked/resources/app.asar` 里允许存在**只属于测试工件**的钩子（`AGENTHUB_USER_DATA`、批次的 `AGENTHUB_FAKE_UPDATE`），它们随 `electron:pack` 重打包而消失，**永远不入库**。
 - 二期已实测并入库的结论不得回退：`applyAutoStart` 的 `.cmd` 目标走 `reg.exe` 直写（835dc94，因 Electron 35 带 `path` 会吃反斜杠）；装更/退出必须先 `stopAndWait` 且端口实测释放；NSIS 完成判据用 **ctime** 不用 mtime。
 
@@ -292,7 +292,8 @@ git commit -m "chore: bundle 基线随上游 v1.18.0 的图表与按需注册改
 - [ ] **Step 4: 打包一次，确认产物与启动器落位**
 
 ```bash
-taskkill //F //IM AgentHub.exe //T 2>/dev/null; npm run electron:pack
+npm run electron:pack          # 前置：先按 pid 精确关掉 release\win-unpacked 下的实例（见 §全局约束），
+                               # 绝不用 taskkill /F /IM AgentHub.exe /T（会连坐打死用户的 H:\AgentHub 实例）
 ls release/win-unpacked/AgentHub.exe release/win-unpacked/agenthub-gateway.cmd
 node -p "require('./release/win-unpacked/resources/app.asar')&&0" 2>/dev/null; echo "asar 存在性用下一条确认"
 ls -la release/win-unpacked/resources/app.asar
@@ -623,7 +624,8 @@ assert.strictEqual(cfg.schedule.persistentGateway, beforePg, "轻量切换顺手
 - [ ] **Step 4: 跑走查并留真机截图两张（设置页开/关两态）**
 
 ```bash
-taskkill //F //IM AgentHub.exe //T 2>/dev/null; npm run electron:pack
+npm run electron:pack          # 前置：先按 pid 精确关掉 release\win-unpacked 下的实例（见 §全局约束），
+                               # 绝不用 taskkill /F /IM AgentHub.exe /T（会连坐打死用户的 H:\AgentHub 实例）
 node tmp/gateway-probe/phase3-lite-entry.cjs
 ```
 
