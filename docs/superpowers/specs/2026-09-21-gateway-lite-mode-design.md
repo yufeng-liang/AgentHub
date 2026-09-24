@@ -156,6 +156,12 @@
 > ④ WAL「停止单调增长」达成（50 次请求后 1,388,472 B 在 t+3→t+30min 恒定不动），但 §5.4 的 64 KB 绝对值未达成：
 >    子进程每 5 分钟挂 `PRAGMA wal_checkpoint(TRUNCATE)` 却一次都没截下去，而 `store.checkpoint()` 的布尔返回值无人观测，
 >    外部无法区分「没执行」与「执行了被挡」——三期两条：给 checkpoint 加成功/失败计数留痕；评估 `PRAGMA journal_size_limit=65536`。
+>    **【三期收口更正，2026-09-24】** 上面那条「恒定不动」经三期取证为**探针卫生事故**，不是产品缺陷：二期泡机与批次④
+>    其余探针并行，后者按镜像名宽杀 `taskkill /F /IM AgentHub.exe /T`，而泡机的常驻网关子进程正是 `AgentHub.exe`
+>    ⇒ 开跑几分钟后被连坐打死，此后泡的是**死进程**（物证 `D:\tmp-agenthub-wal4`：主库 4096 B 空壳、日志断在
+>    `detach-keep` 后一行不增）。三期 Task 4 用改名后的唯一镜像名逐字节复现了该机制并有负对照（不发宽杀则 tick 照常收敛）。
+>    ⇒ **判据 4 的正式表述见 §5.4（已改写为可核命题），其转绿方式是「原缺陷被证伪」而非「修好了」**；三期只把
+>    checkpoint 的成败做成可观测（`wal-checkpoint` 日志行 + `proxy_status.walBytes/lastCheckpoint`），未改任何 checkpoint 调用姿态。
 
 ### 5.1 进程切分线
 
@@ -199,6 +205,14 @@
 
 - `stats.db` 由子进程**独占**：主进程不再 require 网关 store（一期前快照为 `ipc.cjs:472` 的 `proxy.register`，该行号已失效——Task 5 起 proxy 域整体迁入网关子进程，由 `electron/gateway.cjs:26` 装配 `proxy/index.cjs`，主进程对 proxy 域的 require 由 `scripts/dev-gateway-forward-parity-test.cjs` 钉死为零）。
 - WAL：`store.cjs:128-129` 只设 `journal_mode=WAL` + `busy_timeout=5000`，全仓无 `wal_checkpoint`，`store.close()`(`:551`) **无任何调用点**（`proxy.shutdown()` `index.cjs:177-182` 只停 server）。实测本机 WAL 已 1.59 MB 且自 16:41 起零次 checkpoint。补：退出路径调 `close()`、运行期周期性 `PRAGMA wal_checkpoint(TRUNCATE)`。`busy_timeout=5000` 在双进程争锁时会卡转发 5 秒，故必须单一写者。
+  **【三期 Task 3/Task 4 收口改写，2026-09-24】判据 4 的正式表述（取代上面「30 分钟额度刷新后 <64KB」的凑时长写法）**：
+  > **50 条失败请求之后，一次 `checkpoint()` 必须把 WAL 截到 ≤64KB。**
+  原表述里那 30 分钟只是凑时长、不承载判据，**删除**。落地为 `scripts/dev-wal-convergence-test.cjs`（四条腿：判定腿 = 生产常驻形态
+  `detached + --persistent + Electron 运行时`，对照腿 = 非 detached 真子进程，附加 = 进程内，负对照 = 外部持读事务「**必须红**」）。
+  **转绿方式 = 原缺陷被证伪**（二期那条「冻结」是探针卫生事故，见 §四 二期对账段 ④ 的三期更正），**不是**「缺陷被修好」——
+  该闸对原缺陷的防护力 ≈ 0（那个状态今天复现不出来），它的价值是**可观测面**（`wal-checkpoint` 日志行含生效间隔 `ms`、
+  `proxy_status.walBytes/lastCheckpoint`）与**最小冻结构造**（负对照）。**未采纳** `PRAGMA journal_size_limit=65536`
+  （它只压峰值、会掩盖真问题；且真问题已不存在）。
 - `config.json` 唯一属主 = 主进程。子进程只读配置 + 通过管道请求写。`config.cjs:376`（一期落地后行号曾写 `:372`，原写 `:370`；行号以二期当前树为准）曾用固定 `.tmp` 名，跨进程 rename 会互踩，现临时文件名已统一加 pid。**同病实测共四处**，只改 `config.cjs` 会漏三处，四处一并列齐（行号以当前树为准）：`config.cjs:376`、`hub.cjs:41`（`~/.agent_skills/manifest.json`）、`sync-config.cjs:477`、`sync.cjs:187` —— 四处现均为 `${p}.${process.pid}.tmp`，由 `scripts/dev-write-ownership-test.cjs` 的结构判据钉住；其中前两处落在**两个安装共享**的 `~/.agent_skills`，互踩面比 `config.json` 更大。
 - 除 `config.json` 外还有四个数据文件要定写主（实测清单）：`proxyDir()/catalog.json`(`index.cjs:483`)、`rules` 的默认值与补键迁移(`rules.cjs:233/:244`)、`proxyDir()/sync-state.json`(`poolsync.cjs:77`)、`proxyDir()/pool-tombstones.json`(`poolsync.cjs:310`) —— 全部归子进程独占。**规格原来漏了一条反向跨界写**：`ipc.cjs:180` 的 `webdav_shared_save`（原文写 `:176`，一期后处理器漂移）在一期前的主进程里直接 `require("./proxy/poolsync.cjs").onSharedPasswordMaybeChanged()`，那是从主进程写子进程独占的 `sync-state.json`；双拓扑下必须走管道，否则 §5.4 第一条从后门漏掉（Task 5 已实装：改经 `gatewayClient.call("proxy_poolsync_password_changed", ...)` 投递，见 `ipc.cjs:186`）。
 - `rules/*.json` 由子进程只读监听（`rules.cjs:269` chokidar）；写规则仍走主进程 `config` 域。
@@ -240,7 +254,7 @@
 | 字段 | 默认 | 期 | 语义 |
 |---|---|---|---|
 | `schedule.liteOnClose` | `true` | 一 | 关窗即销毁窗口回收 UI 内存；关掉则回到今天的 `hide()` 秒开行为 |
-| `schedule.launchHidden` | `false` | 一 | 启动不建窗，直接进托盘（实测 166.05 MB，比「建过再销毁」的 215.47 再省 49.42 MB） |
+| `schedule.launchHidden` | ~~`false`~~ → **`true`（三期起）** | 一 | 启动不建窗，直接进托盘（实测 166.05 MB，比「建过再销毁」的 215.47 再省 49.42 MB）。**【三期 Task 5 更正，2026-09-24】默认值改为 `true`**：三期把 `liteOnClose` + `launchHidden` 聚合为设置页单一「轻量模式」入口（读看主特征 `liteOnClose`、写同写两条，零 schema 变更），轻量态自洽要求两字段同真 ⇒ **全新安装开机不再自动弹界面**（用户已明确确认）。四处字面量（`electron/backend/config.cjs` / `src/stores/app.ts` / `src/api/mock.ts` / 闸夹具）同源，由 `scripts/dev-config-lite-defaults-test.cjs` 钉住；显式钉 `launchHidden: false` 的探针（`tools/phase1-browser-pass.cjs`、`tools/tray-reopen-watch.cjs`、`scripts/dev-first-paint-check.cjs`）不随默认漂移 |
 | `schedule.persistentGateway` | `false` | 二 | 主 App 退出时保留网关进程（无托盘） |
 
 字段间的关系，避免实现时各写各的：
