@@ -410,6 +410,11 @@ function register(ipcMain) {
   ipcMain.handle("proxy_account_rename", handle(({ id, name }) => {
     const acc = store.getAccount(id);
     if (!acc) return fail("账号不存在");
+    // uid 缺失时改名会改身份键（poolsync.accountKeyOf 退回 name），导致同步后同一 token 变两条号 ⇒ 拒绝
+    // （三期 fork 侧修复，2026-09-24，用户裁决选「拒绝」而非加稳定身份键）
+    if (poolsync.renameWouldChangeIdentity(acc)) {
+      return fail("该账号没有 UID，改名会让号池同步把它认成另一个号（同一 token 变两条）。如需改名请删除后重新添加");
+    }
     store.updateAccount(id, { name: String(name || "").trim() });
     return ok({});
   }));

@@ -373,6 +373,9 @@ function accountView(r) {
     todayReq: r.today_day === dayStr() ? r.today_req : 0,
     todayTokens: r.today_day === dayStr() ? r.today_tokens : 0,
     createdAt: r.created_at,
+    /** 最近一次改名时刻（三期 fork 侧修复）：meta.renamedAt。参与 LWW 时间戳的计算，
+     *  否则「改名不推进任何可比时间戳」会让改名永远输给任何因无关原因动过的对端（见 poolsync.accountStamp） */
+    renamedAt: Number(meta.renamedAt) || 0,
     hasToken: tokenUsable(r),
     domain: meta.domain || "",
     enterpriseId: meta.enterpriseId || "",
@@ -442,7 +445,20 @@ function updateAccount(id, patch) {
   const sets = [];
   const vals = [];
   const put = (col, val) => { sets.push(`${col}=?`); vals.push(val); };
-  if (patch.name != null) put("name", String(patch.name).slice(0, 64));
+  if (patch.name != null) {
+    const next = String(patch.name).slice(0, 64);
+    put("name", next);
+    // 改名必须推进一个参与 LWW 比较的时间戳（三期 fork 侧修复，2026-09-24）：
+    // 旧实现只写 name 列、不推进任何时间戳，而 name 的 LWW 用 updatedAt 比大小 ⇒ 改名**永远不是最新写**，
+    // 会被下一轮号池同步按「对方 updatedAt 更大」还原回去（用户看到「改完名过一会儿自己变回去」）。
+    // 这里落一个独立改名时刻到 meta.renamedAt（不加列，避免 schema 迁移），并由 accountView 暴露、
+    // 经 poolsync.accountStamp 纳入 LWW 时间戳。
+    // ⚠ 只在名字**真的变了**时推进：同步应用远端同名时若也推进，会让两侧时间戳互相追赶、
+    //   每个同步轮都白写一次（值相同但时间戳永动）。
+    if (patch.renamedAt == null && next !== cur.name) {
+      put("meta", JSON.stringify({ ...parseMeta(cur.meta), renamedAt: Date.now() }));
+    }
+  }
   if (patch.status != null) put("status", String(patch.status));
   // credits 允许 -1（企业版无限额度哨兵）；其余负值一律归 0
   if (patch.credits != null) put("credits", Number(patch.credits) < -1 ? 0 : Math.round(Number(patch.credits) || 0));

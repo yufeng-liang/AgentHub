@@ -140,6 +140,39 @@ function accountKeyOf(a) {
   return `${a.channel}:${a.uid || "name:" + (a.name || "")}`;
 }
 
+/** 改名是否会**改变身份键**（三期 fork 侧修复，2026-09-24）。
+ *
+ *  当 `uid` 缺失时 `accountKeyOf` 退回用 name 作身份键（见上）⇒ 改名等于改身份：
+ *  对端 `mergeSnapshot` 走 `!local` 分支按**新键** `addAccount`，于是**同一个 token 在号池里出现两条**
+ *  （旧键那条留本机、新键那条从对端来），且旧键的墓碑也管不住新键。
+ *  触发条件：手动粘贴且 `util.jwtDecode` 拿不到 uid 的账号（`index.cjs` 的 paste 路径 uid 可为 ""）。
+ *
+ *  处置（用户裁决 2026-09-24，选「拒绝改名」）：**uid 缺失的账号不允许改名**，IPC 层直接报错并说明原因。
+ *  代价如实写明：这类账号改不了备注名（可删了重加以新名添加）。比「加稳定身份键」小得多、且无老快照兼容风险。
+ *  `uid` 存在时身份键不依赖 name ⇒ 改名安全，放行。 */
+function renameWouldChangeIdentity(acc) {
+  return !String((acc && acc.uid) || "").trim();
+}
+
+/** 账号的「最新活动时刻」——**导出与导入两侧必须用同一把尺**（三期 fork 侧修复，2026-09-24）。
+ *
+ *  旧实现两侧不对称：导出侧写 `Math.max(creditsAt, lastUsed, createdAt)`，而导入侧比较 name 时用
+ *  `local.creditsAt || local.lastUsed || local.createdAt`（短路取第一个真值）。只要 creditsAt 非 0
+ *  （号池定时刷额度，默认 30 分钟一次），导入侧的阈值就退化成「只看 creditsAt」，与导出侧的 max 各用一把尺。
+ *  后果：改名方把新名推上去，对端按一把更小的尺判「我更新」再把旧名推回来 —— 用户看到「改完名过一会儿自己变回去」。
+ *
+ *  另外：重命名本身不推进任何时间戳（只写 name 列），所以这里把 `renamedAt` 一并纳入 —— 改名动作
+ *  自己就是一个「最新活动」，否则改名在 LWW 里永远不是最新写（`store.updateAccount` 在写 name 时落
+ *  `meta.renamedAt`）。四个来源取 max，两侧共用本函数，不再各写一份。 */
+function accountStamp(a) {
+  return Math.max(
+    Number(a.creditsAt || 0),
+    Number(a.lastUsed || 0),
+    Number(a.createdAt || 0),
+    Number(a.renamedAt || 0),
+  );
+}
+
 /** 导出本机号池为快照对象：token/refreshToken 为 DPAPI 解密后的明文（只进加密包，绝不上明文）。
  *  channel 给定时只导出该渠道（同步页支持「只同步某一个编译器」）。
  *  凭据为空的账号跳过：把空号打进加密包会传播到所有设备（他机拿到的是无凭据坏号） */
@@ -164,7 +197,7 @@ function exportPool(channel) {
         creditsAt: view.creditsAt || 0,
         source: view.source || "paste",
         meta: view.meta && typeof view.meta === "object" ? view.meta : {},
-        updatedAt: Math.max(view.creditsAt || 0, view.lastUsed || 0, view.createdAt || 0),
+        updatedAt: accountStamp(view),
       };
     })
     .filter(Boolean);
@@ -264,8 +297,9 @@ function mergeSnapshot(snap, channel) {
       patch.creditsAt = ra.creditsAt;
       patch.expiresAt = ra.expiresAt;
     }
-    // 自定义备注名（用户备注）：远端较新时覆盖本机（LWW，以 updatedAt 为准）
-    if (typeof ra.name === "string" && ra.name && Number(ra.updatedAt || 0) > Number(local.creditsAt || local.lastUsed || local.createdAt || 0)) {
+    // 自定义备注名（用户备注）：远端较新时覆盖本机（LWW）。阈值必须与导出侧**同一把尺**（accountStamp），
+    // 否则「各用一把尺」会让改名方的新名被对端按更小的阈值判回去（三期 fork 侧修复，2026-09-24）
+    if (typeof ra.name === "string" && ra.name && Number(ra.updatedAt || 0) > accountStamp(local)) {
       patch.name = ra.name;
     }
     if (!local.hasToken && ra.token) {
@@ -471,4 +505,4 @@ function onSharedPasswordMaybeChanged() {
   savePersisted(p);
 }
 
-module.exports = { run, cancel, progress, configured, noteRemoved, onSharedPasswordMaybeChanged, accountKeyOf };
+module.exports = { run, cancel, progress, configured, noteRemoved, onSharedPasswordMaybeChanged, accountKeyOf, accountStamp, renameWouldChangeIdentity };
