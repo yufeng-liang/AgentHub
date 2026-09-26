@@ -4,7 +4,6 @@
 "use strict";
 const fs = require("node:fs");
 const path = require("node:path");
-const { shell } = require("electron");
 const config = require("../config.cjs");
 const store = require("./store.cjs");
 const rules = require("./rules.cjs");
@@ -19,6 +18,21 @@ const ideswitch = require("./ideswitch.cjs");
 const poolsync = require("./poolsync.cjs");
 const ccswitch = require("./ccswitch.cjs");
 const zip = require("../zip.cjs");
+const secretbox = require("./secretbox.cjs");
+
+// getShell 只在 2 条「留主进程」命令的**同名实现体**里被引用：proxy_open_rules_dir /
+// proxy_open_data_dir 的 openPath。这两条在主进程由 gateway-client.cjs 用真 shell 另行实现
+// （UI_LOCAL 四条之二），子进程表里的这份实现体只是命令表完整性的一部分，永远不会被派发到 ——
+// 顶层 require("electron") 会让整张依赖图在纯 Node 子进程里加载不了（Task 0 实测唯一 FAIL 点），
+// 故惰性取 + 拿不到时明确抛错，而不是让子进程 require 到一半炸掉。
+function getShell() {
+  try {
+    const el = require("electron");
+    return el && typeof el === "object" ? el.shell : null;
+  } catch {
+    return null;
+  }
+}
 
 // ===== 号池 JSON 导入（粘贴 / 文件共用）：单个对象或数组，字段容忍常见别名 =====
 
@@ -83,7 +97,10 @@ function settings() {
   return config.loadConfig().proxy;
 }
 
-let booted = false;
+// 子进程角色开关：attachGatewayMode() 置真——事件出口换管道（events.setSink）。
+// 监听决策归主进程（主进程 start() 成功后按 restoreOnLaunch 发 proxy_start / proxy_status），
+// 本模块自身不按 restoreOnLaunch 自动 listen。
+let gatewayAttached = false;
 
 // ===== 签到（Trae ug 签到 / WB 双区 daily-checkin / WB AI trial 加油包，参考项目实证端点） =====
 /** 批量签到动作：channel 为空 = 全渠道；accountId 指定 = 单账号（OAuth 登录后自动签到用）。
@@ -160,25 +177,68 @@ function stopCheckinAuto() {
   checkinTimer = null;
 }
 
-/** 启动装配：规则热加载初始化 + 数据库 + 定时额度刷新 + 按上次的开关状态恢复网关
- *  （restoreOnLaunch 不是「用户偏好」而是「上次退出时网关是开是关」，默认 false → 首次打开是关闭的） */
-async function boot() {
-  if (booted) return;
-  booted = true;
-  rules.init();
-  store.open();
-  credits.startScheduler(() => settings().creditsRefreshMin);
-  startCheckinAuto();
-  if (settings().restoreOnLaunch) {
-    server.start(settings).then(() => events.emit({ type: "status" })).catch(() => {});
-  }
-}
-
+/** 停机：先让在途监听与定时任务停下，最后才关库句柄（顺序反了会让在途请求写到已关闭的 db 上）。
+ *  store.close() 在这里落地 = stats.db 的句柄归属有人收（二期写权归子进程独占，Task 3 把它升级成
+ *  gracefulShutdown 并接上 stopAsync / 周期 checkpoint 计时器的停止）。
+ *  与下面 gracefulShutdown() 的分工：这条是**主进程退出路径**的同步版——before-quit 不会 await 它，
+ *  所以全程必须同步，否则 store.close() 赶不上进程退出；子进程侧用 await 版。
+ *  Task 7 的装更互锁会把两者收敛到 gateway-client.stopAndWait() 一条实现上。 */
 function shutdown() {
   credits.stopScheduler();
   stopCheckinAuto();
   discovery.cancelOAuth();
   server.stop();
+  store.close();
+}
+
+/** 排空在途异步作业的预算上限（ms）。它与 server.cjs 的 CLOSE_BUDGET_MS、gateway.cjs 的
+ *  RESPONSE_FLUSH_MS 一起构成「等干净的三段之和 < gateway.cjs 那条唯一硬退计时器的 EXIT_CEILING_MS」
+ *  这条不变式（评审 I2②：旧值 1000 + stopAsync 的 1000 已经吃掉整个 2 s 上界，"必须退"总是抢在
+ *  "等干净"前面拿到决定权）。四个数字由 scripts/dev-gateway-pipe-test.cjs 的**同一条断言**钉住，
+ *  合计口径也只有那一条断言在算（CLOSE + DRAIN + FLUSH = 1600 < 2000）——这里不留第二个「预算」导出，
+ *  免得下一位改数的人把少算一段的那个当成真相源。 */
+const DRAIN_BUDGET_MS = 800;
+
+/** 子进程侧唯一的优雅停机实现（Task 7 的 gateway_shutdown 命令体复用它，不开第二份）。
+ *  与一期 shutdown() 的三处差别：① server.stop() 换成 await server.stopAsync()——
+ *    stop()（server.cjs 的 stop）连监听释放都不等，跨进程场景下 NSIS 要的是映像解锁 + 端口释放；
+ *  ② store.close() 内含 checkpoint 与周期计时器停止（Task 2 落地了调用点，Task 3 成对收尾计时器）；
+ *  ③ 追加 rules.close() + drainLibuvWork()：热重载 watcher 既 ref 着事件循环，它首扫丢到
+ *    libuv 线程池的 readdir/stat 作业又会在进程已 exit 时被工作线程回报到已关闭的 uv_async_t 上
+ *    （实测 0xC0000409 fastfail，见 rules.close 的注释）。停机的定义因此必须含「在途异步作业落地」。
+ *  返回值一路原样交给父进程（gateway.cjs 把它编进 gateway_shutdown 的响应）：
+ *   · drained=false 排空超时、· forced=true 监听没在预算内释放、· port 是刚释放的那个端口。
+ *  这两布尔缺一不可地上报（评审 I2③）：本任务最坏的失败形态「停不干净」过去在代码里是被允许通过的那一支。 */
+async function gracefulShutdown() {
+  credits.stopScheduler();
+  stopCheckinAuto();
+  discovery.cancelOAuth();
+  const st = await server.stopAsync();
+  await rules.close();
+  store.close();
+  const drained = await drainLibuvWork();
+  return { ok: true, drained, forced: !!st.forced, port: Number(st.port) || 0 };
+}
+
+/** libuv 线程池上还有没有在途作业（fs 异步请求这类）。getActiveResourcesInfo() 是 Node 18+ 的
+ *  公开 API，它把 handle 与 request 混在同一个数组里返回；request 的名字一律带 "Req"
+ *  （FSReqCallback / GetAddrinfoReq / FileHandleReq），handle 的名字一律是 *Wrap / Timeout /
+ *  Immediate，所以按 "Req" 取的就是「工作线程上还压着的活」。只等 request 不等 handle：
+ *  handle 漏关是本机代码的配置问题，不该拿「给进程续命」来兜。 */
+function pendingLibuvWork() {
+  try { return process.getActiveResourcesInfo().filter((n) => /Req/.test(String(n))).length; }
+  catch { return 0; }   // runtime 不提供这个 API 时不阻塞停机，行为退回修复前
+}
+
+/** 排空在途异步作业，带上界：停不干净也必须让 NSIS 拿到解锁的映像，不许把安装器挂死。
+ *  返回是否在预算内排空（超时只是「没等到」，不是错误）。 */
+async function drainLibuvWork(budgetMs) {
+  const deadline = Date.now() + (Number(budgetMs) > 0 ? Number(budgetMs) : DRAIN_BUDGET_MS);
+  while (pendingLibuvWork() > 0) {
+    if (Date.now() >= deadline) return false;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  return true;
 }
 
 // ===== IPC =====
@@ -227,51 +287,62 @@ function gatewayStatus() {
     keyCount: store.listKeys().length,
     vaultOk: vaultOk(),
     dbDriver: store.driver(),
+    // WAL 观测出口（三期 Task 3）：walBytes 让「是否还在单调增长」可量化，lastCheckpoint 让
+    // 「上一次周期 checkpoint 跑没跑 / 截动了没有 / 报了什么错」可读。二期结尾那个
+    // 1,388,472 B 冻结缺陷之所以拖了一期，就是这两个量在命令面上一个都不存在。
+    walBytes: store.walBytes(),
+    lastCheckpoint: store.lastCheckpoint(),
   };
 }
 
-function vaultOk() {
-  try {
-    const ss = require("electron").safeStorage;
-    return !!(ss && ss.isEncryptionAvailable());
-  } catch {
-    return false;
-  }
-}
+// 保险可用性 = 「凭据能不能被解」，与在哪个进程无关。旧实现只看 safeStorage，
+// 子进程里没有 electron 绑定 → 恒 false → 网关页误报（见 §5.7 更正：这条命令因此可转发）。
+function vaultOk() { return secretbox.backend() !== "none"; }
 
-/** 记住网关的开关状态：每次启停都写回整体配置的 proxy.restoreOnLaunch，
- *  下次打开应用按它决定是否自动启动（默认 false，即首次打开是关闭的） */
-function rememberRunning(running) {
-  try {
-    const cfg = config.loadConfig();
-    if (cfg.proxy.restoreOnLaunch === running) return;
-    cfg.proxy.restoreOnLaunch = running;
-    config.saveConfig(cfg);
-  } catch {
-    /* 落盘失败不影响本次启停，只影响下次开机是否自动拉起 */
-  }
+// rememberRunning（proxy.restoreOnLaunch 的写权）二期 Task 5 撤出本文件、上移到
+// gateway-client.cjs：启停命令的转发体在主进程，成功后由**主进程**写 config.json。
+// 子进程永不写 config.json —— 那是主进程的写权（Task 2 的写权归属），留在这里就会双写。
+
+/** 子进程侧后台作业（二期 Task 5）：额度定时刷新 + 定时自动签到。
+ *  这两个计时器过去在主进程跑；43 条命令下沉子进程后随实现体一起下沉 ——
+ *  留在主进程就会双跑（同一批号被签到两次、同一批号被刷两次额度），这是 gateway.cjs
+ *  文件头「子进程不跑计时器」那条注释的解除时刻。签到/刷新的实现体本就在本模块
+ *  （checkinBatch / credits），gateway.cjs 装配时调用这里这一个入口，不开第二份实现。 */
+function startBackgroundJobs() {
+  credits.startScheduler(() => settings().creditsRefreshMin);
+  startCheckinAuto();
 }
 
 function register(ipcMain) {
-  // ===== 服务启停 / 状态 =====
+  // ===== 服务启停 / 状态（主进程侧的薄包装见 gateway-client.cjs：转发 + 成功后写 restoreOnLaunch） =====
   ipcMain.handle("proxy_status", handle(() => gatewayStatus()));
   ipcMain.handle("proxy_start", handle(async () => {
     const r = await server.start(settings);
-    if (r.ok) rememberRunning(true);
+    // claimed 分支的 restoreOnLaunch 守卫（评审 I3）随写权一起上移到 gateway-client.cjs：
+    // 那条分支里本进程没有监听，配置不能记「本机在监听」，判断依据是响应里的 claimed 字段。
     events.emit({ type: "status" });
-    return r.ok ? ok({ port: r.port, already: !!r.already }) : fail(r.message);
+    // claimed：端口其实被**已常驻的网关**占着（server.cjs 的 EADDRINUSE 分支查过 gateway.json 并双检通过），
+    // 此时本进程没有监听，接管状态与端口归属都由认领方维持（Task 6 的认领路径依赖这条不报错）
+    return r.ok ? ok({ port: r.port, already: !!r.already, claimed: !!r.claimed }) : fail(r.message);
   }));
   ipcMain.handle("proxy_stop", handle(() => {
     server.stop();
-    rememberRunning(false);
     events.emit({ type: "status" });
     return ok({});
   }));
   // 改端口后调用：同进程 stop→listen，秒级完成（方案 §6.6）
   ipcMain.handle("proxy_restart", handle(async () => {
-    await server.stopAsync();
+    const st = await server.stopAsync();
+    // 评审裁定（Task 5 刀 2）：stop 没在预算内释放端口（forced=true）时**不盲启**。旧实现无视
+    // forced 继续 start()，那个端口上挂着的正是自己没释放干净的旧监听 —— EADDRINUSE 分支的
+    // probeResidentGateway 还会把它误认成「常驻网关」接管（claimed），看似成功实则无人监听，
+    // 而且主进程会照常把 restoreOnLaunch 记成 true。代价：用户要手动再点一次（预算 1.5 s 内
+    // 端口通常早释放了，forced 本来就是罕见路径），换来「成功必然真在监听」这个不变式。
+    if (st.forced) {
+      events.emit({ type: "status" });
+      return fail("旧监听未能在预算内释放（端口 " + (Number(st.port) || settings().port) + " 仍被占用），请稍后重试");
+    }
     const r = await server.start(settings);
-    if (r.ok) rememberRunning(true);
     credits.startScheduler(() => settings().creditsRefreshMin); // 刷新周期一并热生效
     events.emit({ type: "status" });
     return r.ok ? ok({ port: r.port }) : fail(r.message);
@@ -333,6 +404,20 @@ function register(ipcMain) {
       : { status: "disabled" });
     return ok({});
   }));
+  // 重命名账号（自定义备注）：只写 name 列，不推进任何参与 LWW 比较的时间戳 ⇒ 已知缺陷（本期不修）：
+  // uid 缺失的号以 name 作身份键（poolsync.accountKeyOf），改名会被下一轮号池同步还原、并在对端按新键多出一条号
+  // （上游 v1.18.0 带来的命令，三期 Task 1 接线：随 register() 同源进 dispatchTable ⇒ 归子进程，号池写权仍单一）
+  ipcMain.handle("proxy_account_rename", handle(({ id, name }) => {
+    const acc = store.getAccount(id);
+    if (!acc) return fail("账号不存在");
+    // uid 缺失时改名会改身份键（poolsync.accountKeyOf 退回 name），导致同步后同一 token 变两条号 ⇒ 拒绝
+    // （三期 fork 侧修复，2026-09-24，用户裁决选「拒绝」而非加稳定身份键）
+    if (poolsync.renameWouldChangeIdentity(acc)) {
+      return fail("该账号没有 UID，改名会让号池同步把它认成另一个号（同一 token 变两条）。如需改名请删除后重新添加");
+    }
+    store.updateAccount(id, { name: String(name || "").trim() });
+    return ok({});
+  }));
   // 手动解除冷却：cooling 账号立即回 online，同时豁免该账号的模型级负缓存
   ipcMain.handle("proxy_account_cool_off", handle(({ id }) => {
     const r = pool.releaseCool(String(id || ""));
@@ -378,6 +463,12 @@ function register(ipcMain) {
     credits.refreshAccount(r.id).catch(() => {});
     return ok({ id: r.id, updated: r.updated });
   }));
+  // oauth_begin 的形状（Task 5）：本进程只创建 OAuth 会话，登录页的打开由**主进程**做 ——
+  // 会话建好、拿到 url 后推 {type:"oauth-open", url} 事件（CRITICAL_EVENTS 成员，背压不丢），
+  // 主进程收到才 shell.openExternal。旧实现在这里直接开浏览器，下沉后拿不到 shell。
+  // 抛错时机说明：beginOAuth 同步抛的错（已有进行中的登录 / 未知渠道 / 小浣熊不支持）在
+  // handle() 里收成 {ok:false, message}，用户立刻看到；旧实现「beginOAuth 成功之后才可能
+  // 因 shell 缺失而抛错」的那条路径随 openExternal 下移而消失（主进程 shell 恒在）。
   ipcMain.handle("proxy_oauth_begin", handle(async ({ channel }) => {
     const ch = adapters.get(channel) ? String(channel) : store.CHANNELS[0].id;
     const r = await discovery.beginOAuth(ch, (result) => {
@@ -388,7 +479,7 @@ function register(ipcMain) {
       }
       events.emit({ type: "oauth-done", channel: ch, ...result });
     });
-    if (r.ok && r.url) await shell.openExternal(r.url);
+    if (r.ok && r.url) events.emit({ type: "oauth-open", channel: ch, url: r.url });
     return r.ok ? ok({ url: r.url, mode: r.mode }) : fail(r.message);
   }));
   ipcMain.handle("proxy_oauth_cancel", handle(() => ok({ cancelled: discovery.cancelOAuth() })));
@@ -406,26 +497,23 @@ function register(ipcMain) {
     if (invalid) parts.push(`${invalid} 条记录缺 token 忽略`);
     return ok({ ...r, invalid, message: parts.join("，") });
   }));
-  // 从 JSON/ZIP 文件添加：主进程弹文件选择框；zip 读取包内全部 .json 条目合并导入
-  ipcMain.handle("proxy_account_import_file", handle(async ({ channel }) => {
+  // 从 JSON/ZIP 文件添加 · 子进程半段（Task 5 拆两段）：主进程弹框读字节、base64 过管道
+  // 投到这条命令（zip.readZip + importAccounts，即拆分前的 :412-432 主体）。文件选择框在
+  // 纯 Node 子进程里弹不了，字节过管道后实现体留在这一侧——号池写权（store）归子进程独占。
+  // name：原始文件名，zip 判定沿用「按扩展名」（拆分前就是 /\.zip$/i），结果文案也用它。
+  ipcMain.handle("proxy_account_import_blob", handle(({ channel, blob, name }) => {
     const fallback = adapters.get(channel) ? String(channel) : store.CHANNELS[0].id;
-    const { dialog, BrowserWindow } = require("electron");
-    const parent = BrowserWindow.getAllWindows()[0];
-    const opts = {
-      title: "选择账号 JSON / ZIP 文件",
-      properties: ["openFile"],
-      filters: [
-        { name: "账号文件（JSON / ZIP）", extensions: ["json", "zip"] },
-        { name: "所有文件", extensions: ["*"] },
-      ],
-    };
-    const r = await (parent ? dialog.showOpenDialog(parent, opts) : dialog.showOpenDialog(opts));
-    if (r.canceled || !r.filePaths.length) return ok({ canceled: true });
-    const file = r.filePaths[0];
-    const buf = fs.readFileSync(file);
+    const buf = Buffer.from(String(blob || ""), "base64");
+    if (!buf.length) return fail("文件内容为空");
+    const fileName = String(name || "");
     let texts = [];
-    if (/\.zip$/i.test(file)) {
-      const entries = zip.readZip(buf).filter((e) => /\.json$/i.test(e.name));
+    if (/\.zip$/i.test(fileName)) {
+      let entries;
+      try {
+        entries = zip.readZip(buf).filter((e) => /\.json$/i.test(e.name));
+      } catch (e) {
+        return fail("压缩包读取失败：" + String((e && e.message) || e));
+      }
       if (!entries.length) return fail("压缩包里没有 .json 文件");
       texts = entries.map((e) => e.data.toString("utf8"));
     } else {
@@ -449,7 +537,15 @@ function register(ipcMain) {
     const parts = [`成功导入 ${added} 个账号`];
     if (dup) parts.push(`${dup} 个同 UID 已存在跳过`);
     if (invalid) parts.push(`${invalid} 条记录无效忽略`);
-    return ok({ added, dup, invalid, file: path.basename(file), message: parts.join("，") });
+    return ok({ added, dup, invalid, message: parts.join("，") });
+  }));
+  ipcMain.handle("proxy_account_import_file", handle(() =>
+    fail("该命令的文件选择半段只在主进程：子进程表保留这个占位名是为逐字相等闸（④ ⊇ ②）无例外，字节应经 proxy_account_import_blob 投递")));
+  // webdav_shared_save 的反向跨界半段（Task 5）：主进程改了 WebDAV 共享口令后投这条命令，
+  // 在**子进程内**给 sync-state.json 记 keyChangeAt（那份文件归子进程独占，主进程不再直接写）
+  ipcMain.handle("proxy_poolsync_password_changed", handle(() => {
+    poolsync.onSharedPasswordMaybeChanged();
+    return ok({});
   }));
 
   // ===== 模型目录 =====
@@ -514,10 +610,14 @@ function register(ipcMain) {
   // ===== 规则文件 / 目录 / 安全 =====
   ipcMain.handle("proxy_rules_list", handle(() => rules.list()));
   ipcMain.handle("proxy_open_rules_dir", handle(async () => {
+    const shell = getShell();
+    if (!shell) throw new Error("该操作需要主进程界面，不能由后台常驻网关执行");
     await shell.openPath(rules.rulesDir());
     return ok({});
   }));
   ipcMain.handle("proxy_open_data_dir", handle(async () => {
+    const shell = getShell();
+    if (!shell) throw new Error("该操作需要主进程界面，不能由后台常驻网关执行");
     await shell.openPath(store.proxyDir());
     return ok({});
   }));
@@ -538,4 +638,42 @@ function register(ipcMain) {
   ipcMain.handle("proxy_poolsync_cancel", handle(() => poolsync.cancel()));
 }
 
-module.exports = { boot, shutdown, register, settings };
+// ===== 子进程侧的命令出口（二期 Task 3）=====
+
+// 表只在首次用到时构建一次，之后复用模块内缓存（每条命令重建一次全部闭包是纯浪费）
+let TABLE = null;
+
+/** 子进程侧：把 register() 的 ipcMain 换成收集器，register() 里每条命令名与实现体一字不动地复用。
+ *  为什么这样而不是重构出 COMMANDS 表：那是 290 行的重排，会掩盖「二期只改出口、不改命令语义」这个契约，
+ *  且 Task 5 的逐字相等闸（dev-gateway-forward-parity-test）就没法拿旧注册当基线。 */
+function dispatchTable() {
+  if (TABLE) return TABLE;
+  const cmds = {};
+  register({ handle: (name, fn) => { cmds[name] = fn; } });
+  TABLE = cmds;
+  return TABLE;
+}
+
+/** 走管道调一条命令。第一个参数是假的 _event：全仓每条处理体都不使用 event / event.sender
+ *  （逐条核过；真依赖 UI 的那 4 条靠 getShell() 的惰性 require 抛错，见 §5.7）。 */
+async function dispatch(cmd, args) {
+  const fn = dispatchTable()[cmd];
+  if (!fn) throw new Error("未知命令: " + cmd);
+  return fn({ sender: { send() {} } }, args || {});
+}
+
+/** 子进程装配：把事件出口接到管道广播上（emit 由 gateway.cjs 在 serve() 建成之后给，装配序不是风格）。
+ *  置上网关角色后本模块不再按 restoreOnLaunch 自动 listen —— 监听决策归主进程（Task 6 的新语义）。 */
+function attachGatewayMode({ emit } = {}) {
+  if (typeof emit !== "function") throw new Error("attachGatewayMode 需要 emit(payload) 函数");
+  gatewayAttached = true;
+  events.setSink(emit);
+}
+
+// gatewayStatus 一并导出：proxy_status 命令走它，Task 1 的闸直接断言 vaultOk 字段，
+// Task 5 的转发化也要按这个名字取（藏在 register 里没法单测）
+// dispatchTable/dispatch/attachGatewayMode/gracefulShutdown：二期 Task 3 的子进程入口与管道出口
+// startBackgroundJobs：二期 Task 5 的子进程后台作业入口（credits 定时刷新 + 定时自动签到，
+// 随命令实现体一起下沉；gateway.cjs 装配时调用）
+// DRAIN_BUDGET_MS：停机预算的四个数字之一，供 dev-gateway-pipe-test 断言它们仍复合（合计只在那一条断言里算）
+module.exports = { shutdown, gracefulShutdown, DRAIN_BUDGET_MS, register, settings, gatewayStatus, dispatchTable, dispatch, attachGatewayMode, startBackgroundJobs };

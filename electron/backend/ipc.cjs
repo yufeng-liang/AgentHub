@@ -15,7 +15,11 @@ const updater = require("./updater.cjs");
 const remotesync = require("./remotesync.cjs");
 const webdav = require("./webdav.cjs");
 const watch = require("./watch.cjs");
-const proxy = require("./proxy/index.cjs");
+// 网关主进程注册面（Task 5）：全部 proxy_* 命令 + 子进程转发出口。注意这里 require 的不是
+// proxy 域——一条 require("./proxy/index.cjs") 会把整张依赖图（含 store.cjs 的库句柄路径）拉回主进程，
+// §5.4 的「stats.db 子进程独占」就白做了。主进程对 proxy 域的 require 由
+// scripts/dev-gateway-forward-parity-test.cjs 钉死为零。
+const gatewayClient = require("./gateway-client.cjs");
 
 // 渲染层拿到的密码一律是掩码；保存/测试连接收到精确掩码时回填磁盘真值
 const PASSWORD_MASK = "••••••••";
@@ -117,7 +121,10 @@ function register(ctx) {
   ipcMain.handle("get_update_status", () => updater.getStatus());
   ipcMain.handle("check_update", () => updater.check(true));
   ipcMain.handle("download_update", () => updater.download());
-  ipcMain.handle("install_update", () => updater.triggerInstall());
+  // 「立即安装」经 requestInstall 打装更标记 + app.quit()，把退出交回 main.cjs before-quit 的
+  // 唯一停机出口 quitForInstall()（Task 7）：先停干净网关子进程并实测端口释放，然后才 quitAndInstall。
+  // 直连 updater.triggerInstall() 会绕过停机互锁（scripts/dev-gateway-interlock-test.cjs ③ 钉死）。
+  ipcMain.handle("install_update", () => updater.requestInstall());
   ipcMain.handle("open_release_page", () => updater.openReleases());
   ipcMain.handle("open_repo_page", () => updater.openRepo());
 
@@ -172,8 +179,11 @@ function register(ctx) {
   ipcMain.handle("webdav_shared_get", handle(() => config.maskedSharedWebdav()));
   ipcMain.handle("webdav_shared_save", handle(({ config: form }) => {
     const r = config.saveSharedWebdav(form || {});
-    // WebDAV 密码同时是号池压缩包的加密口令：改动后令历史包标记 keyChange，下次同步重打包
-    try { require("./proxy/poolsync.cjs").onSharedPasswordMaybeChanged(); } catch { /* 模块未装载不影响保存 */ }
+    // WebDAV 密码同时是号池压缩包的加密口令：改动后令历史包标记 keyChange，下次同步重打包。
+    // Task 5 起经管道投给子进程（sync-state.json 归子进程独占，主进程不再直接写）；网关没起时
+    // 这次标记先跳过——下次同步的上传跳过条件里带口令指纹（remoteKey 含 keyFingerprint），换了
+    // 密码指纹必不匹配，历史包照样重打，漏一次标记不产生数据错（poolsync.cjs :414-417）。
+    gatewayClient.call("proxy_poolsync_password_changed", {}).catch(() => {});
     return r;
   }));
   ipcMain.handle("webdav_shared_test", handle(({ config: form }) => {
@@ -470,8 +480,8 @@ function register(ctx) {
   // ===== 用量同步模块（原「用量记录同步」backend/ipc.cjs，冲突命令已加 sync_ 前缀） =====
   require("./sync-ipc.cjs").registerSync(ctx);
 
-  // ===== 反代网关（命令实现见 backend/proxy/index.cjs） =====
-  proxy.register(ipcMain);
+  // ===== 反代网关（Task 5：proxy_* 命令注册面在 gateway-client，实现体经管道在子进程 proxy/index.cjs） =====
+  gatewayClient.register(ipcMain);
 }
 
 module.exports = { register };

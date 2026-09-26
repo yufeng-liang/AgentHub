@@ -3,6 +3,11 @@
 //   node tools/gen-phosphor-subset.cjs        # 生成 phosphor-used.css
 // 图标集合变化后重跑即可；扫到字体表里不存在的类名会直接失败退出，不静默丢。
 "use strict";
+
+// 守卫（三期收尾，2026-09-24）：被 require 时零副作用。本仓 5 个脚本曾因缺它而在被 require 时
+// 真把探针跑了一次（Task 5 实现者核验导出面时误触 phase1-browser-pass）。
+// 顶层 return 在 CJS 模块包装函数里合法：作为入口时 require.main === module 照常执行。
+if (require.main !== module) return;
 const fs = require("node:fs");
 const path = require("node:path");
 

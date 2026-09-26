@@ -1,30 +1,27 @@
-// 反代网关 · 存储层：SQLite（WAL）+ DPAPI 加密凭据
+// 反代网关 · 存储层：SQLite（WAL）+ 系统级加密凭据
 // 表结构对齐方案 §5.1：keys / agents / accounts / credits_history / usage_requests
-// 驱动优先 better-sqlite3（方案选型），ABI 不匹配等加载失败时回退 Node 22 内置 node:sqlite（接口对齐）
-// 凭据（token/refreshToken）不落明文：复用 config.cjs 的 safeStorage(DPAPI) enc:v1: 信封，等效方案 vault.bin
+// 驱动只有 node:sqlite 一种（二期整张图跑在 Node 22+ 的内嵌运行时里）。曾经这里还挂着一条
+// better-sqlite3 回退分支：该包既不在 dependencies、node_modules/better-sqlite3 也实测不存在，
+// 属于永远走不到的死代码（规格 §九 指定二期改 store.cjs 时顺手清掉）。
+// 凭据（token/refreshToken/Key）不落明文：走 proxy/secretbox.cjs 的 enc:v1: 信封，等效方案 vault.bin
 "use strict";
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const config = require("../config.cjs");
 
-// 驱动与用量同步模块一致：Node 22 内置 node:sqlite 优先（纯 JS 无原生编译依赖）；
-// 老运行时没有 node:sqlite 时回退 better-sqlite3（方案选型，接口对齐）
 let Database = null;
 let driver = "none";
 try {
   Database = require("node:sqlite").DatabaseSync;
   driver = "node:sqlite";
 } catch {
-  try {
-    Database = require("better-sqlite3");
-    driver = "better-sqlite3";
-  } catch {
-    Database = null;
-  }
+  Database = null;
 }
 
-/** 网关数据目录：%APPDATA%\AgentHub\proxy\（stats.db / rules / logs 都在这里） */
+/** 网关数据目录：%APPDATA%\AgentHub\proxy\（stats.db / rules / logs 都在这里）。
+ *  这句「logs 在这里」到二期 Task 3 才成真：网关子进程日志落在本目录的 logs/gateway.log，
+ *  实现与轮转策略见 backend/gateway-log.cjs（目录真相源就是本函数，别处不再另拼一条路径）。 */
 function proxyDir() {
   const d = path.join(config.dataDir(), "proxy");
   fs.mkdirSync(d, { recursive: true });
@@ -119,12 +116,16 @@ const CHANNELS = [
   { id: "raccoon", display: "商汤小浣熊", domain: "xiaohuanxiong.com" },
 ];
 
+/** stats.db 完整路径：open() 与 walBytes() 共用一份解析口径，不留两份真相源 */
+function dbFile() {
+  return path.join(proxyDir(), "stats.db");
+}
+
 /** 打开数据库（幂等）；建表 + WAL + 三渠道种子 + 90 天流水 GC */
 function open() {
   if (db) return db;
-  if (!Database) throw new Error("无可用 SQLite 驱动（better-sqlite3 加载失败且无 node:sqlite）");
-  const file = path.join(proxyDir(), "stats.db");
-  db = new Database(file);
+  if (!Database) throw new Error("无可用 SQLite 驱动：运行时没有 node:sqlite（Node 22+ 内置）");
+  db = new Database(dbFile());
   db.exec("PRAGMA journal_mode=WAL;");
   db.exec("PRAGMA busy_timeout=5000;");
   db.exec(SCHEMA);
@@ -200,7 +201,7 @@ function listKeys() {
     id: r.id,
     name: r.name,
     mask: `${r.key_prefix}····${r.key_suffix}`,
-    secret: r.key_enc ? config.decryptSecret(r.key_enc) : "",
+    secret: decryptForRead(r.key_enc),
     route: r.route,
     dailyQuota: r.daily_quota,
     rateLimit: r.rate_limit,
@@ -272,6 +273,63 @@ function setPoolStrategy(channel, strategy) {
 
 // ===== 号池账号 =====
 
+/** 凭据解密失败计数：secretbox.decrypt 从「返回 ""」改成「抛错」后，读路径接住抛错但必须留下痕迹。
+ *  Task 3 的 /readyz 用它区分「号池真没号」与「有号但解不开」（换机器 / 主密钥不可得），
+ *  后者不该被报成前者。只记次数与首条原因，绝不记明文/密文/密钥。
+ *  ⚠ 本计数是**本次进程内的累计次数，只增不减**（Task 1 定的契约，dev-secretbox-test 守着）：
+ *  它是诊断量，不能直接当 readiness 判据——那会让 credFail 一旦为真就永久为真。
+ *  要「当前是否还解不开」请用它下面那条 decryptFailureActive()。 */
+let decryptFailures = 0;
+let decryptFailureReason = "";
+let decryptFailureLogged = false;
+function rememberDecryptFailure(e) {
+  decryptFailures++;
+  if (!decryptFailureReason) decryptFailureReason = String((e && e.message) || e).split("\n")[0].slice(0, 200);
+  if (!decryptFailureLogged) {
+    decryptFailureLogged = true;
+    try { console.error("[proxy/store] 凭据解密失败（原因只记一次，计数继续累加）：" + decryptFailureReason); } catch { /* 无 stderr 的宿主忽略 */ }
+  }
+}
+function decryptFailureCount() { return decryptFailures; }
+
+/** 最近一次**真去解**且解不开的密文信封（抛错才算，解出空串不算：那是号池同步传播进来的空 token，
+ *  属「这号本来就没凭据」而不是「本机主密钥不可得」）。解密成功时从集合里摘掉，所以它表达的是
+ *  「按当前这台机器的状态，这些凭据还解不开」，而不是「这个进程历史上失败过」。 */
+const decryptFailedEnvelopes = new Set();
+
+/** 当前仍解不开的凭据条数（readiness 判据）。与 decryptFailureCount() 的分工看上面那条注释。
+ *  两点必须知道：
+ *  ① 只在**读路径真的解过**之后才有结论（没解过就回 0，宁可少报也不误报），所以 /readyz 里
+ *    要先算号池（poolSummary→accountView→tokenUsable 会把号池里每条凭据都解一遍）再算本函数；
+ *  ② 与库内存活信封对账后顺手清掉历史信封——用户删号或换上新凭据后本函数会自己掉回 0，
+ *    不会因为一次失败就永久把「没号」误报成「解不开」。 */
+function decryptFailureActive() {
+  open();
+  const live = new Set();
+  for (const r of db.prepare("SELECT token_enc AS e, refresh_enc AS r FROM accounts").all()) {
+    if (r.e) live.add(r.e);
+    if (r.r) live.add(r.r);
+  }
+  for (const r of db.prepare("SELECT key_enc AS e FROM keys").all()) if (r.e) live.add(r.e);
+  for (const e of [...decryptFailedEnvelopes]) if (!live.has(e)) decryptFailedEnvelopes.delete(e);
+  return decryptFailedEnvelopes.size;
+}
+
+/** 读路径的解密：解不开回空串（等价旧行为，不新增抛穿面），但一定留下痕迹 */
+function decryptForRead(stored) {
+  if (!stored) return "";
+  try {
+    const v = config.decryptSecret(stored);
+    decryptFailedEnvelopes.delete(stored);          // 解得开就把「当前解不开」这条划掉，readiness 才不会粘住
+    return v;
+  } catch (e) {
+    e.credentialFailure = true;
+    rememberDecryptFailure(e);
+    decryptFailedEnvelopes.add(stored);
+    return "";
+  }
+}
+
 /** 行内凭据是否真的可用：号池同步曾把空 token 的账号（加密空串信封）传播进库，
  *  hasToken 只看 token_enc 非空会把这类坏号当可用号调度（全 401）。这里真实解密判一次。
  *  解密结果按信封 memo（信封不变=结果不变；更新凭据会写新信封），避免每次选号都打 DPAPI */
@@ -284,8 +342,12 @@ function tokenUsable(r) {
   let ok = false;
   try {
     ok = !!config.decryptSecret(r.token_enc);
-  } catch {
+    if (ok) decryptFailedEnvelopes.delete(r.token_enc);
+  } catch (e) {
     ok = false;
+    e.credentialFailure = true;
+    rememberDecryptFailure(e);   // 解不开 ≠ 没号：交给 /readyz 说清差别
+    decryptFailedEnvelopes.add(r.token_enc);
   }
   usableCache.set(r.token_enc, ok);
   return ok;
@@ -311,6 +373,9 @@ function accountView(r) {
     todayReq: r.today_day === dayStr() ? r.today_req : 0,
     todayTokens: r.today_day === dayStr() ? r.today_tokens : 0,
     createdAt: r.created_at,
+    /** 最近一次改名时刻（三期 fork 侧修复）：meta.renamedAt。参与 LWW 时间戳的计算，
+     *  否则「改名不推进任何可比时间戳」会让改名永远输给任何因无关原因动过的对端（见 poolsync.accountStamp） */
+    renamedAt: Number(meta.renamedAt) || 0,
     hasToken: tokenUsable(r),
     domain: meta.domain || "",
     enterpriseId: meta.enterpriseId || "",
@@ -341,11 +406,13 @@ function getAccount(id) {
   return r || null;
 }
 
-/** 取解密后的凭据（仅主进程内部使用，绝不外传渲染层） */
+/** 取解密后的凭据（仅主进程内部使用，绝不外传渲染层）。
+ *  热路径每请求走到这里一次：解不开时回空串 + 计数，不把抛错打到请求链路上——
+ *  选号阶段 tokenUsable 已经过滤过，这里抛穿的后果是整条请求 500，而不是换下一个号。 */
 function accountSecrets(r) {
   return {
-    token: config.decryptSecret(r.token_enc),
-    refreshToken: config.decryptSecret(r.refresh_enc),
+    token: decryptForRead(r.token_enc),
+    refreshToken: decryptForRead(r.refresh_enc),
   };
 }
 
@@ -378,7 +445,20 @@ function updateAccount(id, patch) {
   const sets = [];
   const vals = [];
   const put = (col, val) => { sets.push(`${col}=?`); vals.push(val); };
-  if (patch.name != null) put("name", String(patch.name).slice(0, 64));
+  if (patch.name != null) {
+    const next = String(patch.name).slice(0, 64);
+    put("name", next);
+    // 改名必须推进一个参与 LWW 比较的时间戳（三期 fork 侧修复，2026-09-24）：
+    // 旧实现只写 name 列、不推进任何时间戳，而 name 的 LWW 用 updatedAt 比大小 ⇒ 改名**永远不是最新写**，
+    // 会被下一轮号池同步按「对方 updatedAt 更大」还原回去（用户看到「改完名过一会儿自己变回去」）。
+    // 这里落一个独立改名时刻到 meta.renamedAt（不加列，避免 schema 迁移），并由 accountView 暴露、
+    // 经 poolsync.accountStamp 纳入 LWW 时间戳。
+    // ⚠ 只在名字**真的变了**时推进：同步应用远端同名时若也推进，会让两侧时间戳互相追赶、
+    //   每个同步轮都白写一次（值相同但时间戳永动）。
+    if (patch.renamedAt == null && next !== cur.name) {
+      put("meta", JSON.stringify({ ...parseMeta(cur.meta), renamedAt: Date.now() }));
+    }
+  }
   if (patch.status != null) put("status", String(patch.status));
   // credits 允许 -1（企业版无限额度哨兵）；其余负值一律归 0
   if (patch.credits != null) put("credits", Number(patch.credits) < -1 ? 0 : Math.round(Number(patch.credits) || 0));
@@ -547,12 +627,116 @@ function usageView(r) {
   };
 }
 
-/** 关闭数据库句柄（应用退出/热重启时调用；重复调用安全） */
+/** 关闭数据库句柄（应用退出 / 网关停机时调用；重复调用安全）。
+ *  关之前先 checkpoint(TRUNCATE)：正常退出留不下大 WAL，下次开机不用先解一截孤儿日志。
+ *  成对停掉周期 checkpoint 计时器（Task 2 登记给 Task 3 的那条）：计时器的回调打的是即将置 null 的
+ *  db，留着它就是一条无人认领的 interval——startCheckpointTimer() 的 stop 出口本就是给这里用的。 */
 function close() {
   if (db) {
+    stopCheckpointTimer();
+    checkpoint();
     try { db.close(); } catch { /* 已关 */ }
     db = null;
   }
+}
+
+// ===== WAL 收敛与句柄归属（Task 2） =====
+
+/** 最近一次 checkpoint 的观测（三期 Task 3）：{ok,before,after,err}。
+ *  存在的理由：二期结尾留下一个未解缺陷——常驻子进程的 -wal 长到 1,388,472 B 后**冻结不收敛**，
+ *  而 `PRAGMA wal_checkpoint(TRUNCATE)` 的成败在旧实现里被压成一个布尔丢弃掉了，没有任何一处能
+ *  回答「它到底跑没跑 / 跑了为什么没截动 / 报了什么错」。三期的既定顺序是先可观测、再取证、再修，
+ *  所以这里只留痕，**不夹带任何修法**（PASSIVE 退档 / journal_size_limit / 读返回码都归 Task 4）。
+ *  lastCk 本身就是无回调时的兜底出口：既有调用方（close()、write-ownership 闸）不接回调也读得到它。 */
+let lastCk = null;
+
+/** WAL 收敛：本机实测 stats.db-wal 曾长到 1.59 MB 且自 16:41 起零次 checkpoint ——
+ *  （Task 2 之前的现状：全仓只有 journal_mode=WAL，没有 wal_checkpoint，close() 更是无人调用。）
+ *  双进程争锁时 busy_timeout=5000 会把转发卡 5 秒，所以二期必须单一写者；这条是第二道保险。
+ *  返回值（三期 Task 3 改形状）：旧实现回 `false/true`（是否做成了），现在回观测结构
+ *  `{ok,before,after,err}` —— `ok` 就是旧的那个布尔，`before/after` 是本次 checkpoint 前后的
+ *  -wal 字节数（`after===before` 即「跑了但没截动」，这是二期冻结缺陷的关键判别量）。
+ *  ⚠ 形状变更的消费方：`scripts/dev-write-ownership-test.cjs` 里 ③ 那一组曾以
+ *  `strictEqual(store.checkpoint(), false/true)` 消费布尔（三处：库未开 / 库已开 / close 之后），
+ *  已同改判据为该结构的 `.ok`（判别力不变：库没开必须不假装成功、库开了必须真做成）。`close()` 里是弃值调用，不受影响。 */
+function checkpoint() {
+  const before = walBytes();
+  if (!db) { lastCk = { ok: false, before, after: before, err: "db-not-open" }; return lastCk; }
+  try {
+    db.exec("PRAGMA wal_checkpoint(TRUNCATE);");
+    lastCk = { ok: true, before, after: walBytes(), err: "" };
+  } catch (e) {
+    lastCk = { ok: false, before, after: walBytes(), err: String((e && e.message) || e) };
+  }
+  return lastCk;
+}
+
+/** 读最近一次 checkpoint 的观测（从未做过 / 进程刚起时回 null；Task 4 的决策表读它） */
+function lastCheckpoint() { return lastCk; }
+
+const CHECKPOINT_MS = 5 * 60 * 1000;
+let ckTimer = null;
+// 周期 checkpoint 的成败回调：由装配方（gateway.cjs）注入——store 不认识日志层，
+// 回调必须由装配方给，避免跨层 require。Task 4 分支 (c) 若把注册点搬进 open()，靠这个模块级
+// 变量把回调一起带走，否则 Task 3 的留痕会随那次改动消失。
+let ckOnResult = null;
+
+/** 周期 checkpoint：二期由常驻网关子进程在启动时挂上（Task 3），返回 stop 函数给停机路径用。
+ *  计时器 unref：它不该给进程续命，空闲时进程要能自己退。
+ *  签名向后兼容三种调用形态（既有闸 dev-write-ownership-test.cjs 里「周期 checkpoint」那组
+ *  吃的是数字形态 `startCheckpointTimer(30)` 并断言返回 stop 函数）：
+ *   · 无参 `startCheckpointTimer()`      → 用 CHECKPOINT_MS（生产形态，gateway.cjs 走这条）
+ *   · 数字 `startCheckpointTimer(30)`    → 覆盖周期（自测用）
+ *   · 回调 `startCheckpointTimer(fn)`    → 注入成败回调 + 用 CHECKPOINT_MS
+ *  `stopCheckpointTimer()` 的返回值仍是同一个 stop 函数（三种形态都一样），停机路径的契约不变。
+ *  回调现在是**双参** `(result, { ms, source })`：第二参是本次生效的间隔与其来源（评审 Concern 3 的
+ *  自证要求），既有单参调用方（gateway.cjs 的 `(r) => …`）多收一个被忽略的参数，不受影响。 */
+function startCheckpointTimer(onResult) {
+  const ms = typeof onResult === "number" ? onResult : 0;
+  if (typeof onResult === "function") ckOnResult = onResult;
+  stopCheckpointTimer();
+  // 生效间隔算一次、闭包持有：tick 里不再重读 env（否则 env 中途被改会让「本次生效值」这一留痕
+  // 变成随读随变的假证词）。`msArg` 是显式数字形参（自测用），留痕里如实标成 "arg" 来源。
+  const msArg = ms || checkpointMs();
+  const src = ms ? "arg" : checkpointMsSource();
+  ckTimer = setInterval(
+    () => { const r = checkpoint(); if (ckOnResult) ckOnResult(r, { ms: msArg, source: src }); },
+    msArg,
+  );
+  if (ckTimer.unref) ckTimer.unref();
+  return stopCheckpointTimer;
+}
+
+/** 周期取值的真相源：生产恒为 CHECKPOINT_MS，只有 AGENTHUB_CHECKPOINT_MS 能覆盖它。
+ *  ⚠ 这是**测试缝**，不是配置项：三期 Task 3 的收敛闸（dev-wal-convergence-test.cjs）要在真子进程里
+ *  观察周期 checkpoint，而 5 min 的自然 tick 会让那条闸跑 5.5 分钟以上。默认值一字未动
+ *  （不设环境变量时行为与二期完全一致），也**没有**留任何「手动触发 checkpoint」的命令面。
+ *  归因（D-P3）：本行是 Task 3 的新增生产代码，为可测试性而生，不改变生产默认行为。
+ *
+ *  ⚠ 缝落在**生产实走路径**上（`gateway.cjs` → `startCheckpointTimer(fn)` → 无数字 → 本函数），
+ *  所以任何能给网关子进程设 env 的场景（启动器、自启项、调试）都能静默改产线节奏。评审 Concern 3
+ *  的处置是**让日志自证**而不是假装缝不存在：gateway.cjs 把本函数的返回值写进每一条 `wal-checkpoint`
+ *  行（`ms` 字段），并在覆盖生效时另打一行 `wal-checkpoint-override`。事后复盘只看日志就能判断
+ *  当时生效的是 5 min 默认值还是被覆盖过的值，不需要再去猜进程环境。
+ *  没有选「只在未打包 / test flag 下认 env」那条：判定腿 Leg B′ 用的正是**打包 electron.exe**，
+ *  任何以「是否打包」为闸门的做法都会把它误关（`app.isPackaged` 同理）。 */
+function checkpointMs() {
+  const n = Number(process.env.AGENTHUB_CHECKPOINT_MS);
+  return Number.isFinite(n) && n > 0 ? n : CHECKPOINT_MS;
+}
+
+/** 本次生效间隔的**来源**（留痕自证用）："env" = 被 AGENTHUB_CHECKPOINT_MS 覆盖，"default" = 生产默认。
+ *  与 checkpointMs() 同读一个环境变量、同一套判别（有限正数才算覆盖），两处口径必须一起改。 */
+function checkpointMsSource() {
+  const n = Number(process.env.AGENTHUB_CHECKPOINT_MS);
+  return Number.isFinite(n) && n > 0 ? "env" : "default";
+}
+
+function stopCheckpointTimer() { if (ckTimer) clearInterval(ckTimer); ckTimer = null; }
+
+/** 当前 -wal 的字节数（没有库 / 没有 WAL 都回 0）；Task 8 用它量 WAL 是否还在单调增长 */
+function walBytes() {
+  try { return fs.statSync(dbFile() + "-wal").size; } catch { return 0; }
 }
 
 /** 模型级冷却负缓存（账号×模型，pool.cjs 写穿）：6004 墙钟可达数小时、11102 封顶 24h，
@@ -579,6 +763,13 @@ function deleteModelCooldowns(accId, model) {
 module.exports = {
   open, close, proxyDir, dayStr, dayStartMs,
   driver: () => driver,
+  decryptFailureCount,                 // 进程内累计次数（只增不减，诊断/日志用）
+  decryptFailureActive,                // 当前仍解不开的条数（/readyz 的 credFail 用它，见函数注释）
+  // WAL 收敛与句柄归属（Task 2）；stop 由 startCheckpointTimer 的返回值给出。
+  // lastCheckpoint 是三期 Task 3 的留痕出口：checkpoint() 的观测结构（Task 4/9 判据读它）。
+  // checkpointMsSource 是缝的自证面（评审 Concern 3）：让闸能对「默认值一字的惰性」与「被覆盖时如实标 env」
+  // 两极都下断言，而不是只信注释。纯函数、无副作用（只读 env，不开库、不碰 WAL）。
+  checkpoint, startCheckpointTimer, walBytes, lastCheckpoint, checkpointMsSource,
   CHANNELS,
   channelDisplay: (id) => (CHANNELS.find((c) => c.id === id) || {}).display || String(id),
   createKey, listKeys, findKeyBySecret, updateKey, deleteKey, keyTodayReq,

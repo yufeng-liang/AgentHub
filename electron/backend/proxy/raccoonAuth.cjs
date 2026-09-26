@@ -76,7 +76,11 @@ function writeTokens({ accessToken, refreshToken, officeIdentity } = {}) {
   if (accessToken) next.access_token = String(accessToken);
   if (refreshToken) next.refresh_token = String(refreshToken);
   if (officeIdentity) next.office_identity = String(officeIdentity);
-  const tmp = `${file}.agenthub-tmp`;
+  // 临时名带 pid（与同目录 ideswitch.cjs:91/:272 同口径）：这份 auth.json 与官方桌面客户端共用，
+  // AgentHub 自身两个写入者（并发回写，或 Task 3 后常驻子进程与主进程同刻）撞在一起时，固定名会把
+  // 对方的半成品 rename 成最终文件——落进凭据的就是半截 JSON。保留 `agenthub-` 前缀是为了在这个共享
+  // 目录里认出半成品属于谁（官方客户端自己也会往同目录写）。mode 0o600 不能丢：明文 refresh_token。
+  const tmp = `${file}.agenthub-tmp-${process.pid}`;
   try {
     fs.writeFileSync(tmp, JSON.stringify(next, null, 2), { encoding: "utf8", mode: 0o600 });
     fs.renameSync(tmp, file);

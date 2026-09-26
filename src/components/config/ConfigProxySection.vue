@@ -128,8 +128,8 @@ function openDataDir() {
         </div>
         <div class="set-row">
           <div class="set-info">
-            <div class="set-name">记住网关开关（随应用启动）</div>
-            <div class="set-desc">默认关闭：首次打开应用网关是停的，需在「总览」页手动启动；启动/停止都会记在这里，下次打开按它恢复</div>
+            <div class="set-name">启动时自动监听网关</div>
+            <div class="set-desc">本次启动时是否让网关子进程进入监听状态（新建或认领回来的常驻网关都算）；启动/停止网关会同步到这里。默认关闭：首次打开网关是停的，需在「总览」页手动启动</div>
           </div>
           <button class="switch" :class="{ on: app.config.proxy.restoreOnLaunch }" @click="app.config.proxy.restoreOnLaunch = !app.config.proxy.restoreOnLaunch"></button>
         </div>

@@ -236,6 +236,8 @@ export interface AppConfig {
     /** 启动不建窗，直接进托盘；依赖 minimizeToTray */
     launchHidden: boolean;
     autoStart: boolean;
+    /** 主 App 退出后网关子进程继续常驻（便携版不支持；自启注册目标随它切换） */
+    persistentGateway: boolean;
     hourly: boolean;
     daily: boolean;
     dailyTime: string;
@@ -395,6 +397,11 @@ export interface ProxyGatewayStatus {
   keyCount: number;
   vaultOk: boolean;
   dbDriver: string;
+  /** 当前 stats.db-wal 的字节数（三期 Task 3：量「WAL 是否还在单调增长」的唯一出口） */
+  walBytes: number;
+  /** 最近一次周期 checkpoint 的观测；从未做过 / 进程刚起时为 null。
+   *  after === before 即「跑了但没截动」，是二期 1,388,472 B 冻结缺陷的判别量。 */
+  lastCheckpoint: { ok: boolean; before: number; after: number; err: string } | null;
 }
 
 export interface ProxyUsageRow {

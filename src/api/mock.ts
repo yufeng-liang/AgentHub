@@ -34,7 +34,7 @@ function defaultConfig(): AppConfig {
       deviceId: "b3f2a1c8-77d2-4e5a-9b01-3f6c8d2e4a7b",
       deviceName: "DESK-01",
     },
-    schedule: { minimizeToTray: true, liteOnClose: true, launchHidden: false, autoStart: true, hourly: false, daily: true, dailyTime: "09:00", notifyOnSuccess: false },
+    schedule: { minimizeToTray: true, liteOnClose: true, launchHidden: true, autoStart: true, persistentGateway: false, hourly: false, daily: true, dailyTime: "09:00", notifyOnSuccess: false },
     watch: { enabled: true },
     proxy: {
       port: 9527,
@@ -404,6 +404,9 @@ export const mock = {
           today: { req: 1284, tokens: 312400, successRate: 99.4, ttftAvg: 820 },
           channels: PROXY_POOL.map((c) => ({ id: c.id, display: c.display, ...c.summary })),
           keyCount: PROXY_KEYS.length, vaultOk: true, dbDriver: "node:sqlite",
+          // 预览态给确定性的假值（不模拟真实 WAL 增长）：walBytes 为 0、从未周期 checkpoint 过。
+          // 与真机同形状即可，前端拿它渲染「WAL 观测」一栏不会因字段缺失而崩。
+          walBytes: 0, lastCheckpoint: null,
         };
       case "proxy_start":
         return { ok: true, port: 9527 };
@@ -440,6 +443,15 @@ export const mock = {
       case "proxy_oauth_cancel":
       case "proxy_oauth_submit_callback":
         return { ok: true };
+      // 重命名账号（自定义备注）：改预览池里的 name —— 与真实链路逐字同语义：
+      // index.cjs 注册体先 `String(name || "").trim()`，store.updateAccount 再 `slice(0, 64)`，
+      // 所以预览态也必须「先 trim 后截断」，否则「  我的主力号  」和纯空格名在两边行为不一致
+      case "proxy_account_rename": {
+        const hit = PROXY_POOL.flatMap((c) => c.accounts).find((a) => a.id === args?.id);
+        if (!hit) return { ok: false, message: "账号不存在" };
+        hit.name = String(args?.name || "").trim().slice(0, 64);
+        return { ok: true };
+      }
       case "proxy_pool":
         return JSON.parse(JSON.stringify(PROXY_POOL));
       case "proxy_account_add":

@@ -1,6 +1,8 @@
 // 一期首屏产物门槛：entry 体积、CSS 总量、echarts 是否还在首屏、视图是否真的切开、覆盖层有没有被懒注入 CSS 反超。
 // 改动前基线：单 chunk 2445 KB JS + 584 KB CSS。
 // 用法：npm run build && node scripts/dev-bundle-check.cjs
+//       加 --check 跑漂移闸：与 scripts/.bundle-baseline.json 比对 entry/CSS 字节，漂移 >5% 红
+//       （首跑无基线时把当前值写进去，随提交入库；有意改体积后删掉基线文件重跑 --check 重录）。
 "use strict";
 const fs = require("node:fs");
 const path = require("node:path");
@@ -332,6 +334,45 @@ for (const f of css) {
 }
 for (const c of collisions) fails.push(`覆盖层级联：${c}`);
 if (!collisions.length) console.log(`OK 覆盖层顺序：element.css ${overrides.size} 条选择器无被懒注入 CSS 反超`);
+
+// ===== --check 漂移闸（Task 9 项 4，一期评审点名）=====
+// 硬门槛是「超线才红」，门槛之内的缓慢漂移没人看：entry 454→490 KB 连续几轮各 +8% 也全绿。
+// --check 把当前 entry/CSS 字节与 scripts/.bundle-baseline.json 比对，漂移 >5% 报「先核对是否有意」。
+// 有意改动后删掉基线文件重跑 --check 重录（闸门绝不自动重写基线，否则等于没闸）。
+// jsChunks 只记账不设闸：视图增删会合理地改 chunk 数，拿它红人全是噪声。
+const DRIFT_LIMIT = 0.05;
+const BASELINE = path.join(__dirname, ".bundle-baseline.json");
+if (process.argv.includes("--check")) {
+  if (fails.length) {
+    console.error("--check 跳过：先解决上面的硬门槛，漂移基线只对全绿的产物有意义");
+  } else {
+    const cur = {
+      entryBytes: entry.length,
+      cssBytes: Math.round(cssKB * 1024),
+      jsChunks: js.length,
+      checkedAt: new Date().toISOString(),
+    };
+    if (!fs.existsSync(BASELINE)) {
+      fs.writeFileSync(BASELINE, JSON.stringify(cur, null, 2) + "\n");
+      console.log(`OK 漂移闸首跑：基线已写入 ${path.relative(ROOT, BASELINE)}`
+        + `（entry ${cur.entryBytes} B · CSS ${cur.cssBytes} B · ${cur.jsChunks} chunk）——记得随提交入库`);
+    } else {
+      const base = JSON.parse(fs.readFileSync(BASELINE, "utf8"));
+      const drift = (k) => (base[k] > 0 ? Math.abs(cur[k] - base[k]) / base[k] : 0);
+      const over = ["entryBytes", "cssBytes"].filter((k) => drift(k) > DRIFT_LIMIT);
+      if (over.length) {
+        for (const k of over) {
+          const label = k === "entryBytes" ? "entry JS" : "CSS 合计";
+          fails.push(`漂移闸：${label} ${cur[k]} B 与基线 ${base[k]} B 漂移 ${(drift(k) * 100).toFixed(1)}% > 5%`
+            + "——先核对是否有意；有意则删掉基线文件重跑 --check 重录");
+        }
+      } else {
+        console.log(`OK 漂移闸：entry/CSS 与基线偏差均 ≤5%`
+          + `（entry ${(drift("entryBytes") * 100).toFixed(1)}% · CSS ${(drift("cssBytes") * 100).toFixed(1)}%）`);
+      }
+    }
+  }
+}
 
 for (const f of fails) console.error("FAIL " + f);
 if (fails.length) process.exit(1);

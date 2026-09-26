@@ -69,6 +69,7 @@ const ALLOWED_COMMANDS = new Set([
   "get_trend",
   "get_heatmap",
   "get_aggregate",
+  "get_dimensions",
   "get_device_breakdowns",
   "get_records",
   // 同步
@@ -119,6 +120,9 @@ const ALLOWED_COMMANDS = new Set([
   "proxy_account_add",
   "proxy_account_remove",
   "proxy_account_toggle",
+  // 上游 v1.18.0 带来的账号重命名：三期 Task 1 过完「preload 白名单 == 主进程转发面 == 子进程
+  // dispatch 表」三处对齐（闸：scripts/dev-gateway-forward-parity-test.cjs）。
+  "proxy_account_rename",
   "proxy_account_cool_off",
   "proxy_account_refresh",
   "proxy_credits_refresh",

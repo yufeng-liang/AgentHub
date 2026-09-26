@@ -269,7 +269,7 @@ function switchIdeAccount(accountId) {
     { uid: acc.uid, name: acc.name, expiresAt: acc.expires_at, tokenType: acc.meta && acc.meta.tokenType },
     secrets
   );
-  const tmp = `${file}.tmp`;
+  const tmp = `${file}.tmp-${process.pid}`;
   try {
     fs.writeFileSync(tmp, JSON.stringify(merged, null, 2), "utf8");
     fs.renameSync(tmp, file);

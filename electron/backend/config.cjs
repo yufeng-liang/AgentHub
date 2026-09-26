@@ -22,27 +22,25 @@ function isPortable() {
   return !!process.env.PORTABLE_EXECUTABLE_DIR;
 }
 
-// WebDAV 密码用系统级密钥加密落盘（safeStorage 不可用就降级明文）。
-// 渲染层永远只拿掩码，真值留在主进程
-let safeStorage = null;
-try { safeStorage = require("electron").safeStorage; } catch { /* 自测环境无 electron */ }
-const ENC_PREFIX = "enc:v1:";
+// WebDAV 密码 / 号池凭据的系统级加解密：实现唯一落在 proxy/secretbox.cjs（后端优先级
+// safeStorage → v10 → plain-dev → none），这里只保留既有导出名，config.cjs / proxy/store.cjs 的调用点不动。
+// 语义变化（Task 1）：解不开时 **抛错** 而不是静默返回 ""——静默空串会让「换了机器」伪装成
+// 「号池没号」。配置读取链路（loadConfig）例外，见 decryptSecretLenient()。
+// 渲染层永远只拿掩码，真值留在主进程。
+const secretbox = require("./proxy/secretbox.cjs");
 
-function encryptSecret(plain) {
-  const s = String(plain || "");
-  if (!s || s.startsWith(ENC_PREFIX)) return s; // 空值或已是密文不重复加密
-  if (!safeStorage || !safeStorage.isEncryptionAvailable()) return s;
-  return ENC_PREFIX + safeStorage.encryptString(s).toString("base64");
-}
+function encryptSecret(plain) { return secretbox.encrypt(plain); }
 
-function decryptSecret(stored) {
-  const s = String(stored || "");
-  if (!s.startsWith(ENC_PREFIX)) return s; // 明文（降级环境存的）直接用
-  if (!safeStorage || !safeStorage.isEncryptionAvailable()) return "";
+function decryptSecret(stored) { return secretbox.decrypt(stored); }
+
+/** 配置读取专用的宽容版：解不开就是「密码为空」，让用户重填（旧语义）。
+ *  loadConfig 是全站入口级的公共路径（网关 settings() 每次请求都读），
+ *  那里冒未捕获抛错会让整个配置读取炸掉，比空号池严重得多，故只在这两处降级。 */
+function decryptSecretLenient(stored) {
   try {
-    return safeStorage.decryptString(Buffer.from(s.slice(ENC_PREFIX.length), "base64"));
+    return secretbox.decrypt(stored);
   } catch {
-    return ""; // 密文来自其他机器解不开，让用户重填
+    return "";
   }
 }
 
@@ -122,8 +120,9 @@ function defaultConfig() {
     schedule: {
       minimizeToTray: true, // 关窗缩到托盘
       liteOnClose: true,    // 关窗即销毁窗口回收 UI 内存（重开需重新加载首屏）
-      launchHidden: false,  // 启动不建窗，直接进托盘
+      launchHidden: true,   // 启动不建窗（三期：并入「轻量模式」，默认开）
       autoStart: false,     // 开机自启（便携版无效）
+      persistentGateway: false, // 主 App 退出后网关子进程继续常驻（便携版不支持；自启注册目标随它切换）
       hourly: false,        // 每小时自动同步
       daily: false,         // 每天定时同步
       dailyTime: "09:00",
@@ -137,7 +136,10 @@ function defaultConfig() {
     proxy: {
       port: 9527,               // 监听端口（默认 9527）
       bind: "127.0.0.1",        // 绑定地址：127.0.0.1 仅本机 / 0.0.0.0 局域网开放
-      restoreOnLaunch: false,    // 网关开关的上次状态：启动应用时是否随之启动（默认关，由用户自行开启）
+      // 语义（Task 6 重定义，规格 §六）：本次启动时，是否让（新建或认领来的）子进程进入监听状态——
+      // 不再是「上次退出时网关开没开」。常驻（persistentGateway）detach 出去的就是「监听中」这个状态，
+      // 主 App 下次启动认领回来；启动/停止网关仍会同步到这里，作为下次启动的监听意愿。
+      restoreOnLaunch: false,
       routeStrategy: "smart",   // smart=智能路由（健康度×余额打分）/ fixed=指定渠道优先
       fixedChannel: "trae",     // fixed 策略下的优先渠道
       rateLimitPerMin: 120,     // 单 Key 令牌桶限速（次/分钟，Key 可单独覆盖）
@@ -315,13 +317,13 @@ function loadConfig() {
   if (!disk || typeof disk !== "object" || Array.isArray(disk)) disk = {};
   const merged = mergeConfig(defaultConfig(), disk);
   // 迁移：旧版 proxy.autoStart 是「永远自启」的开关且默认 true，不是用户选择；
-  // 新语义是 restoreOnLaunch「记住上次开关」，所以旧值一律丢弃，改完存盘即不再出现
+  // 新语义是 restoreOnLaunch「本次启动是否让子进程进入监听」，所以旧值一律丢弃，改完存盘即不再出现
   if (merged.proxy && "autoStart" in merged.proxy) delete merged.proxy.autoStart;
   if (merged.theme !== "dark" && merged.theme !== "light") merged.theme = "dark";
   merged.moduleOrder = normalizeModuleOrder(merged.moduleOrder);
-  merged.webdav.password = decryptSecret(merged.webdav.password);
+  merged.webdav.password = decryptSecretLenient(merged.webdav.password);
   merged.webdavShared = normalizeShared(merged.webdavShared);
-  merged.webdavShared.password = decryptSecret(merged.webdavShared.password);
+  merged.webdavShared.password = decryptSecretLenient(merged.webdavShared.password);
   // deviceId / 本机名惰性补全并写回，保证多次调用稳定
   if (!merged.webdav.deviceId || !merged.webdav.deviceName) {
     if (!merged.webdav.deviceId) merged.webdav.deviceId = crypto.randomUUID();
@@ -369,9 +371,16 @@ function saveConfig(cfg) {
   disk.webdav.password = encryptSecret(disk.webdav.password);
   if (disk.webdavShared) disk.webdavShared = normalizeShared(disk.webdavShared);
   disk.webdavShared.password = encryptSecret(disk.webdavShared.password);
-  const tmp = p + ".tmp";
-  fs.writeFileSync(tmp, JSON.stringify(disk, null, 2), "utf8");
-  fs.renameSync(tmp, p);
+  // 带 pid：二期主进程与常驻网关子进程可能同刻写盘（子进程不写 config.json，但写
+  // sync-state.json / catalog.json 的同族写法在 hub/sync 里），固定名会互相 rename 踩掉。
+  const tmp = `${p}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(disk, null, 2), "utf8");
+    fs.renameSync(tmp, p);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* 半成品已不在（多半是被自己 rename 走了） */ }
+    throw e;
+  }
   return { ok: true, message: "设置保存成功" };
 }
 
@@ -393,17 +402,61 @@ function setUpdateNotified(version) {
   }
 }
 
-// 开机自启即时生效；便携版注册的是临时解压路径，开发模式不必注册
+// 开机自启即时生效；便携版注册的是临时解压路径，开发模式不必注册。
+// 注册目标随 schedule.persistentGateway 切换（Task 6）：
+//  · 关（默认）→ 主 App exe：开机拉起完整应用（不传 path，Electron 默认注册 process.execPath）；
+//  · 开 → 安装根目录的 agenthub-gateway.cmd（package.json extraFiles 落位，与主 exe 同目录）：
+//    开机只拉常驻网关子进程（--persistent，不建窗），主 App 由用户手动打开后认领该网关。
+// 【终审修复】双向注销对称：换目标**不会**覆盖旧项，三条路径都显式双清：
+//  · autoStart=false：两个目标都注销；
+//  · autoStart=true && persistentGateway=false：注册主 exe + 清 .cmd；
+//  · autoStart=true && persistentGateway=true：注册 .cmd + 清主 exe。
+// 【真机批次② 发现】.cmd 目标**不能**走 setLoginItemSettings 带 path：Electron 35.7.5 实测（最小
+// 复现：真路径 H:\x\agenthub-gateway.cmd 注册后 Run 项变 H:xagenthub-gateway.cmd）会把路径里的
+// 反斜杠当转义序列吃掉一级（\r 还被当回车拆出 args），落盘的是坏路径、开机拉不起来。故 .cmd 目标
+// 改经 reg.exe 直写 HKCU Run（主 exe 目标不带 path、不受该 bug 影响，仍走 setLoginItemSettings）。
+const RUN_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+const RUN_VALUE = "AgentHubGatewayCmd";
+// 间接层：launcher 闸把它换成记账器断言入参形状，真注册表一次都不许碰。
+// 默认实现用 System32 绝对路径调 reg.exe——不指望 PATH（有机器缺 System32，concurrently 曾因此起不来）。
+function regExePath() {
+  return path.join(process.env.SystemRoot || "C:\\Windows", "System32", "reg.exe");
+}
+function regExec(args) {
+  return require("node:child_process").spawnSync(regExePath(), args, { stdio: "ignore", windowsHide: true });
+}
+// /d 带内嵌引号：Run 项启动走 CreateProcess 拼命令行，安装路径含空格（如 C:\Program Files\）时没引号会截断
+function addGatewayRunItem(cmdPath) {
+  try { module.exports.regExec(["add", RUN_KEY, "/v", RUN_VALUE, "/t", "REG_SZ", "/d", '"' + cmdPath + '"', "/f"]); } catch { /* 注册失败不拦保存 */ }
+}
+function removeGatewayRunItem() {
+  try { module.exports.regExec(["delete", RUN_KEY, "/v", RUN_VALUE, "/f"]); } catch { /* 注销失败不拦保存 */ }
+}
 function applyAutoStart(cfg) {
   if (isPortable() || !electronApp || process.env.VITE_DEV_SERVER_URL) return;
   try {
     if (!electronApp.isPackaged) return;
-    electronApp.setLoginItemSettings({ openAtLogin: !!(cfg.schedule && cfg.schedule.autoStart) });
+    const autoStart = !!(cfg.schedule && cfg.schedule.autoStart);
+    const cmdPath = path.join(path.dirname(process.execPath), "agenthub-gateway.cmd");
+    if (!autoStart) {
+      // 关自启：不管上次停在哪一档，两条 Run 项都清干净
+      electronApp.setLoginItemSettings({ openAtLogin: false });
+      module.exports.removeGatewayRunItem();
+      return;
+    }
+    if (cfg.schedule && cfg.schedule.persistentGateway) {
+      module.exports.addGatewayRunItem(cmdPath);
+      electronApp.setLoginItemSettings({ openAtLogin: false }); // 清主 exe 残留
+    } else {
+      electronApp.setLoginItemSettings({ openAtLogin: true });
+      module.exports.removeGatewayRunItem(); // 清 .cmd 残留
+    }
   } catch { /* 注册失败不拦保存 */ }
 }
 
 module.exports = {
   dataDir, configPath, hubDir, ensureHub, loadConfig, saveConfig, defaultConfig,
   getUpdateNotified, setUpdateNotified, isPortable, encryptSecret, decryptSecret, applyAutoStart,
+  RUN_KEY, RUN_VALUE, regExePath, regExec, addGatewayRunItem, removeGatewayRunItem,
   loadSharedWebdav, saveSharedWebdav, maskedSharedWebdav, moduleWebdav, PASSWORD_MASK,
 };

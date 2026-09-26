@@ -13,8 +13,10 @@ const watch = require("./backend/watch.cjs");
 const usageConfig = require("./backend/sync-config.cjs");
 const usagedb = require("./backend/db.cjs");
 const usagesync = require("./backend/sync.cjs");
-// 反代网关模块：本地 OpenAI 兼容服务（默认 127.0.0.1:9527），托盘常驻期间持续提供 API
-const proxy = require("./backend/proxy/index.cjs");
+// 网关子进程监督器（二期）：spawn / 认领 / 管道转发 / 事件回流 / 全部 proxy_* 命令的注册面
+// （Task 5 起 ipc.cjs 经它注册，主进程不再 require proxy 域 —— stats.db 归子进程独占）。
+// 日志由它自己经 gateway-log 落 proxyDir()/logs/gateway.log，主进程不再另开一份写点。
+const gatewayClient = require("./backend/gateway-client.cjs");
 const usageScheduler = require("./backend/usage-scheduler.cjs");
 
 const DEV_URL = process.env.VITE_DEV_SERVER_URL || "http://localhost:1420";
@@ -28,6 +30,38 @@ let quitting = false;
 // 「跳到软件更新卡片」是一次性待办：窗口销毁态下 send 过去没有监听者（App.vue 的 app:event
 // 监听在渲染层挂载后才注册），所以先记账，等那个窗口的 did-finish-load 补投，投完即清
 let pendingFocusUpdate = false;
+
+// ===== Task 7 退出/装更互锁：三条入口共用唯一退出口 quitForInstall() =====
+// installPhase：idle（未进互锁）→ stopping（stopAndWait 在飞）→ stopped（已停干净，放行续跑）。
+// 它同时是防重入闸：triggerInstall 的 quitAndInstall 会再触发一次 before-quit，第二次必须直落续跑路径。
+let installPhase = "idle";
+
+/**
+ * Task 7 的唯一退出口：拦下本次退出 → 停干净网关子进程 → 再续跑（装更或退出）。
+ * 三条入口都汇到这里：
+ *  · before-quit 检出装更意愿（updater.pendingInstall() / pendingInstallRequested()）；
+ *  · before-quit 的非托盘退出（!quitting：quitAndInstall 重入 / OS 会话结束引发的 quit）；
+ *  · 渲染层 install_update（ipc.cjs 只经 updater.requestInstall() 打标记 + app.quit()，
+ *    不再直连 quitAndInstall 绕过本函数）。
+ * 停机走 gatewayClient.stopAndWait（gateway_shutdown → 等进程退 → 实测 connect 端口失败），
+ * 子进程赖着不走时它内部强杀兜底；端口仍未释放时**显式通知**而不是静默卡住（规格 §5.6）。
+ */
+function quitForInstall(wantInstall) {
+  if (installPhase !== "idle") return;   // 在飞/已完成：本次 before-quit 只被拦下，不重入
+  installPhase = "stopping";
+  scheduler.stop();
+  usageScheduler.stop();
+  watch.stop();
+  gatewayClient.stopAndWait({ timeoutMs: 5000 })
+    // stopAndWait 自己抛错也不能把退出挂死在 preventDefault 上：按「没停干净」续跑并留痕
+    .catch((e) => ({ stopped: false, portFreed: false, message: String((e && e.message) || e) }))
+    .then((r) => {
+      installPhase = "stopped";
+      if (!r.portFreed) notify("AgentHub", "网关端口未释放，安装可能失败：" + r.message); // 报错而不是静默卡住
+      if (wantInstall) updater.triggerInstall();
+      else app.quit();
+    });
+}
 
 /** 资源目录：打包后为 process.resourcesPath 的相邻 build，开发时为项目 build/ */
 function buildDir() {
@@ -241,7 +275,22 @@ function buildTrayMenu() {
       click: () => { usageScheduler.setPaused(!usageScheduler.isPaused()); refreshTrayMenu(); },
     },
     { type: "separator" },
-    { label: "退出", click: () => { quitting = true; app.quit(); } },
+    // stopping 窗口的托盘竞态（Task 7b）：**只在 stopAndWait 在飞（stopping）时**点「退出」什么都不做 ——
+    // 此刻 quitForInstall 的停机正在飞，再来一次 app.quit() 会并发走第二遍停机路径（托盘这条是唯一
+    // 绕过 before-quit 互锁判定、直接把 quitting 置真的入口）。在飞的收尾会自己把进程退掉。
+    // ⚠ 判据只能是 `=== "stopping"`，**不能**写 `!== "idle"`（终审修复，2026-09-24）：installPhase 到
+    // `stopped` 后**永不复位**（updater.cjs 从不碰它），而 `stopped` 的语义是「已停干净、放行续跑」——
+    // 装更被拦时 triggerInstall 10s 后复位、onUpdateError 只改状态**不退出进程**，于是应用继续活着而
+    // installPhase 永远停在 stopped ⇒ 用 `!== "idle"` 会把托盘「退出」永久堵死，用户再也退不掉。
+    // 与 before-quit 的互锁判据（`installPhase !== "stopped"`，即 stopped 时放行）保持同一套语义。
+    {
+      label: "退出",
+      click: () => {
+        if (installPhase === "stopping") return;
+        quitting = true;
+        app.quit();
+      },
+    },
   );
   return Menu.buildFromTemplate(items);
 }
@@ -358,7 +407,17 @@ const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
-  app.on("second-instance", () => showWindow());
+  // 规格二期认领（Task 9 项 2）：second-instance 此前忽略 argv——「--gateway-start 这类从托盘/
+  // 命令行拉起网关的入口」需要它。决定：本期只补 argv 解析与一条留痕日志，不加新入口——现在的
+  // 网关认领不需要 argv，而新入口涉及命令行 → 网关生命周期的编排，归后续产品决策（简报原文）。
+  app.on("second-instance", (_event, argv) => {
+    const { flags, hasStart } = gatewayClient.parseGatewayArgv(argv);
+    if (flags.length) {
+      console.log(`[second-instance] 网关相关参数 ${flags.join(" ")}`
+        + (hasStart ? "（--gateway-start 已识别；入口编排本期未接，仅留痕）" : ""));
+    }
+    showWindow();
+  });
 
   app.whenReady().then(() => {
     const boot = config.loadConfig();
@@ -374,8 +433,36 @@ if (!gotLock) {
     ipc.register({ ipcMain, app, shell, nativeTheme });
     remotesync.setOnFinish(notifySync);
     usagesync.setOnFinish(notifyUsageSync);
-    // 反代网关：规则热加载 + 额度定时刷新 + 按配置自启网关服务（服务独立于窗口存续）
-    proxy.boot();
+    // 网关子进程（Task 5 起为正式启动路径，不再是 opt-in）：那张 proxy_* 命令表全部在子进程跑，
+    // 主进程不再装配 proxy 域（rules/store/credits/checkin 计时器都随实现体下沉，gateway.cjs）。
+    // 这里先 spawn；监听决策按 restoreOnLaunch 新语义（Task 6 重定义：本次启动时是否让（新建或
+    // 认领来的）子进程进入监听状态，不再是「上次退出时网关开没开」）在 start() 成功后落地——
+    // true → 转发一次 proxy_start（与用户点开关同一条路径，claimed 守卫等语义完全一致）；
+    // false → 只发一次 proxy_status 同步状态：常驻网关被认领时可能已在监听（detach 出去的就是
+    // 「监听中」这个状态），这里只查询、不强开也不强停。本条保持「应用起来 = 子进程在」的最小不变式。
+    // 不 await：whenReady 回调保持同步；成败都由 gateway-client 写进 proxyDir()/logs/gateway.log。
+    // 这条裸调与转发侧 ensureStarted 汇入同一条互斥：在飞去重长在 start() 本体（评审 I1），
+    // boot-start 在飞期间渲染层首条 proxy 命令只会拿到同一条 promise，不会再 spawn 第二个子进程。
+    gatewayClient.start({ persistent: boot.schedule.persistentGateway })
+      .then((r) => {
+        if (!r.ok) return;
+        return gatewayClient.call(boot.proxy && boot.proxy.restoreOnLaunch ? "proxy_start" : "proxy_status", {})
+          .catch(() => {});
+      })
+      .catch((e) => {
+        console.error("网关子进程启动失败：" + String((e && e.message) || e));
+      });
+    // 子进程回流的代理事件扇给所有窗口（与 events.cjs 一期语义一致：无窗口时直接丢弃）。
+    // oauth-open 是唯一要在主进程就地消费的事件：登录页由 shell.openExternal 打开 ——
+    // 会话在子进程（拿不到 shell），事件经管道回来，这里收到才开浏览器（CRITICAL_EVENTS 保投递）。
+    gatewayClient.onEvent((payload) => {
+      if (payload && payload.type === "oauth-open" && payload.url) {
+        shell.openExternal(String(payload.url)).catch(() => {});
+      }
+      for (const win of BrowserWindow.getAllWindows()) {
+        if (!win.isDestroyed()) win.webContents.send("app:event", payload);
+      }
+    });
     // 启动即进托盘：首帧不建窗，GPU 侧连建窗残留都不产生（一期打包版实测私有 166.05 MB / GPU 32.2，
     // 对比「建过再销毁」的 215.47 MB，再省 49.42 MB）。
     // minimizeToTray 关时不生效 —— 那种配置下关窗就是退出，不该留一个没有界面的进程
@@ -397,22 +484,26 @@ if (!gotLock) {
   });
 
   app.on("before-quit", (e) => {
-    // 下载完的更新：拦下这次退出，静默装完自动重启
-    if (updater.pendingInstall()) {
+    // 互锁判定（简报 Step 2 模板语义）：installPhase !== "stopped" && (wantInstall || !quitting)
+    //  · wantInstall：装更必须先停干净子进程 —— NSIS 覆盖安装要解锁 exe 映像、新进程要拿到端口。
+    //    pendingInstallRequested() 堵 triggerInstall 的洞：它先置 installTriggered 再 quitAndInstall，
+    //    后者再触发 before-quit 时 pendingInstall() 已是 false，光看它装更路径会漏检。
+    //  · !quitting：非托盘发起的退出（装更重入 / OS 会话结束）同样走互锁。
+    //  托盘「退出」（quitting=true 且无装更意愿）**有意不拦**：常驻网关「活过主 App」是 Task 6 的
+    //  定案语义（看门狗 parent-exit → detach-keep），而 gateway_shutdown 没有常驻豁免，走互锁等于
+    //  每次退出都杀掉常驻网关。非常驻子进程由 parent-exit 的优雅停机兜住（≤5s），无需主进程确认。
+    const wantInstall = updater.pendingInstall() || updater.pendingInstallRequested();
+    if (installPhase !== "stopped" && (wantInstall || !quitting)) {
       e.preventDefault();
-      quitting = true;
-      scheduler.stop();
-      usageScheduler.stop();
-      watch.stop();
-      proxy.shutdown();
-      updater.triggerInstall();
+      quitForInstall(wantInstall);
       return;
     }
+    // 续跑路径（互锁后的第二次 before-quit / 托盘退出）：只做与网关无关的收尾。
+    // Task 5 起主进程不持有网关的任何句柄（store/rules 都在子进程），这里不收口网关。
     quitting = true;
     scheduler.stop();
     usageScheduler.stop();
     watch.stop();
-    proxy.shutdown();
   });
 
   app.on("window-all-closed", () => {

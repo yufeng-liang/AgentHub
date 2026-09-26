@@ -143,6 +143,13 @@ async function toggleAppBehavior() {
   await app.save();
 }
 
+/** 轻量模式：liteOnClose + launchHidden 的聚合视图（三期定案：读看主特征 liteOnClose，写同写两条）。
+    部分为真只可能来自手改 JSON，点一次即归一，故不做 indeterminate。 */
+const liteMode = computed({
+  get: () => app.config.schedule.liteOnClose,
+  set: (v) => { app.config.schedule.liteOnClose = v; app.config.schedule.launchHidden = v; },
+});
+
 /** 外观切换（与左栏亮暗按钮同源） */
 function setTheme(v: string | number | boolean | undefined) {
   if (v === "dark" || v === "light") app.setTheme(v);
@@ -298,24 +305,37 @@ onUnmounted(() => {
       </div>
       <div class="set-row">
         <div class="set-info">
-          <div class="set-name">关闭最小化到托盘</div>
-          <div class="set-desc">点关闭按钮不退出，仅最小化到托盘（托盘菜单「退出」才是真正退出）</div>
+          <div class="set-name">关窗后留在托盘（不退出）</div>
+          <div class="set-desc">点关闭不退出程序，缩在托盘继续跑；托盘菜单「退出」才是真正退出（关掉它 = 关窗即退出）</div>
         </div>
         <el-switch v-model="app.config.schedule.minimizeToTray" @change="toggleAppBehavior" />
       </div>
-      <div class="set-row">
+      <!-- 常驻网关（Task 6）：主 App 退出后子进程继续在后台监听；便携版是临时解压副本，detach 会锁住
+           解压目录，整项灰置。生效时机：退出前已开着网关就原样 detach，下次启动直接认领回来。
+           三期 Task 6：位置随轻量模式升降——轻量关时它是平级独立行（渲染在轻量模式行之前），
+           轻量开时降为轻量模式的子行（渲染在轻量模式行之后）。**只换位置，绝不清零该字段**：
+           它可能对应一个正在后台常驻的网关和一条已注册的开机自启项 -->
+      <div v-if="!liteMode" class="set-row">
         <div class="set-info">
-          <div class="set-name">关窗后释放界面内存</div>
-          <div class="set-desc">关闭窗口即结束界面进程，后台只留反代网关与定时同步，占用内存更低；代价是重新打开要多加载一次界面</div>
+          <div class="set-name">主 App 退出后网关继续常驻</div>
+          <div class="set-desc">{{ isPortable ? "便携版不支持后台常驻（临时解压副本退出即失效）" : "主 App 退出后网关继续常驻，额度刷新与自动签到随它一起留在后台跑（便携版不支持）" }}</div>
         </div>
-        <el-switch v-model="app.config.schedule.liteOnClose" :disabled="!app.config.schedule.minimizeToTray" @change="toggleAppBehavior" />
+        <el-switch v-model="app.config.schedule.persistentGateway" :disabled="isPortable" @change="toggleAppBehavior" />
       </div>
       <div class="set-row">
         <div class="set-info">
-          <div class="set-name">启动不打开主界面</div>
-          <div class="set-desc">开机后直接缩在托盘，需要时点托盘图标或菜单「显示主界面」再打开（下次启动生效）</div>
+          <div class="set-name">轻量模式</div>
+          <div class="set-desc">关窗即结束界面进程、下次启动不自动开界面，需要时点托盘图标打开。代价是重新打开要多加载一次界面</div>
         </div>
-        <el-switch v-model="app.config.schedule.launchHidden" :disabled="!app.config.schedule.minimizeToTray" @change="toggleAppBehavior" />
+        <el-switch v-model="liteMode" :disabled="!app.config.schedule.minimizeToTray" @change="toggleAppBehavior" />
+      </div>
+      <!-- 轻量开：同一块常驻行模板，降为轻量模式的子行（仅加缩进类，字段与灰置条件与上方一字不动） -->
+      <div v-if="liteMode" class="set-row set-row-sub">
+        <div class="set-info">
+          <div class="set-name">主 App 退出后网关继续常驻</div>
+          <div class="set-desc">{{ isPortable ? "便携版不支持后台常驻（临时解压副本退出即失效）" : "主 App 退出后网关继续常驻，额度刷新与自动签到随它一起留在后台跑（便携版不支持）" }}</div>
+        </div>
+        <el-switch v-model="app.config.schedule.persistentGateway" :disabled="isPortable" @change="toggleAppBehavior" />
       </div>
     </div>
 
@@ -435,6 +455,17 @@ onUnmounted(() => {
   padding-bottom: 2px;
   border-bottom: none;
 }
+/* 常驻网关行降为「轻量模式」的子行时的缩进（三期 Task 6：只改呈现，不动字段与灰置条件）。
+   左侧细线 + 缩进表明从属关系，与平级态（无此类）在视觉上可区分 */
+.set-row-sub {
+  padding-left: 14px;
+  margin-left: 2px;
+  border-left: 2px solid var(--line-strong);
+}
+.set-row-sub .set-name {
+  font-weight: 500;
+  color: var(--text-2);
+}
 /* 通知/托盘跳转进来的落点提示：高亮一圈，1.6 秒后自行退去 */
 .card.flash {
   border-color: var(--accent-line);
@@ -482,13 +513,7 @@ onUnmounted(() => {
 }
 
 /* ===== 免责声明弹窗 ===== */
-.disclaimer-dialog {
-  max-width: calc(100vw - 48px);
-}
-.disclaimer-dialog :deep(.el-dialog__body) {
-  max-height: min(52vh, 460px);
-  overflow-y: auto;
-}
+/* 类名落点与限高的原因说明在文件末尾的全局样式块（append-to-body 弹窗不能走 scoped） */
 .dc-title {
   font-size: 15px;
   font-weight: 700;
@@ -519,5 +544,31 @@ onUnmounted(() => {
   font-size: 11px;
   color: var(--text-3);
   text-align: right;
+}
+</style>
+<style>
+/* ===== 免责声明弹窗：全局块（不能 scoped）===== */
+/* append-to-body 把弹窗传送到 body 之下，本组件的 data-v 作用域属性到不了 EP 内层元素——
+   1.0.0 起写在 scoped :deep 里的 body 限高从未命中，这就是内容超高时（一期实测 1109px 内容
+   > 779px 视口）整窗在 .el-overlay-dialog 的 overflow:auto 里顶对齐、「我已知晓」要滚到底才
+   点得到的根因。class 经 $attrs 逐字落在 .el-dialog 根元素上（EP 2.14.5 dialog.vue 把
+   $attrs 传给 dialog-content，其根节点即 .el-dialog），全局类名选择器必然命中。
+   限高取 calc(100vh - 64px)：上下各留 32px 呼吸位，align-center 的 flex 居中依旧成立；
+   内容不超高时 max-height 不约束，维持原视觉。 */
+.disclaimer-dialog {
+  max-width: calc(100vw - 48px);
+  max-height: calc(100vh - 64px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.disclaimer-dialog .el-dialog__header,
+.disclaimer-dialog .el-dialog__footer {
+  flex-shrink: 0;
+}
+.disclaimer-dialog .el-dialog__body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 </style>
