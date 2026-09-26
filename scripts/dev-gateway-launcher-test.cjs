@@ -88,7 +88,7 @@ async function runCase(name, fn) {
   catch (e) { failures.push(name); console.error("FAIL " + name + "\n  " + String((e && e.message) || e)); }
 }
 
-// ===== ① 启动器内容 + package.json 接线（extraFiles 新增、extraResources 一字未动） =====
+// ===== ① 启动器内容 + package.json 接线（extraFiles 新增、extraResources 原有三条一字未动） =====
 async function case1() {
   const cmdText = fs.readFileSync(path.join(ROOT, "build", "gateway-launcher.cmd"), "utf8");
   assert.ok(cmdText.includes("@echo off"), "缺 @echo off");
@@ -104,11 +104,20 @@ async function case1() {
   assert.deepStrictEqual(pkg.build.extraFiles,
     [{ from: "build/gateway-launcher.cmd", to: "agenthub-gateway.cmd" }],
     "extraFiles 必须恰好一条：launcher → 安装根目录 agenthub-gateway.cmd（不是 extraResources）");
-  assert.deepStrictEqual(pkg.build.extraResources, [
+  // extraResources 的判据是「这三条原样仍在」而非「恰等于三条」——2026-09-26 合并上游时改：
+  // 上游 v1.25.x 记忆仓库合法新增了第 4 条（tools/mcp-memory-server.cjs → mcp/），
+  // 而本判据真正要守的是「Task 6 只许新增 extraFiles，resources/sqlcipher 一字不许动」，
+  // 不是禁止上游继续往里加东西。改为**子集**断言后原意完整保留，且上游新增不再假红。
+  const mustKeep = [
     { from: "build/icon.png", to: "build/icon.png" },
     { from: "build/tray.png", to: "build/tray.png" },
     { from: "resources/sqlcipher", to: "sqlcipher" },
-  ], "extraResources 被改动了：Task 6 只许新增 extraFiles，resources/sqlcipher 一字不许动");
+  ];
+  for (const need of mustKeep) {
+    assert.ok(pkg.build.extraResources.some((e) => e.from === need.from && e.to === need.to),
+      `extraResources 丢了原有条目 ${need.from} → ${need.to}（resources/sqlcipher 一字不许动）`
+      + `；当前为 ${JSON.stringify(pkg.build.extraResources)}`);
+  }
 }
 
 // ===== ①-P4 守门断言：--persistent + stdin 永不关闭 → gateway.json 8s 内出现且 pipe 可连通 =====
@@ -242,7 +251,7 @@ async function case4() {
 }
 
 (async () => {
-  await runCase("① 启动器内容 + package.json extraFiles 接线（extraResources 一字未动）", case1);
+  await runCase("① 启动器内容 + package.json extraFiles 接线（extraResources 原有三条一字未动）", case1);
   await runCase("①-P4 守门：--persistent 且 stdin 永不关闭 → gateway.json 8s 内出现且 pipe 可连通", case1p4);
   await runCase("①-B second-instance argv 解析契约（--gateway-start 识别，本期只解析留痕不动作）", case1b);
   await runCase("② 便携版拒常驻：契约返回 + 不 spawn + 不落 Run 项", case2);
