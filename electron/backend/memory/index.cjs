@@ -354,7 +354,7 @@ function writeReport(kind, title, lines) {
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, `${kind}-${new Date().toISOString().slice(0, 10)}.md`);
   const content = `# ${title}\n\n> 生成时间：${new Date().toLocaleString("zh-CN")}\n\n${lines.join("\n")}\n`;
-  const tmp = `${file}.tmp`;
+  const tmp = `${file}.tmp-${process.pid}`;
   fs.writeFileSync(tmp, content, "utf8");
   if (fs.existsSync(file)) fs.rmSync(file, { force: true });
   fs.renameSync(tmp, file);

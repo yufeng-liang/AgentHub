@@ -44,7 +44,7 @@ class MemoryHttpApi {
     const payload = { port: this.port, token: this.token, pid: process.pid, startedAt: Date.now() };
     try {
       fs.mkdirSync(path.dirname(this.runtimeFile), { recursive: true });
-      const tmp = `${this.runtimeFile}.tmp`;
+      const tmp = `${this.runtimeFile}.tmp-${process.pid}`;
       fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), "utf8");
       if (fs.existsSync(this.runtimeFile)) fs.rmSync(this.runtimeFile, { force: true });
       fs.renameSync(tmp, this.runtimeFile);

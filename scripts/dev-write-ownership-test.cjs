@@ -264,7 +264,16 @@ async function main() {
   const IDENT = "([A-Za-z_$][\\w$]*)";                       // 只认「裸变量名」：`b.dst` 这类成员表达式天然不匹配
   const WRITE_RE = new RegExp("\\bwriteFileSync\\(\\s*" + IDENT + "\\s*,", "g");
   const RENAME_RE = new RegExp("\\brenameSync\\(\\s*" + IDENT + "\\s*,", "g");
-  const TMP_LITERAL = /\.tmp(?![A-Za-z])/;    // .tmp 后不接字母 = 写盘临时名；os.tmpdir() 的 `.tmpdir` 不命中
+  // rename 的**目的地**（第二个实参为裸变量名时）。中转名永远不会是目的地——它只会被 rename 到目标去。
+  // 2026-09-26 合并上游时补这条方向判据：memory/store.cjs 的 Windows 覆盖改名先
+  // `renameSync(target, staging)` 把原文件挪走（target 在此是**源**），而 target 恰在更早的
+  // `!atomic` 提前返回分支里被 writeFileSync 过 ⇒ 被误判成「没拼 pid 的中转名」。
+  // 真实中转名（tmp / staging）从不作目的地，故这条排除不放宽任何真站点。
+  const RENAME_DST_RE = new RegExp("\\brenameSync\\(\\s*" + IDENT + "\\s*,\\s*" + IDENT + "\\s*\\)", "g");
+  // 词元副闸：写盘临时名。必须排除 `\.tmp`（转义点号）——那是**正则字面量里的匹配式**
+  // （如 memory/sync.cjs 的 /\.tmp(\.\d+)?$/ 用来判断「这个 basename 是不是中转文件」），
+  // 不是写盘路径。转义与否是最干净的判别：真中转名写在模板字符串里，点号不转义。
+  const TMP_LITERAL = /(?<!\\)\.tmp(?![A-Za-z])/;
   const COMMENT = /^\s*(\/\/|\*|\/\*)/;
   const DECL_OF = (name) => new RegExp(`^\\s*(?:const|let|var)\\s+${name}\\s*=`);
   // 已知原子写点（相对 electron/ 的 posix 路径）：新增写点就登记在这里，漏登记会被「少了一个」那条咬
@@ -272,6 +281,10 @@ async function main() {
     "backend/config.cjs", "backend/hub.cjs", "backend/sync-config.cjs", "backend/sync.cjs",
     "backend/proxy/ideswitch.cjs", "backend/proxy/raccoonAuth.cjs",
     "gateway.cjs",   // Task 3 新增：gateway.json 握手文件的中转名（子进程写、主进程读，跨进程同刻写是常态）
+    // 上游 v1.25.x 记忆仓库带来的三个写点（合并时登记；中转名已按同目录口径补 pid）
+    "backend/memory/index.cjs",    // 报告 .md 落盘
+    "backend/memory/store.cjs",    // 记忆 MD 的原子写（含 fsync + Windows 覆盖改名）
+    "backend/memory/httpapi.cjs",  // memory-runtime.json 握手文件（主进程写、MCP 桥读）
   ];
   const sites = [];      // 结构判据清单（中转覆盖型原子写）
   const litHits = [];    // 词元副闸命中
@@ -282,12 +295,13 @@ async function main() {
       if (e.isDirectory()) { walkCjs(abs, r); continue; }
       if (!e.name.endsWith(".cjs")) continue;
       const lines = fs.readFileSync(abs, "utf8").split(/\r?\n/);
-      const writes = [], renames = [];
+      const writes = [], renames = [], dstNames = new Set();
       lines.forEach((line, i) => {
         if (COMMENT.test(line)) return;                     // 注释里的写法不算
         if (TMP_LITERAL.test(line)) litHits.push({ file: r, line: i + 1, text: line.trim() });
         for (const m of line.matchAll(WRITE_RE)) writes.push({ name: m[1], line: i + 1 });
         for (const m of line.matchAll(RENAME_RE)) renames.push({ name: m[1], line: i + 1 });
+        for (const m of line.matchAll(RENAME_DST_RE)) dstNames.add(m[2]);
       });
       for (const rn of renames) {
         // rename 的源必须是本文件里声明的局部变量（挪走参数/外部传入的路径 = 不是中转名）
@@ -295,6 +309,8 @@ async function main() {
         const isDecl = DECL_OF(rn.name);
         for (let i = rn.line - 2; i >= 0; i--) if (isDecl.test(lines[i])) { decl = i; break; }
         if (decl < 0) continue;
+        // 该变量若同时是某次 rename 的目的地，它就是「被挪走的原文件」而非中转名（见 RENAME_DST_RE）
+        if (dstNames.has(rn.name)) continue;
         // 声明与 rename 之间必须真的写过这个变量 —— 这一条就是「中转覆盖」与「改名挪走」的分界
         const wr = writes.find((w) => w.name === rn.name && w.line > decl && w.line < rn.line);
         if (!wr) continue;
