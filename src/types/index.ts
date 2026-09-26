@@ -299,9 +299,9 @@ export interface ProxyConfig {
 
 // ===== 反代网关：数据结构（跟 electron/backend/proxy/* 返回一一对应） =====
 
-/** 内置生态渠道：只有这 4 家有 OAuth / 本机扫描 / 签到 / 号池同步这些"生态"概念 */
-export type ProxyBuiltinChannelId = "trae" | "workbuddy" | "workbuddy_ai" | "raccoon";
-/** 渠道 id = 内置 4 家 + 用户自建提供商的 slug。
+/** 内置生态渠道：有 OAuth / 本机扫描 / 签到 / 号池同步这些"生态"概念（自建提供商没有） */
+export type ProxyBuiltinChannelId = "trae" | "workbuddy" | "workbuddy_ai" | "raccoon" | "cline_free" | "cline_pass" | "autoclaw" | "autoclaw_intl" | "qoder";
+/** 渠道 id = 内置渠道 + 用户自建提供商的 slug。
  *  自建 slug 是运行期数据，编译期无从枚举，所以这里放宽成普通字符串（同 ProxyRoute 的既有做法），
  *  保留字面量联合只为了 IDE 补全。**需要"仅内置"约束的地方请用 ProxyBuiltinChannelId。** */
 export type ProxyChannelId = ProxyBuiltinChannelId | (string & {});

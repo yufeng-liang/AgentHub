@@ -1,11 +1,18 @@
 // 反代网关 · 凭据接入：本机软件导入（首选）→ OAuth 登录（兜底）→ 手动粘贴
 //
-// 三条渠道各自独立的登录方式（参考 cockpit-tools 的实证口径）：
+// 各渠道各自独立的登录方式（参考 cockpit-tools 的实证口径）：
 //   trae        Trae SOLO CN：PKCE(S256) + 本地回环回调 http://127.0.0.1:<port>/authorize
 //               登录主机由官方 GetLoginGuidance 下发（失败才用 www.trae.cn 兜底），
 //               授权地址必须带 auth_from=solo / hide_saas_login / code_challenge，缺一不可
 //   workbuddy   WorkBuddy（中国区）：官方 state 轮询
 //   workbuddy_ai WorkBuddy AI（国际版）：同一套 state 轮询，换上游域
+//   cline_free/cline_pass WorkOS 设备码流（RFC 8628）：authorize/device 发起 → authenticate 轮询
+//              → auth/register 换成带 workos: 前缀的 Cline 会话令牌；两池共用同一条登录流
+//   qoder      PKCE(S256) 设备授权：本地拼授权页（无起始请求）→ deviceToken/poll 2s 轮询
+//              → userinfo 补资料；edition 决定 global / cn 两套上游域
+//   autoclaw_intl AutoClaw 国际版：只有网页 OAuth（zai / google），前置阿里云风控滑块；
+//              回环回调 http://127.0.0.1:<port>/aclaw-cb/{vendor}/{taskState}，
+//              路径里的 state 只作 CSRF 校验，换码必须用查询串里上游回的 state（双 state）
 //
 // 本机导入：
 //   WorkBuddy 读 %LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy*.info
@@ -13,6 +20,11 @@
 //                凭据在 auth.accessToken；出现 $wbEncrypted 说明官方已开启加密，如实提示）
 //   Trae SOLO CN 读 %APPDATA%\<App>\User\globalStorage\storage.json，
 //              iCubeAuthInfo 是 ByteCrypto(AES-128-CBC) 信封，按官方算法离线解开取 JWT
+//   Cline       读 ~/.cline/data/settings/providers.json（providers.cline.settings.auth，明文）；
+//              uid 必须用 JWT external_id（usr-…），sub 是 WorkOS user_… 不能用于去重/余额路径
+//   AutoClaw    读 %APPDATA%\AutoClaw\auth.json（Electron safeStorage 密文，离线解密）；
+//              地区门禁：auth.json 无地区标记，只导国内渠道，国际版账号走 OAuth/粘贴；
+//              备来源 ~/.openclaw-autoclaw/openclaw.json（明文 JWT，无 refreshToken → 标注不可刷新）
 "use strict";
 const fs = require("node:fs");
 const os = require("node:os");
@@ -23,6 +35,8 @@ const store = require("./store.cjs");
 const rules = require("./rules.cjs");
 const util = require("./util.cjs");
 const adapters = require("./adapters.cjs");
+const clineAuth = require("./clineAuth.cjs");
+const acCred = require("./autoclawCredentials.cjs");
 const raccoonAuth = require("./raccoonAuth.cjs");
 
 const OAUTH_PORT = 17388; // 首选回环端口；被占用时退到系统随机端口（授权地址里会带实际端口）
@@ -396,9 +410,66 @@ function raccoonJwtPayload(token) {
   }
 }
 
-/** 全量扫描（本机四渠道候选） */
+// ===== Cline（~/.cline/data/settings/providers.json，明文；协议参考 §1.7） =====
+
+function scanCline() {
+  const cred = clineAuth.readClineDesktopAuth();
+  if (!cred) return [];
+  // uid 必须用 JWT external_id（usr-…），sub 是 WorkOS user_… 不能用于去重/余额路径
+  const uid = clineAuth.clineUid(cred.token, cred.accountId);
+  if (!uid) return [];
+  return [{
+    channel: "cline_free", // 两池同账号同凭证：默认落 free 池，UI 可 channelOverride 改投 pass
+    uid, name: cred.displayName || "Cline 账号",
+    token: cred.token, refreshToken: cred.refreshToken,
+    expiresAt: cred.expiresAt,
+    meta: {},
+    source: "scan", file: "providers.json",
+  }];
+}
+
+// ===== AutoClaw（%APPDATA%/AutoClaw/auth.json，safeStorage 密文；协议参考 §2.7） =====
+// 地区门禁照抄参考项目 local_credentials()：auth.json 无地区标记，只导国内渠道；
+// 国际版账号走 OAuth/粘贴。备来源 openclaw.json 是明文 JWT，无 refreshToken → 标注不可刷新。
+
+function scanAutoClaw() {
+  const out = [];
+  try {
+    const cred = acCred.readAutoClawAuth();
+    if (cred && cred.token) {
+      // util.jwtDecode 返回 {token,uid,exp,payload}，user_id/user_name 声明在 payload（简报直取顶层是笔误，按真实接口修正）
+      const claims = util.jwtDecode(cred.token).payload || {};
+      out.push({
+        channel: "autoclaw",
+        uid: `user-${String(claims.user_id || cred.uid || "")}`,
+        name: String(claims.user_name || cred.name || "AutoClaw 账号"),
+        token: cred.token, refreshToken: cred.refreshToken,
+        expiresAt: cred.expiresAt,
+        meta: cred.deviceId ? { device_id: cred.deviceId } : {},
+        source: "scan", file: "auth.json",
+      });
+    }
+  } catch { /* 解密失败不进候选（UI 走粘贴） */ }
+  try {
+    const alt = acCred.readOpenclawFallback();
+    if (alt && alt.token) {
+      const claims = util.jwtDecode(alt.token).payload || {};
+      out.push({
+        channel: "autoclaw",
+        uid: `user-${String(claims.user_id || "")}`,
+        name: "AutoClaw（openclaw.json，无刷新令牌）",
+        token: alt.token, refreshToken: "", // 无 refreshToken → 刷新链路会如实报「请重新粘贴」
+        expiresAt: Number(claims.exp || 0) * 1000 || 0,
+        meta: {}, source: "scan", file: "openclaw.json",
+      });
+    }
+  } catch { /* 同上 */ }
+  return out;
+}
+
+/** 全量扫描（本机六渠道候选） */
 function scanAll() {
-  return [...scanTrae(), ...scanWorkBuddy(), ...scanRaccoon()];
+  return [...scanTrae(), ...scanWorkBuddy(), ...scanRaccoon(), ...scanCline(), ...scanAutoClaw()];
 }
 
 /** 导入扫描结果入池：同渠道同 uid 已存在则更新凭据（刷新 token），否则新建 */
@@ -1114,6 +1185,298 @@ async function fetchWorkBuddyAccount(base, channel, state, token) {
   };
 }
 
+// ===== 设备授权流（cline WorkOS / qoder PKCE，同构「发起→轮询→落库」，无回环端口） =====
+
+/** WorkOS 轮询响应判定（RFC 8628；协议参考 §1.3/第四章 §1） */
+function workosPollVerdict(status, body) {
+  if (status === 200 && body && (body.access_token || body.accessToken)) return "done";
+  const err = body && body.error;
+  if (err === "authorization_pending") return "pending";
+  if (err === "slow_down") return "slow_down";
+  if (err === "expired_token") return "expired";
+  if (err === "access_denied") return "denied";
+  return status >= 200 && status < 300 ? "done" : "pending";
+}
+
+/** qoder 地区归一：""/global/intl → global，cn → cn（协议参考 §3.1） */
+function qoderRegionOfMode(mode) { return String(mode || "").toLowerCase() === "cn" ? "cn" : "global"; }
+
+// cline：POST authorize/device（body 仅 client_id）→ verification_uri_complete 免手输 → 轮询 authenticate
+// → 必做 /auth/register 换 Cline 会话令牌（头带 X-CLIENT-TYPE: cline-sdk）→ 落库
+const CLINE_WORKOS_BASE = "https://api.workos.com";
+const CLINE_WORKOS_CLIENT_ID = "client_01K3A541FN8TA3EPPHTD2325AR"; // 逐字（credentials.rs:69）
+const CLINE_DEVICE_FALLBACK_URL = "https://authkit.cline.bot/device";
+const CLINE_API_BASE = "https://api.cline.bot/api/v1"; // 只有单层 v1（协议参考 §1.1；简报的条件式拼写按裁定改字面量）
+
+async function beginClineOAuth(channel, onDone) {
+  const pool = channel === "cline_pass" ? "pass" : "free";
+  const r = await adapters.httpJson(`${CLINE_WORKOS_BASE}/user_management/authorize/device`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
+    body: `client_id=${encodeURIComponent(CLINE_WORKOS_CLIENT_ID)}`,
+  }).catch((e) => ({ ok: false, status: 0, data: null, message: String(e) }));
+  const d = r.data || {};
+  const deviceCode = d.device_code, userCode = d.user_code;
+  if (!r.ok || !deviceCode) return { ok: false, message: `设备授权发起失败（HTTP ${r.status}）${d.error || ""}` };
+  const url = String(d.verification_uri_complete || d.verification_uri || CLINE_DEVICE_FALLBACK_URL);
+  oauthSession = {
+    mode: "device", channel, url, userCode, server: null, onDone,
+    interval: Math.max(1, Number(d.interval) || 5), slow: 0,
+    deadline: Date.now() + Math.max(OAUTH_TIMEOUT_MS, (Number(d.expires_in) || 300) * 1000),
+    submit: async () => ({ ok: false, message: "设备授权无需粘贴回调地址，请在授权页确认后回到本窗口等待" }),
+  };
+  const poll = async () => {
+    if (!oauthSession || oauthSession.userCode !== userCode) return;
+    if (Date.now() > oauthSession.deadline) { finishOAuth({ ok: false, message: "登录超时" }); return; }
+    const pr = await adapters.httpJson(`${CLINE_WORKOS_BASE}/user_management/authenticate`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
+      body: `grant_type=${encodeURIComponent("urn:ietf:params:oauth:grant-type:device_code")}&device_code=${encodeURIComponent(deviceCode)}&client_id=${encodeURIComponent(CLINE_WORKOS_CLIENT_ID)}`,
+    }).catch(() => null);
+    const verdict = workosPollVerdict(pr && pr.status, pr && pr.data);
+    // 在途请求期间用户可能已取消/改登别的渠道：会话不是原来那个就直接收手，
+    // 别再往 null 上写 slow/timer（与 pollWorkBuddyToken 的 state 复查同款）
+    if (!oauthSession || oauthSession.userCode !== userCode) return;
+    if (verdict === "done") {
+      try {
+        // 必做第四步：WorkOS 身份令牌换 Cline 会话令牌（协议参考 第四章 §1.4，不能省）
+        const reg = await adapters.httpJson(`${CLINE_API_BASE}/auth/register`, {
+          method: "POST",
+          headers: { "content-type": "application/json", accept: "application/json", "x-client-type": "cline-sdk" },
+          body: JSON.stringify({ accessToken: pr.data.access_token, refreshToken: pr.data.refresh_token }),
+        });
+        const rd = reg.data && reg.data.data;
+        if (!reg.ok || !rd || !rd.accessToken) throw new Error(`换会话令牌失败（HTTP ${reg.status}）`);
+        const token = clineAuth.ensureTokenPrefix(rd.accessToken);
+        // 前缀只属于 accessToken（§1.3 口径 1 / §1.7 桌面端样例的 refreshToken 是裸值）：
+        // adapters 的 refreshToken 会把存的原样发给 /auth/refresh，登录来源与扫描来源必须一致
+        const refreshToken = String(rd.refreshToken || pr.data.refresh_token || "");
+        const claims = clineAuth.jwtClaims(token);
+        const uid = clineAuth.clineUid(token, rd.accountId);
+        if (!uid) throw new Error("未取到 Cline 账号标识（JWT external_id 与 accountId 均缺失），请改用「导入本机登录态」或粘贴 token");
+        const id = await saveDiscoveredAccount(channel, {
+          uid, name: clineAuth.clineDisplayName(claims, claims.email),
+          token, refreshToken, expiresAt: clineAuth.clineExpiresAt(rd.expiresAt, claims),
+          meta: {}, source: "oauth",
+        });
+        finishOAuth({ ok: true, id, uid, pool });
+      } catch (e) { finishOAuth({ ok: false, message: String((e && e.message) || e) }); }
+      return;
+    }
+    if (verdict === "expired") { finishOAuth({ ok: false, message: "设备码已过期，请重新发起登录" }); return; }
+    if (verdict === "denied") { finishOAuth({ ok: false, message: "你在授权页拒绝了本次登录" }); return; }
+    if (verdict === "slow_down") oauthSession.slow = Math.min(oauthSession.slow + 1000, 30000); // 间隔 +1s、上限 30s
+    oauthSession.timer = setTimeout(poll, oauthSession.interval * 1000 + oauthSession.slow);
+  };
+  oauthSession.timer = setTimeout(poll, oauthSession.interval * 1000);
+  return { ok: true, url, mode: "device", userCode };
+}
+
+// qoder：无起始请求，本地拼授权页；2s 轮询 poll（202/404 = 继续）→ userinfo 补资料 → 落库 meta.mode
+async function beginQoderOAuth(channel, edition, onDone) {
+  const region = qoderRegionOfMode(edition);
+  const cfg = {
+    global: { webOrigin: "https://qoder.com", openApi: "https://openapi.qoder.sh" },
+    cn: { webOrigin: "https://qoder.com.cn", openApi: "https://openapi.qoder.com.cn" },
+  }[region];
+  const verifier = crypto.randomBytes(32).toString("base64url");
+  const challenge = crypto.createHash("sha256").update(verifier).digest("base64url"); // S256 无填充
+  const machineId = qoderMachineIdOf();
+  const nonce = util.uuid().replace(/-/g, "");
+  const url = `${cfg.webOrigin}/device/selectAccounts?challenge=${encodeURIComponent(challenge)}&challenge_method=S256&machine_id=${encodeURIComponent(machineId)}&nonce=${nonce}`;
+  oauthSession = {
+    mode: "device", channel, url, userCode: "", server: null, onDone, nonce,
+    deadline: Date.now() + OAUTH_TIMEOUT_MS * 2, // qoder 授权页含登录+选账号，给足 6 分钟
+    submit: async () => ({ ok: false, message: "设备授权无需粘贴回调地址，请在授权页选择账号后回到本窗口等待" }),
+  };
+  const poll = async () => {
+    if (!oauthSession || oauthSession.nonce !== nonce) return;
+    if (Date.now() > oauthSession.deadline) { finishOAuth({ ok: false, message: "登录超时" }); return; }
+    const r = await adapters.httpJson(`${cfg.openApi}/api/v1/deviceToken/poll?nonce=${encodeURIComponent(nonce)}&verifier=${encodeURIComponent(verifier)}&challenge_method=S256`, {
+      method: "GET", headers: { "cosy-version": "1.0.1", "cosy-clienttype": "5", "user-agent": "qoder-local-proxy" },
+    }).catch(() => null);
+    if (r && (r.status === 200 || r.status === 201)) {
+      const d = r.data || {};
+      if (d.token && d.refresh_token && !String(d.refresh_token).includes("|")) {
+        try {
+          // 登录后初始请求：userinfo 补 name/email（容忍失败：poll 已带 user_id，协议参考 §2.5）
+          let name = "Qoder 账号", email = "", userId = String(d.user_id || "");
+          const ui = await adapters.httpJson(`${cfg.openApi}/api/v1/userinfo`, {
+            method: "GET", headers: { "cosy-version": "1.0.1", "cosy-clienttype": "5", "user-agent": "qoder-local-proxy", authorization: `Bearer ${d.token}` },
+          }).catch(() => null);
+          if (ui && ui.ok && ui.data) {
+            const info = ui.data.data || ui.data;
+            name = String(info.nickname || info.name || name);
+            email = String(info.email || "");
+            userId = String(info.id || info.user_id || userId);
+          }
+          // 容忍规则（协议参考 §2.5）：poll 已带 user_id 时 userinfo 失败可容忍，否则必须报错——
+          // 空 uid 会跳过同 uid 查找，每次重登堆一个「未命名账号」
+          if (!userId) throw new Error("未取到 Qoder 账号标识（poll 未返回 user_id 且 userinfo 失败），请重新登录");
+          const id = await saveDiscoveredAccount(channel, {
+            uid: userId, name, token: String(d.token),
+            refreshToken: `${String(d.refresh_token)}|${userId}|${machineId}`, // 打包串（协议参考 §3.7）
+            expiresAt: util.toMs(d.expires_at) || Date.now() + 30 * 86400 * 1000, // 毫秒|秒|RFC3339 自动识别（§3.7 credentials.rs:175-182）
+            meta: { mode: region, email, machine_id: machineId, user_id: userId },
+            source: "oauth",
+          });
+          finishOAuth({ ok: true, id, uid: userId });
+        } catch (e) { finishOAuth({ ok: false, message: String((e && e.message) || e) }); }
+        return;
+      }
+    }
+    // 202/404/网络错误 = 还没确认，继续轮（协议参考 §2.3）
+    if (!oauthSession || oauthSession.nonce !== nonce) return; // 在途请求期间已取消/换渠道：不再排期
+    oauthSession.timer = setTimeout(poll, 2000);
+  };
+  oauthSession.timer = setTimeout(poll, 2000);
+  return { ok: true, url, mode: "device", userCode: "" };
+}
+
+/** 登录/导入共用的落库：同渠道同 uid 更新凭据，否则新建（store.addAccount/updateAccount 既有语义） */
+async function saveDiscoveredAccount(channel, { uid, name, token, refreshToken, expiresAt, meta, source }) {
+  const existing = uid ? store.listAccounts(channel).find((a) => a.uid === uid) : null;
+  if (existing) {
+    store.updateAccount(existing.id, { token, refreshToken, expiresAt, meta, status: "online", coolUntil: 0, coolReason: "" });
+    return existing.id;
+  }
+  return store.addAccount({ channel, uid, name, token, refreshToken, source: source || "oauth", expiresAt, meta });
+}
+
+/** qoder 机器标识：与对话侧共用 adapters 的单一实现（同一批候选文件、同一份落盘位置、同一进程内缓存），
+ *  避免两处各写一份读文件逻辑导致机器码漂移。 */
+function qoderMachineIdOf() {
+  return adapters._qoderMachineId();
+}
+
+// ===== AutoClaw 国际版 OAuth（协议参考 第四章 §3.2）：三步——
+// ① captcha-config（主进程拉，签名头）→ ② renderer 弹滑块拿 captchaVerifyParam → oauth-url 拿授权页
+// → ③ 系统浏览器登录 302 回环 /aclaw-cb/{vendor}/{taskState}?code&state（上游不校验回调主机）
+// 双 state 陷阱：路径里是本网关任务 state（CSRF 校验），换码必须用查询串里上游回的 state——传错稳定 631001。
+const AUTOCLAW_INTL_USERAPI = "https://autoglm-api.autoglm.ai"; // 与 adapters.cjs 的 AUTOCLAW_REGIONS.intl.userapi 同值，直接字面量写在这里避免跨文件私有引用
+const AUTOCLAW_CALLBACK_PREFIX = "/aclaw-cb/";
+const AUTOCLAW_INTL_OK_PAGE = '<meta charset=utf-8><body style="font-family:system-ui;background:#0b0d0f;color:#44e07f;display:grid;place-items:center;height:100vh">登录成功，已返回网关，可以关闭此页面。</body>';
+
+function autoclawParseCallback(pathname, search) {
+  const rest = String(pathname || "").startsWith(AUTOCLAW_CALLBACK_PREFIX) ? String(pathname).slice(AUTOCLAW_CALLBACK_PREFIX.length) : "";
+  const [vendor, taskState] = rest.split("/");
+  const q = new URLSearchParams(String(search || ""));
+  return { vendor: vendor || "", taskState: taskState || "", code: q.get("code") || "", upstreamState: q.get("state") || "", error: q.get("error") || "" };
+}
+
+function autoclawSignedHeaders(token) {
+  // userapi 域签名头族与 adapters 的 _userapiHeaders 逐字同构（含 x-harness-type: zcode + MD5 签名）。
+  // 复用单一实现而非在本文件再写一份：appId/appKey 与签名公式两处副本迟早漂移（qoderMachineIdOf 同一口径）
+  return adapters.get("autoclaw_intl")._userapiHeaders(token || "");
+}
+
+/**
+ * 本流程专属收尾：只有全局会话仍是本次发起的那一个才交给 finishOAuth 收口；
+ * 用户取消/改登别的渠道之后迟到的回调只关自己的回环服务、不替别人的会话收尾
+ * （规避已知遗留 m4「finishOAuth 不校验会话身份」在这里被复制一份，不动既有 WorkBuddy/Trae 流程）
+ */
+function finishAutoClawIntlOAuth(mine, result) {
+  if (mine && oauthSession === mine) {
+    finishOAuth(result);
+    return;
+  }
+  if (mine && mine.server) {
+    try {
+      mine.server.close();
+    } catch { /* 已关 */ }
+  }
+}
+
+async function beginAutoClawIntlOAuth(channel, opts, onDone) {
+  const userapi = AUTOCLAW_INTL_USERAPI;
+  // 第 0 步：没带 captchaVerifyParam → 回滑块配置（renderer 加载阿里云 SDK 弹滑块，Task 13）
+  if (!opts || !opts.captchaVerifyParam) {
+    const cfg = await adapters.httpJson(`${userapi}/userapi/overseasv1/oauth-captcha-config`, { method: "POST", headers: autoclawSignedHeaders(""), body: "{}" })
+      .catch((e) => ({ ok: false, status: 0, data: null, message: String(e) }));
+    const d = (cfg.data && (cfg.data.data || cfg.data)) || {};
+    if (!cfg.ok || !d.enabled) return { ok: false, message: "上游滑块验证未启用（captcha-config enabled=false）" };
+    return { ok: true, needCaptcha: true, captcha: { region: d.region, prefix: d.prefix, sceneId: d.scene_id, supplier: d.captcha_supplier || "aliyun" } };
+  }
+  const vendor = String(opts.vendor || "");
+  if (vendor !== "zai" && vendor !== "google") return { ok: false, message: "vendor 只支持 zai / google" };
+  // 第 1 步：先起回环回调服务（端口要进 navigate_uri），再换授权地址
+  const taskId = crypto.randomBytes(16).toString("hex"); // 32 位小写 hex（协议参考 §3.2 ③）
+  // session / cur 的声明必须先于 server 创建：listen 与赋值之间打进来的回调会在闭包里读它们，
+  // 用 let 占位把这处 TDZ 窗口关死（读不到时按「非本次发起」拒绝，而不是抛 ReferenceError）
+  let session = null;
+  let cur = null;
+  const server = http.createServer((req, res) => {
+    const u = new URL(req.url || "/", "http://127.0.0.1");
+    if (!u.pathname.startsWith(AUTOCLAW_CALLBACK_PREFIX)) { res.statusCode = 404; res.end("not found"); return; }
+    const parsed = autoclawParseCallback(u.pathname, u.search);
+    if (!session || parsed.taskState !== session.taskId) { res.statusCode = 400; res.end(ERR_PAGE("回调校验不通过（非本次发起的授权回调）")); return; }
+    if (!cur || oauthSession !== cur) { res.statusCode = 200; res.end(ERR_PAGE("登录会话已结束，请返回应用重新发起")); return; }
+    if (!parsed.error && !parsed.code && !parsed.upstreamState) { res.statusCode = 200; res.end(PENDING_PAGE); return; } // 空参探测回调可达性：继续等待，绝不能结束会话（Trae 同款实测坑）
+    if (parsed.error || !parsed.code || !parsed.upstreamState) { res.statusCode = 200; res.end(ERR_PAGE(`授权未完成：${parsed.error || "回调缺参数"}`)); finishAutoClawIntlOAuth(cur, { ok: false, message: `授权未完成：${parsed.error || "回调缺参数"}` }); return; }
+    if (session.settled) { res.statusCode = 200; res.end(AUTOCLAW_INTL_OK_PAGE); return; } // 重复回调幂等回成功页，不再烧一次 code
+    session.settled = true;
+    res.statusCode = 200; res.end(AUTOCLAW_INTL_OK_PAGE);
+    // 第 3 步：换码——state 用查询串里上游回的（双 state 陷阱）；navigate_uri 与 oauth-url 请求逐字相同
+    exchangeAutoClawIntl(userapi, vendor, parsed.code, parsed.upstreamState, session.navigateUri, session.deviceId)
+      .then((cred) => saveDiscoveredAccount(channel, cred).then((id) => ({ id, uid: cred.uid })))
+      .then((r) => finishAutoClawIntlOAuth(cur, { ok: true, id: r.id, uid: r.uid }))
+      .catch((e) => finishAutoClawIntlOAuth(cur, { ok: false, message: String((e && e.message) || e) }));
+  });
+  let loopbackPort = 0;
+  try {
+    loopbackPort = await listenLoopback(server);
+  } catch (e) {
+    try { server.close(); } catch { /* 已关 */ }
+    return { ok: false, message: `回环端口监听失败：${(e && e.message) || e}` }; // 端口没起来就返回，不留半个监听占着 navigate_uri
+  }
+  const deviceId = crypto.randomBytes(32).toString("hex"); // 64hex，两跳同值（协议参考 §3.2 ⑤）
+  const navigateUri = `http://127.0.0.1:${loopbackPort}${AUTOCLAW_CALLBACK_PREFIX}${vendor}/${taskId}`;
+  const r = await adapters.httpJson(`${userapi}/userapi/overseasv1/${vendor}-oauth-url`, {
+    // 超时走 httpJson 的统一 60s：简报原写的 timeout:15000 是死键（httpJson 不读该键），留着会误导排障
+    method: "POST", headers: autoclawSignedHeaders(""),
+    body: JSON.stringify({ source_id: "autoclaw", device_id: deviceId, navigate_uri: navigateUri, ali_captcha_verify_param: String(opts.captchaVerifyParam) }),
+  }).catch((e) => ({ ok: false, status: 0, data: null, message: String(e) }));
+  const dd = (r.data && (r.data.data || r.data)) || {};
+  if (!r.ok || !dd.oauth_url) {
+    try { server.close(); } catch { /* 已关 */ }
+    // 631002 = 缺/坏 captcha 参数；630014 = 风控验证未通过；631001 = 授权码无效（协议参考 §3.2 ③码表）
+    return { ok: false, message: `获取授权地址失败（HTTP ${r.status}）${dd.message || r.message || ""}` };
+  }
+  session = { taskId, navigateUri, deviceId, vendor, settled: false };
+  cur = {
+    mode: "callback", channel, url: String(dd.oauth_url), userCode: "", server, onDone,
+    deadline: Date.now() + OAUTH_TIMEOUT_MS * 2, // 回调是唯一入口（无轮询可判定用户放弃），给足 6 分钟兜底
+    submit: async (pasted) => ({ ok: false, message: "AutoClaw 国际版登录由回调页自动完成，无需粘贴地址" }),
+  };
+  oauthSession = cur;
+  cur.timer = setTimeout(() => finishAutoClawIntlOAuth(cur, { ok: false, message: "登录超时（6 分钟）" }), OAUTH_TIMEOUT_MS * 2);
+  return { ok: true, url: String(dd.oauth_url), mode: "callback" };
+}
+
+/** 换码（协议参考 §3.2 ⑤）：state 传上游回的、navigate_uri 与上一跳逐字相同，device_id 两跳同值 */
+async function exchangeAutoClawIntl(userapi, vendor, code, upstreamState, navigateUri, deviceId) {
+  const r = await adapters.httpJson(`${userapi}/userapi/overseasv1/${vendor}-oauth-login`, {
+    method: "POST", headers: autoclawSignedHeaders(""),
+    body: JSON.stringify({ source_id: "autoclaw", device_id: deviceId, code, state: upstreamState, navigate_uri: navigateUri }),
+  }).catch((e) => { throw new Error(`换码失败：${e.message}`); });
+  const d = (r.data && (r.data.data || r.data)) || {};
+  if (!r.ok || !d.access_token) throw new Error(`换码失败（HTTP ${r.status}）${d.message || ""}`);
+  // util.jwtDecode 返回 {token,uid,exp,payload}：user_id/user_name 声明在 .payload，exp 才在顶层（简报直取顶层是笔误）
+  const dec = util.jwtDecode(String(d.access_token));
+  const claims = dec.payload || {};
+  const numId = String(d.user_id || claims.user_id || "");
+  if (!numId) throw new Error("未取到 AutoClaw 国际版账号标识（响应与 JWT 均无 user_id），请重新登录或改用粘贴 token");
+  return {
+    uid: `intl-user-${numId}`, // 前缀与适配器 userInfo 同源，两地 userId 空间可能撞号
+    name: String(d.user_name || claims.user_name || claims.nickname || "AutoClaw 国际版账号"),
+    token: String(d.access_token).replace(/^Bearer\s+/i, ""),
+    refreshToken: String(d.refresh_token || ""),
+    expiresAt: (Number(dec.exp) || 0) * 1000 || 0,
+    meta: { device_id: deviceId }, // 刷新要用（adapters.refreshToken 优先读 meta.device_id）
+    source: "oauth",
+  };
+}
+
 // ===== 会话收尾 =====
 
 function finishOAuth(result) {
@@ -1133,15 +1496,33 @@ function finishOAuth(result) {
 
 /**
  * 开始 OAuth：按渠道选流程
- * @returns {Promise<{ok:boolean,url?:string,message?:string,mode?:string}>} url 由主进程 shell.openExternal 打开
+ * @param {string} channel 内置渠道 id
+ * @param {{edition?:string, vendor?:string, captchaVerifyParam?:string}|Function} opts
+ *        设备流/回调流的额外入参（qoder 用 edition 选区；autoclaw 国际版用 vendor + captchaVerifyParam，
+ *        同一渠道调两次：第一次不带滑块参数只回 {needCaptcha, captcha}，第二次带参数回授权地址）；
+ *        也可直接传回调函数（兼容 Task 11 之前的两参调用）
+ * @param {(result:object)=>void} [onDone] 登录结束回调（成功/失败都回一次）
+ * @returns {Promise<{ok:boolean,url?:string,message?:string,mode?:string,userCode?:string,needCaptcha?:boolean,captcha?:object}>} url 由主进程 shell.openExternal 打开
  */
-async function beginOAuth(channel, onDone) {
+async function beginOAuth(channel, opts, onDone) {
+  const o = opts && typeof opts === "object" ? opts : {};
+  const cb = typeof opts === "function" ? opts : onDone; // 兼容旧两参签名
   const ch = String(channel || "trae");
   if (oauthSession) throw new Error("已有进行中的登录，请先完成或取消");
   if (!adapters.get(ch)) throw new Error(`未知渠道 ${ch}`);
-  if (ch === "raccoon") return beginRaccoonOAuth(ch, onDone);
-  if (ch === "trae") return beginTraeOAuth(ch, onDone);
-  return beginWorkBuddyOAuth(ch, onDone);
+  // 小浣熊：上游 v1.18.0 已支持应用内登录（打开官方授权页 → 用户粘回 office-raccoon:// 深链换码），
+  // 本分支基点（b476f52）时还只有「不支持」的抛错，合并时按上游实现放行（不再抛错）。
+  if (ch === "raccoon") return beginRaccoonOAuth(ch, cb);
+  if (ch === "autoclaw") {
+    // 国内版官方只有客户端登录（手机号+验证码）+ auth.json 落盘，没有可代收的网页授权
+    throw new Error("AutoClaw（国内）官方没有网页登录：请用「从本机软件导入」（自动读取 %APPDATA%/AutoClaw/auth.json）或粘贴 token");
+  }
+  if (ch === "cline_free" || ch === "cline_pass") return beginClineOAuth(ch, cb);
+  if (ch === "qoder") return beginQoderOAuth(ch, o.edition, cb);
+  // autoclaw 国际版只有网页 OAuth（阿里云滑块前置 + 回环回调换码）；滑块参数由 renderer 两次调用透传
+  if (ch === "autoclaw_intl") return beginAutoClawIntlOAuth(ch, o, cb);
+  if (ch === "trae") return beginTraeOAuth(ch, cb);
+  return beginWorkBuddyOAuth(ch, cb);
 }
 
 /** 手动提交回调地址（浏览器没跳回回环地址时的兜底路径） */
@@ -1170,6 +1551,8 @@ module.exports = {
   scanAll,
   scanWorkBuddy,
   scanTrae,
+  scanCline,
+  scanAutoClaw,
   importCandidate,
   beginOAuth,
   submitCallbackUrl,
@@ -1178,4 +1561,9 @@ module.exports = {
   OAUTH_PORT,
   wbAuthDir,
   traeStoragePaths,
+  // 测试窥视口（下划线前缀 = 非公共契约）：设备流的轮询判定与地区归一纯函数，dev-cline/dev-qoder-test 直测
+  _workosPollVerdict: workosPollVerdict,
+  _qoderRegionOfMode: qoderRegionOfMode,
+  // autoclaw 国际版回调的双 state 拆解（路径 state ≠ 查询串 state），dev-autoclaw-test 直测
+  _autoclawParseCallback: autoclawParseCallback,
 };

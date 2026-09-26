@@ -49,6 +49,11 @@ export const CHANNEL_NAMES: Record<string, string> = {
   workbuddy: "WorkBuddy",
   workbuddy_ai: "WorkBuddy AI",
   raccoon: "商汤小浣熊",
+  cline_free: "Cline 免费池",
+  cline_pass: "Cline 订阅池",
+  autoclaw: "智谱 AutoClaw（国内）",
+  autoclaw_intl: "智谱 AutoClaw（国际）",
+  qoder: "Qoder",
 };
 export const channelName = (id: string) => CHANNEL_NAMES[id] || id || "-";
 

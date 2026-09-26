@@ -127,9 +127,16 @@ async function checkinBatch({ channel, accountId, action }) {
       const secrets = store.accountSecrets(store.getAccount(acc.id));
       try {
         let r;
-        if (useAct === "status") r = await ad.checkinStatus(acc, secrets);
-        else if (useAct === "checkin") r = await ad.checkin(acc, secrets);
-        else r = typeof ad.trial === "function" ? await ad.trial(acc, secrets) : { ok: false, message: "该渠道没有加油包" };
+        // 能力门禁：新渠道（cline_free/cline_pass/autoclaw/autoclaw_intl/qoder）官方就没有签到体系，
+        // 适配器根本不定义这两个方法。缺守卫就是 "ad.checkin is not a function" 这句英文 TypeError
+        // 原样进结果行、直出到前端。判据与下方 trial 一致（typeof === "function"）；缺能力按既有约定回
+        // ok:true + unavailable:true（同 adapters 的 1001 分支）——前端 checkinTagCls 先判 !r.ok 就红，
+        // 用 ok:false 会把「这渠道没签到」渲染成「这个号签到失败」。
+        if (useAct === "status") {
+          r = typeof ad.checkinStatus === "function" ? await ad.checkinStatus(acc, secrets) : { ok: true, unavailable: true, checkedIn: false, message: "该渠道没有签到状态可查" };
+        } else if (useAct === "checkin") {
+          r = typeof ad.checkin === "function" ? await ad.checkin(acc, secrets) : { ok: true, unavailable: true, checkedIn: false, message: "该渠道没有签到" };
+        } else r = typeof ad.trial === "function" ? await ad.trial(acc, secrets) : { ok: false, message: "该渠道没有加油包" };
         rows.push({ accountId: acc.id, channel: acc.channel, name: acc.name, uid: acc.uid, ok: !!r.ok, ...r });
         // 签到成功（且不是幂等/不可用）后顺手刷新余额，让号池立刻看到新积分
         if (useAct !== "status" && r.ok && !r.unavailable && !r.already) {
@@ -471,17 +478,19 @@ function register(ipcMain) {
     credits.refreshAccount(r.id).catch(() => {});
     return ok({ id: r.id, updated: r.updated });
   }));
-  // oauth_begin 的形状（Task 5）：本进程只创建 OAuth 会话，登录页的打开由**主进程**做 ——
+  // oauth_begin 的形状（二期 Task 5）：本进程只创建 OAuth 会话，登录页的打开由**主进程**做 ——
   // 会话建好、拿到 url 后推 {type:"oauth-open", url} 事件（CRITICAL_EVENTS 成员，背压不丢），
   // 主进程收到才 shell.openExternal。旧实现在这里直接开浏览器，下沉后拿不到 shell。
   // 抛错时机说明：beginOAuth 同步抛的错（已有进行中的登录 / 未知渠道 / 小浣熊不支持）在
   // handle() 里收成 {ok:false, message}，用户立刻看到；旧实现「beginOAuth 成功之后才可能
   // 因 shell 缺失而抛错」的那条路径随 openExternal 下移而消失（主进程 shell 恒在）。
-  ipcMain.handle("proxy_oauth_begin", handle(async ({ channel }) => {
+  // 参数：edition/vendor/captchaVerifyParam 供新渠道用（autoclaw 国际的滑块第二跳要原样回传
+  // captchaVerifyParam，edition/vendor 决定跳哪个授权域），旧调用只传 channel 时它们为 undefined。
+  ipcMain.handle("proxy_oauth_begin", handle(async ({ channel, edition, vendor, captchaVerifyParam }) => {
     // OAuth 只对内置生态渠道存在：提供商没有授权页可跳，落到兜底渠道会把用户带去登录别人的账号
     if (!store.isBuiltinChannel(channel) || !adapters.get(channel)) return fail("该渠道不支持 OAuth 登录");
     const ch = String(channel);
-    const r = await discovery.beginOAuth(ch, (result) => {
+    const r = await discovery.beginOAuth(ch, { edition, vendor, captchaVerifyParam }, (result) => {
       if (result.ok) {
         credits.refreshAccount(result.id).catch(() => {});
         // 登录后自动签到一次（参考项目 login.sh / signin 同款：自动签到 + 查积分）
@@ -490,7 +499,12 @@ function register(ipcMain) {
       events.emit({ type: "oauth-done", channel: ch, ...result });
     });
     if (r.ok && r.url) events.emit({ type: "oauth-open", channel: ch, url: r.url });
-    return r.ok ? ok({ url: r.url, mode: r.mode }) : fail(r.message);
+    // mode=device（cline WorkOS / qoder PKCE 设备流）额外回 userCode 供 UI 展示；
+    // needCaptcha/captcha 必须一并透传：autoclaw_intl 第一跳没有 url，只回滑块配置，
+    // 丢了这两个键 UI 就分不清「要滑块」还是「已打开登录页」，会停在假等待态（Task 12 终审 M1）
+    return r.ok
+      ? ok({ url: r.url, mode: r.mode, userCode: r.userCode || "", needCaptcha: !!r.needCaptcha, captcha: r.captcha })
+      : fail(r.message);
   }));
   ipcMain.handle("proxy_oauth_cancel", handle(() => ok({ cancelled: discovery.cancelOAuth() })));
   // 浏览器没跳回回环地址时的兜底：把地址栏内容整段粘回来完成登录
@@ -580,11 +594,20 @@ function register(ipcMain) {
     // 提供商的清单归 models_json、由提供商页自己拉。放过来会把提供商的模型写进内置目录，
     // 而且内置适配器签名是 fetchModels(account, secrets)、compat 是 fetchModels(secrets)，
     // 这里统一按内置签名调用，提供商渠道会拿到一个 undefined 的 Key——两条都是静默错。
+    // 注意先判「渠道到底存不存在」：若直接按 !isBuiltinChannel 拦，一个真的拼错的渠道名
+    // （如 "no-such-channel"）也会拿到「请去提供商页拉取」的误导文案（本分支合并时踩到）。
     if (!store.isBuiltinChannel(ch)) {
-      return fail("自定义提供商的模型清单请在「提供商」页的模型列表里拉取与勾选");
+      return store.getProvider(ch)
+        ? fail("自定义提供商的模型清单请在「提供商」页的模型列表里拉取与勾选")
+        : fail(`未知渠道 "${ch}"`);
     }
     const adapter = adapters.get(ch);
-    if (!adapter || typeof adapter.fetchModels !== "function") return fail(`未知渠道 "${ch}"`);
+    if (!adapter) return fail(`未知渠道 "${ch}"`);
+    // 适配器在、只是不提供 fetchModels：AutoClaw 的模型目录就是内置静态表（官方目录端点无人调用），
+    // 这时报「未知渠道」是谎报——渠道明明存在，用户会以为号池配坏了。按渠道类别说清缺的是哪个能力。
+    if (typeof adapter.fetchModels !== "function") {
+      return fail(store.isBuiltinChannel(ch) ? "该渠道模型目录为内置，不支持同步" : `自定义提供商 "${ch}" 不支持模型目录同步`);
+    }
     const acc = pool.poolAccounts(ch).find((a) => a.status === "online" && a.hasToken);
     if (!acc) return fail(`${store.channelDisplay(ch)}号池无可用账号，无法拉取模型目录`);
     const secrets = store.accountSecrets(store.getAccount(acc.id));
@@ -681,6 +704,8 @@ function register(ipcMain) {
   ipcMain.handle("proxy_provider_fetch_models", handle(({ id }) => provider.fetchModels(id)));
 }
 
+// checkinBatch 一并导出：给 scripts/dev-provider-test.cjs 直测「渠道缺签到能力」这条门禁
+// （proxy_checkin_run / proxy_checkin_status 两个 IPC handler 只是它的包装，不必为了测试拉起 Electron）
 // ===== 子进程侧的命令出口（二期 Task 3）=====
 
 // 表只在首次用到时构建一次，之后复用模块内缓存（每条命令重建一次全部闭包是纯浪费）
@@ -719,4 +744,5 @@ function attachGatewayMode({ emit } = {}) {
 // startBackgroundJobs：二期 Task 5 的子进程后台作业入口（credits 定时刷新 + 定时自动签到，
 // 随命令实现体一起下沉；gateway.cjs 装配时调用）
 // DRAIN_BUDGET_MS：停机预算的四个数字之一，供 dev-gateway-pipe-test 断言它们仍复合（合计只在那一条断言里算）
-module.exports = { shutdown, gracefulShutdown, DRAIN_BUDGET_MS, register, settings, gatewayStatus, dispatchTable, dispatch, attachGatewayMode, startBackgroundJobs };
+// checkinBatch：给 scripts/dev-provider-test.cjs 直测「渠道缺签到能力」这条门禁（本分支新增导出）
+module.exports = { shutdown, gracefulShutdown, DRAIN_BUDGET_MS, register, settings, gatewayStatus, dispatchTable, dispatch, attachGatewayMode, startBackgroundJobs, checkinBatch };

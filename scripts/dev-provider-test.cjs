@@ -56,7 +56,7 @@ ok("重复 slug 被拒", !provider.create({ id: "relay", ...base }).ok);
 ok("模型名含斜杠被拒", !provider.create({ id: "p2", ...base, models: ["google/gemini"] }).ok, provider.create({ id: "p2", ...base, models: ["google/gemini"] }).message);
 
 console.log("\n渠道视图与路由合法性:");
-ok("channelList 含内置 4 家 + relay", store.channelList().length === 5, store.channelList().map((c) => c.id));
+ok("channelList 含全部内置渠道 + relay", store.channelList().length === store.BUILTIN_CHANNELS.length + 1, store.channelList().map((c) => c.id));
 ok("relay 标记为 openai_compat", (store.channelList().find((c) => c.id === "relay") || {}).kind === "openai_compat");
 ok("内置渠道 kind=builtin", (store.channelList().find((c) => c.id === "trae") || {}).kind === "builtin");
 ok("routeOk 接受提供商 slug", store.channelList().some((c) => c.id === "relay"));
@@ -241,6 +241,25 @@ ok("删不存在的提供商回 false", provider.remove("relay").ok === false);
 console.log("\n探测的离线校验分支（不发网络请求）:");
 const server = require("../electron/backend/proxy/server.cjs");
 
+console.log("\n渠道选择优先级（钉渠道 vs 单归属强制）:");
+const RS = { routeStrategy: "smart", fixedChannel: "trae", modelOverrides: {} };
+// 回归本分支引入的风险：qoder 目录含 auto/ultimate 这类通用词后，单归属强制若排在钉渠道之前，
+// 钉着 trae 的客户端发 model:"auto" 会被静默改投 qoder（qoder 无号即报错）
+ok("钉渠道优先于单归属（qoder 独有的 auto 也不改投）", server._resolveChannel({ route: "trae" }, "auto", RS).channel === "trae", server._resolveChannel({ route: "trae" }, "auto", RS));
+ok("钉渠道优先于单归属（Qwen3.8-Flash 同理）", server._resolveChannel({ route: "trae" }, "Qwen3.8-Flash", RS).channel === "trae");
+ok("钉渠道时目录外模型仍透传给该渠道（不判未知模型）", (() => {
+  const r = server._resolveChannel({ route: "trae" }, "some-client-only-model", RS);
+  return r.channel === "trae" && !r.unknownModel;
+})(), server._resolveChannel({ route: "trae" }, "some-client-only-model", RS));
+ok("auto 模式下单归属仍直达唯一所有者", server._resolveChannel({ route: "auto" }, "auto", RS).channel === "qoder", server._resolveChannel({ route: "auto" }, "auto", RS));
+ok("提供商前缀排在最前，钉别的渠道也让位", (() => {
+  // 自带夹具：此点之前的清理段已删掉 relay，不能依赖环境里残留的提供商
+  provider.create({ id: "pinslug", baseUrl: "https://pin.test/v1", models: ["m1"] });
+  const ch = server._resolveChannel({ route: "trae" }, "pinslug/m1", RS).channel;
+  provider.remove("pinslug");
+  return ch === "pinslug";
+})());
+
 /** 假 OpenAI 兼容上游：按 Authorization 决定成败，从而**确定性地**验到多 Key 轮转
  *  （比"先 429 再成功"的时序写法可靠——那种要靠重试次数碰）。 */
 function startFakeUpstream(port) {
@@ -391,6 +410,57 @@ const call = async (base, secret, model, stream) => {
   fake.close();
   provider.remove("myprov");
 
+  // ===== 能力缺失的三条出口（终审 F3 / F4）：走真实 IPC handler，测的就是按钮真正打到的那个函数 =====
+  // index.cjs 顶层 require("electron") 只为拿 shell，纯 node 下把该模块预置成空导出即可加载；
+  // register(ipcMain) 是入参注入，用假 ipcMain 收 handler，不碰任何真实 IPC。
+  console.log("\n签到 / 额度 / 目录三项能力门禁:");
+  const electronPath = require.resolve("electron");
+  require.cache[electronPath] = { id: electronPath, filename: electronPath, loaded: true, exports: {} };
+  const ipc = new Map();
+  require("../electron/backend/proxy/index.cjs").register({ handle: (name, fn) => ipc.set(name, fn) });
+  const callIpc = (name, args) => ipc.get(name)(null, args || {});
+  ok("handler 注册齐（proxy_checkin_run / proxy_models_sync 都在）", ipc.has("proxy_checkin_run") && ipc.has("proxy_models_sync"), [...ipc.keys()].length);
+
+  store.addAccount({ channel: "qoder", uid: "q-uid", name: "Qoder 号", token: "eyJqb2lk", refreshToken: "", source: "paste" });
+  store.addAccount({ channel: "raccoon", uid: "rc-uid", name: "小浣熊号", token: "eyJyY24", refreshToken: "", source: "paste" });
+  const realFetch2 = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: false, status: 500, text: async () => '{"code":500,"message":"boom"}' });
+
+  const ckQoder = await callIpc("proxy_checkin_run", { channel: "qoder", action: "checkin" });
+  ok("qoder 无签到方法 → 批量签到回结构化 unavailable，不是 TypeError", (() => {
+    const row = (ckQoder.rows || [])[0] || {};
+    return ckQoder.ok === true && ckQoder.total === 1 && row.ok === true && row.unavailable === true
+      && row.channel === "qoder" && /该渠道没有签到/.test(row.message || "") && !/is not a function|TypeError/.test(row.message || "");
+  })(), ckQoder);
+  const stQoder = await callIpc("proxy_checkin_status", { channel: "qoder" });
+  ok("status 动作同样不抛（缺 checkinStatus 也按 unavailable 收口）", (() => {
+    const row = (stQoder.rows || [])[0] || {};
+    return stQoder.ok === true && row.unavailable === true && !/is not a function|TypeError/.test(row.message || "");
+  })(), stQoder);
+  const ckRaccoon = await callIpc("proxy_checkin_run", { channel: "raccoon", action: "checkin" });
+  ok("有签到能力的渠道不被守卫误伤（照常打到适配器）", (() => {
+    const row = (ckRaccoon.rows || [])[0] || {};
+    return ckRaccoon.ok === true && !row.unavailable && !/该渠道没有签到/.test(row.message || "");
+  })(), ckRaccoon);
+
+  const syncAclaw = await callIpc("proxy_models_sync", { channel: "autoclaw" });
+  ok("autoclaw 有适配器但无 fetchModels → 说「模型目录为内置」，不谎报未知渠道",
+    syncAclaw.ok === false && /模型目录为内置，不支持同步/.test(syncAclaw.message || "") && !/未知渠道/.test(syncAclaw.message || ""), syncAclaw);
+  const syncBogus = await callIpc("proxy_models_sync", { channel: "no-such-channel" });
+  ok("真·未知渠道仍报未知渠道", syncBogus.ok === false && /未知渠道/.test(syncBogus.message || ""), syncBogus);
+  const syncTrae = await callIpc("proxy_models_sync", { channel: "trae" });
+  ok("有 fetchModels 的渠道照常进后续判断（不被能力门禁挡掉）",
+    syncTrae.ok === false && /无可用账号/.test(syncTrae.message || ""), syncTrae);
+
+  const rcQoder = await credits.refreshChannel("qoder");
+  ok("内置渠道无额度接口 → 文案说清「不提供额度查询」，不扣 API Key 的帽子",
+    rcQoder.ok === false && /不提供额度查询/.test(rcQoder.message || "") && !/API Key/.test(rcQoder.message || ""), rcQoder);
+  const qoderRow = store.accountRows("qoder")[0];
+  const raQoder = await credits.refreshAccount(qoderRow.id).then(() => null, (e) => String(e.message));
+  ok("单账号刷新同样按渠道类别说文案", /不提供额度查询/.test(raQoder || "") && !/API Key/.test(raQoder || ""), raQoder);
+
+  globalThis.fetch = realFetch2;
+
   console.log(`\n${pass} passed, ${fail} failed`);
   store.close();
   process.exit(fail ? 1 : 0);
@@ -398,3 +468,8 @@ const call = async (base, secret, model, stream) => {
   console.error("\n闸自身异常:", e);
   process.exit(1);
 });
+
+console.log("新增内置渠道（Task 1）:");
+for (const id of ["cline_free", "cline_pass", "autoclaw", "autoclaw_intl", "qoder"]) {
+  ok(`${id} 是内置渠道`, store.isBuiltinChannel(id));
+}

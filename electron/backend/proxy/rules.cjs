@@ -69,6 +69,69 @@ const DEFAULTS = {
         maxOutputTokens: 80000,
       })),
     },
+    // Cline 双池静态兜底（协议参考 §1.4 FALLBACK_MODELS 逐字移植；rate 未知留 null）：
+    // 免鉴权 recommended-models 接口不可用时保证模型目录开箱即用；拉取成功后整段覆盖对应渠道。
+    // free 组混有裸名条目（z-ai/glm-5.3-flash、poolside/...），归池看响应分组不看前缀
+    cline_free: {
+      syncedAt: 0,
+      models: [
+        { id: "cline-free/deepseek-v4.1-flash", name: "DeepSeek V4.1 Flash (免费)", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0 },
+        { id: "cline-free/muse-spark-1.3-contributor", name: "Muse Spark 1.3 (免费)", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "cline-free/solar-pro4", name: "Solar Pro 4 (免费)", rate: null, capabilities: { images: false, reasoning: false, tools: true }, contextLength: 128000, maxOutputTokens: 0 },
+        { id: "z-ai/glm-5.3-flash", name: "GLM-5.3-Flash (免费)", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1310720, maxOutputTokens: 0 },
+        { id: "poolside/laguna-s-2.1:free", name: "Laguna S 2.1 (免费)", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 262144, maxOutputTokens: 0 },
+      ],
+    },
+    cline_pass: {
+      syncedAt: 0,
+      models: [
+        { id: "cline-pass/glm-5.3", name: "GLM-5.3 (ClinePass)", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "cline-pass/kimi-k3", name: "Kimi K3 (ClinePass)", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 256000, maxOutputTokens: 0 },
+        { id: "cline-pass/deepseek-v4.1-flash", name: "DeepSeek V4.1 Flash (ClinePass)", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0 },
+        { id: "cline-pass/deepseek-v4-pro", name: "DeepSeek V4 Pro (ClinePass)", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 128000, maxOutputTokens: 0 },
+        { id: "cline-pass/qwen3.8-max", name: "Qwen3.8 Max (ClinePass)", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 256000, maxOutputTokens: 0 },
+      ],
+    },
+    // AutoClaw 双区静态兜底（客户端模型选择器现役仅有的两个模型，协议参考 §2.4）；
+    // 拉取 autoclaw-model-config 成功后整段覆盖对应渠道。两地目录一致，各占一节防串区
+    autoclaw: {
+      syncedAt: 0,
+      models: [
+        { id: "glm-5.3", name: "GLM-5.3", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1048576, maxOutputTokens: 307200 },
+        { id: "glm-5.3-flash", name: "GLM-5.3-Flash", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1048576, maxOutputTokens: 131072 },
+      ],
+    },
+    autoclaw_intl: {
+      syncedAt: 0,
+      models: [
+        { id: "glm-5.3", name: "GLM-5.3", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1048576, maxOutputTokens: 307200 },
+        { id: "glm-5.3-flash", name: "GLM-5.3-Flash", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1048576, maxOutputTokens: 131072 },
+      ],
+    },
+    // Qoder 静态兜底（协议参考 §3.8 global 区 17 条快照，rate=price_factor，0 是合法值）；
+    // 拉取 model/list 成功后整段覆盖对应渠道。cn 区清单在适配器 QODER_FALLBACK 内置
+    qoder: {
+      syncedAt: 0,
+      models: [
+        { id: "Qwen3.8-Flash", name: "Qwen3.8-Flash", rate: 0.1, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "Qwen3.8-Max", name: "Qwen3.8-Max", rate: 0.5, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "Auto", name: "Auto", rate: 1, capabilities: { images: true, reasoning: false, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "Ultimate", name: "Ultimate", rate: 1.6, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "Performance", name: "Performance", rate: 1.1, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "Efficient", name: "Efficient", rate: 0.3, capabilities: { images: true, reasoning: false, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "Sonus", name: "Sonus", rate: 3.2, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "Cantus", name: "Cantus", rate: 3.2, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "Qwen3.7-Max", name: "Qwen3.7-Max", rate: 0.5, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "Qwen3.7-Plus", name: "Qwen3.7-Plus", rate: 0.1, capabilities: { images: true, reasoning: false, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "Kimi-K3", name: "Kimi-K3", rate: 0.8, capabilities: { images: true, reasoning: false, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "Kimi-K2.8-Preview", name: "Kimi-K2.8-Preview", rate: 0.3, capabilities: { images: true, reasoning: false, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "GLM-5.3", name: "GLM-5.3", rate: 0.6, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "GLM-5.3-Flash", name: "GLM-5.3-Flash", rate: 0.1, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "DeepSeek-V4-Pro", name: "DeepSeek-V4-Pro", rate: 0.8, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "DeepSeek-Flash", name: "DeepSeek-Flash", rate: 0.2, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "MiniMax-M3", name: "MiniMax-M3", rate: 0.2, capabilities: { images: true, reasoning: false, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+      ],
+    },
   },
   // Trae function 字段按模型分发（TraeWorkAssistant models_sync.rs 实证：
   // 部分模型仅在 solo_agent 下可用，其余走 solo_work_lite；未命中默认 solo_work_lite）

@@ -258,6 +258,33 @@ const PROXY_POOL = [
       { id: "a6", channel: "raccoon", uid: "rc_88213", name: "小浣熊 1 号", status: "online", credits: 9800, creditsAt: NOW - 12 * 60000, expiresAt: NOW + 29 * 86400000, coolUntil: 0, coolReason: "", source: "json", lastUsed: NOW - 9 * 60000, todayReq: 18, todayTokens: 5200, createdAt: NOW - 3 * 86400000, hasToken: true },
     ],
   },
+  // 新增的五个生态渠道：预览态一律空号池，只为让「添加账号」弹窗里的设备码 / 滑块 / edition 切换
+  // 面板在 npm run dev:web 里可达（display / domain 与 store.cjs 的 BUILTIN_CHANNELS 逐字同源）
+  {
+    id: "cline_free", display: "Cline 免费池", domain: "api.cline.bot", poolStrategy: "expire_first",
+    summary: { channel: "cline_free", totalCredits: 0, accountCount: 0, onlineCount: 0, earliestExpire: 0, expiringSoon: false, todayReq: 0, todayTokens: 0, lastCreditsAt: 0 },
+    accounts: [],
+  },
+  {
+    id: "cline_pass", display: "Cline 订阅池", domain: "api.cline.bot", poolStrategy: "expire_first",
+    summary: { channel: "cline_pass", totalCredits: 0, accountCount: 0, onlineCount: 0, earliestExpire: 0, expiringSoon: false, todayReq: 0, todayTokens: 0, lastCreditsAt: 0 },
+    accounts: [],
+  },
+  {
+    id: "autoclaw", display: "智谱 AutoClaw（国内）", domain: "autoglm-acceleration-api.zhipuai.cn", poolStrategy: "expire_first",
+    summary: { channel: "autoclaw", totalCredits: 0, accountCount: 0, onlineCount: 0, earliestExpire: 0, expiringSoon: false, todayReq: 0, todayTokens: 0, lastCreditsAt: 0 },
+    accounts: [],
+  },
+  {
+    id: "autoclaw_intl", display: "智谱 AutoClaw（国际）", domain: "autoglm-api.autoglm.ai", poolStrategy: "expire_first",
+    summary: { channel: "autoclaw_intl", totalCredits: 0, accountCount: 0, onlineCount: 0, earliestExpire: 0, expiringSoon: false, todayReq: 0, todayTokens: 0, lastCreditsAt: 0 },
+    accounts: [],
+  },
+  {
+    id: "qoder", display: "Qoder", domain: "api3.qoder.sh", poolStrategy: "expire_first",
+    summary: { channel: "qoder", totalCredits: 0, accountCount: 0, onlineCount: 0, earliestExpire: 0, expiringSoon: false, todayReq: 0, todayTokens: 0, lastCreditsAt: 0 },
+    accounts: [],
+  },
   // 自定义提供商在号池页的样子：kind=openai_compat 时余额/到期/签到/切到 IDE 全部不出现
   {
     id: "myrelay", display: "我的中转站", domain: "relay.example.com", poolStrategy: "round_robin", kind: "openai_compat", enabled: true,
@@ -965,8 +992,31 @@ export const mock = {
         ];
       case "proxy_scan_import":
         return { ok: true, id: "a-imp", updated: false };
-      case "proxy_oauth_begin":
-        return { ok: true, url: "https://www.trae.cn/authorization?...（预览）", mode: args?.channel === "trae" ? "loopback" : "poll" };
+      case "proxy_oauth_begin": {
+        // 预览态与主进程 discovery 同源：mode 只有 loopback（Trae）/ poll（WorkBuddy 双区）/
+        // device（cline、qoder）/ callback（AutoClaw 国际）四种，旧夹具里的统一 "poll" 是陈旧值。
+        // autoclaw_intl 第一跳不回 url、只回滑块配置，带 captchaVerifyParam 的二次调用才回 url——
+        // 不分支演这条真链路，设备码与滑块面板在预览里永远出不来
+        const ch = String(args?.channel || "trae");
+        const capParam = String(args?.captchaVerifyParam || "");
+        if (ch === "autoclaw_intl") {
+          return capParam
+            ? { ok: true, url: "https://autoglm-api.autoglm.ai/oauth/authorize?…（预览）", mode: "callback" }
+            : { ok: true, needCaptcha: true, captcha: { region: "cn", prefix: "1f0z2a", sceneId: "sq51tr", supplier: "aliyun" } };
+        }
+        if (ch === "cline_free" || ch === "cline_pass") {
+          return { ok: true, url: "https://authkit.cline.bot/device?code=ABCD-EFGH（预览）", mode: "device", userCode: "ABCD-EFGH" };
+        }
+        if (ch === "qoder") {
+          // qoder 的授权页免验证码（challenge/nonce 全在 URL 里），userCode 为空 → UI 不显设备码行
+          return { ok: true, url: "https://qoder.com/device/selectAccounts?…（预览）", mode: "device", userCode: "" };
+        }
+        if (ch === "trae") return { ok: true, url: "https://www.trae.cn/authorization?…（预览）", mode: "loopback" };
+        // 与小浣熊 / AutoClaw 国内版的真实门禁一致：官方没有可代收的网页登录，预览也要拒得干脆
+        if (ch === "raccoon") return { ok: false, message: "小浣熊暂不支持在应用内直接登录：请在客户端登录后用「从本机软件导入」或粘贴 auth.json" };
+        if (ch === "autoclaw") return { ok: false, message: "AutoClaw（国内）官方没有网页登录：请用「从本机软件导入」或粘贴 token" };
+        return { ok: true, url: "https://copilot.tencent.com/login?…（预览）", mode: "poll" };
+      }
       case "proxy_account_import_json":
         return { ok: true, added: 2, dup: 1, invalid: 0, message: "成功导入 2 个账号，1 个同 UID 已存在跳过" };
       case "proxy_account_import_file":

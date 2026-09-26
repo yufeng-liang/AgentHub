@@ -21,6 +21,12 @@ const CHANNELS: { id: ProxyBuiltinChannelId | ""; label: string }[] = [
   { id: "workbuddy", label: "WorkBuddy（中国区）" },
   { id: "workbuddy_ai", label: "WorkBuddy AI（国际版）" },
   { id: "raccoon", label: "商汤小浣熊" },
+  // targetChannel 是同步范围而非显示筛选（传给 proxyPoolsyncRun），缺项的渠道无法单独同步
+  { id: "cline_free", label: "Cline 免费池" },
+  { id: "cline_pass", label: "Cline 订阅池" },
+  { id: "autoclaw", label: "智谱 AutoClaw（国内）" },
+  { id: "autoclaw_intl", label: "智谱 AutoClaw（国际）" },
+  { id: "qoder", label: "Qoder" },
 ];
 
 const running = computed(() => !!st.value?.running);

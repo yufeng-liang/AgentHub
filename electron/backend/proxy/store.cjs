@@ -122,6 +122,11 @@ const BUILTIN_CHANNELS = [
   { id: "workbuddy", display: "WorkBuddy（中国区）", domain: "copilot.tencent.com" },
   { id: "workbuddy_ai", display: "WorkBuddy AI（国际版）", domain: "www.workbuddy.ai" },
   { id: "raccoon", display: "商汤小浣熊", domain: "xiaohuanxiong.com" },
+  { id: "cline_free", display: "Cline 免费池", domain: "api.cline.bot" },
+  { id: "cline_pass", display: "Cline 订阅池", domain: "api.cline.bot" },
+  { id: "autoclaw", display: "智谱 AutoClaw（国内）", domain: "autoglm-acceleration-api.zhipuai.cn" },
+  { id: "autoclaw_intl", display: "智谱 AutoClaw（国际）", domain: "autoglm-api.autoglm.ai" },
+  { id: "qoder", display: "Qoder", domain: "api3.qoder.sh" },
 ];
 const BUILTIN_IDS = new Set(BUILTIN_CHANNELS.map((c) => c.id));
 

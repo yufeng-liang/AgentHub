@@ -56,15 +56,17 @@ function emitRequestThrottled() {
   }, 2000);
 }
 
-/** 渠道选择（方案 §6.2）：提供商显式前缀 → 单源强制 → per-model 覆盖 → 打分（健康度×余额）/ 指定渠道优先 */
+/** 渠道选择（方案 §6.2）：提供商显式前缀 → 钉渠道 → 单源强制 → per-model 覆盖 → 打分（健康度×余额） */
 function resolveChannel(key, model, settings) {
   // `slug/model` 前缀直达提供商。这里只交出渠道，不改模型名——上游真名由适配器的 upstreamFor 剥前缀
   // 再映射，与内置适配器「收到客户端模型名、自己改写」的契约保持一致，调度层不需要知道第二套命名口径。
   const slug = provider.parseModelRef(model);
   if (slug) return { channel: slug };
-  const owners = adapters.modelOwners(model);
-  if (owners.length === 1) return { channel: owners[0] }; // 模型仅存在于单渠道目录 → 强制
+  // 钉渠道排在单归属之前：key.route 是用户显式意图。排在后面的话，某个通用模型名
+  // （auto/ultimate 这类）一旦被别家目录收走，钉着 trae 的客户端会被静默改投且无从察觉。
   if (key.route !== "auto") return { channel: key.route };
+  const owners = adapters.modelOwners(model);
+  if (owners.length === 1) return { channel: owners[0] }; // auto 模式下模型仅存在于单渠道目录 → 直达
   if (owners.length > 1) {
     const ov = (settings.modelOverrides || {})[model];
     if (ov && owners.includes(ov)) return { channel: ov };
@@ -826,4 +828,4 @@ function status() {
   };
 }
 
-module.exports = { start, stop, stopAsync, status, CLOSE_BUDGET_MS };
+module.exports = { start, stop, stopAsync, status, CLOSE_BUDGET_MS, _resolveChannel: resolveChannel };

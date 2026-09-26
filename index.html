@@ -2,9 +2,17 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <!-- CSP：渲染进程只加载本地资源；unsafe-inline 供 Vue SFC 运行时注入样式，
-         ws://localhost:1420 仅供 Vite 开发热更新，打包后不生效 -->
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws://localhost:1420" />
+    <!-- CSP：渲染进程默认只加载本地资源；unsafe-inline 供 Vue SFC 运行时注入样式，
+         ws://localhost:1420 仅供 Vite 开发热更新，打包后不生效。
+         *.alicdn.com / *.aliyuncs.com 只为 AutoClaw 国际版登录的阿里云滑块 SDK 放行
+         （官方浏览器端 SDK 无 npm 包：脚本在 o.alicdn.com，验证接口与静态图在各 region 的
+         captcha-open / static-captcha 域，见阿里云验证码 2.0 接入文档 Q11）；
+         范围刻意收到这两家阿里自有域，不给通配符 https: -->
+    <!-- 阿里云滑块验证码 SDK 的资源域（官方文档清单）：CDN 只有 o/g/x.alicdn.com，
+         验证码静态资源与接口只有 static-captcha(.sgp).aliyuncs.com 与 *.captcha-open(.sgp).aliyuncs.com。
+         不要图省事改成 https://*.aliyuncs.com——那会连带放开用户可写的 OSS 域，等于给渲染进程开出站外传通道。
+         阿里云换域的表现是 SDK 初始化失败（可见报错），不是静默降级。 -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://o.alicdn.com https://g.alicdn.com https://x.alicdn.com; style-src 'self' 'unsafe-inline' https://*.alicdn.com; img-src 'self' data: https://*.alicdn.com https://static-captcha.aliyuncs.com https://static-captcha.sgp.aliyuncs.com; connect-src 'self' ws://localhost:1420 https://o.alicdn.com https://g.alicdn.com https://x.alicdn.com https://*.captcha-open.aliyuncs.com https://*.captcha-open-sgp.aliyuncs.com https://static-captcha.aliyuncs.com https://static-captcha.sgp.aliyuncs.com; frame-src 'self' https://*.captcha-open.aliyuncs.com https://*.captcha-open-sgp.aliyuncs.com" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>AgentHub · Agent中控台</title>
   </head>
