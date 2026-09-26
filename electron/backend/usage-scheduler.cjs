@@ -13,6 +13,7 @@ let lastLocalAt = 0;
 let lastRemoteAt = 0;
 let lastDailyAt = ""; // "YYYY-MM-DD"
 let paused = false;
+let stopped = false; // 停机标志：stop() 拦不住已经 await 出去的那一拍，得由它自己作废（与 watch.cjs 同构）
 
 /** 触发时间持久化到 meta 表：重启后不重置，避免启动即同步/当天 daily 重复补跑 */
 function rememberLast(kind, value) {
@@ -95,9 +96,14 @@ function tick() {
       lastRemoteAt = now;
       rememberLast("hourly", now);
     }
-    // 同 tick 双命中时先本地后远程串行执行：保证 WebDAV 上传携带刚采完的最新数据
+    // 同 tick 双命中时先本地后远程串行执行：保证 WebDAV 上传携带刚采完的最新数据。
+    // 后半程开工前先看停机标志：与 watch.cjs 同构的缺陷——stop() 只清 timer，双命中拍的
+    // 本地统计挂在 await 上时停机，WebDAV 上传照样落地（外发网络写）。本地统计一旦开跑
+    // 没有取消接口（runLocal 是真写库，不同于 watch 里只读的 fingerprint），stop() 能拦住
+    // 的是这拍的后半程与停机后的后续拍；scripts/dev-usage-scheduler-test.cjs 钉的就是这条。
     (async () => {
       if (localDue) await sync.runLocal(cfg).catch(() => {});
+      if (stopped) return; // 停机期间挂起中的那一拍直接作废，见 stop()
       if (remoteDue) await sync.runRemote(cfg).catch(() => {});
     })();
   } catch {
@@ -107,6 +113,7 @@ function tick() {
 
 function start() {
   if (timer) return;
+  stopped = false; // 允许重启调度：不清掉的话 start 之后每一拍都自我作废（与 watch.cjs 同款反证）
   // 恢复上次触发时间：重启后接着原节奏调度，而不是立刻补跑
   try {
     const l = Number(db.getMeta("sched_last_local"));
@@ -121,11 +128,18 @@ function start() {
   timer = setInterval(tick, 60 * 1000);
 }
 
+// 只清 timer 不够：stop() 那一刻可能正有一拍挂在 runLocal 的 await 上，它会在停机之后
+// resume 并走到 runRemote（WebDAV 外发）。旧同步版一拍跑完，before-quit 结构上看不到在飞
+// 任务；现在必须留标志让那拍的后半程自己作废——尤其 main.cjs 的退出/装更互锁会
+// preventDefault 后继续 pump 事件循环，stop() 之后循环还长着。
+// 判据用 stopped 而不是"timer 为空"：自测（dev-usage-scheduler-test.cjs）直连 tick()，
+// 按 timer 判空会把那些拍全作废，恢复拍（断言 7）当场红。
 function stop() {
+  stopped = true;
   if (timer) {
     clearInterval(timer);
     timer = null;
   }
 }
 
-module.exports = { start, stop, setPaused, isPaused };
+module.exports = { start, stop, tick, setPaused, isPaused };

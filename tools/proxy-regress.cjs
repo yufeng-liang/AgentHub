@@ -1,5 +1,10 @@
 // 回归探针：新实现实测（余额求和 / 1001 unavailable / 签到状态 / 渠道过滤导出）
 "use strict";
+
+// 守卫（三期收尾，2026-09-24）：被 require 时零副作用。本仓 5 个脚本曾因缺它而在被 require 时
+// 真把探针跑了一次（Task 5 实现者核验导出面时误触 phase1-browser-pass）。
+// 顶层 return 在 CJS 模块包装函数里合法：作为入口时 require.main === module 照常执行。
+if (require.main !== module) return;
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");

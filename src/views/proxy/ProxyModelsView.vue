@@ -16,7 +16,13 @@ const filter = ref("");
 const activeTab = ref(""); // "" = 全部
 
 // 渠道候选 = 号池当前渠道（渠道后续扩充时自动跟进，不写死）
-const channels = ref<{ id: string; display: string }[]>([]);
+// kind 决定这一页能对它做什么：内置渠道的元数据在 rules/catalog.json（本页可拉取），
+// 自定义提供商的清单在 agents.models_json（只有「提供商」页能编辑）
+const channels = ref<{ id: string; display: string; kind?: string }[]>([]);
+// 正向判内置，缺 kind 视为内置（浏览器预览的 mock 数据就没带这个字段）
+const isBuiltinChannel = (c: { kind?: string }) => !c.kind || c.kind === "builtin";
+const builtinChannels = computed(() => channels.value.filter(isBuiltinChannel));
+const activeIsBuiltin = computed(() => !activeTab.value || isBuiltinChannel(channels.value.find((c) => c.id === activeTab.value) || {}));
 const CHANNEL_OPTIONS = computed<{ value: "" | ProxyChannelId; label: string }[]>(() => [
   { value: "", label: "自动（打分）" },
   ...channels.value.map((c) => ({ value: c.id as ProxyChannelId, label: c.display })),
@@ -122,16 +128,19 @@ async function syncCatalog(channel: string) {
   }
 }
 
-/** 全部渠道并发拉取：逐渠道汇总结果，部分失败不拖垮整体 */
+/** 内置渠道并发拉取：逐渠道汇总结果，部分失败不拖垮整体。
+ *  刻意不含自定义提供商——它们的清单由「提供商」页写进 models_json，
+ *  这条通道落的是 rules/catalog.json，混在一起会把提供商的模型灌进内置目录。 */
 async function syncAll() {
   if (syncing.value) return;
   syncing.value = "__all__";
+  const targets = builtinChannels.value;
   try {
-    const results = await Promise.all(channels.value.map((c) => api.proxyModelsSync(c.id).catch((e) => ({ ok: false as const, message: String((e as Error).message || e) }))));
+    const results = await Promise.all(targets.map((c) => api.proxyModelsSync(c.id).catch((e) => ({ ok: false as const, message: String((e as Error).message || e) }))));
     const okParts: string[] = [];
     const failParts: string[] = [];
     results.forEach((r, i) => {
-      const name = channelName(channels.value[i].id);
+      const name = channelName(targets[i].id);
       if (r && r.ok !== false) okParts.push(`${name} ${r.count ?? 0} 个`);
       else failParts.push(`${name}：${(r && r.message) || "失败"}`);
     });
@@ -174,9 +183,10 @@ onMounted(refresh);
             <input v-model="filter" class="search-input" placeholder="搜索模型" spellcheck="false" />
             <button v-if="filter" class="search-clear" title="清空搜索" @click.prevent="filter = ''"><i class="ph ph-x"></i></button>
           </label>
-          <button v-if="activeTab" class="btn btn-cta" :disabled="!!syncing" @click="syncCatalog(activeTab)">
+          <button v-if="activeTab && activeIsBuiltin" class="btn btn-cta" :disabled="!!syncing" @click="syncCatalog(activeTab)">
             <i class="ph ph-cloud-arrow-down"></i>{{ syncing === activeTab ? "拉取中…" : "拉取模型" }}
           </button>
+          <span v-else-if="activeTab" class="set-desc tab-hint">自定义提供商的模型清单请在「提供商」页编辑（这一页只管启用/别名/覆盖）</span>
           <button v-else class="btn btn-cta" :disabled="!!syncing" @click="syncAll">
             <i class="ph ph-cloud-arrow-down"></i>{{ syncing === "__all__" ? "拉取中…" : "全部拉取" }}
           </button>
@@ -215,25 +225,29 @@ onMounted(refresh);
                   <span v-for="s in m.sources" :key="s" class="tag tag-dim" style="margin-right: 4px">{{ channelName(s) }}</span>
                 </td>
                 <td>
-                  <el-select
-                    :model-value="m.override"
+                  <select
+                    class="f-select"
+                    style="width: 132px"
+                    :value="m.override"
                     :disabled="!m.enabled || m.sources.length === 1"
                     :title="m.sources.length === 1 ? '单源模型强制走所属渠道，无需覆盖' : ''"
-                    popper-class="glass-popper"
-                    size="small"
-                    style="width: 132px"
-                    @change="setOverride(m, $event)"
+                    @change="setOverride(m, ($event.target as HTMLSelectElement).value)"
                   >
-                    <el-option
+                    <option
                       v-for="o in CHANNEL_OPTIONS.filter((o) => !o.value || m.sources.includes(o.value as ProxyChannelId))"
                       :key="o.value"
                       :value="o.value"
-                      :label="o.label"
-                    />
-                  </el-select>
+                    >{{ o.label }}</option>
+                  </select>
                 </td>
                 <td>
-                  <el-switch :model-value="m.enabled" @change="toggleEnabled(m, $event)" />
+                  <div
+                    class="switch"
+                    :class="{ on: m.enabled }"
+                    role="switch"
+                    :aria-checked="!!m.enabled"
+                    @click="toggleEnabled(m, !m.enabled)"
+                  ></div>
                 </td>
               </tr>
               <tr v-if="!rows.length">
@@ -254,9 +268,10 @@ onMounted(refresh);
         <div class="alias-form">
           <input v-model="aliasName" class="input" style="width: 220px" placeholder="别名（如 gpt-4o）" />
           <span class="alias-arrow">→</span>
-          <el-select v-model="aliasTarget" popper-class="glass-popper" size="default" filterable style="width: 260px" placeholder="目标模型">
-            <el-option v-for="m in models" :key="m.id" :value="m.id" :label="m.id" />
-          </el-select>
+          <select v-model="aliasTarget" class="f-select" style="width: 260px">
+            <option value="" disabled>目标模型</option>
+            <option v-for="m in models" :key="m.id" :value="m.id">{{ m.id }}</option>
+          </select>
           <button class="btn" :disabled="!aliasName.trim() || !aliasTarget" @click="addAlias">添加映射</button>
         </div>
         <div v-if="aliases.length" class="alias-list">
@@ -337,6 +352,11 @@ onMounted(refresh);
   outline-offset: 1px;
 }
 /* 搜索框：图标 + 无框输入 + 快捷清空；聚焦时整框点亮主色并给图标染色 */
+/* 提供商 tab 上不放拉取按钮：它的清单归「提供商」页，这里只给一句去处 */
+.tab-hint {
+  align-self: center;
+  color: var(--text-3);
+}
 .search-box {
   display: inline-flex;
   align-items: center;

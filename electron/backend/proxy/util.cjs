@@ -145,6 +145,8 @@ function injectThinking(obj, defaultEffort) {
 }
 
 const EFFORT_RANK = { off: 0, minimal: 1, low: 2, medium: 3, high: 4, xhigh: 5, max: 6 };
+// 档位词表的唯一出处：提供商侧配置要校验用户填的档位，必须用同一份而不是再抄一个字面量数组
+const EFFORT_LEVELS = Object.keys(EFFORT_RANK);
 
 /** reasoning_effort 档位降级（参考项目 normalizeReasoningEffort）：模型目录声明 supportedEfforts
  *  时按其收敛——请求档不在支持集则降到 ≤ 请求档的最高支持档；支持档全高于请求档取最低档。 */
@@ -271,13 +273,19 @@ function stripEmptyDelta(d) {
  * 判据必须与 Aggregator.pushDelta 认的三类字段一致——若用"清洗后还有键"代替，
  * 上游私有的非空扩展字段（extra_fields:{} 之类）会被判成已出线，
  * 既进不了聚合器，又封死 server 侧 streamErr 的换号路径，最终把空响应记成 200。
- * 全空噪声帧（function_call:null / refusal:"" / tool_calls:[] / role 重复）恒为 false。
+ * 全空噪声帧（function_call:null / refusal:"" / tool_calls:[] / role 重复）恒为 false；
+ * 唯一的例外是带内容的 legacy function_call：虽经 OpenAI 协议早已废弃，但若上游真用它
+ * 流式输出（旧协议兼容通道），本函数若不视为出线，流中失败会换号重发散成拼接；
+ * 与「已经发出去的半截内容不能撤回」更一致才算出线。空名空参的占位帧仍是噪声。
  */
 function hasConsumableDelta(d) {
   if (!d || typeof d !== "object") return false;
+  const fc = d.function_call;
+  const hasLegacyFn = !!fc && typeof fc === "object" && (!!fc.name || !!fc.arguments);
   return !!d.reasoning_content
     || !!d.content
-    || (Array.isArray(d.tool_calls) && d.tool_calls.length > 0);
+    || (Array.isArray(d.tool_calls) && d.tool_calls.length > 0)
+    || hasLegacyFn; // legacy 兼容通道的真实调用仍算出线，防流中换号重发拼接
 }
 
 /** OpenAI 流式 chunk 组装 */
@@ -367,9 +375,16 @@ function estimateTokens(text) {
   return Math.max(1, Math.ceil(String(text || "").length / 4));
 }
 
+/** 版本号：两端同源。旧实现是 poolsync.appVersion（本地私有函数），用 electron 的 app.getVersion()，
+ *  try 吞错后在子进程里恒返回 ""，会让 gateway.json 的版本比对（Task 3/7）永远"不匹配"→ 每次启动都重杀子进程。 */
+function appVersion() {
+  try { return require("../../../package.json").version || ""; } catch { return ""; }
+}
+
 module.exports = {
   uuid, traceId, jwtDecode, dig, toMs,
   isCompleteJson, parseRetryAfterHeaders, stableConvId, promptCacheKey,
-  isDeepSeekModel, injectThinking, normalizeReasoningEffort, backfillReasoningContent,
+  isDeepSeekModel, injectThinking, normalizeReasoningEffort, backfillReasoningContent, EFFORT_LEVELS,
   SseScanner, stripEmptyDelta, hasConsumableDelta, chunk, DONE, Aggregator, openaiError, validateChatBody, estimateTokens,
+  appVersion,
 };

@@ -1376,7 +1376,7 @@ function raccoonIdentity(account) {
 }
 
 /** LLM 请求头（box-agent 链路）：六头 + 会话关联头 + Bearer。仅 x-client-* 给官方域用 */
-function raccoonChatHeaders(c, account, secrets, sessionId, turnId) {
+function raccoonChatHeaders(c, account, secrets, sessionId, turnId, title) {
   const idn = raccoonIdentity(account);
   const h = {
     "content-type": "application/json",
@@ -1391,7 +1391,8 @@ function raccoonChatHeaders(c, account, secrets, sessionId, turnId) {
     // 会话级关联头：request 内同 id（重试/换号复用），跨 request 不复用（会话2 §1.4）
     "X-RACCOON-Session-ID": sessionId,
     "X-RACCOON-Turn-ID": turnId,
-    "X-RACCOON-Title": "",
+    // 官方客户端取首条用户消息前 20 字符作标题；空串是异常信号（风控识别点）
+    "X-RACCOON-Title": title || "",
     "X-RACCOON-Call-Kind": "chat",
   };
   // 团队版才带组织码（个人版 office_identity="personal"，不带）
@@ -1503,14 +1504,24 @@ const raccoon = {
   },
 
   /** OpenAI body → raccoon 改写：模型别名归一 + 强制流式 usage；剥离 AgentHub 注入的内部字段，
-   *  只留 OpenAI 标准字段（raccoon 上游疑似 LiteLLM，未知字段可能 400） */
+   *  只留 OpenAI 标准字段（raccoon 上游疑似 LiteLLM，未知字段可能 400）；
+   *  max_tokens 缺省时补 80000（官方 hosted 默认值，会话3 §1.3），客户端已发则尊重原值 */
   rewriteBody(model, body) {
     const out = { ...(body || {}) };
     out.model = this.mapModel(model);
     out.stream = true;
     if (!out.stream_options || typeof out.stream_options !== "object") out.stream_options = {};
     out.stream_options.include_usage = true;
-    // 内部/非标准字段（不发给上游；其他标准字段如 temperature/top_p/tools/max_tokens 原样透传）
+    // 官方客户端恒发 max_tokens=80000（hosted）；上游对缺失该字段的复杂请求（带 tools/长 prompt）
+    // 会静默丢弃不返回字节——表现为 10s 首字节超时，而极简测试连接能过
+    if (!out.max_tokens && !out.max_completion_tokens) out.max_tokens = 80000;
+    // max_completion_tokens → max_tokens 翻译（新版 OpenAI SDK 客户端发前者）
+    if (out.max_completion_tokens != null) {
+      const mct = Number(out.max_completion_tokens);
+      if (Number.isFinite(mct) && mct > 0 && out.max_tokens == null) out.max_tokens = mct;
+      delete out.max_completion_tokens;
+    }
+    // 内部/非标准字段（不发给上游；其他标准字段如 temperature/top_p/tools 原样透传）
     delete out.conversation_id;
     delete out.conversationId;
     delete out.prompt_cache_key;
@@ -1521,11 +1532,29 @@ const raccoon = {
   async chat({ account, secrets, model, body, emit, meta }) {
     const c = this.cfg();
     const payload = JSON.stringify(this.rewriteBody(model, body));
-    // server 的 meta = {conversationRequestId, conversationId}（会话3）：request 级稳定 id，
-    // 重试/换号复用同一 id 保证服务端会话聚合；meta 缺失才回退随机
-    const sessionId = (meta && (meta.conversationId || meta.sessionId)) || util.uuid();
-    const turnId = (meta && (meta.conversationRequestId || meta.turnId)) || util.uuid();
-    const headers = raccoonChatHeaders(c, account, secrets, sessionId, turnId);
+    // 会话头稳定性：同一会话内 X-RACCOON-Session-ID 必须恒定（官方客户端行为）。
+    // 原来每请求随机生成，多轮对话时上游看到"新 session 却带完整历史"的逻辑矛盾，
+    // 触发风控静默丢弃（真实请求 10s 超时而测试连接通过的根因）。
+    // sessionId = sha256(账号uid + 消息指纹)，跨请求稳定；turnId = sessionId + 消息数（第几轮）
+    const convKey = (meta && meta.conversationId) || util.stableConvId(body && body.messages) || "";
+    const uid = String((account && account.uid) || "anon");
+    let sessionId, turnId;
+    if (convKey) {
+      const seed = crypto.createHash("sha256").update(`raccoon:sess:${uid}:${convKey}`).digest("hex");
+      sessionId = `${seed.slice(0, 8)}-${seed.slice(8, 12)}-4${seed.slice(13, 16)}-a${seed.slice(17, 20)}-${seed.slice(20, 32)}`;
+      const turnN = Array.isArray(body && body.messages) ? body.messages.length : 1;
+      const tSeed = crypto.createHash("sha256").update(`${seed}:turn:${turnN}`).digest("hex");
+      turnId = `${tSeed.slice(0, 8)}-${tSeed.slice(8, 12)}-4${tSeed.slice(13, 16)}-a${tSeed.slice(17, 20)}-${tSeed.slice(20, 32)}`;
+    } else {
+      sessionId = util.uuid();
+      turnId = util.uuid();
+    }
+    // 官方客户端标题：首条用户消息前 20 字符（认证与令牌会话 §3.3）
+    let title = "";
+    const msgs = Array.isArray(body && body.messages) ? body.messages : [];
+    const firstUser = msgs.find((m) => m && m.role === "user" && typeof m.content === "string");
+    if (firstUser) title = String(firstUser.content).replace(/\s+/g, " ").trim().slice(0, 20);
+    const headers = raccoonChatHeaders(c, account, secrets, sessionId, turnId, title);
     const { resp, cancelTimer } = await fetchStream(c.chatUrl, { method: "POST", headers, body: payload });
     const result = { status: 200, planLimit: false };
     try {
@@ -1619,26 +1648,42 @@ const raccoon = {
    *  与桌面端共用 ~/.box-agent/config/auth.json：刷前以文件里的最新 refresh_token 为准
    *  （桌面端可能刚刷过并旋转，用号池快照里的旧值会吃 401 —— 掉登录根因），
    *  刷新成功后原子写回，让两边始终持同一份凭据；文件归属校验不过则绝不碰文件。
-   *  旋转竞态兜底：401 可能是并发刷新已旋转 refresh，交由 refreshTokenLocked 单飞收敛 */
+   *  旋转竞态兜底：401 可能是并发刷新已旋转 refresh——重读文件，值变了就用新值再试一次，
+   *  仍 401 才判失效（方案文档 §2.3：/401 后重读文件再试一次） */
   async refreshToken(account, secrets) {
     const c = this.cfg();
-    const own = raccoonAuth.ownedTokens(account && account.uid, secrets && secrets.refreshToken);
-    const refreshToken = (own && own.refreshToken) || (secrets && secrets.refreshToken) || "";
+    const uid = account && account.uid;
+    const own0 = raccoonAuth.ownedTokens(uid, secrets && secrets.refreshToken);
+    let refreshToken = (own0 && own0.refreshToken) || (secrets && secrets.refreshToken) || "";
     if (!refreshToken) return { ok: false, message: "无 refreshToken，请重新登录或粘贴" };
-    const headers = raccoonRefreshHeaders(c, account);
-    const body = JSON.stringify({ refresh_token: refreshToken });
-    const r = await httpJson(c.refreshUrl, { method: "POST", headers, body }).catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
-    const d = (r.data && (r.data.data || r.data)) || null;
-    const token = d && (d.access_token || d.accessToken || d.token);
-    if (r.ok && token) {
-      // 服务端旋转 refresh 就覆盖，不返回则保留旧的（会话1 §1.3；协议支持旋转但不强制）
-      const nextRefresh = d.refresh_token || d.refreshToken ? String(d.refresh_token || d.refreshToken) : refreshToken;
-      // 回写共用文件（仅当文件确属本号）：桌面端下次刷新读到新值，不再拿旧 refresh 撞 401
-      if (own) raccoonAuth.writeTokens({ accessToken: String(token), refreshToken: nextRefresh });
-      return { ok: true, token: String(token), refreshToken: nextRefresh };
+    let headers = raccoonRefreshHeaders(c, account);
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const body = JSON.stringify({ refresh_token: refreshToken });
+      const r = await httpJson(c.refreshUrl, { method: "POST", headers, body }).catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
+      const d = (r.data && (r.data.data || r.data)) || null;
+      const token = d && (d.access_token || d.accessToken || d.token);
+      if (r.ok && token) {
+        // 服务端旋转 refresh 就覆盖，不返回则保留旧的（会话1 §1.3；协议支持旋转但不强制）
+        const nextRefresh = d.refresh_token || d.refreshToken ? String(d.refresh_token || d.refreshToken) : refreshToken;
+        // 回写共用文件（仅当文件确属本号）：桌面端下次刷新读到新值，不再拿旧 refresh 撞 401
+        const own = raccoonAuth.ownedTokens(uid, nextRefresh);
+        if (own) raccoonAuth.writeTokens({ accessToken: String(token), refreshToken: nextRefresh });
+        return { ok: true, token: String(token), refreshToken: nextRefresh };
+      }
+      if (r.status === 401) {
+        // 401 可能是桌面端并发刷新旋转了 refresh——重读文件，值变了就用新值再试一次
+        const own = raccoonAuth.ownedTokens(uid, refreshToken);
+        const latest = (own && own.refreshToken) || "";
+        if (latest && latest !== refreshToken) {
+          refreshToken = latest;
+          continue; // 值变了，再试一次
+        }
+        return { ok: false, expired: true, message: "登录态已过期，请重新登录" };
+      }
+      return { ok: false, message: (d && (d.message || d.msg)) || r.message || `刷新失败 HTTP ${r.status}` };
     }
-    if (r.status === 401) return { ok: false, expired: true, message: "登录态已过期，请重新登录" };
-    return { ok: false, message: (d && (d.message || d.msg)) || r.message || `刷新失败 HTTP ${r.status}` };
+    return { ok: false, expired: true, message: "登录态已过期（重试后仍 401），请重新登录" };
   },
 
   /** 用户信息（导入后补全 uid/昵称）：GET /auth/v1/user_info（会话4 §6）。
@@ -2476,15 +2521,37 @@ function statusFromCompatError(errObj, data) {
   return 502;
 }
 
-/** Anthropic 形态上游的端点：归一化后的 base 只补 /messages（与 openai 通路同一条约定） */
-function aupUrl(base) {
-  return `${base}/messages`;
+/** 出站端点统一在这里拼：`base_url` 存的是**不含 /v1 的根**（归一化侧保证），所以 /v1 必须由这里补。
+ *  真机实测（2026-09-23，一家只开 /v1/messages 的中转站）：只拼 leaf 会打到它的前端页面——
+ *  回 200 + text/html，比 404 更难归因。Anthropic 生态里 `base + "/v1/messages"` 是唯一约定
+ *  （Claude Code 对 ANTHROPIC_BASE_URL 也这么拼），OpenAI 兼容站的挂载点同样是 /v1。
+ *  规则只写这一处：换协议只换 leaf。 */
+function compatUrl(base, leaf) {
+  return `${base}/v1/${leaf}`;
 }
 
 function makeOpenaiCompat(row) {
   const entries = compatModelEntries(row);
-  const chatUrl = `${row.baseUrl}/chat/completions`;
-  const upstreamByClient = new Map(entries.map((e) => [e.client.toLowerCase(), e.upstream]));
+  const chatUrl = compatUrl(row.baseUrl, "chat/completions");
+  // 客户端名 → 上游真名 / → 条目。别名与模型名同等参与解析（别名不进 /v1/models，
+  // 但客户端拿它发请求必须能命中），所以两张表都要把 aliases 铺进去。
+  const upstreamByClient = new Map();
+  const entryByClient = new Map();
+  for (const e of entries) {
+    upstreamByClient.set(e.client.toLowerCase(), e.upstream);
+    entryByClient.set(e.client.toLowerCase(), e);
+    for (const a of (e.entry && Array.isArray(e.entry.aliases) ? e.entry.aliases : [])) {
+      const k = String(a || "").toLowerCase();
+      if (!k) continue;
+      upstreamByClient.set(k, e.upstream);
+      entryByClient.set(k, e);
+    }
+  }
+  /** 剥掉自家的 `slug/` 前缀（那是路由信息，上游听不懂） */
+  const stripPrefix = (clientModel) => {
+    const s = String(clientModel || "");
+    return s.slice(0, row.id.length + 1).toLowerCase() === `${row.id}/`.toLowerCase() ? s.slice(row.id.length + 1) : s;
+  };
   return {
     /** 提供商没有 rules/headers.json 那套 UA/指纹伪装：头 = 标准 JSON + Bearer + 用户自定义覆盖 */
     headers(secrets) {
@@ -2497,13 +2564,17 @@ function makeOpenaiCompat(row) {
       return h;
     },
 
-    /** 客户端模型名 → 上游真名：先剥自家的 `slug/` 前缀（那是路由信息，上游听不懂），
-     *  再查条目配的 upstream 别名。目录外模型原样透传：用户显式点名了提供商，而中转站实际开放的
+    /** 客户端模型名 → 上游真名：先剥自家的 `slug/` 前缀，再查条目配的 upstream（模型名与别名同表）。
+     *  目录外模型原样透传：用户显式点名了提供商，而中转站实际开放的
      *  模型常常领先于它的清单（内置渠道同款"透传试错"语义）。 */
     upstreamFor(clientModel) {
-      let s = String(clientModel || "");
-      if (s.slice(0, row.id.length + 1).toLowerCase() === `${row.id}/`.toLowerCase()) s = s.slice(row.id.length + 1);
+      const s = stripPrefix(clientModel);
       return upstreamByClient.get(s.toLowerCase()) || s;
+    },
+
+    /** 客户端模型名（或别名）→ 该条目的元数据；查不到回 null，调用方按"无目录元数据"处理 */
+    entryFor(clientModel) {
+      return entryByClient.get(stripPrefix(clientModel).toLowerCase()) || null;
     },
 
     models() {
@@ -2514,11 +2585,22 @@ function makeOpenaiCompat(row) {
       return entries;
     },
 
-    /** 拉上游自己的清单（GET {base}/models）：中转站大多支持，失败如实回错，由 UI 引导手填 */
+    /** 拉上游自己的清单（GET {base}/v1/models）：中转站大多支持（真机实测连只开 /v1/messages
+     *  的 Claude 中转站也开了它），失败如实回错，由 UI 引导手填。
+     *  Anthropic 形态的站认 x-api-key，别发 Bearer。 */
     async fetchModels(secrets) {
-      const r = await httpJson(`${row.baseUrl}/models`, { method: "GET", headers: this.headers(secrets) })
+      const headers = row.kind === "anthropic_messages"
+        ? { "x-api-key": String(secrets && secrets.token || ""), "anthropic-version": "2023-06-01" }
+        : this.headers(secrets);
+      const r = await httpJson(compatUrl(row.baseUrl, "models"), { method: "GET", headers })
         .catch((e) => ({ ok: false, status: 0, data: null, text: String((e && e.message) || e) }));
-      if (!r.ok) return { ok: false, message: `HTTP ${r.status || 0} ${(r.text || "").slice(0, 200)}` };
+      if (!r.ok) {
+        return {
+          ok: false,
+          message: `HTTP ${r.status || 0} ${(r.text || "").slice(0, 200)}` +
+            (r.status === 404 ? "（该上游没有模型目录接口，请在模型清单里手填）" : ""),
+        };
+      }
       const list = (r.data && (Array.isArray(r.data) ? r.data : r.data.data)) || [];
       const models = list.map((m) => String((m && (m.id ?? m.model ?? m.name)) || "")).filter(Boolean);
       return { ok: true, models };
@@ -2530,6 +2612,10 @@ function makeOpenaiCompat(row) {
       out.stream = true; // 一律流式打上游，非流式由 server 侧 Aggregator 本地聚合（见 chat() 注释）
       if (!isPlainObj(out.stream_options)) out.stream_options = {};
       out.stream_options.include_usage = true;
+      // 思考档位按该模型声明的支持集降级（与内置渠道同一个 util，档位词表也同源）：
+      // 客户端要 low 而上游只有 medium/high 时，透传过去是一个 400，降级才可用
+      const entry = this.entryFor(model);
+      util.normalizeReasoningEffort(out, entry && entry.entry && entry.entry.reasoning);
       // 网关自己注入的内部字段，上游不认（raccoon 同款剔除清单）
       delete out.conversation_id;
       delete out.conversationId;
@@ -2604,7 +2690,7 @@ function makeOpenaiCompat(row) {
       const headers = { "content-type": "application/json", accept: "application/json", "anthropic-version": "2023-06-01" };
       for (const [k, v] of Object.entries(row.extraHeaders || {})) headers[k] = String(v);
       headers["x-api-key"] = secrets.token || "";
-      const { resp, cancelTimer } = await fetchStream(aupUrl(row.baseUrl), { method: "POST", headers, body: JSON.stringify(payloadObj) });
+      const { resp, cancelTimer } = await fetchStream(compatUrl(row.baseUrl, "messages"), { method: "POST", headers, body: JSON.stringify(payloadObj) });
       const result = { status: 200, planLimit: false };
       // type 表认不出的形状交给通用关键词表；而"欠费"无论上游把 type 写成什么都必须认出来——
       // 只有 402 会走「切号 + planLimit」这条既有链路，落到 400/502 就是把坏 Key 当好 Key 反复打。

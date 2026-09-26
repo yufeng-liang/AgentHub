@@ -28,6 +28,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const config = require("../config.cjs");
+const server = require("./server.cjs");
 
 // 驱动与 store.cjs 一致：Node 22 内置 node:sqlite 优先，better-sqlite3 回退
 let Database = null;
@@ -350,7 +351,12 @@ function register({ appType, apiKey, model, port } = {}) {
   // 直连开关：默认关（翻译链路是用户当下实测在用的路径），置 true 才让客户端原生打网关的
   // /v1/messages 与 /v1/responses。只在注册时读一次，改完要重新点一次「注册」。
   const proxyCfg = (config.loadConfig() || {}).proxy || {};
-  if (!Number.isFinite(port) || port <= 0) port = proxyCfg.port || 9527;
+  if (!Number.isFinite(port) || port <= 0) {
+    // 端口回落读**实际监听状态**（二期 Task 5）：本命令的实现体跑在子进程里，可直接读 server；
+    // 旧回落走 config.proxy.port，改过端口没重启（或配置漂移）时注册进 CC Switch 的
+    // base_url 会指向一个没人监听的死端口。
+    port = server.status().port || 9527;
+  }
   const native = proxyCfg.ccSwitchNativeFormat === true;
   const p = dbPath();
   if (!fs.existsSync(p)) {

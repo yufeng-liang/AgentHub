@@ -271,7 +271,12 @@ globalThis.fetch = async (url, opts) => { lastReq = { url, opts }; return { ok: 
     return r.ok === false && r.message === "vendor 只支持 zai / google";
   })());
   ok("autoclaw（国内）没有网页登录 → 明确抛错引导导入", await discovery.beginOAuth("autoclaw", { edition: "cn" }, () => {}).then(() => false, (e) => /没有网页登录/.test(e.message)));
-  ok("旧两参签名兼容（第二参直接是回调）仍走到分派", await discovery.beginOAuth("raccoon", () => {}).then(() => false, (e) => /小浣熊暂不支持/.test(e.message)));
+  // 旧两参签名兼容（第二参直接是回调）仍走到分派：小浣熊上游 v1.18.0 起支持应用内登录，
+  // 故这里断言「返回 manual 模式会话」而不是「抛不支持」（本分支基点时还是抛错，合并后按上游事实改）
+  ok("旧两参签名兼容（第二参直接是回调）仍走到分派", await discovery.beginOAuth("raccoon", () => {}).then(
+    (r) => r.ok === true && r.mode === "manual" && /xiaohuanxiong\.com/.test(r.url || ""),
+    () => false
+  ));
 
   restoreClock();
   globalThis.fetch = realFetch;

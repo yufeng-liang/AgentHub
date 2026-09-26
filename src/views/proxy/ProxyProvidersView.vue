@@ -2,7 +2,7 @@
      一个提供商 = 一个上游端点 + 若干把 API Key（Key 走号池轮转与冷却）；模型以 `标识/模型名` 形态被客户端调用。
      与「号池」页的分工：这里管端点本身（地址、Key 集合、模型清单、连通性），号池页管各渠道账号的运行状态 -->
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, type Ref } from "vue";
 import * as api from "../../api/ipc";
 import type { ProxyProvider, ProxyProviderKind, ProxyProviderModel, ProxyProviderTestResult, ProxyAccount } from "../../types";
 import { ACCOUNT_STATUS, fmtAgo } from "./format";
@@ -30,8 +30,8 @@ async function refresh() {
 }
 
 // ===== 新建 / 编辑表单 =====
-// modelsText / keysText 用文本承载：一行一个模型名是常态，
-// 需要 upstream 别名或目录元数据时整段写 JSON 数组即可（两种写法都支持，见 parseModelsText）
+// 模型清单的**唯一真相是 modelRows**（结构化表格）。高级 JSON 文本框只能单向"应用到表格"，
+// 不再是可编辑源——它一旦成为源，「从上游拉取」就会把已写的元数据整段抹平成裸名（曾经的真实行为）。
 const formOpen = ref(false);
 const editingId = ref("");
 const form = ref({
@@ -39,7 +39,6 @@ const form = ref({
   display: "",
   baseUrl: "",
   kind: "openai_compat" as ProxyProviderKind,
-  modelsText: "",
   keysText: "",
   extraHeadersText: "",
   extraBodyText: "",
@@ -51,20 +50,78 @@ const testing = ref(false);
 
 const isEdit = computed(() => !!editingId.value);
 
-/** 一行一个（也容忍逗号分隔）；整段以 [ 或 { 开头则按 JSON 解析，供 upstream 别名与元数据用 */
-function parseModelsText(text: string): ProxyProviderModel[] | string {
-  const t = String(text || "").trim();
-  if (!t) return [];
-  if (t.startsWith("[") || t.startsWith("{")) {
-    try {
-      const v = JSON.parse(t);
-      return Array.isArray(v) ? (v as ProxyProviderModel[]) : [v as ProxyProviderModel];
-    } catch (e) {
-      return `模型清单不是合法 JSON：${String((e as Error).message || e)}`;
-    }
-  }
-  return t.split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
+/** 档位词表必须与后端 util.EFFORT_LEVELS 同源，漂移由 dev-provider-test 断言守住 */
+const EFFORT_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+const CAPS = [
+  { key: "images", label: "视觉" },
+  { key: "tools", label: "工具" },
+  { key: "reasoning", label: "思考" },
+] as const;
+
+type ModelRow = {
+  model: string;
+  upstream: string;
+  aliases: string[];
+  contextLength: string;
+  maxOutputTokens: string;
+  rate: string;
+  caps: Record<string, boolean>;
+  efforts: string[];
+};
+
+/** 空行：给"添加模型"用 */
+function blankRow(): ModelRow {
+  return { model: "", upstream: "", aliases: [], contextLength: "", maxOutputTokens: "", rate: "", caps: {}, efforts: [] };
 }
+
+/** 存库形状 → 表格行（字符串简写与历史缺字段都在这一步补齐，写回时再统一收敛） */
+function toRow(m: ProxyProviderModel): ModelRow {
+  const o = typeof m === "string" ? { model: m } : m || { model: "" };
+  return {
+    model: String(o.model || ""),
+    upstream: String(o.upstream || ""),
+    aliases: Array.isArray(o.aliases) ? o.aliases.map(String) : [],
+    contextLength: o.contextLength ? String(o.contextLength) : "",
+    maxOutputTokens: o.maxOutputTokens ? String(o.maxOutputTokens) : "",
+    rate: o.rate != null ? String(o.rate) : "",
+    caps: { ...((o.capabilities || {}) as Record<string, boolean>) },
+    efforts: Array.isArray(o.reasoning?.supportedEfforts) ? [...o.reasoning!.supportedEfforts!] : [],
+  };
+}
+
+const modelRows = ref<ModelRow[]>([]);
+
+/** 表格行 → 存库条目：只写有值的键，避免 models_json 里堆一串 null/空数组 */
+function rowToModel(r: ModelRow): ProxyProviderModel {
+  const upstream = (r.upstream || "").trim();
+  const out: Record<string, unknown> = { model: (r.model || "").trim() };
+  if (upstream && upstream !== out.model) out.upstream = upstream;
+  const aliases = (r.aliases || []).map((a) => String(a).trim()).filter((a) => a && a.toLowerCase() !== String(out.model).toLowerCase());
+  if (aliases.length) out.aliases = [...new Set(aliases)];
+  if (Number(r.contextLength) > 0) out.contextLength = Number(r.contextLength);
+  if (Number(r.maxOutputTokens) > 0) out.maxOutputTokens = Number(r.maxOutputTokens);
+  if (r.rate !== "" && !Number.isNaN(Number(r.rate))) out.rate = Number(r.rate);
+  const caps: Record<string, boolean> = {};
+  for (const c of CAPS) if (r.caps?.[c.key]) caps[c.key] = true;
+  if (Object.keys(caps).length) out.capabilities = caps;
+  if (r.efforts?.length) out.reasoning = { supportedEfforts: r.efforts };
+  return out as ProxyProviderModel;
+}
+
+const modelNames = computed(() => modelRows.value.map((r) => (r.model || "").trim()).filter(Boolean));
+
+/** 表格里的模型名重复会让"该名字映射到哪个上游真名"变成猜——保存前先在前端拦一道，
+ *  后端的 normalizeModels 是去重静默丢，那不适合当交互反馈 */
+const dupModels = computed(() => {
+  const seen = new Set<string>();
+  const dup = new Set<string>();
+  for (const n of modelNames.value) {
+    const k = n.toLowerCase();
+    if (seen.has(k)) dup.add(n);
+    seen.add(k);
+  }
+  return [...dup];
+});
 
 function parseJsonObject(text: string, label: string): Record<string, unknown> | string {
   const t = String(text || "").trim();
@@ -86,14 +143,11 @@ function keysFromText(): { key: string }[] {
     .map((key) => ({ key }));
 }
 
-function modelsPreview(text: string): string {
-  const m = parseModelsText(text);
-  return typeof m === "string" ? "" : m.map((x) => (typeof x === "string" ? x : x.model)).join(", ");
-}
-
 function openCreate() {
   editingId.value = "";
-  form.value = { id: "", display: "", baseUrl: "", kind: "openai_compat", modelsText: "", keysText: "", extraHeadersText: "", extraBodyText: "", enabled: true };
+  form.value = { id: "", display: "", baseUrl: "", kind: "openai_compat", keysText: "", extraHeadersText: "", extraBodyText: "", enabled: true };
+  modelRows.value = [];
+  rowTest.value = {};
   formErr.value = "";
   testResult.value = null;
   formOpen.value = true;
@@ -106,12 +160,13 @@ function openEdit(row: ProxyProvider) {
     display: row.display,
     baseUrl: row.baseUrl,
     kind: row.kind === "anthropic_messages" ? "anthropic_messages" : "openai_compat",
-    modelsText: row.models && row.models.length ? JSON.stringify(row.models, null, 2) : "",
     keysText: "",
     extraHeadersText: row.extraHeaders && Object.keys(row.extraHeaders).length ? JSON.stringify(row.extraHeaders, null, 2) : "",
     extraBodyText: row.extraBody && Object.keys(row.extraBody).length ? JSON.stringify(row.extraBody, null, 2) : "",
     enabled: row.enabled,
   };
+  modelRows.value = (row.models || []).map(toRow);
+  rowTest.value = {};
   formErr.value = "";
   testResult.value = null;
   formOpen.value = true;
@@ -119,9 +174,9 @@ function openEdit(row: ProxyProvider) {
 
 async function doSave() {
   if (busy.value) return;
-  const models = parseModelsText(form.value.modelsText);
-  if (typeof models === "string") {
-    formErr.value = models;
+  const models = modelRows.value.filter((r) => (r.model || "").trim()).map(rowToModel);
+  if (dupModels.value.length) {
+    formErr.value = `模型名重复：${dupModels.value.join("、")}（同名会说不清该映射到哪个上游真名）`;
     return;
   }
   const headers = parseJsonObject(form.value.extraHeadersText, "extraHeaders");
@@ -162,25 +217,143 @@ async function doSave() {
   }
 }
 
-/** 连通性探测：优先用表单里当场填的地址 + 第一行 Key；编辑态不重填 Key 时改从号池挑一把
- *  （主进程按 accountId 自己解密，明文不经过渲染层）。两条路都不读号池调度，
- *  所以按新地址试一次不会把号池里的 Key 打成冷却。 */
-async function doTest() {
-  if (testing.value) return;
-  const keys = keysFromText();
-  const model = modelsPreview(form.value.modelsText).split(",")[0]?.trim() || "";
-  if (!model) {
-    testResult.value = { ok: false, message: "请先填至少一个模型名" };
+// ===== 逐模型：行操作 / 批量 / 连通性 =====
+const rowSel = ref<Set<string>>(new Set());
+const rowTest = ref<Record<string, { state: "testing" | "ok" | "fail"; ms?: number; message?: string; sample?: string }>>({});
+
+function rowId(r: ModelRow) {
+  return (r.model || "").trim().toLowerCase() || `__blank_${modelRows.value.indexOf(r)}`;
+}
+function addModelRow() {
+  modelRows.value.push(blankRow());
+}
+function removeModelRow(i: number) {
+  const id = rowId(modelRows.value[i]);
+  modelRows.value.splice(i, 1);
+  rowSel.value.delete(id);
+  delete rowTest.value[id];
+}
+function toggleRow(r: ModelRow) {
+  const id = rowId(r);
+  if (rowSel.value.has(id)) rowSel.value.delete(id);
+  else rowSel.value.add(id);
+  rowSel.value = new Set(rowSel.value);
+}
+/** 别名输入框用逗号串承载，写回时切分去空去重——比让用户在表格里操作数组少一层歧义 */
+function setAliases(r: ModelRow, text: string) {
+  const list = String(text || "")
+    .split(/[,，]/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  r.aliases = [...new Set(list)];
+}
+function setCap(r: ModelRow, key: string, on: boolean) {
+  if (on) r.caps = { ...r.caps, [key]: true };
+  else {
+    const next = { ...r.caps };
+    delete next[key];
+    r.caps = next;
+  }
+}
+const allSelected = computed(
+  () => modelRows.value.length > 0 && modelRows.value.every((r) => (r.model || "").trim() ? rowSel.value.has(rowId(r)) : true),
+);
+function toggleAll() {
+  if (allSelected.value) rowSel.value = new Set();
+  else rowSel.value = new Set(modelRows.value.filter((r) => (r.model || "").trim()).map(rowId));
+}
+
+/** 批量设置：留空的字段不参与修改——"全选后顺手清了上下文"这种误操作代价太高 */
+const batch = ref({ contextLength: "", maxOutputTokens: "", rate: "", images: "", tools: "", reasoning: "", efforts: [] as string[] });
+function applyBatch() {
+  const b = batch.value;
+  const touched = b.contextLength || b.maxOutputTokens || b.rate || b.images || b.tools || b.reasoning || b.efforts.length;
+  if (!touched) {
+    formErr.value = "批量设置里至少要填一项（留空表示不修改）";
     return;
   }
+  formErr.value = "";
+  for (const r of modelRows.value) {
+    if (!rowSel.value.has(rowId(r))) continue;
+    if (b.contextLength) r.contextLength = b.contextLength;
+    if (b.maxOutputTokens) r.maxOutputTokens = b.maxOutputTokens;
+    if (b.rate) r.rate = b.rate;
+    for (const [key, val] of [["images", b.images], ["tools", b.tools], ["reasoning", b.reasoning]] as const) {
+      if (!val) continue;
+      if (val === "1") r.caps = { ...r.caps, [key]: true };
+      else delete r.caps[key];
+    }
+    if (b.efforts.length) r.efforts = [...b.efforts];
+  }
+}
+
+/** 单个模型探一次真实请求。Key 来源与"测试连接"一致：表单里现填的优先，
+ *  编辑态不重填则从号池挑一把（明文不出主进程）。刻意不做"批量测全部"——
+ *  一次点下去就是 N 个真实计费请求，用户要的是按需验一个。 */
+async function testOne(r: ModelRow) {
+  const model = (r.model || "").trim();
+  if (!model) return;
+  const id = rowId(r);
+  if (rowTest.value[id]?.state === "testing") return;
+  const keys = keysFromText();
+  const key = keys[0]?.key || "";
+  if (!key && !isEdit.value) {
+    formErr.value = "请先在「API Key」里填一把 Key 再测试";
+    return;
+  }
+  if (!key) {
+    keyPickList.value = (await api.proxyPool()).find((c) => c.id === editingId.value)?.accounts || [];
+    keyPickId.value = keyPickList.value[0]?.id || "";
+    keyPickModel.value = model;
+    keyPickOpen.value = true;
+    return;
+  }
+  await runRowTest(id, model, { key });
+}
+
+async function runRowTest(id: string, model: string, { key = "", accountId = "" }) {
+  rowTest.value = { ...rowTest.value, [id]: { state: "testing" } };
+  const headers = parseJsonObject(form.value.extraHeadersText, "extraHeaders");
+  const body = parseJsonObject(form.value.extraBodyText, "extraBody");
+  try {
+    const r: ProxyProviderTestResult = await api.proxyProviderTest({
+      id: form.value.id.trim(),
+      accountId: accountId || undefined,
+      baseUrl: form.value.baseUrl.trim(),
+      key,
+      model,
+      kind: form.value.kind,
+      extraHeaders: typeof headers === "string" ? {} : (headers as Record<string, string>),
+      extraBody: typeof body === "string" ? {} : body,
+    });
+    rowTest.value = {
+      ...rowTest.value,
+      [id]: r.ok
+        ? { state: "ok", ms: r.ms, sample: r.sample }
+        : { state: "fail", ms: r.ms, message: r.message || "探测失败" },
+    };
+  } catch (e) {
+    rowTest.value = { ...rowTest.value, [id]: { state: "fail", message: String((e as Error).message || e) } };
+  }
+}
+
+/** 连通性探测（整店一次）：仍用列表里第一个模型，作用是"地址与 Key 通不通" */
+async function doTest() {
+  if (testing.value) return;
+  const model = modelNames.value[0] || "";
+  if (!model) {
+    testResult.value = { ok: false, message: "请先添加至少一个模型" };
+    return;
+  }
+  const keys = keysFromText();
   if (!keys[0]?.key) {
     if (!isEdit.value) {
       formErr.value = "请先在「API Key」里填一把 Key 再测试";
       return;
     }
-    // 编辑态：弹选择框让用户指定用号池里哪把 Key 试，选完自动继续这次探测
     keyPickList.value = (await api.proxyPool()).find((c) => c.id === editingId.value)?.accounts || [];
     keyPickId.value = keyPickList.value[0]?.id || "";
+    keyPickModel.value = "";
     keyPickOpen.value = true;
     return;
   }
@@ -199,7 +372,8 @@ async function runTest({ key = "", accountId = "" }) {
       accountId: accountId || undefined,
       baseUrl: form.value.baseUrl.trim(),
       key,
-      model: modelsPreview(form.value.modelsText).split(",")[0]?.trim() || "",
+      model: modelNames.value[0] || "",
+      kind: form.value.kind,
       extraHeaders: typeof headers === "string" ? {} : (headers as Record<string, string>),
       extraBody: typeof body === "string" ? {} : body,
     });
@@ -214,9 +388,130 @@ async function runTest({ key = "", accountId = "" }) {
 const keyPickOpen = ref(false);
 const keyPickId = ref("");
 const keyPickList = ref<ProxyAccount[]>([]);
+// 从"某一行的测试按钮"进来时记住模型名，选完 Key 直接续上那次探测；整店测试留空
+const keyPickModel = ref("");
 async function confirmKeyPick() {
   keyPickOpen.value = false;
+  if (keyPickModel.value) {
+    const model = keyPickModel.value;
+    keyPickModel.value = "";
+    await runRowTest(model.toLowerCase(), model, { accountId: keyPickId.value });
+    return;
+  }
   await runTest({ accountId: keyPickId.value });
+}
+
+// ===== 从上游拉取：三态 diff，勾选合并 =====
+const importOpen = ref(false);
+const importState = ref<"loading" | "ready" | "error" | "stale">("loading");
+const importErr = ref("");
+const upstreamIds = ref<string[]>([]);
+// 拉取时的地址/协议签名：改过之后再结果就"过期"了，直接应用会拿旧清单配新地址
+const importSig = ref("");
+const selAdd = ref<Set<string>>(new Set());
+const selKeep = ref<Set<string>>(new Set());
+const selDrop = ref<Set<string>>(new Set());
+
+const importGroups = computed(() => {
+  const cur = new Set(modelNames.value.map((s) => s.toLowerCase()));
+  const up = new Set(upstreamIds.value.map((s) => s.toLowerCase()));
+  return {
+    added: upstreamIds.value.filter((id) => !cur.has(id.toLowerCase())),
+    existing: upstreamIds.value.filter((id) => cur.has(id.toLowerCase())),
+    removed: [...cur].filter((k) => !up.has(k)).map((k) => modelNames.value.find((m) => m.toLowerCase() === k) || k),
+  };
+});
+
+function sigNow() {
+  return `${form.value.baseUrl.trim()}|${form.value.kind}`;
+}
+
+async function openImport() {
+  if (!isEdit.value) {
+    formErr.value = "「从上游拉取」要先保存一次（拉取用号池里已存的 Key）";
+    return;
+  }
+  formErr.value = "";
+  importOpen.value = true;
+  await doImport();
+}
+
+async function doImport() {
+  importState.value = "loading";
+  importErr.value = "";
+  importSig.value = sigNow();
+  try {
+    const r = await api.proxyProviderFetchModels(editingId.value);
+    if (r.ok === false) {
+      importState.value = "error";
+      importErr.value = r.message || "拉取失败";
+      return;
+    }
+    upstreamIds.value = (r.models || []).map(String);
+    const g = importGroups.value;
+    // 新增默认不勾（用户可能只想看），已存在默认保持，下架默认保留——删除必须是显式动作
+    selAdd.value = new Set();
+    selKeep.value = new Set(g.existing);
+    selDrop.value = new Set(g.removed);
+    importState.value = "ready";
+  } catch (e) {
+    importState.value = "error";
+    importErr.value = String((e as Error).message || e);
+  }
+}
+
+// 模板里 ref 会自动解包，所以不能把 selAdd 当 Ref 传进函数——各自给一个显式切换器
+function toggleAdd(id: string) {
+  const s = new Set(selAdd.value);
+  if (s.has(id)) s.delete(id);
+  else s.add(id);
+  selAdd.value = s;
+}
+function toggleDrop(id: string) {
+  const s = new Set(selDrop.value);
+  if (s.has(id)) s.delete(id);
+  else s.add(id);
+  selDrop.value = s;
+}
+
+function applyImport() {
+  const keep = new Set(modelNames.value.map((s) => s.toLowerCase()));
+  for (const id of importGroups.value.removed) {
+    if (!selDrop.value.has(id)) keep.delete(id.toLowerCase());
+  }
+  const rows = modelRows.value.filter((r) => keep.has(rowId(r)));
+  for (const id of selAdd.value) {
+    if (!keep.has(id.toLowerCase())) rows.push({ ...blankRow(), model: id });
+  }
+  modelRows.value = rows;
+  importOpen.value = false;
+}
+
+const importStale = computed(() => importState.value === "ready" && importSig.value !== sigNow());
+
+// 高级：直接编辑 JSON（单向应用到表格）
+const advancedOpen = ref(false);
+const advancedText = ref("");
+function openAdvanced() {
+  advancedText.value = JSON.stringify(modelRows.value.filter((r) => (r.model || "").trim()).map(rowToModel), null, 2);
+  advancedOpen.value = !advancedOpen.value;
+}
+function applyAdvanced() {
+  const t = advancedText.value.trim();
+  if (!t) {
+    modelRows.value = [];
+    advancedOpen.value = false;
+    return;
+  }
+  try {
+    const v = JSON.parse(t);
+    const list = Array.isArray(v) ? v : [v];
+    modelRows.value = list.map((x: unknown) => toRow(x as ProxyProviderModel));
+    advancedOpen.value = false;
+    formErr.value = "";
+  } catch (e) {
+    formErr.value = `模型清单不是合法 JSON：${String((e as Error).message || e)}`;
+  }
 }
 
 // ===== Key 管理 =====
@@ -292,29 +587,6 @@ async function doDelete() {
   }
 }
 
-/** 从上游 /models 拉清单回填文本框（需要该提供商已有 Key，主进程用号池里的 Key 去打） */
-const fetchBusy = ref(false);
-async function doFetchModels() {
-  if (!isEdit.value || fetchBusy.value) {
-    if (!isEdit.value) formErr.value = "「从上游拉取」要先保存一次（拉取用号池里已存的 Key）";
-    return;
-  }
-  fetchBusy.value = true;
-  formErr.value = "";
-  try {
-    const r = await api.proxyProviderFetchModels(editingId.value);
-    if (r.ok === false) {
-      formErr.value = r.message || "拉取失败";
-      return;
-    }
-    form.value.modelsText = (r.models || []).join("\n");
-  } catch (e) {
-    formErr.value = String((e as Error).message || e);
-  } finally {
-    fetchBusy.value = false;
-  }
-}
-
 onMounted(refresh);
 </script>
 
@@ -370,7 +642,7 @@ onMounted(refresh);
     <Teleport to="body">
       <!-- 新建 / 编辑 -->
       <div v-if="formOpen" class="p-mask" @click.self="formOpen = false">
-        <div class="p-dlg glass">
+        <div class="p-dlg glass form-dlg">
           <div class="p-title">{{ isEdit ? "编辑提供商" : "添加提供商" }}</div>
           <div v-if="formErr" class="set-row">
             <div class="set-info"><div class="set-desc err-text">{{ formErr }}</div></div>
@@ -392,7 +664,7 @@ onMounted(refresh);
           <div class="set-row">
             <div class="set-info">
               <div class="set-name">上游地址</div>
-              <div class="set-desc">填到版本前缀为止，如 https://relay.example.com/v1；保存时会自动去掉尾部的 /v1 与 /chat/completions</div>
+              <div class="set-desc">填到版本前缀为止，如 https://relay.example.com/v1；保存时去掉尾部的 /v1 与端点名，请求时由网关按上游协议补回 /v1/chat/completions 或 /v1/messages</div>
             </div>
             <input v-model="form.baseUrl" class="input mono" style="width: 300px" placeholder="https://relay.example.com/v1" />
           </div>
@@ -407,16 +679,86 @@ onMounted(refresh);
               <el-option value="anthropic_messages" label="Anthropic Messages" />
             </el-select>
           </div>
-          <div class="set-row">
+          <div class="set-row models-row">
             <div class="set-info">
               <div class="set-name">模型清单</div>
-              <div class="set-desc">一行一个模型名。需要「客户端名 ≠ 上游真名」或补上下文长度等元数据时，整段改写 JSON 数组：<br />[{ "model": "gpt-4o", "upstream": "gpt-4o-2024-11-20", "contextLength": 128000 }]<br />留空也能用：带前缀的模型名会原样透传给上游</div>
+              <div class="set-desc">
+                表格逐模型配置；<b>从上游拉取</b>可比对出新增 / 已存在 / 上游已下架三组再勾选合并。<br />
+                客户端用 <span class="mono">标识/模型名</span> 或 <span class="mono">标识/别名</span> 都能请求；别名只是多一个入口，不出现在 /v1/models。<br />
+                留空也能用：带前缀的模型名会原样透传给上游。
+              </div>
+              <div v-if="dupModels.length" class="set-desc err-text">模型名重复：{{ dupModels.join("、") }}</div>
             </div>
             <div class="models-col">
-              <textarea v-model="form.modelsText" class="input mono" rows="5" placeholder="gpt-4o&#10;claude-sonnet-4.5&#10;deepseek-v3.2"></textarea>
-              <div class="models-tools">
-                <button class="btn btn-sm" :disabled="fetchBusy" @click="doFetchModels">{{ fetchBusy ? "拉取中…" : "从上游拉取" }}</button>
-                <span v-if="modelsPreview(form.modelsText)" class="set-desc">预览：{{ modelsPreview(form.modelsText) }}</span>
+              <div class="models-bar">
+                <button class="btn btn-sm" @click="openImport">从上游拉取</button>
+                <button class="btn btn-sm" @click="addModelRow">添加模型</button>
+                <span class="set-desc">{{ modelRows.filter((r) => r.model).length }} 个模型</span>
+                <label v-if="modelRows.length" class="m-selall">
+                  <input type="checkbox" :checked="allSelected" @change="toggleAll" /> 全选
+                </label>
+              </div>
+
+              <div v-if="!modelRows.length" class="models-empty set-desc">还没有模型 —— 点「添加模型」手填，或「从上游拉取」后勾选导入</div>
+
+              <div v-for="(m, i) in modelRows" :key="i" class="m-row" :class="{ on: rowSel.has(rowId(m)) }">
+                <div class="m-line">
+                  <input type="checkbox" class="m-check" :checked="rowSel.has(rowId(m))" @change="toggleRow(m)" />
+                  <input v-model="m.model" class="input mono m-name" placeholder="gpt-4o" />
+                  <input :value="m.aliases.join(', ')" class="input mono m-alias" placeholder="别名，逗号分隔"
+                         @input="setAliases(m, ($event.target as HTMLInputElement).value)" />
+                  <input v-model="m.upstream" class="input mono m-up" placeholder="上游真名（缺省同模型名）" />
+                </div>
+                <div class="m-line m-sub">
+                  <label class="m-num">上下文<input v-model="m.contextLength" class="input mono" type="number" placeholder="128000" /></label>
+                  <label class="m-num">最大输出<input v-model="m.maxOutputTokens" class="input mono" type="number" placeholder="4096" /></label>
+                  <label class="m-num">倍率<input v-model="m.rate" class="input mono" type="number" step="0.1" placeholder="-" /></label>
+                  <label v-for="c in CAPS" :key="c.key" class="m-cap">
+                    <input type="checkbox" :checked="!!m.caps[c.key]" @change="setCap(m, c.key, ($event.target as HTMLInputElement).checked)" /> {{ c.label }}
+                  </label>
+                  <el-select v-model="m.efforts" multiple collapse-tags collapse-tags-tooltip size="small"
+                             popper-class="glass-popper" class="m-efforts" placeholder="思考档位">
+                    <el-option v-for="e in EFFORT_LEVELS" :key="e" :value="e" :label="e" />
+                  </el-select>
+                  <button class="btn-link btn-sm m-del" @click="removeModelRow(i)">移除</button>
+                  <button class="btn btn-sm m-test" :disabled="!m.model || rowTest[rowId(m)]?.state === 'testing'" @click="testOne(m)">
+                    {{ rowTest[rowId(m)]?.state === "testing" ? "测试中…" : "测试" }}
+                  </button>
+                  <span v-if="rowTest[rowId(m)]?.state === 'ok'" class="tag tag-ok" :title="rowTest[rowId(m)]?.sample">
+                    可用 {{ rowTest[rowId(m)]?.ms }}ms
+                  </span>
+                  <span v-else-if="rowTest[rowId(m)]?.state === 'fail'" class="tag tag-warn m-fail" :title="rowTest[rowId(m)]?.message">
+                    {{ (rowTest[rowId(m)]?.message || "").slice(0, 40) }}
+                  </span>
+                </div>
+              </div>
+
+              <div v-if="rowSel.size" class="m-batch">
+                <span class="set-desc">已选 {{ rowSel.size }} 个 →</span>
+                <label class="m-num">上下文<input v-model="batch.contextLength" class="input mono" type="number" placeholder="不改" /></label>
+                <label class="m-num">最大输出<input v-model="batch.maxOutputTokens" class="input mono" type="number" placeholder="不改" /></label>
+                <label class="m-num">倍率<input v-model="batch.rate" class="input mono" type="number" step="0.1" placeholder="不改" /></label>
+                <label v-for="c in CAPS" :key="c.key" class="m-num">
+                  {{ c.label }}
+                  <select v-model="batch[c.key]" class="input">
+                    <option value="">不改</option><option value="1">设为支持</option><option value="0">设为不支持</option>
+                  </select>
+                </label>
+                <el-select v-model="batch.efforts" multiple collapse-tags size="small" popper-class="glass-popper" class="m-efforts" placeholder="档位（不改）">
+                  <el-option v-for="e in EFFORT_LEVELS" :key="e" :value="e" :label="e" />
+                </el-select>
+                <button class="btn btn-sm" @click="applyBatch">应用到所选</button>
+              </div>
+
+              <div class="models-adv">
+                <button class="btn-link btn-sm" @click="openAdvanced">{{ advancedOpen ? "收起 JSON" : "高级：直接编辑 JSON" }}</button>
+                <template v-if="advancedOpen">
+                  <textarea v-model="advancedText" class="input mono" rows="6" spellcheck="false"></textarea>
+                  <div class="models-tools">
+                    <button class="btn btn-sm" @click="applyAdvanced">应用到模型表</button>
+                    <span class="set-desc">这里是单向的：应用会按这段 JSON 重建上面的表格</span>
+                  </div>
+                </template>
               </div>
             </div>
           </div>
@@ -526,6 +868,61 @@ onMounted(refresh);
         </div>
       </div>
 
+      <!-- 从上游拉取：三态 diff 勾选合并（新增默认不勾 / 已存在默认保留 / 下架默认保留，删除要显式取消勾选） -->
+      <div v-if="importOpen" class="p-mask" @click.self="importOpen = false">
+        <div class="p-dlg glass imp-dlg">
+          <div class="p-title">从上游拉取模型</div>
+          <div v-if="importState === 'loading'" class="set-desc">正在请求上游 /v1/models…</div>
+          <div v-else-if="importState === 'error'" class="set-desc err-text">
+            {{ importErr }}
+            <div class="p-actions"><button class="btn" @click="importOpen = false">关闭</button><button class="btn btn-primary" @click="doImport">重试</button></div>
+          </div>
+          <template v-else>
+            <div v-if="importStale" class="set-desc imp-stale">
+              地址或上游协议在拉取之后改过了，这份清单已经过期——先重新拉取再合并，否则会把旧地址的模型配到新地址上。
+              <button class="btn-link btn-sm" @click="doImport">重新拉取</button>
+            </div>
+            <div class="set-desc imp-sum">上游共 {{ upstreamIds.length }} 个模型：新增 {{ importGroups.added.length }} · 已存在 {{ importGroups.existing.length }} · 上游已下架 {{ importGroups.removed.length }}</div>
+
+            <div v-if="importGroups.added.length" class="imp-group">
+              <div class="imp-head">
+                <b>新增</b>
+                <span class="set-desc">默认不勾选，勾上的才加进清单</span>
+                <button class="btn-link btn-sm" @click="selAdd = new Set(importGroups.added)">全选</button>
+                <button class="btn-link btn-sm" @click="selAdd = new Set()">清空</button>
+              </div>
+              <label v-for="id in importGroups.added" :key="id" class="imp-item">
+                <input type="checkbox" :checked="selAdd.has(id)" @change="toggleAdd(id)" /> <span class="mono">{{ id }}</span>
+              </label>
+            </div>
+
+            <div v-if="importGroups.existing.length" class="imp-group">
+              <div class="imp-head"><b>已存在</b><span class="set-desc">保留现有配置（别名、上下文、档位都不动）</span></div>
+              <div class="imp-item set-desc">共 {{ importGroups.existing.length }} 个：{{ importGroups.existing.join("、") }}</div>
+            </div>
+
+            <div v-if="importGroups.removed.length" class="imp-group">
+              <div class="imp-head">
+                <b>上游已下架</b>
+                <span class="set-desc">默认保留；取消勾选即从清单里删除</span>
+              </div>
+              <label v-for="id in importGroups.removed" :key="id" class="imp-item">
+                <input type="checkbox" :checked="selDrop.has(id)" @change="toggleDrop(id)" /> <span class="mono">{{ id }}</span>
+              </label>
+            </div>
+
+            <div v-if="!importGroups.added.length && !importGroups.removed.length" class="set-desc">上游清单与本地一致，无需合并。</div>
+
+            <div class="p-actions">
+              <button class="btn" @click="importOpen = false">取消</button>
+              <button class="btn btn-primary" :disabled="importStale" @click="applyImport">
+                合并（新增 {{ selAdd.size }} 个、删除 {{ importGroups.removed.length - selDrop.size }} 个）
+              </button>
+            </div>
+          </template>
+        </div>
+      </div>
+
       <!-- 删除确认 -->
       <div v-if="delOpen" class="p-mask" @click.self="delOpen = false">
         <div class="p-dlg glass">
@@ -573,6 +970,148 @@ onMounted(refresh);
   gap: 6px;
   flex: 1;
   min-width: 0;
+}
+/* 模型清单表格：一行两排（名字/别名/上游真名 一行，数值与能力一行），
+   比一张八列表格在窄抽屉里可读得多，也不用横向滚动 */
+.models-row {
+  /* 标签列 + 表格并排会把表格压到 400px 以内（三个输入框只能竖排），
+     所以这一行改成上下堆叠，让模型表吃满抽屉宽度 */
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+.form-dlg {
+  width: 780px;
+  max-height: 88vh;
+  overflow: auto;
+}
+.models-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.m-selall {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-3);
+  margin-left: auto;
+}
+.models-empty {
+  padding: 10px;
+  border: 1px dashed var(--border, rgba(255, 255, 255, 0.12));
+  border-radius: 8px;
+  text-align: center;
+}
+.m-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px;
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.1));
+  border-radius: 8px;
+}
+.m-row.on {
+  border-color: var(--accent);
+  background: var(--accent-dim, rgba(90, 140, 255, 0.08));
+}
+.m-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.m-sub {
+  padding-left: 22px;
+}
+.m-check {
+  flex: none;
+}
+.m-name {
+  width: 208px;
+}
+.m-alias {
+  width: 196px;
+}
+.m-up {
+  width: 244px;
+}
+.m-num {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+.m-num .input {
+  width: 86px;
+}
+.m-cap {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+.m-efforts {
+  width: 168px;
+}
+.m-test {
+  flex: none;
+}
+.m-del {
+  margin-left: auto;
+}
+.m-fail {
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.m-batch {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+}
+.models-adv {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+/* 导入弹窗 */
+.imp-dlg {
+  max-height: 78vh;
+  overflow: auto;
+}
+.imp-stale {
+  color: var(--warn, #d9a13b);
+  margin-bottom: 6px;
+}
+.imp-sum {
+  margin-bottom: 8px;
+}
+.imp-group {
+  margin-bottom: 10px;
+}
+.imp-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+.imp-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0 2px 6px;
+  font-size: 13px;
 }
 .models-tools {
   display: flex;

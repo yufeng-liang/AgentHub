@@ -151,14 +151,17 @@ const scanMsg = ref("");
 const scanErr = ref(false);
 // 用「渠道:文件」当导入中的行标识：列表在导入过程中会被重新扫描替换，下标引用不稳
 const scanImporting = ref("");
+// 账号重命名（点击名称进入编辑）：renamingId 当前编辑行，renameText 输入内容
+const renamingId = ref("");
+const renameText = ref("");
 
 // 添加方式可用性：oauth 这一档按渠道门禁，其余三档所有内置渠道都开放
-// · 小浣熊：登录走客户端深链回调（office-raccoon://auth/callback），应用内无法代收，只隐藏 OAuth
 // · AutoClaw 国内版：官方只有客户端手机号+验证码登录，没有可代收的网页授权（主进程 beginOAuth 直接拒）
-// 两者都仍支持「从本机软件导入」（scanRaccoon 读 ~/.box-agent/config/auth.json、scanAutoClaw 读 %APPDATA%/AutoClaw/auth.json）与文件/粘贴导入
+// · 小浣熊：上游 v1.18.0 起已支持应用内登录（打开官方授权页 → 粘回 office-raccoon:// 深链换码），
+//   本分支基点（b476f52）时还没有，合并时按上游事实放行（不再挡）
 function addTabAllowed(key: AddMethod): boolean {
   if (key !== "oauth") return true;
-  return addChannel.value !== "raccoon" && addChannel.value !== "autoclaw";
+  return addChannel.value !== "autoclaw";
 }
 
 // 渠道允许的添加方式（分段控件按渠道过滤）
@@ -188,7 +191,7 @@ const OAUTH_HELP: Record<string, { title: string; desc: string }> = {
   },
   raccoon: {
     title: "用「商汤小浣熊」官方授权页登录",
-    desc: "小浣熊登录走客户端深链回调（office-raccoon://auth/callback），应用内无法代收。<br />请改用「从本机软件导入」（自动读取 ~/.box-agent/config/auth.json）或「粘贴 JSON」导入 access_token 与 refresh_token。",
+    desc: "跳转官方授权页完成登录后，浏览器地址栏会显示 office-raccoon://auth/callback?code=…<br />把地址栏整段内容复制粘贴到下方输入框，即可完成登录入池。<br />3 分钟无操作即超时。",
   },
   // ===== 新增五渠道（autoclaw 国内版无网页登录，不出 OAuth 档，故本表无它的条目） =====
   cline_free: {
@@ -430,6 +433,32 @@ async function toggleAccount(acc: ProxyAccount) {
 
 /** 手动解除冷却：账号级立即回 online，模型级负缓存一并豁免（解了就要能立刻被调度） */
 const coolOffId = ref("");
+
+// ===== 账号重命名（自定义备注）：点击名称变输入框，失焦/回车提交，Esc 取消 =====
+
+function startRename(acc: ProxyAccount) {
+  renamingId.value = acc.id;
+  renameText.value = acc.name || "";
+}
+
+async function commitRename(acc: ProxyAccount) {
+  const name = renameText.value.trim();
+  if (!name || name === acc.name) {
+    renamingId.value = "";
+    return;
+  }
+  try {
+    const r = await api.proxyAccountRename(acc.id, name);
+    if (r.ok === false) toast(r.message || "重命名失败", "err");
+  } catch (e) {
+    toast(String((e as Error).message || e), "err");
+  } finally {
+    renamingId.value = "";
+    renameText.value = "";
+    await refresh();
+  }
+}
+
 async function releaseCool(acc: ProxyAccount) {
   if (coolOffId.value) return;
   coolOffId.value = acc.id;
@@ -470,8 +499,8 @@ function openAdd(ch: ProxyChannelView) {
   }
   // 上面已按 kind 分流，走到这里 ch 必是内置渠道
   addChannel.value = ch.id as ProxyBuiltinChannelId;
-  // 没有应用内 OAuth 的渠道（raccoon 深链代收不了、autoclaw 国内版官方无网页登录）
-  // 默认落到「从本机软件导入」，否则会停在一个已被隐藏的标签页上
+  // 没有应用内 OAuth 的渠道（autoclaw 国内版官方无网页登录）默认落到「从本机软件导入」，
+  // 否则会停在一个已被隐藏的标签页上（raccoon 上游已支持 OAuth，走上面的正常分支）
   addMethod.value = addTabAllowed("oauth") ? "oauth" : "local";
   pasteJson.value = "";
   pasteMsg.value = "";
@@ -705,15 +734,14 @@ async function loadScan() {
   }
 }
 
-/** 候选排序：当前渠道优先，其次未导入的、能直接用的 */
+/** 候选排序与过滤：只显示当前渠道的（各渠道各自管理本机登录态，不混在一起） */
 const scanRows = computed(() =>
-  [...scanList.value].sort((a, b) => {
-    const ca = a.channel === addChannel.value ? 0 : 1;
-    const cb = b.channel === addChannel.value ? 0 : 1;
-    if (ca !== cb) return ca - cb;
-    if (a.imported !== b.imported) return a.imported ? 1 : -1;
-    return 0;
-  })
+  scanList.value
+    .filter((c) => c.channel === addChannel.value)
+    .sort((a, b) => {
+      if (a.imported !== b.imported) return a.imported ? 1 : -1;
+      return 0;
+    })
 );
 
 const scanKey = (c: ProxyScanCandidate) => `${c.channel}:${c.file}`;
@@ -946,15 +974,13 @@ onUnmounted(() => {
           <span v-if="ch.summary.expiringSoon" class="tag tag-warn">24h 内有到期</span>
           <!-- 工具栏：只属于当前渠道（策略 / 添加 / 签到或加油包 / 刷新），与其他渠道互不关联 -->
           <span class="panel-tools">
-            <el-select
-              :model-value="ch.poolStrategy"
-              popper-class="glass-popper"
-              size="small"
-              class="strategy-select"
-              @change="setStrategy(ch, $event as ProxyPoolStrategy)"
+            <select
+              class="f-select strategy-select"
+              :value="ch.poolStrategy"
+              @change="setStrategy(ch, ($event.target as HTMLSelectElement).value as ProxyPoolStrategy)"
             >
-              <el-option v-for="s in STRATEGIES" :key="s.value" :value="s.value" :label="s.label" />
-            </el-select>
+              <option v-for="s in STRATEGIES" :key="s.value" :value="s.value">{{ s.label }}</option>
+            </select>
             <button class="btn btn-sm" @click="openAdd(ch)">{{ isBuiltin(ch) ? "添加账号" : "管理 Key" }}</button>
             <!-- 签到 / 加油包 / 额度刷新都是生态渠道专属动作：自定义提供商只有一把 API Key，
                  既没有每日签到可领，也没有余额可查（主进程一律明确拒答，不该在界面上摆出来） -->
@@ -998,7 +1024,16 @@ onUnmounted(() => {
               </tr>
               <tr v-for="acc in ch.accounts" :key="acc.id">
                 <td class="acc-cell">
-                  <span class="acc-name" :title="acc.name">{{ acc.name || "（未命名账号）" }}</span>
+                  <span v-if="renamingId !== acc.id" class="acc-name" :title="acc.name + '（点击重命名）'" @click="startRename(acc)">{{ acc.name || "（未命名账号）" }}</span>
+                  <input
+                    v-else
+                    v-model="renameText"
+                    class="input input-xs"
+                    style="width: 120px"
+                    @blur="commitRename(acc)"
+                    @keydown.enter="commitRename(acc)"
+                    @keydown.esc="renamingId = ''"
+                  />
                   <span class="acc-sub">
                     <span class="acc-src">{{ SOURCE_NAMES[acc.source] || acc.source }}</span>
                     <i>·</i>
@@ -1141,9 +1176,14 @@ onUnmounted(() => {
                 <span>如页面未自动带上验证码，请手动输入：</span>
                 <code class="oauth-user-code">{{ oauthUserCode }}</code>
               </div>
-              <!-- 回环模式下浏览器没跳回来时的兜底：整段粘贴回调地址（只有 Trae 的 loopback 会话收这个） -->
-              <div v-if="oauthMode === 'loopback' && oauthWaiting" class="cb-row">
-                <input v-model="callbackInput" class="input" style="flex: 1" placeholder="浏览器没跳回？把地址栏整段粘到这里" />
+              <!-- 回环模式兜底 + 手动粘贴模式主操作：整段粘贴回调地址 -->
+              <div v-if="(oauthMode === 'loopback' || oauthMode === 'manual') && oauthWaiting" class="cb-row">
+                <input
+                  v-model="callbackInput"
+                  class="input"
+                  style="flex: 1"
+                  :placeholder="oauthMode === 'manual' ? '登录完成后，把浏览器地址栏整段粘到这里（office-raccoon://auth/callback?code=…）' : '浏览器没跳回？把地址栏整段粘到这里'"
+                />
                 <button class="btn btn-sm" :disabled="!callbackInput.trim() || callbackBusy" @click="submitCallback">
                   {{ callbackBusy ? "提交中…" : "提交" }}
                 </button>
@@ -1164,7 +1204,6 @@ onUnmounted(() => {
               </div>
               <div class="scan-list">
                 <div v-for="(c, i) in scanRows" :key="`${c.channel}-${c.uid || i}`" class="scan-row" :class="{ dim: c.imported || c.encrypted }">
-                  <span class="scan-ch">{{ channelName(c.channel) }}</span>
                   <div class="scan-main">
                     <div class="scan-name">
                       {{ c.name || c.uid || "（未识别账号）" }}
@@ -1558,9 +1597,7 @@ onUnmounted(() => {
   width: 108px;
   margin-right: 8px;
   vertical-align: middle;
-}
-.strategy-select :deep(.el-select__wrapper) {
-  min-height: var(--ctl-h-sm);
+  height: var(--ctl-h-sm);
   font-size: 11px;
 }
 /* ===== 添加账号弹窗：头部 + 分段方式切换 + 等高面板 + 固定底部操作（弹窗外壳版式见 global.css 的 .p-dlg） ===== */
@@ -2011,6 +2048,11 @@ onUnmounted(() => {
   white-space: nowrap;
   font-size: 12px;
   font-weight: 600;
+  cursor: text;
+  border-bottom: 1px dashed transparent;
+}
+.acc-name:hover {
+  border-bottom-color: var(--text-3);
 }
 .acc-sub {
   display: flex;

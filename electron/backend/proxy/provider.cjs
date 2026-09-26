@@ -10,6 +10,7 @@ const crypto = require("node:crypto");
 const config = require("../config.cjs");
 const store = require("./store.cjs");
 const adapters = require("./adapters.cjs");
+const util = require("./util.cjs");
 
 // slug 就是路由前缀（`myslug/gpt-4o`），也是 accounts.channel 的键值，一旦有账号挂上去就不许改。
 // 字符集刻意窄于可读性：小写字母数字加 -_，禁 '/'（分隔符本身），长度卡住是为了 UI 一行放得下。
@@ -59,6 +60,11 @@ function normalizeBaseUrl(raw) {
 
 /** 模型清单归一：字符串或 {model,...} 混填都接受，落成 objects-only 存库（读侧再归一）。
  *  空清单允许存在：前缀路由对未列出的模型照样透传（中转站的实际能力常常领先于它的清单）。 */
+/** models_json 条目归一。字段口径与内置渠道的 catalog.json 对齐（name/rate/capabilities/
+ *  contextLength/maxOutputTokens），另加两项提供商特有的：
+ *    aliases[]  下游可用别名——原名照样能请求，别名只是多一个入口，且**不进 /v1/models**
+ *    reasoning  {supportedEfforts[], defaultEffort} —— 与 catalog 同一形状，供请求期档位降级
+ *  白名单之外的键一律丢掉：留着它们只会让人以为生效了（reasoning 曾经就是这么被静默吞掉的）。 */
 function normalizeModels(raw) {
   const list = Array.isArray(raw) ? raw : String(raw || "").split(/[\n,]/);
   const out = [];
@@ -72,9 +78,14 @@ function normalizeModels(raw) {
     const key = model.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
+    const aliases = normalizeAliases(e.aliases, model, seen);
+    if (aliases.error) return { ok: false, message: aliases.error };
+    const reasoning = normalizeReasoning(e.reasoning);
     out.push({
       model,
       upstream: String(e.upstream || model).trim() || model,
+      ...(aliases.list.length ? { aliases: aliases.list } : {}),
+      ...(reasoning ? { reasoning } : {}),
       name: e.name ? String(e.name).slice(0, 64) : undefined,
       rate: e.rate != null && !Number.isNaN(Number(e.rate)) ? Number(e.rate) : undefined,
       capabilities: e.capabilities && typeof e.capabilities === "object" ? e.capabilities : undefined,
@@ -83,6 +94,42 @@ function normalizeModels(raw) {
     });
   }
   return { ok: true, models: out };
+}
+
+const ALIAS_MAX = 8;
+
+/** 别名与模型名同规则（不含 /），且不能与本提供商内任何其他名字撞——撞了两个名字就说不清
+ *  该映射到哪个上游真名。撞内置模型名不在此拦：裸名解析本来就是内置优先，结构上遮蔽不了。 */
+function normalizeAliases(raw, model, seen) {
+  const arr = Array.isArray(raw) ? raw : typeof raw === "string" ? raw.split(/[\n,]/) : [];
+  const out = [];
+  for (const a of arr) {
+    const s = String(a || "").trim();
+    if (!s || s.toLowerCase() === model.toLowerCase()) continue;
+    if (s.includes("/")) return { error: `别名 "${s}" 含 /，不能用作别名` };
+    if (out.length >= ALIAS_MAX) return { error: `模型 "${model}" 的别名超过 ${ALIAS_MAX} 个` };
+    const k = s.toLowerCase();
+    if (seen.has(k)) return { error: `别名 "${s}" 与本提供商的另一个模型/别名重复` };
+    seen.add(k);
+    out.push(s.slice(0, 128));
+  }
+  return { list: out };
+}
+
+/** 思考档位归一：只认 util.EFFORT_LEVELS 那份词表（与内置渠道 catalog 同源），
+ *  defaultEffort 不在 supportedEfforts 里就丢掉——一个"默认但选不到"的档位只会让人困惑。 */
+function normalizeReasoning(raw) {
+  const o = raw && typeof raw === "object" ? raw : null;
+  if (!o) return undefined;
+  const supported = (Array.isArray(o.supportedEfforts) ? o.supportedEfforts : [])
+    .map((x) => String(x || "").toLowerCase())
+    .filter((x) => util.EFFORT_LEVELS.includes(x));
+  const uniq = [...new Set(supported)];
+  const dft = String(o.defaultEffort || "").toLowerCase();
+  const out = {};
+  if (uniq.length) out.supportedEfforts = uniq;
+  if (dft && util.EFFORT_LEVELS.includes(dft) && (!uniq.length || uniq.includes(dft))) out.defaultEffort = dft;
+  return Object.keys(out).length ? out : undefined;
 }
 
 function normalizeHeaders(raw) {
@@ -241,14 +288,27 @@ function parseModelRef(model) {
 
 /** 裸名兜底（proxy.allowBareProviderModel）：只在**没有任何内置渠道拥有该模型**时调用，
  *  且要求恰好唯一命中一个提供商——两个提供商都有 gpt-4o 时不猜，交回上层的 unknown model 提示，
- *  让用户用 slug/model 写清楚。内置优先 + 歧义不猜，这两条合起来就是「不会静默遮蔽」的全部含义。 */
+ *  让用户用 slug/model 写清楚。内置优先 + 歧义不猜，这两条合起来就是「不会静默遮蔽」的全部含义。
+ *  别名与模型名同等参与：客户端拿别名打裸名也是同一个入口，同样只在无内置归属时才生效。 */
 function findUniqueByBareModel(model) {
   const target = String(model || "").toLowerCase();
   if (!target || target.includes("/")) return null;
+  // 内置归属先判：裸名的「内置优先」原本靠调用方（server.resolveChannel）的调用顺序兜，
+  // 但判据放在这里才封得住——别名让同一个提供商可以声明任意多个裸名，
+  // 少一个调用点检查就是静默遮蔽。
+  if (adapters.modelOwners(model).length) return null;
   const hits = [];
   for (const row of store.channelList()) {
     if (row.kind === "builtin") continue;
-    if ((row.models || []).some((m) => String(typeof m === "string" ? m : m.model).toLowerCase() === target)) hits.push(row.id);
+    const names = [];
+    for (const m of row.models || []) {
+      if (typeof m === "string") names.push(m);
+      else if (m && m.model) {
+        names.push(m.model);
+        if (Array.isArray(m.aliases)) names.push(...m.aliases);
+      }
+    }
+    if (names.some((n) => String(n).toLowerCase() === target)) hits.push(row.id);
   }
   return hits.length === 1 ? hits[0] : null;
 }
@@ -277,11 +337,21 @@ async function probe({ id, accountId, baseUrl, key, model, kind, extraHeaders, e
   const headers = normalizeHeaders(extraHeaders || {});
   if (!headers.ok) return headers;
 
+  // 已保存过的提供商要拿它自己的清单去探：否则 upstream 真名映射、别名、思考档位降级全都不生效，
+  // "探测通过但真实请求 400"就是这么来的。新建表单（无 id 或清单里没这个模型）才退化成裸名直传。
+  const saved = id ? store.getProvider(String(id)) : null;
+  const probeModels = (saved && saved.models && saved.models.length ? saved.models : []).some((m) => {
+    const name = typeof m === "string" ? m : m.model;
+    return String(name || "").toLowerCase() === target.toLowerCase();
+  })
+    ? saved.models
+    : [{ model: target, upstream: target }];
+
   const adapter = adapters.makeOpenaiCompat({
     id: id || "__probe__",
     kind: KINDS.has(kind) ? kind : KIND_DEFAULT,
     baseUrl: base.url,
-    models: [{ model: target, upstream: target }],
+    models: probeModels,
     extraHeaders: headers.headers,
     extraBody: (extraBody && typeof extraBody === "object" ? extraBody : {}),
   });
@@ -312,13 +382,14 @@ async function probe({ id, accountId, baseUrl, key, model, kind, extraHeaders, e
   return { ok: true, ms, model: target, sample: sample.slice(0, 200), finishReason, usage };
 }
 
-/** 拉上游自己的模型清单：用号池里第一把可用 Key（与探测不同，这里没有"当场输入"的 Key）。 */
+/** 拉上游自己的模型清单：用号池里第一把可用 Key（与探测不同，这里没有"当场输入"的 Key）。
+ *  两种上游形态都试：真机实测，连只开放 /v1/messages 的 Claude 中转站也提供 /v1/models；
+ *  真没有的会拿到 404，adapter 回「请手填」，不必在这里替上游预判并拒掉有能力的那批。 */
 function fetchModels(id) {
   const provider = store.getProvider(id);
   if (!provider) return Promise.resolve({ ok: false, message: `提供商 "${id}" 不存在` });
   const row = store.accountRows(id).find((r) => r.status !== "disabled" && r.token_enc);
   if (!row) return Promise.resolve({ ok: false, message: "该提供商还没有可用 Key，先添加一把" });
-  if (provider.kind === "anthropic_messages") return Promise.resolve({ ok: false, message: "Anthropic 形态上游没有 /models 目录接口，请在模型清单里手填" });
   const adapter = adapters.makeOpenaiCompat({ ...provider, models: [] });
   return adapter.fetchModels({ token: config.decryptSecret(row.token_enc) || "", refreshToken: "" });
 }

@@ -19,6 +19,22 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "agenthub-paint-"));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---------------------------------------------------------------------------
+// 夹具必须显式钉 launchHidden:false。三期起产品默认值是 launchHidden:true（开机不建窗），
+// 而本探针的 userData 是全新 mkdtemp（无 config.json）⇒ mergeConfig 会把缺字段补成新默认
+// ⇒ main.cjs 的门 `!(launchHidden && minimizeToTray)` 为假 ⇒ 不建窗 ⇒ pageTarget() 等 30s 拿不到
+// CDP page，首屏基线/回归测量失效。这里显式写进本次 userData（--user-data-dir 就是它），
+// 不随产品默认值漂移（与 tools/phase1-browser-pass.cjs / tools/tray-reopen-watch.cjs 同款处置）。
+// ---------------------------------------------------------------------------
+function writeUserDataConfig(dir) {
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "config.json"),
+    JSON.stringify({ schedule: { minimizeToTray: true, liteOnClose: true, launchHidden: false } }, null, 2),
+    "utf8"
+  );
+}
+
+// ---------------------------------------------------------------------------
 // 只连"自己拉起的那个实例"：--remote-debugging-port=0 让 Chromium 自己挑口，
 // 再把真实端口写进本次 userData 的 DevToolsActivePort。固定端口（旧版写死 9333）下，
 // 上一轮没杀干净的探针会继续占着 9333，本轮实例绑不上，pageTarget() 就返回那个旧 target，
@@ -200,6 +216,7 @@ function removeProbeUserData(dir) {
 
 async function main() {
   if (!fs.existsSync(EXE)) throw new Error(`找不到 ${EXE}——先跑 npm run electron:pack`);
+  writeUserDataConfig(tmp); // 本探针要窗，显式钉 launchHidden:false，不随产品默认漂移（见函数注释）
   const proc = spawn(EXE, ["--remote-debugging-port=0", `--user-data-dir=${tmp}`], {
     cwd: ROOT, stdio: "ignore", detached: true,
   });
@@ -245,4 +262,5 @@ if (require.main === module) {
 module.exports = {
   ROOT, EXE, TASKKILL, tmp, sleep, evaluate, readDevToolsPort, pageTarget, assertOwnPage,
   killProcessTree, pidAlive, removeProbeUserData, unusableReason, probeUntilUsable, PROBE, main,
+  writeUserDataConfig,
 };
