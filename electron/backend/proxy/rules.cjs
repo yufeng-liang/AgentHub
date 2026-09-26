@@ -202,6 +202,7 @@ const DESC = {
 
 const cache = new Map(); // file -> { data, error }
 let watcher = null;
+let rawWatcher = null;   // chokidar 不可用时的 fs.watch 退路。以前连句柄都没存下来，停机想关也无从下手
 
 function rulesDir() {
   const d = path.join(store.proxyDir(), "rules");
@@ -269,7 +270,7 @@ function loadFile(file) {
 function init() {
   ensureFiles();
   for (const file of Object.keys(DEFAULTS)) loadFile(file);
-  if (watcher) return;
+  if (watcher || rawWatcher) return;
   const dir = rulesDir();
   const onChange = (file) => {
     if (file && DEFAULTS[file]) loadFile(file);
@@ -286,9 +287,30 @@ function init() {
     });
   } catch {
     try {
-      fs.watch(dir, (_ev, file) => onChange(file));
+      rawWatcher = fs.watch(dir, (_ev, file) => onChange(file));
     } catch { /* 热加载不可用时静默，重启仍生效 */ }
   }
+}
+
+/** 停机：释放热重载占住的句柄。二期 Task 3 起这是子进程优雅停机的必需一步，原因有两层：
+ *  ① 它 ref 着事件循环——不关掉，子进程停完子系统也没法自己收摊；
+ *  ② chokidar 首扫的 readdir/stat 是丢给 **libuv 线程池**的异步作业，进程带着在途作业
+ *     `process.exit()` 时，工作线程会把完成通知发到已经关掉的 `loop->wq_async`（uv_async_t）上，
+ *     撞进 libuv 的断言 `!(handle->flags & UV_HANDLE_CLOSING)`（src/win/async.c:94）
+ *     → 进程以 0xC0000409 fastfail 收场（实测「刚 init() 就停」崩溃率 23/30，见 Task 3 报告）。
+ *  注意 chokidar 3 的 close() 是同步的、**不等在途作业**，所以真正收口的是
+ *  index.cjs 的 drainLibuvWork()：这里负责「不再产生新的异步 fs 作业」并交出 ref 句柄。
+ *  之后若再有命令（proxy_open_rules_dir 走 list()→init()）会重新挂上，语义与 init() 一致。 */
+async function close() {
+  const w = watcher; watcher = null;
+  const rw = rawWatcher; rawWatcher = null;
+  if (w) {
+    try {
+      const r = w.close();
+      if (r && typeof r.then === "function") await r;
+    } catch { /* 已关 */ }
+  }
+  if (rw) { try { rw.close(); } catch { /* 已关 */ } }
 }
 
 /** 取规则数据（永远有值：文件 → 上次快照 → 内置默认） */
@@ -321,4 +343,4 @@ function list() {
   });
 }
 
-module.exports = { init, get, list, reload, rulesDir, DEFAULTS };
+module.exports = { init, close, get, list, reload, rulesDir, DEFAULTS };

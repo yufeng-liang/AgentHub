@@ -17,8 +17,8 @@ const defaultConfig: AppConfig = {
   trashDays: 7,
   update: { channel: "stable", autoCheck: true, notifiedVersion: "" },
   webdav: { endpoint: "", username: "", password: "", root: "/agent-skills", deviceId: "", deviceName: "" },
-  schedule: { minimizeToTray: true, liteOnClose: true, launchHidden: false, autoStart: false, hourly: false, daily: false, dailyTime: "09:00", notifyOnSuccess: false },
-  watch: { enabled: true },
+  schedule: { minimizeToTray: true, liteOnClose: true, launchHidden: true, autoStart: false, persistentGateway: false, hourly: false, daily: false, dailyTime: "09:00", notifyOnSuccess: false },
+  watch: { enabled: true, intervalSeconds: 15 },
   // 反代网关设置兜底（权威默认值见 electron/backend/config.cjs）
   proxy: {
     port: 9527,
@@ -41,6 +41,8 @@ const defaultConfig: AppConfig = {
     fallbackModel: "",
     ccSwitchModel: "",
   },
+  // 记忆仓库指针（其余配置在 <仓库>/config/memory.config.json，由 memory 模块页读取）
+  memory: { enabled: true, rootDir: "" },
 };
 
 /** 技能仓库内的页面 id（skill-detail 为隐藏详情页，不进横条菜单，由技能库卡片进入） */
@@ -77,7 +79,7 @@ export const useAppStore = defineStore("app", {
       const byKey = new Map(MODULES.map((m) => [m.key, m]));
       return s.config.moduleOrder.map((k) => byKey.get(k)).filter((m): m is ModuleDef => !!m);
     },
-    /** 当前模块的子页面 */
+    /** 当前模块的子页面（全部显示，顺序即 MODULES 定义顺序） */
     pagesOf(s): PageDef[] {
       return this.moduleOf(s.activeModule).pages;
     },

@@ -3,6 +3,11 @@
 // ① 空参探测 → 200 挂起页且会话存活  ② error 参数 → 400 结束会话
 // ③ 空探测后带凭据回调 → 换令牌链路照常执行  ④ hash 形态粘贴解析  ⑤ authCodeInfo 解析
 "use strict";
+
+// 守卫（三期收尾，2026-09-24）：被 require 时零副作用。本仓 5 个脚本曾因缺它而在被 require 时
+// 真把探针跑了一次（Task 5 实现者核验导出面时误触 phase1-browser-pass）。
+// 顶层 return 在 CJS 模块包装函数里合法：作为入口时 require.main === module 照常执行。
+if (require.main !== module) return;
 const discovery = require("../electron/backend/proxy/discovery.cjs");
 const rules = require("../electron/backend/proxy/rules.cjs");
 

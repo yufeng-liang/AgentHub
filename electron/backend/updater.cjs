@@ -270,6 +270,7 @@ function download() {
 function triggerInstall() {
   if (installTriggered || !autoUpdater || status.status !== "downloaded") return status;
   installTriggered = true;
+  installRequested = false; // 标记已被 before-quit 的互锁消费掉：装更失败时不能留下假意愿
   // 复位通知去重，万一安装器被拦没装上，下次启动还能提醒
   config.setUpdateNotified("");
   autoUpdater.quitAndInstall(true, true);
@@ -286,6 +287,33 @@ function triggerInstall() {
 
 function pendingInstall() {
   return !installTriggered && status.status === "downloaded" && !!autoUpdater && !isPortable();
+}
+
+// 渲染层「立即安装」的意愿标记（Task 7）：requestInstall 打上，before-quit 读走，triggerInstall 消费。
+let installRequested = false;
+
+/**
+ * install_update 的互锁入口（Task 7）：只打标记 + app.quit()，**不**直接 quitAndInstall。
+ * 过去直连 triggerInstall() → quitAndInstall 会绕过 main.cjs before-quit 的网关停机互锁——
+ * 安装器在映像仍被锁、端口仍被占时开跑。这里把退出交回 before-quit 的唯一停机出口 quitForInstall()：
+ * 先 stopAndWait 停干净子进程并实测端口释放，然后才轮到装更。
+ * 口径与 triggerInstall 的 no-op 一致（便携版 / 状态不对时什么都不做，也不触发退出）。
+ */
+function requestInstall() {
+  if (installTriggered || !autoUpdater || status.status !== "downloaded" || isPortable()) return status;
+  installRequested = true;
+  app.quit();
+  return status;
+}
+
+/**
+ * before-quit 的装更意愿第二来源（堵 triggerInstall 的洞）：triggerInstall 先置 installTriggered
+ * 再 quitAndInstall，后者再触发一次 before-quit 时 pendingInstall() 已是 false —— 光看它，
+ * 装更路径会在 before-quit 里漏检。形状与 pendingInstall() 对齐（状态必须仍成立），只是不看
+ * installTriggered——它恰恰是被置真之后才需要这个标记兜底。
+ */
+function pendingInstallRequested() {
+  return installRequested && status.status === "downloaded" && !!autoUpdater && !isPortable();
 }
 
 function openReleases() {
@@ -337,4 +365,4 @@ function getStatus() {
   return status || idleStatus();
 }
 
-module.exports = { init, check, download, triggerInstall, pendingInstall, getStatus, openReleases, openRepo, isPortable };
+module.exports = { init, check, download, triggerInstall, pendingInstall, pendingInstallRequested, requestInstall, getStatus, openReleases, openRepo, isPortable };

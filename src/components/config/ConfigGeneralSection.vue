@@ -143,6 +143,13 @@ async function toggleAppBehavior() {
   await app.save();
 }
 
+/** 轻量模式：liteOnClose + launchHidden 的聚合视图（三期定案：读看主特征 liteOnClose，写同写两条）。
+    部分为真只可能来自手改 JSON，点一次即归一，故不做 indeterminate。 */
+const liteMode = computed({
+  get: () => app.config.schedule.liteOnClose,
+  set: (v) => { app.config.schedule.liteOnClose = v; app.config.schedule.launchHidden = v; },
+});
+
 /** 外观切换（与左栏亮暗按钮同源） */
 function setTheme(v: string | number | boolean | undefined) {
   if (v === "dark" || v === "light") app.setTheme(v);
@@ -266,7 +273,13 @@ onUnmounted(() => {
           <div class="set-name">界面动效</div>
           <div class="set-desc">默认关闭以降低占用。开启后恢复液滴鼠标与背景流动、粒子等装饰动效，电脑配置较低时可能出现卡顿（状态本机记住）</div>
         </div>
-        <el-switch :model-value="app.config.fx" @change="toggleFx" />
+        <div
+          class="switch"
+          :class="{ on: app.config.fx }"
+          role="switch"
+          :aria-checked="!!app.config.fx"
+          @click="toggleFx(!app.config.fx)"
+        ></div>
       </div>
     </div>
 
@@ -281,8 +294,8 @@ onUnmounted(() => {
         <div v-for="(mod, i) in app.orderedModules" :key="mod.key" class="row">
           <span class="num">{{ i + 1 }}</span>
           <div class="grow"><div class="name">{{ mod.name }}</div></div>
-          <el-button size="small" :disabled="i === 0" @click="move(i, -1)">上移</el-button>
-          <el-button size="small" :disabled="i === app.orderedModules.length - 1" @click="move(i, 1)">下移</el-button>
+          <button class="btn btn-ghost" :disabled="i === 0" @click="move(i, -1)">上移</button>
+          <button class="btn btn-ghost" :disabled="i === app.orderedModules.length - 1" @click="move(i, 1)">下移</button>
         </div>
       </div>
     </div>
@@ -294,28 +307,54 @@ onUnmounted(() => {
           <div class="set-name">开机自启</div>
           <div class="set-desc">{{ isPortable ? "便携版不支持开机自启（注册的会是临时副本）" : "登录 Windows 后自动运行 AgentHub，改动即时生效" }}</div>
         </div>
-        <el-switch v-model="app.config.schedule.autoStart" :disabled="isPortable" @change="toggleAppBehavior" />
+        <div
+          class="switch"
+          :class="{ on: app.config.schedule.autoStart, disabled: isPortable }"
+          role="switch"
+          :aria-checked="!!app.config.schedule.autoStart"
+          :title="isPortable ? '便携版不支持开机自启' : ''"
+          @click="!isPortable && (app.config.schedule.autoStart = !app.config.schedule.autoStart, toggleAppBehavior())"
+        ></div>
       </div>
       <div class="set-row">
         <div class="set-info">
-          <div class="set-name">关闭最小化到托盘</div>
-          <div class="set-desc">点关闭按钮不退出，仅最小化到托盘（托盘菜单「退出」才是真正退出）</div>
+          <div class="set-name">关窗后留在托盘（不退出）</div>
+          <div class="set-desc">点关闭不退出程序，缩在托盘继续跑；托盘菜单「退出」才是真正退出（关掉它 = 关窗即退出）</div>
         </div>
-        <el-switch v-model="app.config.schedule.minimizeToTray" @change="toggleAppBehavior" />
+        <div
+          class="switch"
+          :class="{ on: app.config.schedule.minimizeToTray }"
+          role="switch"
+          :aria-checked="!!app.config.schedule.minimizeToTray"
+          @click="app.config.schedule.minimizeToTray = !app.config.schedule.minimizeToTray; toggleAppBehavior()"
+        ></div>
+      </div>
+      <!-- 常驻网关（Task 6）：主 App 退出后子进程继续在后台监听；便携版是临时解压副本，detach 会锁住
+           解压目录，整项灰置。生效时机：退出前已开着网关就原样 detach，下次启动直接认领回来。
+           三期 Task 6：位置随轻量模式升降——轻量关时它是平级独立行（渲染在轻量模式行之前），
+           轻量开时降为轻量模式的子行（渲染在轻量模式行之后）。**只换位置，绝不清零该字段**：
+           它可能对应一个正在后台常驻的网关和一条已注册的开机自启项 -->
+      <div v-if="!liteMode" class="set-row">
+        <div class="set-info">
+          <div class="set-name">主 App 退出后网关继续常驻</div>
+          <div class="set-desc">{{ isPortable ? "便携版不支持后台常驻（临时解压副本退出即失效）" : "主 App 退出后网关继续常驻，额度刷新与自动签到随它一起留在后台跑（便携版不支持）" }}</div>
+        </div>
+        <el-switch v-model="app.config.schedule.persistentGateway" :disabled="isPortable" @change="toggleAppBehavior" />
       </div>
       <div class="set-row">
         <div class="set-info">
-          <div class="set-name">关窗后释放界面内存</div>
-          <div class="set-desc">关闭窗口即结束界面进程，后台只留反代网关与定时同步，占用内存更低；代价是重新打开要多加载一次界面</div>
+          <div class="set-name">轻量模式</div>
+          <div class="set-desc">关窗即结束界面进程、下次启动不自动开界面，需要时点托盘图标打开。代价是重新打开要多加载一次界面</div>
         </div>
-        <el-switch v-model="app.config.schedule.liteOnClose" :disabled="!app.config.schedule.minimizeToTray" @change="toggleAppBehavior" />
+        <el-switch v-model="liteMode" :disabled="!app.config.schedule.minimizeToTray" @change="toggleAppBehavior" />
       </div>
-      <div class="set-row">
+      <!-- 轻量开：同一块常驻行模板，降为轻量模式的子行（仅加缩进类，字段与灰置条件与上方一字不动） -->
+      <div v-if="liteMode" class="set-row set-row-sub">
         <div class="set-info">
-          <div class="set-name">启动不打开主界面</div>
-          <div class="set-desc">开机后直接缩在托盘，需要时点托盘图标或菜单「显示主界面」再打开（下次启动生效）</div>
+          <div class="set-name">主 App 退出后网关继续常驻</div>
+          <div class="set-desc">{{ isPortable ? "便携版不支持后台常驻（临时解压副本退出即失效）" : "主 App 退出后网关继续常驻，额度刷新与自动签到随它一起留在后台跑（便携版不支持）" }}</div>
         </div>
-        <el-switch v-model="app.config.schedule.launchHidden" :disabled="!app.config.schedule.minimizeToTray" @change="toggleAppBehavior" />
+        <el-switch v-model="app.config.schedule.persistentGateway" :disabled="isPortable" @change="toggleAppBehavior" />
       </div>
     </div>
 
@@ -337,23 +376,23 @@ onUnmounted(() => {
         </div>
         <div class="upd-actions">
           <!-- 三个按钮仅在 available/downloaded 态渲染（即「检测到新版本」），红点随按钮出现即代表有待处理更新；
-               红点用 .dot-host 包一层承载定位：el-button 自带 overflow:hidden，红点直接挂按钮里溢出角会被裁掉一半 -->
+               红点用 .dot-host 包一层承载定位，避免按钮溢出裁剪红点 -->
           <span v-if="update.status === 'available' && !update.isPortable" class="dot-host">
-            <el-button type="primary" size="small" @click="doDownload">下载更新</el-button>
+            <button class="btn btn-cta" @click="doDownload">下载更新</button>
             <span class="dot-ping"></span>
           </span>
           <span v-else-if="update.status === 'downloaded' && !update.isPortable" class="dot-host">
-            <el-button type="primary" size="small" @click="doInstall">重启并安装</el-button>
+            <button class="btn btn-cta" @click="doInstall">重启并安装</button>
             <span class="dot-ping"></span>
           </span>
           <span v-else-if="update.status === 'available'" class="dot-host">
-            <el-button type="primary" size="small" @click="openReleases">前往下载</el-button>
+            <button class="btn btn-cta" @click="openReleases">前往下载</button>
             <span class="dot-ping"></span>
           </span>
-          <el-button v-else-if="update.status === 'error'" size="small" @click="openReleases">前往下载</el-button>
-          <el-button size="small" :disabled="updateBusy" @click="doCheck">
+          <button v-else-if="update.status === 'error'" class="btn btn-ghost" @click="openReleases">前往下载</button>
+          <button class="btn btn-ghost" :disabled="updateBusy" @click="doCheck">
             {{ updateBusy ? "处理中…" : "检查更新" }}
-          </el-button>
+          </button>
         </div>
       </div>
 
@@ -375,7 +414,13 @@ onUnmounted(() => {
           <div class="set-name">自动检查更新</div>
           <div class="set-desc">每小时检查更新，发现新版仅提醒</div>
         </div>
-        <el-switch v-model="app.config.update.autoCheck" @change="setAutoCheck" />
+        <div
+          class="switch"
+          :class="{ on: app.config.update.autoCheck }"
+          role="switch"
+          :aria-checked="!!app.config.update.autoCheck"
+          @click="app.config.update.autoCheck = !app.config.update.autoCheck; setAutoCheck()"
+        ></div>
       </div>
     </div>
 
@@ -389,21 +434,21 @@ onUnmounted(() => {
           <div class="set-name">数据目录</div>
           <div class="set-desc">{{ dataDir || "（浏览器预览）" }}</div>
         </div>
-        <el-button size="small" @click="openDataDir">打开目录</el-button>
+        <button class="btn btn-ghost" @click="openDataDir">打开目录</button>
       </div>
       <div class="set-row">
         <div class="set-info">
           <div class="set-name">GitHub 仓库</div>
           <div class="set-desc">HUIdada1/AgentHub · 软件更新与安装包发布地址</div>
         </div>
-        <el-button size="small" @click="openRepo">打开仓库</el-button>
+        <button class="btn btn-ghost" @click="openRepo">打开仓库</button>
       </div>
       <div class="set-row">
         <div class="set-info">
           <div class="set-name">免责声明</div>
           <div class="set-desc">本平台仅供交流学习使用；使用本平台（含反代网关等功能）产生的一切后果，作者概不负责</div>
         </div>
-        <el-button size="small" @click="disclaimerOpen = true">查看声明</el-button>
+        <button class="btn btn-ghost" @click="disclaimerOpen = true">查看声明</button>
       </div>
     </div>
 
@@ -423,17 +468,33 @@ onUnmounted(() => {
         <div class="dc-foot">—— 作者：沐辉 · AgentHub</div>
       </div>
       <template #footer>
-        <el-button type="primary" @click="disclaimerOpen = false">我已知晓</el-button>
+        <button class="btn btn-cta" @click="disclaimerOpen = false">我已知晓</button>
       </template>
     </el-dialog>
   </div>
 </template>
 
 <style scoped>
+/* 便携版禁用的开机自启开关：置灰且不响应 */
+.switch.disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
 /* 只有标题的设置行：不留底部内边距，让下面的 rows 贴上来 */
 .set-row-head {
   padding-bottom: 2px;
   border-bottom: none;
+}
+/* 常驻网关行降为「轻量模式」的子行时的缩进（三期 Task 6：只改呈现，不动字段与灰置条件）。
+   左侧细线 + 缩进表明从属关系，与平级态（无此类）在视觉上可区分 */
+.set-row-sub {
+  padding-left: 14px;
+  margin-left: 2px;
+  border-left: 2px solid var(--line-strong);
+}
+.set-row-sub .set-name {
+  font-weight: 500;
+  color: var(--text-2);
 }
 /* 通知/托盘跳转进来的落点提示：高亮一圈，1.6 秒后自行退去 */
 .card.flash {
@@ -454,7 +515,7 @@ onUnmounted(() => {
   flex-shrink: 0;
 }
 /* 更新按钮组的红点定位由 .dot-host 承载（global.css 的 .dot-ping/.dot-host），
-   el-button 的 overflow:hidden 会裁掉挂在它里面的红点溢出角 */
+   避免按钮自身的溢出裁剪把红点角裁掉 */
 .upd-notes {
   margin: 2px 0 10px;
   border: 1px solid var(--line);
@@ -482,13 +543,7 @@ onUnmounted(() => {
 }
 
 /* ===== 免责声明弹窗 ===== */
-.disclaimer-dialog {
-  max-width: calc(100vw - 48px);
-}
-.disclaimer-dialog :deep(.el-dialog__body) {
-  max-height: min(52vh, 460px);
-  overflow-y: auto;
-}
+/* 类名落点与限高的原因说明在文件末尾的全局样式块（append-to-body 弹窗不能走 scoped） */
 .dc-title {
   font-size: 15px;
   font-weight: 700;
@@ -519,5 +574,31 @@ onUnmounted(() => {
   font-size: 11px;
   color: var(--text-3);
   text-align: right;
+}
+</style>
+<style>
+/* ===== 免责声明弹窗：全局块（不能 scoped）===== */
+/* append-to-body 把弹窗传送到 body 之下，本组件的 data-v 作用域属性到不了 EP 内层元素——
+   1.0.0 起写在 scoped :deep 里的 body 限高从未命中，这就是内容超高时（一期实测 1109px 内容
+   > 779px 视口）整窗在 .el-overlay-dialog 的 overflow:auto 里顶对齐、「我已知晓」要滚到底才
+   点得到的根因。class 经 $attrs 逐字落在 .el-dialog 根元素上（EP 2.14.5 dialog.vue 把
+   $attrs 传给 dialog-content，其根节点即 .el-dialog），全局类名选择器必然命中。
+   限高取 calc(100vh - 64px)：上下各留 32px 呼吸位，align-center 的 flex 居中依旧成立；
+   内容不超高时 max-height 不约束，维持原视觉。 */
+.disclaimer-dialog {
+  max-width: calc(100vw - 48px);
+  max-height: calc(100vh - 64px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.disclaimer-dialog .el-dialog__header,
+.disclaimer-dialog .el-dialog__footer {
+  flex-shrink: 0;
+}
+.disclaimer-dialog .el-dialog__body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 </style>

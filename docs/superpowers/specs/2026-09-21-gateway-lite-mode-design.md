@@ -17,13 +17,30 @@
 | 现状 | 关窗只 `hide()` | **321.5 MB** | 真实 app 关窗后实测（另一次独立读数 315.9 MB） |
 | 一期后 | 关窗即销毁窗口 | **215.47 MB** | Task 7 真实打包版实测（无窗 3 进程，40 s 落定 5 次采样一字不差；相对开着窗的 424.86 省 209.39 MB / −49.3%） |
 | 一期后（可选） | 启动即不建窗 | **166.05 MB** | Task 7 真实打包版实测（n=3，GPU 仅 32.2 MB，无建窗残留） |
-| 二期后 | 主 App 退出，网关独立常驻 | **33.2 MB** | 探针实测 electron.exe-as-node（真实 app 的二期终态尚未量） |
+| 二期后 | 主 App 退出，网关独立常驻 | **76.94 MB** | 真机批次实测终态（2026-09-23，安装版 × persistentGateway=on：杀掉主进程后只剩 1 个 `AgentHub.exe`，`PrivateMemorySize64` 76.94 MB，`/healthz` 200、`/readyz` 503=空号池真值）。同批交叉验证：关窗销毁格里的网关子进程 74.22 MB 同量级。**探针值 33.2 MB 已被真实值取代**——33.2 量的是裸 electron.exe-as-node，差的那 43 MB 是本应用的 express + 两个 SQLite + rules/号池模块。**三期独立复现**：Task 8 修正后两次采样 73.42 / 75.95 MB（1.18.1 打包态），二期 76.94 落在区间内 ⇒ 两次独立测量互印 |
+| 二期后（main 侧） | 网关搬出主进程后主进程地板价 | ~~130.26 MB~~ → **三期重量：87.82–89.62 MB（稳态）** | **【三期 Task 8 更正，2026-09-24】** 二期那个 130.26 MB 是**窗口拆除的瞬态**，不是稳态：Task 8 五次独立采样一致显示关窗后 main 先停在 ~104–109 MB、**约 2 分钟后落到 ~88–89 MB 并稳住**（t+3m 起极差 0.16 MB），**130.26 本轮未能复现**，故不作为基线沿用。判据 1（≤60 MB）**正式注销**，理由见下 |
+
+**判据 1（main ≤60 MB）注销与替换（三期 Task 8 取证，2026-09-24）**
+
+**注销理由（地板反证，控制器已独立复现）**：把 Electron 二进制以**零应用代码**起成浏览器进程（`app.whenReady()` 后什么都不做），其 main 自持 = **69.89 / 70.66 / 70.52 MB**（另一次独立运行 69.23–72.70 MB）⇒ **60 MB 低于运行环境本身的地板，物理上不可达**。且 main 的 JS 侧总量仅 ~11.3 MB（V8 堆 8.77 + external 2.53，`number_of_detached_contexts = 0`、活跃 handle 仅 4×PipeWrap + 1×ProcessWrap + 4×Timeout），即便把模块全部搬走也补不上 88→60 的 28 MB 缺口。补充对照：关窗销毁稳态 88–89 MB 距「产品最轻配置（不建窗）」地板 84.08–86.28 MB 只差 ~3–4 MB ⇒ **该回收的已经回收干净**，不是「还没搬够」而是「搬完也到不了」。**「继续把模块搬出 main」这条路正式关闭。**
+
+**新靶子（相对靶，抗 Electron/Chromium 升级漂移）**：关窗销毁并**静置 ≥2 min** 后，main 自持 ≤ **空载 Electron 浏览器进程地板 + 20 MB**。本机（Electron 35.7.5）换算 ≈ **90–93 MB**；三期实测 87.82–89.62 MB，**达标且有余量**。若必须用绝对数，取 **≤95 MB**。
+
+**三条取样纪律（必须与判据一起用，否则重演二期的 130.26 误判）**：
+1. 关窗后**静置 ≥2 min** 再采（拆除瞬态可比稳态高 ~15–20 MB）；
+2. 取 **root pid 那一行**，**不读 `memtree` 的 `main` 桶合计**（网关子进程走 `ELECTRON_RUN_AS_NODE`、命令行无 `--type=`，会被并进 `main` 桶——实测该桶合计 ~182 MB vs 真实自持 109.63）；
+3. 采样前确认**网关子进程存活**（`gateway.log` 无 `fatal`），否则量到的是残缺进程树（会把「少一个进程」误当「内存更低」）。
+
+**判据 3（导航 8 样本）三期重量（1.18.1 打包态，两次独立运行）**：
+`[111.56, 116.12, 121.75, 114.68, 115.27, 115.76, 115.69, 116.14]`（上升 5/7）与
+`[108.75, 115.96, 120.46, 114.88, 111.95, 112.43, 111.84, 112.42]`（上升 4/7）。
+两次**形态一致**：峰值都落在第 3 站（skills/dedup），其后 5 站横盘不涨（两次都未再超过峰值）⇒ 「不再单调上涨」这一形态成立；但按二期那条「上升 ≤4 次」的阈值，第一次为 5 次、第二次为 4 次 ⇒ **该阈值偏紧、落在噪声边界上**，判读应以「峰值是否被后续超越」为准（两次都是否）。
 
 > **这张表在 Task 7 之前被污染过一次，此处是更正后的版本**：原先「一期后 175.4 MB / 136.0 MB」两行引的是 §三那支**合成探针**（只建一个 `BrowserWindow` 的裸 Electron app，`tmp/gateway-probe/raw-window-longsettle.jsonl`）的数字，不是本应用的地板价。真实打包版无窗是 215.47，比合成探针的 176.94 高 38.5 MB，其中 **+27.7 MB 在 main**（反代网关 express、两个 SQLite、watch 快照器、两个调度器、配置与号池模块常驻）——这条有独立旁证：对用户自己那份实例做只读枚举得 `main:125.98`，与本构建关窗后的 `main:126.84` 同值，即**这块驻留与窗口无关，关窗路径回收不了它**。教训：探针量的是 Electron，不是 AgentHub，凡引探针数字进验收判据必须标注来源。
 
 一期同时要满足：关窗后重开主界面**不掉体验**——这是「销毁窗口」方案不被察觉的前提。
 
-**二期要付的代价，先写明白**：D3 选了单一拓扑，则「主 App 开着、窗口开着」的常态下内存比现状高约 **25 MB**（多一个 33.2 MB 子进程，主进程只从 99.17 瘦到 91.06）。**这两个 main 数是合成探针的，不是本应用的**——本应用真实 main 无窗驻留实测 126.84 MB（§一 表下说明），二期真正的靶子就是这 126.84 里网关 + 两个 SQLite 占的那部分，收益要按真实值重算，不能沿用 99.17→91.06 那 8 MB。这笔钱只在窗口开着时付，换来的是关窗后按一期实测的 215.47 MB、退出后的独立常驻进程（探针量 33.2 MB，真实终态待量），以及一套网关宿主实现。若不接受这个交换，退回 D3 的备选（可切换宿主），但那正是 D3 否掉的方向。
+**二期要付的代价，先写明白**：D3 选了单一拓扑，则「主 App 开着、窗口开着」的常态下内存比现状高约 **25 MB**（多一个 33.2 MB 子进程，主进程只从 99.17 瘦到 91.06）。**这两个 main 数是合成探针的，不是本应用的**——本应用真实 main 无窗驻留实测 126.84 MB（§一 表下说明），二期真正的靶子就是这 126.84 里网关 + 两个 SQLite 占的那部分，收益要按真实值重算，不能沿用 99.17→91.06 那 8 MB。这笔钱只在窗口开着时付，换来的是关窗后按一期实测的 215.47 MB、退出后的独立常驻进程（探针量 33.2 MB，真实终态待真机批次回填，锚点见 §一 表内该行），以及一套网关宿主实现。若不接受这个交换，退回 D3 的备选（可切换宿主），但那正是 D3 否掉的方向。
 
 ## 二、决策记录
 
@@ -69,7 +86,7 @@
 
 重开复用 `main.cjs:121-128` 的 `showWindow()`——它已有 `if (!mainWindow) createWindow()`，`createWindow()` 内的 `ready-to-show` 揭示（`:93-100`）与 `applyViewportZoom`（`:103-105`）都是每次重建走一遍，无需新增。
 
-两处窗口依赖要兜底，不重构：`ipc.cjs:109` 与 `proxy/index.cjs:413` 的 `dialog.showOpenDialog(BrowserWindow.getAllWindows()[0], ...)`。这两个调用只可能由已打开的窗口发起，但仍补「取不到窗口则不传 parent」的分支，避免将来把入口挪到托盘时静默抛错。
+两处窗口依赖要兜底，不重构：`ipc.cjs:115`（原文写 `:109`，一期后 `browse_dir` 处理器漂移到 `:112-116`）与 `proxy/index.cjs:413` 的 `dialog.showOpenDialog(BrowserWindow.getAllWindows()[0], ...)`。这两个调用只可能由已打开的窗口发起，但仍补「取不到窗口则不传 parent」的分支（ipc.cjs 侧已实装为 `:115` 的三元式），避免将来把入口挪到托盘时静默抛错。
 
 新增配置（见 §六）。
 
@@ -130,6 +147,22 @@
 
 **二期继承的一期未达项（Task 7 实测带来，写死在这里免得丢）**：把无窗常驻从 215.47 MB 拉进原定的 150–200 MB 区间。靶子是 main 那 **126.84 MB**（与窗口无关，关窗回收不动；用户自己那份实例只读枚举同为 125.98 MB），二期把网关 express + 两个 SQLite + `credits`/`rules` 热路径下沉到子进程之后，必须重量这块并给出拆解，而不是沿用 §三 探针的 `99.17 → 91.06`（那是 Electron 的数，不是本应用的）。同一次量测要顺带回答一期留下的一个单点观测：一轮完整逐页导航后 main 从 121.32 涨到 147.10 MB（顾虑：会不会随使用继续爬）。
 
+> **二期真机批次收口（2026-09-23，逐条对账，未达项按实测留档不为过门改判据）**：
+> ① 区间目标**达成且超越**——`persistentGateway=on` 下主 App 退出后只剩 1 个进程 **76.94 MB**（原区间 150–200 MB）；
+> ② 靶子 `main 126.84` 的拆解结论是**搬不动**：网关与两个 SQLite 下沉后 main 自持私有内存仍为 130.26 MB（开窗 131.43 / 关窗销毁后 130.26），
+>    回收量全在 renderer（47.90 → 0）与 GPU 页；「≤60 MB」这条判据按实测判废（§一 表「二期后（main 侧）」行留了完整归因）；
+> ③ 一期的 121.32 → 147.10 单点**不是持续爬升**：8 样本序列 `129.01, 136.40, 141.31, 134.88, 136.25, 135.29, 132.92, 132.10`，
+>    峰值在第 3 站、末值低于峰值 9.2 MB，后三站连续回落；
+> ④ WAL「停止单调增长」达成（50 次请求后 1,388,472 B 在 t+3→t+30min 恒定不动），但 §5.4 的 64 KB 绝对值未达成：
+>    子进程每 5 分钟挂 `PRAGMA wal_checkpoint(TRUNCATE)` 却一次都没截下去，而 `store.checkpoint()` 的布尔返回值无人观测，
+>    外部无法区分「没执行」与「执行了被挡」——三期两条：给 checkpoint 加成功/失败计数留痕；评估 `PRAGMA journal_size_limit=65536`。
+>    **【三期收口更正，2026-09-24】** 上面那条「恒定不动」经三期取证为**探针卫生事故**，不是产品缺陷：二期泡机与批次④
+>    其余探针并行，后者按镜像名宽杀 `taskkill /F /IM AgentHub.exe /T`，而泡机的常驻网关子进程正是 `AgentHub.exe`
+>    ⇒ 开跑几分钟后被连坐打死，此后泡的是**死进程**（物证 `D:\tmp-agenthub-wal4`：主库 4096 B 空壳、日志断在
+>    `detach-keep` 后一行不增）。三期 Task 4 用改名后的唯一镜像名逐字节复现了该机制并有负对照（不发宽杀则 tick 照常收敛）。
+>    ⇒ **判据 4 的正式表述见 §5.4（已改写为可核命题），其转绿方式是「原缺陷被证伪」而非「修好了」**；三期只把
+>    checkpoint 的成败做成可观测（`wal-checkpoint` 日志行 + `proxy_status.walBytes/lastCheckpoint`），未改任何 checkpoint 调用姿态。
+
 ### 5.1 进程切分线
 
 - **子进程**（`electron/gateway.cjs`，纯 Node）：`server` / `store` / `rules` / `pool` / `poolsync` / `adapters` / `credits` / `discovery` / `events`（改为写管道）/ `ideswitch` / `ccswitch` / `util` / `raccoonAuth`。
@@ -161,6 +194,8 @@
 
 不能走「主进程 RPC 回填」：热路径上每次 chat completion 至少 4 次解密调用（`server.cjs:644` → `settings()`(`index.cjs:83`) → `config.loadConfig()` → `decryptSecret` ×2，加 `server.cjs:89` `store.accountSecrets` ×2），逐次跨进程往返直接劣化 TTFT；且与「主 App 可整体退出」自相矛盾。
 
+**Task 5 定案（2026-09-22 落地，与 §5.7 的矛盾就此闭合）**：解密已由子进程自带的 `secretbox` 模块实现（DPAPI + AES-256-GCM），`vaultOk()` 改读凭据后端探测 `secretbox.backend() !== "none"`（`electron/backend/proxy/index.cjs:315`）——纯 Node 子进程**不再误报**保险状态，`proxy_status` 整条转发回界面即可；四种后端下的取值由 `scripts/dev-secretbox-test.cjs`（vaultOk 四后端用例）钉住。
+
 配套闸门：
 
 - `config.cjs:34` `encryptSecret` 在 `safeStorage` 不可用时**静默明文落盘**，而 `server.cjs:96` 的 401 刷新会写 token → 独立进程一旦跑起来就可能把明文 token 混进号池。改为「无加密能力则拒写并抛错」。纯 Node 自测环境（`scripts/dev-ccswitch-test.cjs`、`tools/proxy-smoke.cjs`）走只读降级路径，不受影响。
@@ -168,10 +203,18 @@
 
 ### 5.4 数据与配置写权
 
-- `stats.db` 由子进程**独占**：主进程不再 require 网关 store（现状 `ipc.cjs:472` → `proxy.register` 会把整张依赖图包括 `store.cjs` 拉进主进程）。
+- `stats.db` 由子进程**独占**：主进程不再 require 网关 store（一期前快照为 `ipc.cjs:472` 的 `proxy.register`，该行号已失效——Task 5 起 proxy 域整体迁入网关子进程，由 `electron/gateway.cjs:26` 装配 `proxy/index.cjs`，主进程对 proxy 域的 require 由 `scripts/dev-gateway-forward-parity-test.cjs` 钉死为零）。
 - WAL：`store.cjs:128-129` 只设 `journal_mode=WAL` + `busy_timeout=5000`，全仓无 `wal_checkpoint`，`store.close()`(`:551`) **无任何调用点**（`proxy.shutdown()` `index.cjs:177-182` 只停 server）。实测本机 WAL 已 1.59 MB 且自 16:41 起零次 checkpoint。补：退出路径调 `close()`、运行期周期性 `PRAGMA wal_checkpoint(TRUNCATE)`。`busy_timeout=5000` 在双进程争锁时会卡转发 5 秒，故必须单一写者。
-- `config.json` 唯一属主 = 主进程。子进程只读配置 + 通过管道请求写。`config.cjs:372`（一期落地后行号，原写 `:370`）用固定 `.tmp` 名，跨进程 rename 会互踩，临时文件名加 pid。**同病实测共四处**，只改 `config.cjs` 会漏三处：`hub.cjs:39`（`~/.agent_skills/manifest.json`）、`sync-config.cjs:475`、`sync.cjs:185`，其中前两处落在**两个安装共享**的 `~/.agent_skills`，互踩面比 `config.json` 更大。
-- 除 `config.json` 外还有四个数据文件要定写主（实测清单）：`proxyDir()/catalog.json`(`index.cjs:483`)、`rules` 的默认值与补键迁移(`rules.cjs:233/:244`)、`proxyDir()/sync-state.json`(`poolsync.cjs:77`)、`proxyDir()/pool-tombstones.json`(`poolsync.cjs:310`) —— 全部归子进程独占。**规格原来漏了一条反向跨界写**：`ipc.cjs:176` 的 `webdav_shared_save` 在主进程里直接 `require("./proxy/poolsync.cjs").onSharedPasswordMaybeChanged()`，那是从主进程写子进程独占的 `sync-state.json`；双拓扑下必须走管道，否则 §5.4 第一条从后门漏掉。
+  **【三期 Task 3/Task 4 收口改写，2026-09-24】判据 4 的正式表述（取代上面「30 分钟额度刷新后 <64KB」的凑时长写法）**：
+  > **50 条失败请求之后，一次 `checkpoint()` 必须把 WAL 截到 ≤64KB。**
+  原表述里那 30 分钟只是凑时长、不承载判据，**删除**。落地为 `scripts/dev-wal-convergence-test.cjs`（四条腿：判定腿 = 生产常驻形态
+  `detached + --persistent + Electron 运行时`，对照腿 = 非 detached 真子进程，附加 = 进程内，负对照 = 外部持读事务「**必须红**」）。
+  **转绿方式 = 原缺陷被证伪**（二期那条「冻结」是探针卫生事故，见 §四 二期对账段 ④ 的三期更正），**不是**「缺陷被修好」——
+  该闸对原缺陷的防护力 ≈ 0（那个状态今天复现不出来），它的价值是**可观测面**（`wal-checkpoint` 日志行含生效间隔 `ms`、
+  `proxy_status.walBytes/lastCheckpoint`）与**最小冻结构造**（负对照）。**未采纳** `PRAGMA journal_size_limit=65536`
+  （它只压峰值、会掩盖真问题；且真问题已不存在）。
+- `config.json` 唯一属主 = 主进程。子进程只读配置 + 通过管道请求写。`config.cjs:376`（一期落地后行号曾写 `:372`，原写 `:370`；行号以二期当前树为准）曾用固定 `.tmp` 名，跨进程 rename 会互踩，现临时文件名已统一加 pid。**同病实测共四处**，只改 `config.cjs` 会漏三处，四处一并列齐（行号以当前树为准）：`config.cjs:376`、`hub.cjs:41`（`~/.agent_skills/manifest.json`）、`sync-config.cjs:477`、`sync.cjs:187` —— 四处现均为 `${p}.${process.pid}.tmp`，由 `scripts/dev-write-ownership-test.cjs` 的结构判据钉住；其中前两处落在**两个安装共享**的 `~/.agent_skills`，互踩面比 `config.json` 更大。
+- 除 `config.json` 外还有四个数据文件要定写主（实测清单）：`proxyDir()/catalog.json`(`index.cjs:483`)、`rules` 的默认值与补键迁移(`rules.cjs:233/:244`)、`proxyDir()/sync-state.json`(`poolsync.cjs:77`)、`proxyDir()/pool-tombstones.json`(`poolsync.cjs:310`) —— 全部归子进程独占。**规格原来漏了一条反向跨界写**：`ipc.cjs:180` 的 `webdav_shared_save`（原文写 `:176`，一期后处理器漂移）在一期前的主进程里直接 `require("./proxy/poolsync.cjs").onSharedPasswordMaybeChanged()`，那是从主进程写子进程独占的 `sync-state.json`；双拓扑下必须走管道，否则 §5.4 第一条从后门漏掉（Task 5 已实装：改经 `gatewayClient.call("proxy_poolsync_password_changed", ...)` 投递，见 `ipc.cjs:186`）。
 - `rules/*.json` 由子进程只读监听（`rules.cjs:269` chokidar）；写规则仍走主进程 `config` 域。
 
 ### 5.5 生命周期、认领与自启
@@ -186,15 +229,23 @@
 
 ### 5.6 自动更新互锁
 
-`updater.cjs:270-289 triggerInstall` → `main.cjs:399-416`（一期落地后行号，原写 `:362-373`）的 `before-quit` 只调本进程 `proxy.shutdown()`(`index.cjs:177-182`，**同步四行，内部 `server.stop()` 连监听释放都不等**；实测全仓 `store.close()` 零调用点)，够不到子进程：9527 仍被占、`AgentHub.exe` 映像仍被锁，NSIS 覆盖安装会失败或挂住（AGENTS.md 记录过 electron-builder 撞文件锁卡 10 分钟）。改为：停子进程 → 用 `server.stopAsync()`(`server.cjs:713-726`) 语义确认端口释放 → 才 `quitAndInstall`；停不下来要报错给用户而不是静默卡住。**入口有三条**都要收敛到同一实现：`main.cjs:407`（装更）、`:415`（普通退出）、`ipc.cjs:120`（`install_update` 短路，它走的是 `quitAndInstall` 内部触发的 quit，所以早先那版只写了前两条会漏）。
+`updater.cjs:270-289 triggerInstall` → 主进程退出路径的网关停机互锁，**Task 7 已落地**（行号以二期当前树为准）：唯一退出口 `quitForInstall()` 在 `main.cjs:49-64`，`before-quit` 拦截在 `main.cjs:461-482`（本条设计时锚的旧位置 `:362-373`、一期后曾写 `:399-416`，Task 5/6/7 改动 main.cjs 后漂移，退出逻辑已独立成 `quitForInstall` 函数）。旧病留档：互锁前 `before-quit` 只调本进程 `proxy.shutdown()`(`index.cjs:177-182`，**同步四行，内部 `server.stop()` 连监听释放都不等**；实测全仓 `store.close()` 零调用点)，够不到子进程：9527 仍被占、`AgentHub.exe` 映像仍被锁，NSIS 覆盖安装会失败或挂住（AGENTS.md 记录过 electron-builder 撞文件锁卡 10 分钟）。落地形态：停子进程走 `gatewayClient.stopAndWait()`（`main.cjs:55`，内部 `gateway_shutdown` → 等进程退 → 实测 connect 端口失败才算净，等价 `server.stopAsync()`(`server.cjs:713-726`) 的语义），停不下来/端口未释放时**显式 notify 报错**给用户而不是静默卡住（`main.cjs:60`）。**入口有三条**都已收敛到 `quitForInstall()`：`before-quit` 检出装更意愿（`main.cjs:470`）、`before-quit` 非托盘退出（`!quitting`，`main.cjs:471`）、`ipc.cjs:127` 的 `install_update` → `updater.requestInstall()`（`updater.cjs:302`，只打标记 + `app.quit()`，不再直连 `quitAndInstall` 绕过互锁）。**豁免一条（Task 7 定案）**：托盘「退出」（`quitting=true` 且无装更意愿）有意不拦——常驻网关「活过主 App」是 Task 6 的定案语义，非常驻子进程由看门狗 parent-exit 优雅停机兜住。
 
-### 5.7 归属划分（留主进程的四条）
+### 5.7 归属划分（Task 5 定案：43 条全部改走管道转发）
 
-`proxy_account_import_file`（`index.cjs:410-422` 文件框）、`proxy_open_rules_dir`(`:516`)、`proxy_open_data_dir`(`:520`)、`proxy_oauth_begin` 的 `shell.openExternal`(`:391`)。其余 39 条纯转发。
+**最终形态（2026-09-22 Task 5 刀 2 落地，提交 `e9a92bd` + 逐字相等闸 `b104759`）**：43 条 `proxy_*` 命令的 IPC 名字**逐字不动**（`preload.cjs` 白名单与 `src/api/ipc.ts` 零改动），实现体全部换成主进程注册面 `gateway-client.register(ipcMain)`（`electron/backend/gateway-client.cjs:489`）里的管道转发。**四处逐字相等闸**（`scripts/dev-gateway-forward-parity-test.cjs`）钉死归属：① preload 白名单 == ② main 一期基线（`git show main:electron/backend/proxy/index.cjs` 恰 43 条 `ipcMain.handle("proxy_…`）== ③ 主进程注册面收集到的键集，④ 子进程 `dispatchTable()` ⊇ ② 一条不得少；结构证据另断言 `ipc.cjs` 零直连注册、不再 require `proxy/index.cjs`、`main.cjs` 零 proxy 域 require（`store` 依赖图不回主进程）。
 
-> **2026-09-22 实测更正**：逐条把 43 个处理体的 electron 依赖扫过之后，「四条」实为 **6 条** —— 上面这段漏了 `proxy_status`(`:257`) 与 `proxy_vault_status`(`:524`)，两者都经 `vaultOk()`(`:233-240`) 读 `require("electron").safeStorage`，纯 Node 子进程里恒 `false`，会把保险状态误报给界面。本规格 §5.3 自己早已把 safeStorage 列为阻塞项，却没同步到这条归属表，属自相矛盾。二期计划（`plans/2026-09-22-gateway-lite-mode-phase2.md` Task 1/5）把 `vaultOk()` 改读凭据后端探测结果后，这 2 条回到可转发，最终定案是 **4 条真 UI 依赖 + 3 条薄包装（`proxy_start`/`stop`/`restart` 的 `restoreOnLaunch` 写权留主进程）+ 36 条纯转发 + 1 条新增子命令 `proxy_account_import_blob`**。
+留主进程的薄包装（`gateway-client.cjs:369` `UI_LOCAL` + `:371` `RUN_WRITE` 两个名单字面写死，反推会把整张依赖图拉回主进程）：
 
-`ccswitch.cjs` 与 `ideswitch.cjs` 本身是纯文件/SQLite 写，不需要 UI，跟网关走；但 `ccswitch.cjs:342-344` 注册条目时的端口回落读 `config.proxy.port`，双拓扑下真实监听端口在子进程 → 必须改从子进程状态取，否则注册进 CC Switch 的 `base_url` 指向死端口。
+- `proxy_account_import_file`：主进程开文件框 + 读字节（5 MB 上限），拆出**新增子命令** `proxy_account_import_blob` 过管道给子进程入库；
+- `proxy_open_rules_dir` / `proxy_open_data_dir`：`dialog`；
+- `proxy_oauth_begin`：`shell` 依赖收掉——浏览器打开改为 `oauth-open` 事件在 `main.cjs` 就地 `shell.openExternal`（CRITICAL_EVENTS 保投递），子进程只回业务结果；
+- `proxy_start` / `proxy_stop` / `proxy_restart`：`restoreOnLaunch` 写权留主进程（§六 的语义归主进程配置属主）；
+- `webdav_shared_save` 反向跨界写 `sync-state.json` 的口子同步收掉：主进程拆出 `proxy_poolsync_password_changed` 经管道直投（有意不进 preload 白名单，渲染层永不见它）。
+
+> **2026-09-22 实测更正（历史留档）**：初稿写「留主进程四条」漏了 `proxy_status` 与 `proxy_vault_status` 经 `vaultOk()` 读 `require("electron").safeStorage` 的问题。**Task 5 定案闭合了本节与 §5.3 的自相矛盾**：解密由子进程自带的 `secretbox`（DPAPI + AES-256-GCM，§5.3）承担，`vaultOk()` 改为凭据后端探测 `secretbox.backend() !== "none"`（`electron/backend/proxy/index.cjs:315`），`gatewayStatus()`（`:297`）随 `proxy_status` 整条转发回界面——子进程**不再误报**保险状态，这两条回到可转发，无需留主进程。四种后端（none / plain-dev / v10 / safeStorage）下 `vaultOk` 的取值由 `scripts/dev-secretbox-test.cjs` 的 vaultOk 四后端用例（第 14-17 项）钉住。
+
+`ccswitch.cjs` 与 `ideswitch.cjs` 本身是纯文件/SQLite 写，不需要 UI，跟网关走；`ccswitch.cjs:342-346` 注册条目时的端口回落已按本节要求改从子进程状态取（`server.status().port || 9527`，`config.proxy.port` 的 require 已移除），配置漂移/改端口未重启时不再把死端口写进 CC Switch 的 `base_url`。
 
 ## 六、配置项与语义变更
 
@@ -203,7 +254,7 @@
 | 字段 | 默认 | 期 | 语义 |
 |---|---|---|---|
 | `schedule.liteOnClose` | `true` | 一 | 关窗即销毁窗口回收 UI 内存；关掉则回到今天的 `hide()` 秒开行为 |
-| `schedule.launchHidden` | `false` | 一 | 启动不建窗，直接进托盘（实测 166.05 MB，比「建过再销毁」的 215.47 再省 49.42 MB） |
+| `schedule.launchHidden` | ~~`false`~~ → **`true`（三期起）** | 一 | 启动不建窗，直接进托盘（实测 166.05 MB，比「建过再销毁」的 215.47 再省 49.42 MB）。**【三期 Task 5 更正，2026-09-24】默认值改为 `true`**：三期把 `liteOnClose` + `launchHidden` 聚合为设置页单一「轻量模式」入口（读看主特征 `liteOnClose`、写同写两条，零 schema 变更），轻量态自洽要求两字段同真 ⇒ **全新安装开机不再自动弹界面**（用户已明确确认）。四处字面量（`electron/backend/config.cjs` / `src/stores/app.ts` / `src/api/mock.ts` / 闸夹具）同源，由 `scripts/dev-config-lite-defaults-test.cjs` 钉住；显式钉 `launchHidden: false` 的探针（`tools/phase1-browser-pass.cjs`、`tools/tray-reopen-watch.cjs`、`scripts/dev-first-paint-check.cjs`）不随默认漂移 |
 | `schedule.persistentGateway` | `false` | 二 | 主 App 退出时保留网关进程（无托盘） |
 
 字段间的关系，避免实现时各写各的：
@@ -231,9 +282,9 @@
 | 项 | 手段 |
 |---|---|
 | 一期体积 | 核 `dist/assets/` 分块字节数（不用构建退出码代替产物检查）；目标见 §4.3 |
-| 一期耗时 | CDP 实测「建窗 → 可交互」（AGENTS.md 第三节流程）；探针 `tmp/gateway-probe/memtree.ps1` 可复用 |
+| 一期耗时 | CDP 实测「建窗 → 可交互」（AGENTS.md 第三节流程）；探针 `tools/memtree.ps1` 可复用（Task 8 自 `tmp/gateway-probe/` 提级入库） |
 | 一期内存 | 关窗前后采 `PrivateMemorySize64`，对齐 **§4.1 更正后的判据**（相对降幅 + main 单列）。**不要**对齐 §三——那张表是合成探针，量的是 Electron 不是本应用（教训见 §一 表下说明） |
-| 探针卫生（一期 Task 7 暴露，二期必须遵守） | 用临时 userData 起打包版实例**并不等于隔离**：`hubDir()` 按 `os.homedir()` 解析，仍会读写共享中央仓库 `~/.agent_skills`；packaged 且非便携的实例每次启动都调 `applyAutoStart`，`autoStart` 默认 false 时会把**用户自己的**开机自启 Run 项删掉。故探针三件套：`AGENT_SKILLS_HOME=<临时目录>`（或临时 config 里 `watch.enabled:false`）+ 网关端口改到非 9527（9527 归用户实例，拿它的应答当本构建的证据是错的）+ 收尾核对 HKCU Run 值列表未变。一期四个探针脚本在 gitignored 的 `tmp/gateway-probe/`，二期复用时**四个一起**提到 `tools/`，别只提 `.cjs`（会留下对 `memtree.ps1` 的悬空引用）。另注意 `proxy.boot()` 里的 `discovery.cjs:34,37,347` 会读**真实本机登录文件**（CodeBuddy/Trae 的本地 auth），临时 userData 挡不住它——一期那次隔离实例 `/v1/models` 能列出 `trae` 的模型就是这个原因（只读，discovery/adapter 侧无写入调用；但报告写「号池为空」时必须同时说明这点），二期把 discovery 下沉到子进程时要一并处理。**二期新增第五条：凡「asar 内可 require / electron 不可得」类断言必须从中立 cwd（`%TEMP%` 下）起跑** —— 在仓库目录里跑时 `require("electron")` 会命中 devDependency 的 `node_modules/electron/index.js` 并返回一个 exe 路径**字符串**，于是"没有 Electron 绑定"的断言假绿（本次实测先踩了一次） |
+| 探针卫生（一期 Task 7 暴露，二期必须遵守） | 用临时 userData 起打包版实例**并不等于隔离**：`hubDir()` 按 `os.homedir()` 解析，仍会读写共享中央仓库 `~/.agent_skills`；packaged 且非便携的实例每次启动都调 `applyAutoStart`，`autoStart` 默认 false 时会把**用户自己的**开机自启 Run 项删掉。故探针三件套：`AGENT_SKILLS_HOME=<临时目录>`（或临时 config 里 `watch.enabled:false`）+ 网关端口改到非 9527（9527 归用户实例，拿它的应答当本构建的证据是错的）+ 收尾核对 HKCU Run 值列表未变。一期四个探针脚本原在 gitignored 的 `tmp/gateway-probe/`，**Task 8 已四个一起提级到 `tools/`**（`phase1-browser-pass` / `cascade-verify2` / `run-human-checks4` / `tray-reopen-watch`，连带依赖的 `memtree.ps1`、`close-window.ps1`、`list-and-clean.ps1`，不留悬空引用），`AGENT_SKILLS_HOME` 与 `applyAutoStart` 两个副作用的集中中和点在 `tools/probe-hygiene.cjs`（三件套在任何产品代码 require 之前指进临时目录 + HKCU Run 快照、退出时发现被改自动原样恢复；`list-and-clean.ps1` 的 kill 参数为空严格等价「只列不杀」，一期实测 `$null -ne ''` 为真曾把全部实例杀掉，已修并留注释）。另注意 `proxy.boot()` 里的 `discovery.cjs:34,37,347` 会读**真实本机登录文件**（CodeBuddy/Trae 的本地 auth），临时 userData 挡不住它——一期那次隔离实例 `/v1/models` 能列出 `trae` 的模型就是这个原因（只读，discovery/adapter 侧无写入调用；但报告写「号池为空」时必须同时说明这点），二期把 discovery 下沉到子进程时要一并处理。**二期新增第五条：凡「asar 内可 require / electron 不可得」类断言必须从中立 cwd（`%TEMP%` 下）起跑** —— 在仓库目录里跑时 `require("electron")` 会命中 devDependency 的 `node_modules/electron/index.js` 并返回一个 exe 路径**字符串**，于是"没有 Electron 绑定"的断言假绿（本次实测先踩了一次）。**真机批次②补第六条（打包态隔离的硬事实）**：打包版主进程的 `userData` 由 Chromium 已知目录决定，**只设 `APPDATA` 环境变量对它无效**（`config.cjs:50` 走 `app.getPath("userData")`），实测首轮因此把探针的 `save_config` 写进了用户真实 `config.json`；而网关子进程在 `ELECTRON_RUN_AS_NODE` 下 `electronApp=null`，`dataDir()` 回退读 `process.env.APPDATA`。所以要真隔离一个打包实例，**两个变量必须成对注入且方向不同**：主进程侧要么显式 `app.setPath("userData", …)`（探针用 `AGENTHUB_USER_DATA` 测试钩子，不入库），子进程侧设 `APPDATA`——只设其中一个就会出现「主进程读临时目录、子进程写真实 `%APPDATA%\AgentHub`」的分家，`gateway.json`/`stats.db` 落进用户真实目录（本批次前几轮踩过，用户 `config.json` 三开关全程未受影响，`stats.db` 曾被测试流量写过几行）。**三期 Task 8 补第七条（`--user-data-dir` 不够用）**：`--user-data-dir=<tmp>` 只隔离 Chromium 侧；网关子进程仍回退读 `%APPDATA%\AgentHub` 的 config（实测首轮子进程按默认值去绑用户端口 9527 并失败）。**且 `secretbox.assertUsable()` 需要同目录的 `Local State`**（DPAPI 解 `os_crypt.encrypted_key`），重定向后该文件不存在 ⇒ 子进程 `fatal {"message":"凭据解密失败…"}` → `exit 1`。后果最隐蔽的一点：**此时量到的 main 是一个「网关子进程早已死掉」的进程树，会把「少一个进程」误当「内存更低」**。故内存/进程树类测量的前置硬要求：临时目录里**只读复制真身 `Local State`**（真身 mtime 不得变），且**采样前确认子进程存活**（`gateway.log` 无 `fatal`）。**三期 Task 4 补第八条（按镜像名宽杀）**：探针**绝不许**按镜像名宽杀 `taskkill /F /IM AgentHub.exe /T` —— 它会连坐打死用户正在运行的实例，也会打死同期在跑的其它探针的常驻子进程（二期那条「WAL 冻结」就是被兄弟探针的宽杀连坐打死的泡机子进程，详见 §六 与 `task-4-report.md`）。收尾一律**按记下的 pid 精确清理**。 |
 | 按需注册静默坏掉 | 新增 CDP 冒烟：6 个 chunk 落点页各截一次 DOM，断言图表 canvas 存在、`el-date-picker` 面板月份为中文、图例已渲染 |
 | 图标子集 | 纯静态比对：`src` 用到的类名 ∪ 后端 `toolIcon()` 下发集合 ⊆ 生成的子集 CSS |
 | 二期 | 矩阵：安装版/便携版 × 常驻开关 × 升级装更。验「主 App 退出后 9527 仍通」「重开认领不起第二个进程」「WAL 不再单调增长」「装更前子进程已停」 |
