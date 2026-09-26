@@ -3,7 +3,8 @@
 // 少一条命令名就是渲染层拿到「未授权的 IPC 命令」或界面卡死（AGENTS.md 第四节），
 // 所以四个来源必须逐字相等，不允许可用别名词形（逐字，不是集合同构的宽容比较之外再加拼写）：
 //   ① preload.cjs 的 ALLOWED_COMMANDS 里 proxy_* 全集（渲染层唯一入口）
-//   ② 一期基线：git show main:electron/backend/proxy/index.cjs 里的 43 个 ipcMain.handle 名
+//   ② 一期基线：git show 9b5e966:electron/backend/proxy/index.cjs 里的 43 个 ipcMain.handle 名
+//     （9b5e966 = 一期落 main 的合并提交，锚点是**冻结提交**而非 `main` 分支——见 BASELINE_REF 处说明）
 //     （三期 Task 1 起另记「上游用户面新增」upstreamUserCmds：基线计数判据仍是 43 不变，
 //       但 ① 的比较对象是 ②∪upstreamUserCmds —— 渲染层新调用的命令必须同时过白名单与转发面）
 //   ③ 当前主进程注册面：gateway-client.register(收集器) 实际登记的命令名
@@ -19,7 +20,8 @@
 // 手法约束（与 Task 0/1/2 的闸同一套纪律）：
 //  · 只 require 产品模块、只建收集器，不起管道、不开端口、不 spawn 子进程、不碰真实 %APPDATA%
 //    （APPDATA / AGENT_SKILLS_HOME / CCSWITCH_DB_PATH 在任何产品 require 之前指到临时目录）；
-//  · ② 来自 git show main —— 一期基线是「用户已用过的行为」的快照，拿当前分支当基线 = 自我实现；
+//  · ② 来自 git show 冻结提交 9b5e966 —— 一期基线是「用户已用过的行为」的快照，
+//    拿当前分支当基线 = 自我实现（原实现读 `main`，合并后即踩此坑）；
 //  · 判据逐字比较（数组逐元素相等），不是「个数相等」：改名换字 headline 相等闸抓不住。
 "use strict";
 const { spawnSync } = require("node:child_process");
@@ -29,6 +31,13 @@ const path = require("node:path");
 
 const ROOT = path.resolve(__dirname, "..");
 const work = fs.mkdtempSync(path.join(os.tmpdir(), "agenthub-fwpar-"));
+
+// 一期基线锚点：**必须钉在冻结的提交上，不能写 `main`**（2026-09-26 合并上游时修的闸自身缺陷）。
+// 原实现读 `git show main:...`，其前提是「main 冻结在一期落点」；二期/三期一旦合回 main，
+// 基线就变成当前分支自己（43 → 46）⇒ 「①==②∪上游新增」与「基线恰 43 条」两条同时假红，
+// 而它想守的「用户已用过的行为快照」也彻底失去意义（自我实现，闸注释里本来就警告过这一点）。
+// 9b5e966 = 一期「网关轻量模式」落 main 的合并提交，proxy 域注册面 43 条且全为 proxy_*，此后未变。
+const BASELINE_REF = "9b5e966";
 
 // ===== 隔离：必须早于任何产品代码的 require =====
 process.env.APPDATA = path.join(work, "appdata");
@@ -53,11 +62,11 @@ const fromPreload = allowBlock
 check("① 能从 preload.cjs 解析出 proxy_* 白名单（非空）", fromPreload.length > 0,
   `解析到 ${fromPreload.length} 条 —— ALLOWED_COMMANDS 的字面量形状变了？`);
 
-console.log("② 一期基线（git show main:electron/backend/proxy/index.cjs）");
-const git = spawnSync("git", ["show", "main:electron/backend/proxy/index.cjs"], { cwd: ROOT, encoding: "utf8" });
+console.log(`② 一期基线（git show ${BASELINE_REF}:electron/backend/proxy/index.cjs）`);
+const git = spawnSync("git", ["show", `${BASELINE_REF}:electron/backend/proxy/index.cjs`], { cwd: ROOT, encoding: "utf8" });
 const baselineSrc = git.status === 0 ? git.stdout : "";
 const fromBaseline = [...baselineSrc.matchAll(/ipcMain\.handle\("([a-z0-9_]+)"/g)].map((m) => m[1]);
-check("② git show main 可用", git.status === 0, `exit=${git.status} ${String(git.stderr).slice(0, 200)}`);
+check(`② git show ${BASELINE_REF} 可用`, git.status === 0, `exit=${git.status} ${String(git.stderr).slice(0, 200)}`);
 check("② 基线里 proxy_* 注册恰为 43 条", fromBaseline.filter((n) => n.startsWith("proxy_")).length === 43,
   `数到 ${fromBaseline.filter((n) => n.startsWith("proxy_")).length} 条（43 = 用户已用过的一期行为面，条数变了先核基线再改判据）`);
 check("② 基线没有 proxy_ 之外的注册混进 index.cjs", fromBaseline.every((n) => n.startsWith("proxy_")),
