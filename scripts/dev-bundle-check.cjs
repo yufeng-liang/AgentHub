@@ -3,6 +3,7 @@
 // 用法：npm run build && node scripts/dev-bundle-check.cjs
 //       加 --check 跑漂移闸：与 scripts/.bundle-baseline.json 比对 entry/CSS 字节，漂移 >5% 红
 //       （首跑无基线时把当前值写进去，随提交入库；有意改体积后删掉基线文件重跑 --check 重录）。
+// 阈值沿革：CSS 硬上限 325 → 360 KB（2026-09-26 合并上游记忆仓库模块后重量，见该行注释）。
 "use strict";
 const fs = require("node:fs");
 const path = require("node:path");
@@ -27,7 +28,11 @@ const cssKB = css.reduce((s, f) => s + KB(fs.statSync(path.join(assets, f)).size
 const entryText = entry.toString("utf8");
 const fails = [];
 if (KB(entry.length) > 800) fails.push(`entry JS ${KB(entry.length).toFixed(0)} KB > 800 KB`);
-if (cssKB > 325) fails.push(`CSS 合计 ${cssKB.toFixed(0)} KB > 325 KB`);
+// CSS 上限 325 → 360 KB（2026-09-26 合并上游 v1.25.x）：上游新增第四大模块「记忆仓库」，
+// 带 src/styles/memory.css（40.1 KB 源）等，实测总量 331.8 KB ⇒ 325 这条会红。
+// 与 entry 一样留余量（实测的 ~8%）：这条是「防失控」的粗门槛，不是精确预算；
+// 真正的体积变化由下面的 --check 漂移闸（±5%）盯，两者分工不变。
+if (cssKB > 360) fails.push(`CSS 合计 ${cssKB.toFixed(0)} KB > 360 KB`);
 if (js.length < 15) fails.push(`JS chunk 只有 ${js.length} 个，视图没切开`);
 // echarts 的折线渲染实现只应出现在异步 chunk；这两个标识是全量与 core 共有的内部字段名
 if (/seriesType:\s*"line"/.test(entryText)) fails.push("echarts 疑似仍在 entry chunk");
