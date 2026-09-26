@@ -17,6 +17,8 @@ const usagesync = require("./backend/sync.cjs");
 // （Task 5 起 ipc.cjs 经它注册，主进程不再 require proxy 域 —— stats.db 归子进程独占）。
 // 日志由它自己经 gateway-log 落 proxyDir()/logs/gateway.log，主进程不再另开一份写点。
 const gatewayClient = require("./backend/gateway-client.cjs");
+// 记忆仓库模块：本机项目记忆的写入/检索/自动化/多机同步（主进程内，不 require proxy 域）
+const memory = require("./backend/memory/index.cjs");
 const usageScheduler = require("./backend/usage-scheduler.cjs");
 
 const DEV_URL = process.env.VITE_DEV_SERVER_URL || "http://localhost:1420";
@@ -52,6 +54,9 @@ function quitForInstall(wantInstall) {
   scheduler.stop();
   usageScheduler.stop();
   watch.stop();
+  // 记忆仓库在主进程内（与网关不同，网关已下沉子进程），退出前必须收口它的库句柄与计时器。
+  // 不 await 也不阻塞：与下面 gatewayClient.stopAndWait 并行收尾，各自 catch 兜住。
+  memory.shutdown().catch(() => {});
   gatewayClient.stopAndWait({ timeoutMs: 5000 })
     // stopAndWait 自己抛错也不能把退出挂死在 preventDefault 上：按「没停干净」续跑并留痕
     .catch((e) => ({ stopped: false, portFreed: false, message: String((e && e.message) || e) }))
@@ -463,6 +468,8 @@ if (!gotLock) {
         if (!win.isDestroyed()) win.webContents.send("app:event", payload);
       }
     });
+    // 记忆仓库：仓库初始化 + 本地 HTTP API（供 MCP 桥转发）+ 目录监听；失败只影响本模块
+    memory.boot().catch(() => {});
     // 启动即进托盘：首帧不建窗，GPU 侧连建窗残留都不产生（一期打包版实测私有 166.05 MB / GPU 32.2，
     // 对比「建过再销毁」的 215.47 MB，再省 49.42 MB）。
     // minimizeToTray 关时不生效 —— 那种配置下关窗就是退出，不该留一个没有界面的进程
@@ -504,6 +511,8 @@ if (!gotLock) {
     scheduler.stop();
     usageScheduler.stop();
     watch.stop();
+    // 记忆仓库在主进程内，必须在这里收口（网关子进程由 parent-exit / detach-keep 自行处理）
+    memory.shutdown().catch(() => {});
   });
 
   app.on("window-all-closed", () => {

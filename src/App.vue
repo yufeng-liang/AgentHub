@@ -16,11 +16,13 @@ import SkillsHelpDialog from "./components/SkillsHelpDialog.vue";
 // 用量统计模块（原「用量记录同步」）：数据源顶栏 + 五个页面 + 同步进度弹窗
 import SyncTopBar from "./components/sync/SyncTopBar.vue";
 import SyncDialog from "./components/sync/SyncDialog.vue";
-// 三大模块的页面视图：各自独立目录，分别开发互不干扰
-// 首屏落点三选一（moduleOrder 可被用户自定义排序覆盖，见 stores/app.ts:102-106）：留静态进 entry
+// 四大模块的页面视图：各自独立目录，分别开发互不干扰
+// 首屏落点四选一（moduleOrder 可被用户自定义排序覆盖，见 stores/app.ts:102-106）：留静态进 entry
 import SkillsDashboardView from "./views/skills/SkillsDashboardView.vue";
 import SyncOverviewView from "./views/sync/OverviewView.vue";
 import ProxyHomeView from "./views/proxy/ProxyHomeView.vue";
+import MemoryDashboardView from "./views/memory/DashboardView.vue";
+import { useMemoryStore } from "./stores/memory";
 
 // 其余页面按需加载。模板侧本来就是 v-if="seen(...)" 懒挂载（:560-589），
 // 改造前唯一的浪费是这些页面的代码也在首屏全量解析。
@@ -42,11 +44,25 @@ const ProxyCcSwitchView = defineAsyncComponent(() => import("./views/proxy/Proxy
 const ConfigSkillsSection = defineAsyncComponent(() => import("./components/config/ConfigSkillsSection.vue"));
 const ConfigUsageSection = defineAsyncComponent(() => import("./components/config/ConfigUsageSection.vue"));
 const ConfigProxySection = defineAsyncComponent(() => import("./components/config/ConfigProxySection.vue"));
+const ConfigMemorySection = defineAsyncComponent(() => import("./components/config/ConfigMemorySection.vue"));
+// 记忆仓库模块其余页面：仪表盘已在上方静态引入（首屏落点候选）
+const MemoryBrowseView = defineAsyncComponent(() => import("./views/memory/BrowseView.vue"));
+const MemoryProjectsView = defineAsyncComponent(() => import("./views/memory/ProjectsView.vue"));
+const MemoryProfileView = defineAsyncComponent(() => import("./views/memory/ProfileView.vue"));
+const MemoryAgentsView = defineAsyncComponent(() => import("./views/memory/AgentsView.vue"));
+const MemoryIndexView = defineAsyncComponent(() => import("./views/memory/IndexView.vue"));
+const MemoryAutoView = defineAsyncComponent(() => import("./views/memory/AutoView.vue"));
+const MemoryImportView = defineAsyncComponent(() => import("./views/memory/ImportView.vue"));
+const MemorySyncView = defineAsyncComponent(() => import("./views/memory/SyncView.vue"));
 import * as api from "./api/ipc";
 import type { UpdateEvent } from "./types";
 
 const app = useAppStore();
 const usage = useSyncStore();
+const memory = useMemoryStore();
+
+/** 记忆仓库默认页签：ui.defaultTab（只在首次进入该模块时生效，之后记住用户点过的页） */
+let memoryDefaultApplied = false;
 const usageData = useUsageStore();
 
 /** 系统级减弱动效偏好（VueUse 托管媒体查询，动效层统一听它） */
@@ -118,7 +134,8 @@ function bindPointer() {
   const onMove = (e: MouseEvent) => {
     mx = e.clientX;
     my = e.clientY;
-    hotEl = (e.target as HTMLElement)?.closest?.(".card, .kpi, .module-card") as HTMLElement | null;
+    // 记忆仓库的玻璃卡片（mem-card/mem-kpi/mem-tile）与用量统计卡片共用同一套聚光委托
+    hotEl = (e.target as HTMLElement)?.closest?.(".card, .kpi, .module-card, .mem-card, .mem-kpi, .mem-tile") as HTMLElement | null;
     if (!raf) raf = requestAnimationFrame(tick);
   };
 
@@ -446,7 +463,7 @@ function bindParticles() {
 /** 按钮点击涟漪：一次向外扩散，动画跑完自清（原生 .btn 与 Element 的 .el-button 都吃） */
 function bindRipple() {
   const onDown = (e: PointerEvent) => {
-    const btn = (e.target as HTMLElement)?.closest?.("button.btn, button.el-button, button.sk-btn") as HTMLButtonElement | null;
+    const btn = (e.target as HTMLElement)?.closest?.("button.btn, button.el-button") as HTMLButtonElement | null;
     if (!btn || btn.disabled) return;
     // 文字按钮不铺涟漪
     if (btn.classList.contains("btn-link") || btn.classList.contains("is-link") || btn.classList.contains("is-text")) return;
@@ -504,6 +521,11 @@ onMounted(() => {
       usageData.refreshQuietly();
       return;
     }
+    // 记忆仓库事件分流：store.onEvent 维护新记忆高亮/索引进度/统计重拉
+    if ((ev as { event?: string }).event === "memory") {
+      memory.onEvent(ev as unknown as Parameters<typeof memory.onEvent>[0]);
+      return;
+    }
     app.updateAvailable = ev.status === "available" || ev.status === "downloaded";
   });
   // 动效默认关闭：此刻 config.fx 是初始默认值，仅当（未来默认改动等）为真时才装；
@@ -524,6 +546,19 @@ watch(
     unmountFx();
     if (on) mountFx();
     setCursorFX(on);
+  }
+);
+
+/** 记忆仓库默认页签：ui.defaultTab（首次进入该模块时落到配置页签，之后记住用户点过的页） */
+watch(
+  () => app.activeModule,
+  (m) => {
+    if (m !== "memory" || memoryDefaultApplied) return;
+    memoryDefaultApplied = true;
+    void memory.loadAll().then(() => {
+      const def = memory.cfg("ui.defaultTab", "dashboard");
+      if (typeof def === "string" && app.pagesOf.some((p) => p.id === def)) app.activePage = def;
+    });
   }
 );
 
@@ -588,6 +623,17 @@ const seen = (mod: string, page: string) => !!visited.value[`${mod}/${page}`];
         <ProxyStatsView v-if="seen('proxy', 'stats')" v-show="on('proxy', 'stats')" :class="{ 'page-anim': on('proxy', 'stats') }" />
         <ProxyPoolSyncView v-if="seen('proxy', 'poolsync')" v-show="on('proxy', 'poolsync')" :class="{ 'page-anim': on('proxy', 'poolsync') }" />
         <ProxyCcSwitchView v-if="seen('proxy', 'ccswitch')" v-show="on('proxy', 'ccswitch')" :class="{ 'page-anim': on('proxy', 'ccswitch') }" />
+        <!-- 记忆仓库九页：各页自带 .memory-scope 容器（样式作用域见 styles/memory.css）；
+             模型与网关已并入配置页子板块，调用统计并入仪表盘；待确认并入记忆浏览 -->
+        <MemoryDashboardView v-if="seen('memory', 'dashboard')" v-show="on('memory', 'dashboard')" class="page" :class="{ 'page-anim': on('memory', 'dashboard') }" />
+        <MemoryBrowseView v-if="seen('memory', 'browse')" v-show="on('memory', 'browse')" class="page" :class="{ 'page-anim': on('memory', 'browse') }" />
+        <MemoryProjectsView v-if="seen('memory', 'projects')" v-show="on('memory', 'projects')" class="page" :class="{ 'page-anim': on('memory', 'projects') }" />
+        <MemoryProfileView v-if="seen('memory', 'profile')" v-show="on('memory', 'profile')" class="page" :class="{ 'page-anim': on('memory', 'profile') }" />
+        <MemoryAgentsView v-if="seen('memory', 'agents')" v-show="on('memory', 'agents')" class="page" :class="{ 'page-anim': on('memory', 'agents') }" />
+        <MemoryIndexView v-if="seen('memory', 'index')" v-show="on('memory', 'index')" class="page" :class="{ 'page-anim': on('memory', 'index') }" />
+        <MemoryAutoView v-if="seen('memory', 'auto')" v-show="on('memory', 'auto')" class="page" :class="{ 'page-anim': on('memory', 'auto') }" />
+        <MemoryImportView v-if="seen('memory', 'import')" v-show="on('memory', 'import')" class="page" :class="{ 'page-anim': on('memory', 'import') }" />
+        <MemorySyncView v-if="seen('memory', 'sync')" v-show="on('memory', 'sync')" class="page" :class="{ 'page-anim': on('memory', 'sync') }" />
         <!-- 三大模块的配置页：右上「配置」按钮切换到这里的页面（page + cfg-body 组合出页壳与留白）；
              配置页内部的二级子板块 tab 由各 section 自己渲染 -->
         <div v-if="seen('skills', 'config')" v-show="on('skills', 'config')" class="page cfg-body" :class="{ 'page-anim': on('skills', 'config') }">
@@ -598,6 +644,9 @@ const seen = (mod: string, page: string) => !!visited.value[`${mod}/${page}`];
         </div>
         <div v-if="seen('proxy', 'config')" v-show="on('proxy', 'config')" class="page cfg-body" :class="{ 'page-anim': on('proxy', 'config') }">
           <ConfigProxySection />
+        </div>
+        <div v-if="seen('memory', 'config')" v-show="on('memory', 'config')" class="page cfg-body" :class="{ 'page-anim': on('memory', 'config') }">
+          <ConfigMemorySection />
         </div>
       </div>
     </main>

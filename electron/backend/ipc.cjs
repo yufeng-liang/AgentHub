@@ -20,6 +20,7 @@ const watch = require("./watch.cjs");
 // §5.4 的「stats.db 子进程独占」就白做了。主进程对 proxy 域的 require 由
 // scripts/dev-gateway-forward-parity-test.cjs 钉死为零。
 const gatewayClient = require("./gateway-client.cjs");
+const memory = require("./memory/index.cjs");
 
 // 渲染层拿到的密码一律是掩码；保存/测试连接收到精确掩码时回填磁盘真值
 const PASSWORD_MASK = "••••••••";
@@ -482,6 +483,9 @@ function register(ctx) {
 
   // ===== 反代网关（Task 5：proxy_* 命令注册面在 gateway-client，实现体经管道在子进程 proxy/index.cjs） =====
   gatewayClient.register(ipcMain);
+
+  // ===== 记忆仓库（命令实现见 backend/memory/index.cjs；不 require proxy 域，只经 HTTP 探本机网关） =====
+  memory.register(ipcMain);
 }
 
 module.exports = { register };

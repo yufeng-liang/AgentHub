@@ -1,4 +1,4 @@
-// 自动感知：后台每 15 秒快照各工具技能目录的一层条目（名字+类型+mtime），
+// 自动感知：后台按配置周期快照各工具技能目录的一层条目（名字+类型+mtime），
 // 快照连续两拍稳定且变了才动作；只判断"变没变"，不看内容，开销随条目数走
 // 设计：零冲突零 error 的新收纳/挂载自动执行（覆盖删除全进回收站可还原）；
 // 有冲突绝不替人裁决，只托盘提醒
@@ -10,7 +10,16 @@ const adapter = require("./adapter.cjs");
 const syncer = require("./syncer.cjs");
 const remotesync = require("./remotesync.cjs");
 
-const INTERVAL_SECONDS = 15;
+const DEFAULT_INTERVAL_SECONDS = 15;
+
+// 周期可配（设置 · 同步时间）；每拍现读配置，改完下一拍即生效，无需重启
+function intervalSeconds() {
+  try {
+    const v = Number(config.loadConfig().watch?.intervalSeconds);
+    if (Number.isFinite(v) && v >= 5 && v <= 600) return Math.round(v);
+  } catch { /* 配置读取失败用默认 */ }
+  return DEFAULT_INTERVAL_SECONDS;
+}
 
 let timer = null;
 let baseline = ""; // 已对过账的快照
@@ -57,7 +66,7 @@ async function fingerprint(cfg) {
 }
 
 function status() {
-  return { intervalSeconds: INTERVAL_SECONDS, lastScanAt };
+  return { intervalSeconds: intervalSeconds(), lastScanAt };
 }
 
 // 变化判断：只有真正挡执行的内容冲突 / 异常才算硬冲突，不自动执行；
@@ -125,7 +134,13 @@ async function tick() {
 function start() {
   if (timer) return;
   stopped = false; // 允许重启感知：不清掉的话 start 之后每一拍都自我作废
-  timer = setInterval(tick, INTERVAL_SECONDS * 1000);
+  // setTimeout 链替代 setInterval：每拍现读配置周期，设置页改完下一拍即生效
+  // （tick 现在是异步的，链式排班会让相邻两拍重叠，由 tick 内的 ticking 闸兜住）
+  const loop = () => {
+    tick();
+    timer = setTimeout(loop, intervalSeconds() * 1000);
+  };
+  timer = setTimeout(loop, intervalSeconds() * 1000);
 }
 
 // 只清 timer 不够：stop() 那一刻可能正有一拍挂在 fingerprint 的 await 上，它会在停机之后
@@ -137,7 +152,7 @@ function start() {
 function stop() {
   stopped = true;
   if (timer) {
-    clearInterval(timer);
+    clearTimeout(timer);
     timer = null;
   }
 }

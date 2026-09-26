@@ -293,6 +293,7 @@ async function startRestore(zipPath) {
 }
 
 const CODEX_ARCHIVE_INDEX_KEY = "codex_archived_index";
+const DSH_SESSIONS_INDEX_KEY = "dsh_sessions_index";
 
 async function collectLocal(cfg, opts = {}) {
   const quiet = !!opts.quiet;
@@ -351,6 +352,12 @@ async function collectLocal(cfg, opts = {}) {
     await collectCodexArchived(cfg, deviceId, deviceName);
   }
 
+  // DeepSeek Harness 会话流水补充：官方账本（tokenledger）2026-09 起新版官方软件不再写入，
+  // 9 月后的用量只落在会话流水里；独立于账本增量锚点，按「路径→大小+mtime」清单只解析新变化的文件
+  if (activeSources.includes("dsh")) {
+    await collectDshSessions(cfg, deviceId, deviceName);
+  }
+
   return { deviceId, deviceName, deviceSources };
 }
 
@@ -377,6 +384,40 @@ async function collectCodexArchived(cfg, deviceId, deviceName) {
     db.setMeta(CODEX_ARCHIVE_INDEX_KEY, JSON.stringify(src.buildArchivedIndex(dir)));
   } catch (e) {
     log("extract", "error", "Codex 归档会话扫描失败，已跳过", e.message);
+  }
+}
+
+/** DeepSeek Harness 会话流水补充入库：首扫全量（含官方账本未覆盖的 2026-09 起增量），之后清单增量。失败仅记日志不阻断本轮。 */
+async function collectDshSessions(cfg, deviceId, deviceName) {
+  const src = adapter.byId("dsh");
+  if (!src || !src.extractSessions) return;
+  const sourceCfg = (cfg.sources || []).find((item) => item.source === "dsh");
+  const dir = sourceCfg?.dataDir || src.detect();
+  if (!dir || !src.validate(dir)) return;
+  try {
+    let index = null;
+    try {
+      const raw = db.getMeta(DSH_SESSIONS_INDEX_KEY);
+      if (raw) index = JSON.parse(raw);
+    } catch {
+      index = null; // 清单损坏按未处理对待，重扫全量（幂等无害）
+    }
+    const { records, settledFiles } = await src.extractSessions(dir, deviceId, deviceName, index);
+    if (records.length) {
+      db.insertRecords(records);
+      log("extract", "info", `DeepSeek Harness 会话流水补充入库：${records.length} 条记录`);
+    }
+    // 清单合并：本轮成功的文件用本轮账目；子进程崩溃/超时未完成的文件保留旧账（下轮重试）；
+    // 已消失的文件随枚举自然移除。绝不给未成功文件记新账，否则该文件数据永久漏采。
+    const fresh = src.buildSessionsIndex(dir);
+    const files = {};
+    for (const [rel, meta] of Object.entries(fresh.files)) {
+      if (settledFiles.has(rel)) files[rel] = settledFiles.get(rel);
+      else if (index && index.files && index.files[rel]) files[rel] = index.files[rel];
+    }
+    db.setMeta(DSH_SESSIONS_INDEX_KEY, JSON.stringify({ v: 1, files }));
+  } catch (e) {
+    log("extract", "error", "DeepSeek Harness 会话流水扫描失败，已跳过", e.message);
   }
 }
 
