@@ -362,6 +362,11 @@ const ALL_PROXY_CMDS = [
   "proxy_rules_list", "proxy_open_rules_dir", "proxy_open_data_dir", "proxy_vault_status",
   "proxy_poolsync_status", "proxy_poolsync_run", "proxy_poolsync_cancel",
   "proxy_ccswitch_status", "proxy_ccswitch_register",
+  // 自定义提供商（中转站 / 自建 OpenAI 兼容端点）：实现体在 index.cjs register() 内，
+  // 随 dispatchTable() 进子进程；主进程只转发。合并 main 时补——漏登记会让渲染层拿到
+  // 「未授权的 IPC 命令：proxy_provider_*」（AGENTS.md 第四节），parity 闸会盯住。
+  "proxy_provider_list", "proxy_provider_create", "proxy_provider_update", "proxy_provider_delete",
+  "proxy_provider_add_key", "proxy_provider_remove_key", "proxy_provider_test", "proxy_provider_fetch_models",
 ];
 
 // 4 条真 UI 依赖（规格 §5.7 归属定案）：实现体在本文件，不经管道（dialog/shell 子进程拿不到）。

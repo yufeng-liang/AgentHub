@@ -27,7 +27,10 @@ async function main() {
   // 1. 数据库 + 种子
   store.open();
   console.log("db driver:", store.driver());
-  assert(store.listAgents().length === store.CHANNELS.length, "渠道种子数 = CHANNELS 数（4：trae/workbuddy/workbuddy_ai/raccoon）");
+  const builtin = store.listAgents().filter((a) => a.kind === "builtin");
+  assert(builtin.length === store.BUILTIN_CHANNELS.length, "内置渠道种子数 = BUILTIN_CHANNELS 数（4：trae/workbuddy/workbuddy_ai/raccoon）");
+  assert(store.listProviders().length === 0, "新建库不含自定义提供商：种子只播内置 4 行，提供商一律由用户创建");
+  assert(store.channelList().length === store.BUILTIN_CHANNELS.length, "空库的路由视图 = 内置渠道（无提供商可合并）");
 
   // 2. Key 全链路
   const k = store.createKey({ name: "自测", route: "auto", dailyQuota: 10, rateLimit: 0 });
@@ -148,7 +151,7 @@ async function main() {
   // ===== 商汤小浣熊（raccoon 渠道）离线断言 =====
   const rc = adapters.get("raccoon");
   assert(rc && rc.id === "raccoon", "raccoon 适配器注册");
-  assert(store.CHANNELS.some((c) => c.id === "raccoon"), "store.CHANNELS 含 raccoon");
+  assert(store.BUILTIN_CHANNELS.some((c) => c.id === "raccoon"), "store.BUILTIN_CHANNELS 含 raccoon");
   assert(adapters.modelOwners("raccoon-chat-ml-5-5")[0] === "raccoon", "raccoon-chat-ml-5-5 归属 raccoon");
   assert(rc.mapModel("raccoon-chat") === "raccoon-chat-ml-5-5" && rc.mapModel("raccoon-chat-ml") === "raccoon-chat-ml-5-5", "raccoon 模型别名归一");
   const rbody = rc.rewriteBody("raccoon-chat", { model: "raccoon-chat", conversation_id: "x", prompt_cache_key: "y", messages: [{ role: "user", content: "hi" }], temperature: 0.7 });

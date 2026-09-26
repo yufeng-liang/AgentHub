@@ -95,8 +95,8 @@ const steps = computed<{ id: string; title: string; desc: string; link?: boolean
 const tips: Record<string, string> = {
   start: "服务启动后网关才开始转发请求；监听端口和绑定地址可以在「配置 → 反代网关」里修改，改完需要重新启动服务。",
   key: "API Key 相当于访问网关的密码，客户端用它证明身份。生成后可随时在 Key 列表里查看 / 复制完整 Key；泄露或丢失就删掉重新生成一个。",
-  base: "这是 OpenAI 兼容地址——所有支持“自定义 OpenAI 接口”的软件都能直接填用，不需要装任何插件。默认只监听本机，局域网其他设备访问需在「配置 → 反代网关」里改绑定地址。",
-  model: "模型名必须填网关渠道实际提供的名称（在渠道详情里能看到），填了不存在的名称会报 model not found / 404。",
+  base: "同一个地址讲两种协议：OpenAI 兼容软件（Cursor / Cline / Roo / TRAE 等）直接填上面的 Base URL；<br />Claude Code 走 <span class=\"mono\">ANTHROPIC_BASE_URL</span>，它会把地址拼成 <span class=\"mono\">&lt;base&gt;/v1/messages</span>，所以要填<b>去掉末尾 /v1</b> 的形式（例如 http://127.0.0.1:9527），Key 填在 <span class=\"mono\">ANTHROPIC_AUTH_TOKEN</span>。<br />默认只监听本机；局域网其他设备访问需在「配置 → 反代网关」里改绑定地址。",
+  model: "模型名要填网关实际提供的名称（在「模型目录」页能看到）。接入自定义提供商后，用它的前缀形态 <b>标识/模型名</b>（如 myrelay/gpt-4o）——这个形式是唯一确定的路由写法，裸模型名一律先归内置生态渠道，只有内置目录里没有、且恰好只有一家提供商拥有时才会落到提供商。",
 };
 const openHint = ref<string | null>(null);
 function toggleHint(id: string) {
@@ -109,6 +109,8 @@ function closeHint() {
 /** 地址条与端点标签：点一下整条进剪贴板；文本全部来自实时配置，改端口/绑定后跟着变 */
 const endpoints = [
   { key: "chat", text: "POST /v1/chat/completions" },
+  { key: "messages", text: "POST /v1/messages" },
+  { key: "responses", text: "POST /v1/responses" },
   { key: "models", text: "GET /v1/models" },
   // 二期 Task 3 拆语义：/healthz = 进程活着（liveness），/readyz = 号池可用（readiness）。
   // 两条都列出来，免得只看 healthz 以为「200 = 网关能干活」
@@ -130,7 +132,28 @@ function goKeys() {
   app.setPage("keys");
 }
 
-const exTab = ref<"curl" | "py" | "app">("curl");
+const exTab = ref<"curl" | "py" | "app" | "cli">("curl");
+
+/** 编程 CLI 的接法：两家拼 URL 的规矩正好相反，写错一侧就是 404，所以两段都标在注释里 */
+const cliCmd = computed(() => {
+  const origin = base.value.replace(/\/v1$/, "");
+  return (
+    `# Claude Code —— 走 /v1/messages\n` +
+    `setx ANTHROPIC_BASE_URL   "${origin}"      # 只到端口：它自己拼 /v1/messages\n` +
+    `setx ANTHROPIC_AUTH_TOKEN "sk-你的Key"\n` +
+    `setx ANTHROPIC_MODEL      "我的中转/claude-sonnet-4-5"\n\n` +
+    `# Codex CLI —— 走 /v1/responses，配置在 ~/.codex/config.toml\n` +
+    `model_provider = "agenthub"\n` +
+    `model = "我的中转/gpt-4o"        # 自定义 base_url 时 Codex 不拉模型目录，只能手填\n\n` +
+    `[model_providers.agenthub]\n` +
+    `name = "AgentHub 网关"\n` +
+    `base_url = "${base.value}"    # 必须自带 /v1：它只做 base + "/responses"\n` +
+    `wire_api = "responses"            # "chat" 已从 Codex 删除，写它会硬报错\n` +
+    `env_key = "AGENTHUB_API_KEY"\n` +
+    `stream_idle_timeout_ms = 300000\n\n` +
+    `setx AGENTHUB_API_KEY "sk-你的Key"        # 换终端才生效；macOS/Linux 用 export`
+  );
+});
 
 /** 本页是否处于前台：页面经 v-show 保活，切走后轮询与事件刷新必须停下来，
     否则总览在后台持续拉数据重渲染，挤占前台页（号池等）的每一帧 */
@@ -274,6 +297,7 @@ onUnmounted(() => {
           <button class="ex-tab" :class="{ on: exTab === 'curl' }" @click="exTab = 'curl'">curl 命令</button>
           <button class="ex-tab" :class="{ on: exTab === 'py' }" @click="exTab = 'py'">Python（OpenAI SDK）</button>
           <button class="ex-tab" :class="{ on: exTab === 'app' }" @click="exTab = 'app'">桌面客户端</button>
+          <button class="ex-tab" :class="{ on: exTab === 'cli' }" @click="exTab = 'cli'">编程 CLI</button>
           <span class="ex-note">把 <b>sk-你的Key</b> 换成第 2 步生成的 Key<span class="qwrap">
             <span class="qmark" :class="{ on: openHint === 'replace' }" @click.stop="toggleHint('replace')">?</span>
             <span v-if="openHint === 'replace'" class="qpop">示例里的"sk-你的Key"和模型名都是占位符，替换成你自己的真实值才能跑通。</span>
@@ -281,6 +305,7 @@ onUnmounted(() => {
         </div>
         <div v-if="exTab === 'curl'" class="code">{{ curlCmd }}</div>
         <div v-if="exTab === 'py'" class="code">{{ pyCmd }}</div>
+        <div v-if="exTab === 'cli'" class="code">{{ cliCmd }}</div>
         <ol v-if="exTab === 'app'" class="app-steps">
           <li>打开客户端的「设置 → 模型服务」，点「添加」，选择 <b>OpenAI 兼容 / 自定义</b> 类型。</li>
           <li>API 地址：填上方第 3 步的 Base URL（以 <b>/v1</b> 结尾；个别客户端只要求填到端口，按它的提示来）。</li>

@@ -5,7 +5,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import * as api from "../../api/ipc";
-import type { ProxyChannelView, ProxyAccount, ProxyChannelId, ProxyPoolStrategy, ProxyScanCandidate, ProxyCheckinRow } from "../../types";
+import type { ProxyChannelView, ProxyAccount, ProxyChannelId, ProxyBuiltinChannelId, ProxyChannelKind, ProxyPoolStrategy, ProxyScanCandidate, ProxyCheckinRow } from "../../types";
 import { useAppStore } from "../../stores/app";
 import { fmtInt, fmtK, fmtDate, fmtAgo, ACCOUNT_STATUS, SOURCE_NAMES, channelName } from "./format";
 
@@ -34,12 +34,27 @@ const ideSwitching = ref("");
 let offEvent: (() => void) | undefined;
 
 // 渠道主按钮元信息：图标 + 差异说明（各渠道登录/签到形态互不相同，一眼看出各自独立）
-const CHANNEL_META: Record<ProxyChannelId, { icon: string; hint: string }> = {
+// 键类型收在 ProxyBuiltinChannelId：既保住"漏配某个内置渠道"的编译期检查，
+// 又逼着提供商走 PROVIDER_META 这条显式分支（提供商 id 是运行期数据，不可能配进这张表）
+const CHANNEL_META: Record<ProxyBuiltinChannelId, { icon: string; hint: string }> = {
   trae: { icon: "ph-code-simple", hint: "回环登录 · 每日签到" },
   workbuddy: { icon: "ph-buildings", hint: "官方登录 · 每日签到" },
   workbuddy_ai: { icon: "ph-globe-hemisphere-west", hint: "国际版 · 一次性加油包" },
   raccoon: { icon: "ph-paw-print", hint: "文件导入/粘贴 · 每日签到" },
 };
+// 自定义提供商只有 API Key：没有登录态、没有签到、没有余额概念，措辞要与生态渠道明确区分
+const PROVIDER_META = { icon: "ph-plugs-connected", hint: "API Key 轮转 · 无余额概念" };
+
+function isBuiltin(ch: ProxyChannelView) {
+  return ch.kind !== "openai_compat";
+}
+function metaOf(ch: ProxyChannelView) {
+  return isBuiltin(ch) ? CHANNEL_META[ch.id as ProxyBuiltinChannelId] ?? PROVIDER_META : PROVIDER_META;
+}
+/** 按渠道 id 反查 kind：账号行只带 channel，而"能不能签"/"能不能写回 IDE"这类判断必须先看渠道类型 */
+function channelKind(id: ProxyChannelId): ProxyChannelKind {
+  return pool.value.find((c) => c.id === id)?.kind || "builtin";
+}
 
 // 签到状态区：结果按渠道各自记忆，切渠道互不串扰；跑完弹弹窗展示「发起签到那个渠道」的结果
 const checkinBusy = ref(false);
@@ -64,9 +79,10 @@ function putCheckin(channel: ProxyChannelId, rows: ProxyCheckinRow[]) {
 }
 
 // 添加账号弹窗（四方式：oauth 官方登录 / local 从本机软件导入 / file 从 JSON-ZIP 文件 / paste 粘贴 JSON）
+// 渠道类型收在内置：提供商的 Key 在「提供商」页管（openAdd 已提前分流），这里的弹窗只服务生态渠道
 type AddMethod = "oauth" | "local" | "file" | "paste";
 const addOpen = ref(false);
-const addChannel = ref<ProxyChannelId>("trae");
+const addChannel = ref<ProxyBuiltinChannelId>("trae");
 const addMethod = ref<AddMethod>("oauth");
 const pasteJson = ref("");
 const pasteMsg = ref("");
@@ -270,6 +286,10 @@ async function ideSwitch(acc: ProxyAccount) {
 
 /** 该账号能否写回本地客户端（Trae 的登录态是加密信封，写不了） */
 function ideSupported(acc: ProxyAccount) {
+  // 自定义提供商的账号是一把第三方 API Key，本机没有对应的客户端登录态可写。
+  // 必须挡在最前面：下面的分支对未知渠道会回落到 WorkBuddy 的判定，
+  // 放过去就会把中转站 Key 写进 WorkBuddy 的登录文件。
+  if (channelKind(acc.channel) !== "builtin") return false;
   if (acc.channel === "trae") return false;
   if (!ideStatus.value) return true;
   if (acc.channel === "raccoon") return ideStatus.value.raccoonInstalled !== false;
@@ -277,6 +297,7 @@ function ideSupported(acc: ProxyAccount) {
 }
 
 function ideTitle(acc: ProxyAccount) {
+  if (channelKind(acc.channel) !== "builtin") return "自定义提供商只有一把 API Key，本机没有对应的客户端登录态可写回";
   if (acc.channel === "trae") return "Trae 本地登录态为 ByteCrypto 加密信封（绑定设备密钥），无法构造合法信封，暂不支持写回";
   if (acc.channel === "raccoon") return "把该账号写为本机 ~/.box-agent/config/auth.json（小浣熊登录态，明文 JSON，需重启客户端生效）";
   if (!ideSupported(acc)) return "本机未找到对应客户端的登录文件（未安装或从未登录过）";
@@ -373,7 +394,14 @@ async function doDelete() {
 // ===== 添加账号 =====
 
 function openAdd(ch: ProxyChannelView) {
-  addChannel.value = ch.id;
+  // 提供商的 Key 归「提供商」页管（一把一填，带去重与连通性探测）。这里不复用四方式弹窗：
+  // OAuth / 本机软件导入 / 凭据包 JSON 对中转站都不成立，硬塞进去只会摆三个必然失败的按钮
+  if (!isBuiltin(ch)) {
+    app.setPage("providers");
+    return;
+  }
+  // 上面已按 kind 分流，走到这里 ch 必是内置渠道
+  addChannel.value = ch.id as ProxyBuiltinChannelId;
   // 各渠道默认都落 OAuth 登录（raccoon 现在也支持——手动粘贴回调地址换 token）
   addMethod.value = "oauth";
   pasteJson.value = "";
@@ -678,7 +706,7 @@ onUnmounted(() => {
         >
           <span class="ch-text">
             <span class="ch-name">{{ ch.display }}</span>
-            <span class="ch-hint">{{ CHANNEL_META[ch.id]?.hint }}</span>
+            <span class="ch-hint">{{ metaOf(ch).hint }}</span>
           </span>
           <span class="ch-badge" :class="{ ok: ch.summary.onlineCount > 0 }">
             {{ ch.summary.accountCount ? `${ch.summary.onlineCount}/${ch.summary.accountCount} 可用` : "空号池" }}
@@ -688,7 +716,7 @@ onUnmounted(() => {
       <template v-for="ch in pool" :key="ch.id">
       <div v-if="ch.id === activeChannel" class="card channel-panel" style="margin-bottom: 12px">
         <div class="card-title">
-          <i class="ph" :class="CHANNEL_META[ch.id]?.icon"></i>
+          <i class="ph" :class="metaOf(ch).icon"></i>
           {{ ch.display }}
           <span class="tag" :class="ch.summary.onlineCount > 0 ? 'tag-ok' : 'tag-dim'">
             {{ ch.summary.accountCount ? `${ch.summary.onlineCount}/${ch.summary.accountCount} 可用` : "空号池" }}
@@ -703,37 +731,47 @@ onUnmounted(() => {
             >
               <option v-for="s in STRATEGIES" :key="s.value" :value="s.value">{{ s.label }}</option>
             </select>
-            <button class="btn btn-sm" @click="openAdd(ch)">添加账号</button>
-            <button
-              v-if="ch.id === 'workbuddy_ai'"
-              class="btn btn-sm"
-              :disabled="checkinBusy"
-              :title="'国际版无每日签到，这是一次性 trial 加油包'"
-              @click="runTrial"
-            >{{ checkinBusy ? "领取中…" : "领加油包" }}</button>
-            <button v-else class="btn btn-sm" :disabled="checkinBusy" @click="runCheckinChannel">
-              {{ checkinBusy ? "签到中…" : "一键签到" }}
-            </button>
-            <button class="btn btn-sm btn-primary" :disabled="refreshingChannel" @click="refreshCurrentChannel">
-              {{ refreshingChannel ? "刷新中…" : "刷新" }}
-            </button>
+            <button class="btn btn-sm" @click="openAdd(ch)">{{ isBuiltin(ch) ? "添加账号" : "管理 Key" }}</button>
+            <!-- 签到 / 加油包 / 额度刷新都是生态渠道专属动作：自定义提供商只有一把 API Key，
+                 既没有每日签到可领，也没有余额可查（主进程一律明确拒答，不该在界面上摆出来） -->
+            <template v-if="isBuiltin(ch)">
+              <button
+                v-if="ch.id === 'workbuddy_ai'"
+                class="btn btn-sm"
+                :disabled="checkinBusy"
+                :title="'国际版无每日签到，这是一次性 trial 加油包'"
+                @click="runTrial"
+              >{{ checkinBusy ? "领取中…" : "领加油包" }}</button>
+              <button v-else class="btn btn-sm" :disabled="checkinBusy" @click="runCheckinChannel">
+                {{ checkinBusy ? "签到中…" : "一键签到" }}
+              </button>
+              <button class="btn btn-sm btn-primary" :disabled="refreshingChannel" @click="refreshCurrentChannel">
+                {{ refreshingChannel ? "刷新中…" : "刷新" }}
+              </button>
+            </template>
           </span>
         </div>
         <!-- 聚合顶部（单一数据源实时推导） -->
         <div class="agg">
-          <div class="agg-item"><span>总余额</span><b>{{ fmtInt(ch.summary.totalCredits) }}</b></div>
-          <div class="agg-item"><span>账号数</span><b>{{ ch.summary.accountCount }}</b></div>
+          <!-- 提供商没有余额与到期概念（API Key 不设额度、不过期）：硬显示 0 会被读成「余额不足」，
+               而这三项对生态渠道是真信息，所以按 kind 隐藏而不是换成假数据 -->
+          <div v-if="isBuiltin(ch)" class="agg-item"><span>总余额</span><b>{{ fmtInt(ch.summary.totalCredits) }}</b></div>
+          <div class="agg-item"><span>{{ isBuiltin(ch) ? "账号数" : "Key 数" }}</span><b>{{ ch.summary.accountCount }}</b></div>
           <div class="agg-item"><span>可用</span><b>{{ ch.summary.onlineCount }}</b></div>
-          <div class="agg-item"><span>最早到期</span><b>{{ ch.summary.earliestExpire ? fmtDate(ch.summary.earliestExpire) : "-" }}</b></div>
+          <div v-if="isBuiltin(ch)" class="agg-item"><span>最早到期</span><b>{{ ch.summary.earliestExpire ? fmtDate(ch.summary.earliestExpire) : "-" }}</b></div>
           <div class="agg-item"><span>今日消耗</span><b>{{ ch.summary.todayReq }} 次 · {{ fmtK(ch.summary.todayTokens) }}</b></div>
-          <div class="agg-item"><span>上次刷新</span><b>{{ fmtAgo(ch.summary.lastCreditsAt) }}</b></div>
+          <div v-if="isBuiltin(ch)" class="agg-item"><span>上次刷新</span><b>{{ fmtAgo(ch.summary.lastCreditsAt) }}</b></div>
         </div>
         <!-- 账号明细：6 列两行式布局 —— 账号列首行为名称、副行是来源与 UID（点击看全文）；
              状态列点击弹液态玻璃小窗（只显最近一次上游错误全文），冷却剩余时间直接在列表里秒级跳动 -->
         <div class="tbl-wrap" style="margin-top: 8px">
           <table class="tbl pool-tbl">
             <tbody>
-              <tr><th>账号</th><th>状态</th><th>余额</th><th>到期</th><th>今日</th><th>操作</th></tr>
+              <tr>
+                <th>账号</th><th>状态</th>
+                <template v-if="isBuiltin(ch)"><th>余额</th><th>到期</th></template>
+                <th>今日</th><th>操作</th>
+              </tr>
               <tr v-for="acc in ch.accounts" :key="acc.id">
                 <td class="acc-cell">
                   <span v-if="renamingId !== acc.id" class="acc-name" :title="acc.name + '（点击重命名）'" @click="startRename(acc)">{{ acc.name || "（未命名账号）" }}</span>
@@ -769,15 +807,18 @@ onUnmounted(() => {
                   <!-- 模型级冷却（6004/11102 不落账号状态）：悬浮看逐模型明细 -->
                   <span v-if="modelCoolLeft(acc)" class="cool-left mono" :title="modelCoolTitle(acc)">模型冷却剩 {{ modelCoolLeft(acc) }}</span>
                 </td>
-                <td class="mono num">{{ acc.hasToken ? (acc.credits === -1 ? "不限" : fmtInt(acc.credits)) : "-" }}</td>
-                <td class="mono">{{ acc.expiresAt ? fmtDate(acc.expiresAt) : "-" }}</td>
+                <template v-if="isBuiltin(ch)">
+                  <td class="mono num">{{ acc.hasToken ? (acc.credits === -1 ? "不限" : fmtInt(acc.credits)) : "-" }}</td>
+                  <td class="mono">{{ acc.expiresAt ? fmtDate(acc.expiresAt) : "-" }}</td>
+                </template>
                 <td class="mono num">{{ acc.todayReq }} 次 · {{ fmtK(acc.todayTokens) }}</td>
                 <td>
-                  <button class="btn-link btn-sm" :disabled="refreshingId === acc.id" @click="refreshOne(acc)">
+                  <!-- 单行「刷新」= 查一次余额，对只有 API Key 的提供商没有对象（主进程会明确拒答），故隐藏 -->
+                  <button v-if="isBuiltin(ch)" class="btn-link btn-sm" :disabled="refreshingId === acc.id" @click="refreshOne(acc)">
                     {{ refreshingId === acc.id ? "刷新中…" : "刷新" }}
                   </button>
                   <button
-                    v-if="acc.hasToken"
+                    v-if="acc.hasToken && isBuiltin(ch)"
                     class="btn-link btn-sm"
                     :disabled="checkinBusy"
                     :title="acc.channel === 'workbuddy_ai' ? '国际版无每日签到，用上方工具栏「领加油包」' : acc.channel === 'raccoon' ? '登录送积分（幂等，锁定当日积分 7 天）' : '对该账号执行每日签到'"
@@ -786,6 +827,7 @@ onUnmounted(() => {
                     签到
                   </button>
                   <button
+                    v-if="isBuiltin(ch)"
                     class="btn-link btn-sm"
                     :disabled="ideSwitching === acc.id || !ideSupported(acc)"
                     :title="ideTitle(acc)"

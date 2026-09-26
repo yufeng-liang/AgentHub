@@ -152,6 +152,15 @@ const ALLOWED_COMMANDS = new Set([
   "proxy_poolsync_status",
   "proxy_poolsync_run",
   "proxy_poolsync_cancel",
+  // ===== 反代网关：自定义提供商（中转站 / 自建 OpenAI 兼容端点） =====
+  "proxy_provider_list",
+  "proxy_provider_create",
+  "proxy_provider_update",
+  "proxy_provider_delete",
+  "proxy_provider_add_key",
+  "proxy_provider_remove_key",
+  "proxy_provider_test",
+  "proxy_provider_fetch_models",
   // ===== 反代网关：生态接入（CC Switch） =====
   "proxy_ccswitch_status",
   "proxy_ccswitch_register",

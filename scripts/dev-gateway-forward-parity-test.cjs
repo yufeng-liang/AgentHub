@@ -5,14 +5,14 @@
 //   ① preload.cjs 的 ALLOWED_COMMANDS 里 proxy_* 全集（渲染层唯一入口）
 //   ② 一期基线：git show 9b5e966:electron/backend/proxy/index.cjs 里的 43 个 ipcMain.handle 名
 //     （9b5e966 = 一期落 main 的合并提交，锚点是**冻结提交**而非 `main` 分支——见 BASELINE_REF 处说明）
-//     （三期 Task 1 起另记「上游用户面新增」upstreamUserCmds：基线计数判据仍是 43 不变，
-//       但 ① 的比较对象是 ②∪upstreamUserCmds —— 渲染层新调用的命令必须同时过白名单与转发面）
+//     （三期 Task 1 起另记「基线外用户面新增」extraUserCmds：基线计数判据仍是 43 不变，
+//       但 ① 的比较对象是 ②∪extraUserCmds —— 渲染层新调用的命令必须同时过白名单与转发面）
 //   ③ 当前主进程注册面：gateway-client.register(收集器) 实际登记的命令名
 //     （= 37 条转发 + 4 条 UI_LOCAL + 3 条薄包装，Task 5 起主进程只从这里注册）
 //   ④ 子进程 dispatchTable() 的键集（命令实现体真正的所在地）
 // 断言：①==②∪上游新增==③ 且 ④ ⊇ ②（子进程可以有多出来的 gateway_* 内建命令与 newSubCmds /
-//       upstreamUserCmds 里登记的名，但不得少任何 proxy_*）；② 之外的名不在 ④⊇② 的覆盖面上，
-//       故 upstreamUserCmds 逐条循环生成「体必须在子进程」的成员断言（评审 I-1：不留只加名单的缝隙）。
+//       extraUserCmds 里登记的名，但不得少任何 proxy_*）；② 之外的名不在 ④⊇② 的覆盖面上，
+//       故 extraUserCmds 逐条循环生成「体必须在子进程」的成员断言（评审 I-1：不留只加名单的缝隙）。
 //       另钉两条归属结构证据：
 //   · ipc.cjs 不得再直连注册 proxy_*、不得再 require ./proxy/index.cjs（整张依赖图会被一条 require 拉回主进程）
 //   · main.cjs 不得再 require proxy 域（stats.db 子进程独占由此达成）
@@ -105,25 +105,37 @@ try {
   check("④ dispatchTable() 可在纯 Node 收集", false, String((e && e.message) || e));
 }
 const newSubCmds = ["proxy_account_import_blob", "proxy_poolsync_password_changed"];
-// 上游 v1.18.0 带来的「用户面」新命令：渲染层真会调用它 ⇒ 必须同时进 preload 白名单（①）、
-// 主进程转发面（③）与子进程实现体（④）。与 newSubCmds 的分工：那两条是子进程内部辅助半段
+// 一期基线之外的「用户面」新命令：渲染层真会调用它们 ⇒ 必须同时进 preload 白名单（①）、
+// 主进程转发面（③）与子进程实现体（④）。与 newSubCmds 的分工：那些是子进程内部辅助半段
 // （不过 preload，渲染层看不见，只进 ④ 的白名单），这里每一条则是完整的一条命令面。
 // ② 的「43 条」计数判据不动（它钉的是「用户已用过的行为」快照本身）；只在**比较**时并入这些新增，
-// 等价于把不变式从「① == ②」升级为「① == ② ∪ 上游用户面新增」——归因写在此处与提交信息里。
+// 等价于把不变式从「① == ②」升级为「① == ② ∪ 基线外用户面新增」——归因写在每条 why 与提交信息里。
+// （2026-09-26 合并 main 时把名单从 upstreamUserCmds 改名为 extraUserCmds：来源已不止上游，
+//   本分支的自定义提供商也贡献了 8 条。归因逐条写在 why 里，不再由变量名暗示来源。）
 // 评审 I-1：下面的 ④ ⊇ ② 只覆盖一期基线，基线之外的名**靠这里逐条循环生成成员断言**钉住
 // ⇒ 往这个名单里加一条名字，就自动多一条「实现体必须在子进程 dispatchTable()」的红，
 // 不必再手写单条，也不会出现「只加名单、把实现体留在主进程」而四面全绿（§5.4 单一写者被破）。
-const upstreamUserCmds = [
+const extraUserCmds = [
   { name: "proxy_account_rename", why: "上游 v1.18.0 账号重命名，写号池故必须归子进程" },
+  // 本分支「自定义提供商」新增的 8 条：写号池（agents/accounts 表）故必须归子进程，
+  // 主进程只转发。合并 main 时正是这条闸报出它们漏进了转发白名单。
+  { name: "proxy_provider_list", why: "自定义提供商：列提供商（读号池 agents 表）" },
+  { name: "proxy_provider_create", why: "自定义提供商：新建（写号池 agents/accounts）" },
+  { name: "proxy_provider_update", why: "自定义提供商：更新（写号池）" },
+  { name: "proxy_provider_delete", why: "自定义提供商：删除（写号池）" },
+  { name: "proxy_provider_add_key", why: "自定义提供商：加 Key（写号池 accounts）" },
+  { name: "proxy_provider_remove_key", why: "自定义提供商：删 Key（写号池 accounts）" },
+  { name: "proxy_provider_test", why: "自定义提供商：连通性探测（读号池凭据）" },
+  { name: "proxy_provider_fetch_models", why: "自定义提供商：拉上游模型列表（读号池凭据）" },
 ];
-const upstreamUserNames = upstreamUserCmds.map((c) => c.name);
+const upstreamUserNames = extraUserCmds.map((c) => c.name);
 check("④ 子进程表含 proxy_account_import_blob（import_file 拆两段的子进程半段）",
   subKeys.includes("proxy_account_import_blob"),
   "主进程读完文件字节后没有可投的子命令 —— 文件导入仍是主进程直连实现或整段留在主进程");
 check("④ 子进程表含 proxy_poolsync_password_changed（webdav_shared_save 反向跨界的子进程半段）",
   subKeys.includes("proxy_poolsync_password_changed"),
   "主进程仍在直接 require poolsync 写子进程独占的 sync-state.json");
-for (const c of upstreamUserCmds) {
+for (const c of extraUserCmds) {
   check(`④ 子进程表含 ${c.name}（${c.why}）`, subKeys.includes(c.name),
     `${c.name} 的实现体不在子进程 dispatchTable() ⇒ 走主进程直连 = stats.db/sync-state.json 出现第二个写者，二期 §5.4 单一写者被破`);
 }
@@ -135,7 +147,7 @@ check("④ 子进程多出来的键都在白名单内（gateway_* 内建 + 内�
 
 console.log("断言：①==②∪上游新增==③ 且 ④ ⊇ ②");
 const fromBaselineUnionUpstream = new Set([...fromBaseline, ...upstreamUserNames]);
-check("① == ② ∪ 上游用户面新增（preload 白名单与「一期基线 ∪ upstreamUserCmds」逐字相等）",
+check("① == ② ∪ 基线外用户面新增（preload 白名单与「一期基线 ∪ extraUserCmds」逐字相等）",
   fromPreload.length === fromBaselineUnionUpstream.size && diff(nameSet(fromPreload), fromBaselineUnionUpstream).length === 0
   && diff(fromBaselineUnionUpstream, nameSet(fromPreload)).length === 0,
   "preload 有基线没有：" + diff(nameSet(fromPreload), fromBaselineUnionUpstream).join(", ")

@@ -230,33 +230,59 @@ const PROXY_KEYS = [
 const PROXY_POOL = [
   {
     id: "trae", display: "Trae SOLO CN", domain: "api.trae.cn", poolStrategy: "expire_first",
-    summary: { channel: "trae", totalCredits: 72480, accountCount: 2, onlineCount: 2, earliestExpire: NOW + 48 * 86400000, expiringSoon: false, todayReq: 412, todayTokens: 96400, lastCreditsAt: ago(25) },
+    summary: { channel: "trae", totalCredits: 72480, accountCount: 2, onlineCount: 2, earliestExpire: NOW + 48 * 86400000, expiringSoon: false, todayReq: 412, todayTokens: 96400, lastCreditsAt: NOW - 25 * 60000 },
     accounts: [
-      { id: "a1", channel: "trae", uid: "88213476", name: "主账号 · 沐", status: "online", credits: 51230, creditsAt: ago(25), expiresAt: NOW + 48 * 86400000, coolUntil: 0, coolReason: "", source: "oauth", lastUsed: ago(3), todayReq: 301, todayTokens: 70200, createdAt: NOW - 20 * 86400000, hasToken: true },
-      { id: "a2", channel: "trae", uid: "90247811", name: "备用号", status: "online", credits: 21250, creditsAt: ago(25), expiresAt: NOW + 21 * 86400000, coolUntil: 0, coolReason: "", source: "paste", lastUsed: ago(40), todayReq: 111, todayTokens: 26200, createdAt: NOW - 6 * 86400000, hasToken: true },
+      { id: "a1", channel: "trae", uid: "88213476", name: "主账号 · 沐", status: "online", credits: 51230, creditsAt: NOW - 25 * 60000, expiresAt: NOW + 48 * 86400000, coolUntil: 0, coolReason: "", source: "oauth", lastUsed: NOW - 3 * 60000, todayReq: 301, todayTokens: 70200, createdAt: NOW - 20 * 86400000, hasToken: true },
+      { id: "a2", channel: "trae", uid: "90247811", name: "备用号", status: "online", credits: 21250, creditsAt: NOW - 25 * 60000, expiresAt: NOW + 21 * 86400000, coolUntil: 0, coolReason: "", source: "paste", lastUsed: NOW - 40 * 60000, todayReq: 111, todayTokens: 26200, createdAt: NOW - 6 * 86400000, hasToken: true },
     ],
   },
   {
     id: "workbuddy", display: "WorkBuddy（中国区）", domain: "copilot.tencent.com", poolStrategy: "credit_first",
-    summary: { channel: "workbuddy", totalCredits: 34120, accountCount: 2, onlineCount: 1, earliestExpire: NOW + 12 * 86400000, expiringSoon: false, todayReq: 203, todayTokens: 41200, lastCreditsAt: ago(40) },
+    summary: { channel: "workbuddy", totalCredits: 34120, accountCount: 2, onlineCount: 1, earliestExpire: NOW + 12 * 86400000, expiringSoon: false, todayReq: 203, todayTokens: 41200, lastCreditsAt: NOW - 40 * 60000 },
     accounts: [
-      { id: "a3", channel: "workbuddy", uid: "wb_7c21", name: "工作号", status: "online", credits: 34120, creditsAt: ago(40), expiresAt: NOW + 12 * 86400000, coolUntil: 0, coolReason: "", source: "scan", lastUsed: ago(8), todayReq: 203, todayTokens: 41200, createdAt: NOW - 15 * 86400000, hasToken: true },
-      { id: "a4", channel: "workbuddy", uid: "wb_9e05", name: "历史快照", status: "cooling", credits: 0, creditsAt: ago(300), expiresAt: 0, coolUntil: NOW + 42000, coolReason: "上游限流", source: "scan", lastUsed: ago(55), todayReq: 0, todayTokens: 0, createdAt: NOW - 15 * 86400000, hasToken: true },
+      { id: "a3", channel: "workbuddy", uid: "wb_7c21", name: "工作号", status: "online", credits: 34120, creditsAt: NOW - 40 * 60000, expiresAt: NOW + 12 * 86400000, coolUntil: 0, coolReason: "", source: "scan", lastUsed: NOW - 8 * 60000, todayReq: 203, todayTokens: 41200, createdAt: NOW - 15 * 86400000, hasToken: true },
+      { id: "a4", channel: "workbuddy", uid: "wb_9e05", name: "历史快照", status: "cooling", credits: 0, creditsAt: NOW - 300 * 60000, expiresAt: 0, coolUntil: NOW + 42000, coolReason: "上游限流", source: "scan", lastUsed: NOW - 55 * 60000, todayReq: 0, todayTokens: 0, createdAt: NOW - 15 * 86400000, hasToken: true },
     ],
   },
   {
     id: "workbuddy_ai", display: "WorkBuddy AI（国际版）", domain: "www.workbuddy.ai", poolStrategy: "expire_first",
-    summary: { channel: "workbuddy_ai", totalCredits: 8120, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 33 * 86400000, expiringSoon: false, todayReq: 66, todayTokens: 14800, lastCreditsAt: ago(70) },
+    summary: { channel: "workbuddy_ai", totalCredits: 8120, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 33 * 86400000, expiringSoon: false, todayReq: 66, todayTokens: 14800, lastCreditsAt: NOW - 70 * 60000 },
     accounts: [
-      { id: "a5", channel: "workbuddy_ai", uid: "wba_3d88", name: "Trial 加油包", status: "online", credits: 8120, creditsAt: ago(70), expiresAt: NOW + 33 * 86400000, coolUntil: 0, coolReason: "", source: "paste", lastUsed: ago(30), todayReq: 66, todayTokens: 14800, createdAt: NOW - 4 * 86400000, hasToken: true },
+      { id: "a5", channel: "workbuddy_ai", uid: "wba_3d88", name: "Trial 加油包", status: "online", credits: 8120, creditsAt: NOW - 70 * 60000, expiresAt: NOW + 33 * 86400000, coolUntil: 0, coolReason: "", source: "paste", lastUsed: NOW - 30 * 60000, todayReq: 66, todayTokens: 14800, createdAt: NOW - 4 * 86400000, hasToken: true },
     ],
   },
   {
     id: "raccoon", display: "商汤小浣熊", domain: "xiaohuanxiong.com", poolStrategy: "expire_first",
-    summary: { channel: "raccoon", totalCredits: 9800, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 29 * 86400000, expiringSoon: true, todayReq: 18, todayTokens: 5200, lastCreditsAt: ago(12) },
+    summary: { channel: "raccoon", totalCredits: 9800, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 29 * 86400000, expiringSoon: true, todayReq: 18, todayTokens: 5200, lastCreditsAt: NOW - 12 * 60000 },
     accounts: [
-      { id: "a6", channel: "raccoon", uid: "rc_88213", name: "小浣熊 1 号", status: "online", credits: 9800, creditsAt: ago(12), expiresAt: NOW + 29 * 86400000, coolUntil: 0, coolReason: "", source: "json", lastUsed: ago(9), todayReq: 18, todayTokens: 5200, createdAt: NOW - 3 * 86400000, hasToken: true },
+      { id: "a6", channel: "raccoon", uid: "rc_88213", name: "小浣熊 1 号", status: "online", credits: 9800, creditsAt: NOW - 12 * 60000, expiresAt: NOW + 29 * 86400000, coolUntil: 0, coolReason: "", source: "json", lastUsed: NOW - 9 * 60000, todayReq: 18, todayTokens: 5200, createdAt: NOW - 3 * 86400000, hasToken: true },
     ],
+  },
+  // 自定义提供商在号池页的样子：kind=openai_compat 时余额/到期/签到/切到 IDE 全部不出现
+  {
+    id: "myrelay", display: "我的中转站", domain: "relay.example.com", poolStrategy: "round_robin", kind: "openai_compat", enabled: true,
+    baseUrl: "https://relay.example.com",
+    models: [{ model: "gpt-4o", upstream: "gpt-4o-2024-11-20" }, "deepseek-v3.2"],
+    extraHeaders: {}, extraBody: {}, updatedAt: NOW - 30 * 60000,
+    summary: { channel: "myrelay", totalCredits: 0, accountCount: 2, onlineCount: 2, earliestExpire: 0, expiringSoon: false, todayReq: 96, todayTokens: 21400, lastCreditsAt: 0 },
+    accounts: [
+      { id: "m1", channel: "myrelay", uid: "", name: "Key 1", status: "online", credits: 0, creditsAt: 0, expiresAt: 0, coolUntil: 0, coolReason: "", source: "paste", lastUsed: NOW - 2 * 60000, todayReq: 51, todayTokens: 12200, createdAt: NOW - 2 * 86400000, hasToken: true },
+      { id: "m2", channel: "myrelay", uid: "", name: "Key 2", status: "cooling", credits: 0, creditsAt: 0, expiresAt: 0, coolUntil: NOW + 40000, coolReason: "上游限流", source: "paste", lastUsed: NOW - 6 * 60000, todayReq: 45, todayTokens: 9200, createdAt: NOW - 2 * 86400000, hasToken: true },
+    ],
+  },
+];
+
+/** 提供商列表的预览态：与 PROXY_POOL 里那条 myrelay 是同一个对象，
+ *  这样「提供商」页与「号池」页在 npm run dev:web 里对得上 */
+const MOCK_PROVIDERS: {
+  id: string; display: string; domain: string; kind: string; enabled: boolean; baseUrl: string;
+  models: unknown[]; extraHeaders: Record<string, string>; extraBody: Record<string, unknown>;
+  updatedAt: number; keyCount: number; onlineCount: number;
+}[] = [
+  {
+    id: "myrelay", display: "我的中转站", domain: "relay.example.com", kind: "openai_compat", enabled: true,
+    baseUrl: "https://relay.example.com", models: [{ model: "gpt-4o", upstream: "gpt-4o-2024-11-20" }, "deepseek-v3.2"],
+    extraHeaders: {}, extraBody: {}, updatedAt: NOW - 30 * 60000, keyCount: 2, onlineCount: 2,
   },
 ];
 
@@ -996,6 +1022,49 @@ export const mock = {
         return { ok: true };
       case "proxy_vault_status":
         return { encrypted: true, driver: "node:sqlite", dataDir: "(浏览器预览)" };
+      // ===== 自定义提供商：浏览器预览的内存实现（只演界面，校验与号池都在主进程） =====
+      case "proxy_provider_list":
+        return { ok: true, providers: MOCK_PROVIDERS.map((p) => ({ ...p, models: [...p.models] })) };
+      case "proxy_provider_create": {
+        const id = String(args?.id || "");
+        if (MOCK_PROVIDERS.some((p) => p.id === id)) return { ok: false, message: `标识 "${id}" 已存在` };
+        const p = {
+          id, display: String(args?.display || id), domain: "", kind: "openai_compat", enabled: args?.enabled !== false,
+          baseUrl: String(args?.baseUrl || ""), models: (args?.models as unknown[]) || [],
+          extraHeaders: (args?.extraHeaders as Record<string, string>) || {}, extraBody: (args?.extraBody as Record<string, unknown>) || {},
+          updatedAt: Date.now(), keyCount: ((args?.keys as unknown[]) || []).length, onlineCount: ((args?.keys as unknown[]) || []).length,
+        };
+        MOCK_PROVIDERS.push(p);
+        return { ok: true, provider: p, keyIds: [] };
+      }
+      case "proxy_provider_update": {
+        const p = MOCK_PROVIDERS.find((x) => x.id === args?.id);
+        if (!p) return { ok: false, message: "提供商不存在" };
+        Object.assign(p, args, { updatedAt: Date.now() });
+        return { ok: true, provider: p };
+      }
+      case "proxy_provider_delete": {
+        const i = MOCK_PROVIDERS.findIndex((x) => x.id === args?.id);
+        if (i < 0) return { ok: false, message: "提供商不存在" };
+        MOCK_PROVIDERS.splice(i, 1);
+        return { ok: true };
+      }
+      case "proxy_provider_add_key":
+        return { ok: true, id: "k-" + Date.now() };
+      case "proxy_provider_remove_key":
+        return { ok: true };
+      case "proxy_provider_test": {
+        // 浏览器预览不代打上游，但要能演出两种结果态：清单里有的模型算"可用"，其余回失败文案，
+        // 否则逐行测试这条 UI 在 dev:web 里永远只能看到一种样子
+        const m = String(args?.model || "");
+        const known = MOCK_PROVIDERS.find((p) => p.id === args?.id);
+        const inList = (known?.models || []).some((x) => (typeof x === "string" ? x : (x as { model: string }).model) === m);
+        return inList
+          ? { ok: true, ms: 640 + m.length * 7, model: m, sample: "（预览态假响应）收到", finishReason: "stop", usage: { prompt_tokens: 12, completion_tokens: 3, total_tokens: 15 } }
+          : { ok: false, message: "浏览器预览不代打上游，请在应用内测试" };
+      }
+      case "proxy_provider_fetch_models":
+        return { ok: true, models: ["gpt-4o", "gpt-4o-mini", "o3-pro"] };
       case "webdav_shared_get":
         return {
           endpoint: "https://dav.jianguoyun.com/dav",

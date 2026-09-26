@@ -10,12 +10,21 @@ const events = require("./events.cjs");
 let timer = null;
 let refreshing = false;
 
+/** 该渠道有没有「余额」这个概念：自定义提供商是 API Key 直连，通用适配器刻意不定义 queryCredits
+ *  （见 adapters.cjs 的 makeOpenaiCompat）。缺这个方法还去刷，等于拿用户的第三方 Key 打一个
+ *  不存在的余额接口。三条刷新入口（定时全量 / 单渠道 / 单账号）全部先过这道判断。 */
+function creditsCapable(channel) {
+  const ad = adapters.get(channel);
+  return !!(ad && typeof ad.queryCredits === "function");
+}
+
 /** 单账号额度刷新：成功回写余额缓存 + credits_history 日快照 */
 async function refreshAccount(id) {
   const acc = store.getAccount(id);
   if (!acc) throw new Error("账号不存在");
   const adapter = adapters.get(acc.channel);
   if (!adapter) throw new Error(`未知渠道 ${acc.channel}`);
+  if (!creditsCapable(acc.channel)) throw new Error("该渠道为 API Key 直连，无余额概念");
   let secrets = store.accountSecrets(acc);
   if (!secrets.token) throw new Error("该账号没有凭据");
 
@@ -87,6 +96,7 @@ async function refreshAccount(id) {
 /** 单渠道逐账号批量刷新（号池页「刷新当前渠道」用），每渠道并发 ≤2；单账号失败不影响其余 */
 async function refreshChannel(channel) {
   if (refreshing) return { ok: false, message: "刷新进行中" };
+  if (!creditsCapable(channel)) return { ok: false, message: "该渠道为 API Key 直连，无余额概念" };
   refreshing = true;
   try {
     const ids = store
@@ -114,6 +124,7 @@ async function refreshAll() {
     const byChannel = new Map();
     for (const acc of store.listAccounts()) {
       if (acc.status === "disabled" || !acc.hasToken) continue;
+      if (!creditsCapable(acc.channel)) continue; // 提供商不参与额度刷新（见 creditsCapable 注释）
       if (!byChannel.has(acc.channel)) byChannel.set(acc.channel, []);
       byChannel.get(acc.channel).push(acc.id);
     }

@@ -363,7 +363,9 @@ function noteRemoved(accountKey) {
 async function run(opts) {
   if (state.running) throw new Error("号池同步已在进行中");
   const channel = String((opts && opts.channel) || "");
-  if (channel && !store.CHANNELS.some((c) => c.id === channel)) throw new Error(`未知渠道 "${channel}"`);
+  // 号池同步只在内置生态渠道之间进行：提供商的 Key 是用户自己的第三方凭据，
+  // 同步进/出 WebDAV 等于把它们复制到别处，因此这里刻意不接受提供商 id
+  if (channel && !store.BUILTIN_CHANNELS.some((c) => c.id === channel)) throw new Error(`未知渠道 "${channel}"`);
   const w = wd();
   if (!configured()) throw new Error("WebDAV 未配置完整：请先在「设置 · 数据存储」配置统一服务器");
   // 号池压缩包用 WebDAV 密码加密：未设密码时拒绝同步，避免凭据裸奔

@@ -8,6 +8,7 @@ const rules = require("./rules.cjs");
 const store = require("./store.cjs");
 const util = require("./util.cjs");
 const raccoonAuth = require("./raccoonAuth.cjs");
+const aup = require("./protocols/anthropic-up.cjs");
 
 const FIRST_BYTE_MS = 30000; // 首 token 30s 超时判失败。实测成功请求 TTFT P99≈8.7s、最大 20.2s，
 // 10s 会误杀慢模型/thinking 首包（参考项目无首字节总超时，读空闲容忍 300s，这里取全覆盖+余量的折中）
@@ -1699,10 +1700,308 @@ const raccoon = {
   },
 };
 
+// ===== 自定义提供商：通用 OpenAI 兼容适配器（按 agents 行动态实例化，一张表行 = 一个上游端点） =====
+
+/** extraBody 深合并：只递归普通对象，数组与标量整体替换。
+ *  拼接语义会让用户写 {"stop":["a"]} 时拿到意外的并集，替换语义才可预测。 */
+function deepMerge(base, patch) {
+  if (patch === undefined) return base;
+  if (!isPlainObj(base) || !isPlainObj(patch)) return patch;
+  const out = { ...base };
+  for (const k of Object.keys(patch)) out[k] = deepMerge(base[k], patch[k]);
+  return out;
+}
+function isPlainObj(v) {
+  return !!v && typeof v === "object" && !Array.isArray(v);
+}
+
+/** models_json 条目归一：字符串 = 裸模型名（上游同名）；对象 = 带元数据与别名。
+ *  {model(客户端裸名), upstream(上游真名，缺省=model), name/rate/capabilities/contextLength/maxOutputTokens} */
+function compatModelEntries(row) {
+  const out = [];
+  for (const m of Array.isArray(row.models) ? row.models : []) {
+    if (typeof m === "string") {
+      if (m.trim()) out.push({ client: m.trim(), upstream: m.trim(), entry: null });
+      continue;
+    }
+    if (!isPlainObj(m) || !m.model) continue;
+    const client = String(m.model).trim();
+    if (!client) continue;
+    out.push({ client, upstream: String(m.upstream || client).trim(), entry: m });
+  }
+  return out;
+}
+
+/** 上游错误 → HTTP 语义。中转站的错误体形状远比内置渠道散，这里只认 OpenAI 形状 + 常见措辞：
+ *  余额/配额类判 402（换号）、鉴权类判 401（冷却该 Key）、其余按码透传，认不出的一律 502（可换号）。 */
+function statusFromCompatError(errObj, data) {
+  const raw = String((errObj && (errObj.type || errObj.code)) || "");
+  const msg = String((errObj && errObj.message) || (data && data.message) || "");
+  if (/insufficient_quota|quota|balance|exhausted|欠费|余额|积分/i.test(raw + " " + msg)) return 402;
+  if (/auth|api[_ ]?key|invalid[_ ]?key|unauthorized/i.test(raw + " " + msg)) return 401;
+  const n = Number(errObj && errObj.code);
+  if (n === 429 || n === 401 || n === 404 || n === 400 || n === 402 || (n >= 500 && n < 600)) return n;
+  return 502;
+}
+
+/** 出站端点统一在这里拼：`base_url` 存的是**不含 /v1 的根**（归一化侧保证），所以 /v1 必须由这里补。
+ *  真机实测（2026-09-23，一家只开 /v1/messages 的中转站）：只拼 leaf 会打到它的前端页面——
+ *  回 200 + text/html，比 404 更难归因。Anthropic 生态里 `base + "/v1/messages"` 是唯一约定
+ *  （Claude Code 对 ANTHROPIC_BASE_URL 也这么拼），OpenAI 兼容站的挂载点同样是 /v1。
+ *  规则只写这一处：换协议只换 leaf。 */
+function compatUrl(base, leaf) {
+  return `${base}/v1/${leaf}`;
+}
+
+function makeOpenaiCompat(row) {
+  const entries = compatModelEntries(row);
+  const chatUrl = compatUrl(row.baseUrl, "chat/completions");
+  // 客户端名 → 上游真名 / → 条目。别名与模型名同等参与解析（别名不进 /v1/models，
+  // 但客户端拿它发请求必须能命中），所以两张表都要把 aliases 铺进去。
+  const upstreamByClient = new Map();
+  const entryByClient = new Map();
+  for (const e of entries) {
+    upstreamByClient.set(e.client.toLowerCase(), e.upstream);
+    entryByClient.set(e.client.toLowerCase(), e);
+    for (const a of (e.entry && Array.isArray(e.entry.aliases) ? e.entry.aliases : [])) {
+      const k = String(a || "").toLowerCase();
+      if (!k) continue;
+      upstreamByClient.set(k, e.upstream);
+      entryByClient.set(k, e);
+    }
+  }
+  /** 剥掉自家的 `slug/` 前缀（那是路由信息，上游听不懂） */
+  const stripPrefix = (clientModel) => {
+    const s = String(clientModel || "");
+    return s.slice(0, row.id.length + 1).toLowerCase() === `${row.id}/`.toLowerCase() ? s.slice(row.id.length + 1) : s;
+  };
+  return {
+    /** 提供商没有 rules/headers.json 那套 UA/指纹伪装：头 = 标准 JSON + Bearer + 用户自定义覆盖 */
+    headers(secrets) {
+      const h = {
+        "content-type": "application/json",
+        accept: "application/json",
+        authorization: `Bearer ${secrets.token || ""}`,
+      };
+      for (const [k, v] of Object.entries(row.extraHeaders || {})) h[String(k)] = String(v);
+      return h;
+    },
+
+    /** 客户端模型名 → 上游真名：先剥自家的 `slug/` 前缀，再查条目配的 upstream（模型名与别名同表）。
+     *  目录外模型原样透传：用户显式点名了提供商，而中转站实际开放的
+     *  模型常常领先于它的清单（内置渠道同款"透传试错"语义）。 */
+    upstreamFor(clientModel) {
+      const s = stripPrefix(clientModel);
+      return upstreamByClient.get(s.toLowerCase()) || s;
+    },
+
+    /** 客户端模型名（或别名）→ 该条目的元数据；查不到回 null，调用方按"无目录元数据"处理 */
+    entryFor(clientModel) {
+      return entryByClient.get(stripPrefix(clientModel).toLowerCase()) || null;
+    },
+
+    models() {
+      return entries.map((e) => e.client);
+    },
+
+    modelEntries() {
+      return entries;
+    },
+
+    /** 拉上游自己的清单（GET {base}/v1/models）：中转站大多支持（真机实测连只开 /v1/messages
+     *  的 Claude 中转站也开了它），失败如实回错，由 UI 引导手填。
+     *  Anthropic 形态的站认 x-api-key，别发 Bearer。 */
+    async fetchModels(secrets) {
+      const headers = row.kind === "anthropic_messages"
+        ? { "x-api-key": String(secrets && secrets.token || ""), "anthropic-version": "2023-06-01" }
+        : this.headers(secrets);
+      const r = await httpJson(compatUrl(row.baseUrl, "models"), { method: "GET", headers })
+        .catch((e) => ({ ok: false, status: 0, data: null, text: String((e && e.message) || e) }));
+      if (!r.ok) {
+        return {
+          ok: false,
+          message: `HTTP ${r.status || 0} ${(r.text || "").slice(0, 200)}` +
+            (r.status === 404 ? "（该上游没有模型目录接口，请在模型清单里手填）" : ""),
+        };
+      }
+      const list = (r.data && (Array.isArray(r.data) ? r.data : r.data.data)) || [];
+      const models = list.map((m) => String((m && (m.id ?? m.model ?? m.name)) || "")).filter(Boolean);
+      return { ok: true, models };
+    },
+
+    rewriteBody(model, body) {
+      const out = { ...(body || {}) };
+      out.model = this.upstreamFor(model);
+      out.stream = true; // 一律流式打上游，非流式由 server 侧 Aggregator 本地聚合（见 chat() 注释）
+      if (!isPlainObj(out.stream_options)) out.stream_options = {};
+      out.stream_options.include_usage = true;
+      // 思考档位按该模型声明的支持集降级（与内置渠道同一个 util，档位词表也同源）：
+      // 客户端要 low 而上游只有 medium/high 时，透传过去是一个 400，降级才可用
+      const entry = this.entryFor(model);
+      util.normalizeReasoningEffort(out, entry && entry.entry && entry.entry.reasoning);
+      // 网关自己注入的内部字段，上游不认（raccoon 同款剔除清单）
+      delete out.conversation_id;
+      delete out.conversationId;
+      delete out.prompt_cache_key;
+      return deepMerge(out, row.extraBody || {});
+    },
+
+    /** 对话：按提供商的上游协议形态分派。两种形态共用同一套 emit 词汇与同一份调度、号池、记账代码。
+     *  Anthropic 形态上游不发 stream_options / 不接 OpenAI body，见 chatAnthropic。 */
+    async chat(ctx) {
+      return row.kind === "anthropic_messages" ? this.chatAnthropic(ctx) : this.chatOpenai(ctx);
+    },
+
+    /** OpenAI 协议 1:1 透传 */
+    async chatOpenai({ secrets, model, body, emit }) {
+      const payload = JSON.stringify(this.rewriteBody(model, body));
+      const { resp, cancelTimer } = await fetchStream(chatUrl, { method: "POST", headers: this.headers(secrets), body: payload });
+      const result = { status: 200, planLimit: false };
+      try {
+        // 少数中转站无视 stream:true、直接回一整个 JSON：SseScanner 找不到 data: 行会一条都不产出，
+        // 客户端就拿到 200 空响应。这里按 content-type 单独走非流式分支，别让它静默变空。
+        const ctype = String(resp.headers.get("content-type") || "");
+        if (!ctype.includes("event-stream")) {
+          const text = await resp.text();
+          const data = parseJson(text);
+          if (!data) throw Object.assign(new Error(`上游返回非 JSON（${text.slice(0, 200)}）`), { status: 502 });
+          this.emitWholeResponse(data, emit, result);
+          return result;
+        }
+        await pumpSse(resp, (_event, raw) => {
+          if (raw === "[DONE]") { emit({ type: "finish", reason: "" }); return; }
+          const data = parseJson(raw);
+          if (!data) return;
+          if (data.error) {
+            const status = statusFromCompatError(data.error, data);
+            if (status === 402) result.planLimit = true;
+            emit({ type: "error", status, code: Number(data.error.code) || 0, message: String(data.error.message || "上游错误") });
+            return;
+          }
+          const choice = Array.isArray(data.choices) && data.choices[0];
+          if (choice) {
+            if (choice.delta && Object.keys(choice.delta).length) emit({ type: "delta", delta: choice.delta });
+            if (choice.message && Object.keys(choice.message).length) emit({ type: "delta", delta: choice.message });
+            if (choice.finish_reason) emit({ type: "finish", reason: choice.finish_reason });
+          }
+          if (data.usage) {
+            emit({
+              type: "usage",
+              usage: {
+                prompt_tokens: Number(data.usage.prompt_tokens ?? data.usage.input_tokens) || 0,
+                completion_tokens: Number(data.usage.completion_tokens ?? data.usage.output_tokens) || 0,
+                total_tokens: Number(data.usage.total_tokens) || 0,
+              },
+            });
+          }
+        });
+      } finally {
+        cancelTimer();
+      }
+      return result;
+    },
+
+    /**
+     * Anthropic Messages 形态上游（很多 Claude 中转站只开这一种）。
+     * 请求与事件流的互转都在 protocols/anthropic-up.cjs；这里只管 HTTP 与错误映射。
+     */
+    async chatAnthropic({ secrets, model, body, emit }) {
+      const t = aup.toRequest(this.upstreamFor(model), body);
+      if (!t.ok) throw Object.assign(new Error(t.message), { status: 400, fatal: true });
+      // extraBody 深合并：允许只覆盖 thinking.max_tokens 这类嵌套字段而不丢掉整个对象
+      const payloadObj = deepMerge(t.request, row.extraBody || {});
+      const headers = { "content-type": "application/json", accept: "application/json", "anthropic-version": "2023-06-01" };
+      for (const [k, v] of Object.entries(row.extraHeaders || {})) headers[k] = String(v);
+      headers["x-api-key"] = secrets.token || "";
+      const { resp, cancelTimer } = await fetchStream(compatUrl(row.baseUrl, "messages"), { method: "POST", headers, body: JSON.stringify(payloadObj) });
+      const result = { status: 200, planLimit: false };
+      // type 表认不出的形状交给通用关键词表；而"欠费"无论上游把 type 写成什么都必须认出来——
+      // 只有 402 会走「切号 + planLimit」这条既有链路，落到 400/502 就是把坏 Key 当好 Key 反复打。
+      const statusOf = (errObj, data) => {
+        const byType = aup.upstreamErrorStatus(errObj);
+        const generic = statusFromCompatError(errObj, data);
+        const s = generic === 402 || byType === 502 ? generic : byType;
+        if (s === 402) result.planLimit = true;
+        return s;
+      };
+      const tr = aup.makeTranslator(emit, t.nameMap, statusOf);
+      try {
+        const ctype = String(resp.headers.get("content-type") || "");
+        if (!ctype.includes("event-stream")) {
+          const text = await resp.text();
+          const data = parseJson(text);
+          if (!data) throw Object.assign(new Error(`上游返回非 JSON（${text.slice(0, 200)}）`), { status: 502 });
+          aup.emitWhole(data, emit, t.nameMap, statusOf);
+          return result;
+        }
+        await pumpSse(resp, (_event, raw) => {
+          const data = parseJson(raw);
+          if (data) tr.push(data);
+        });
+        tr.close();
+      } finally {
+        cancelTimer();
+      }
+      return result;
+    },
+
+    /** 非流式上游响应 → 同一套 emit 词汇（role 帧 + 正文 + tool_calls + usage + finish） */
+    emitWholeResponse(data, emit, result) {
+      if (data.error) {
+        const status = statusFromCompatError(data.error, data);
+        if (status === 402) result.planLimit = true;
+        emit({ type: "error", status, code: Number(data.error.code) || 0, message: String(data.error.message || "上游错误") });
+        return;
+      }
+      const choice = Array.isArray(data.choices) && data.choices[0];
+      if (choice && choice.message && Object.keys(choice.message).length) emit({ type: "delta", delta: choice.message });
+      if (choice && choice.finish_reason) emit({ type: "finish", reason: choice.finish_reason });
+      if (data.usage) {
+        emit({
+          type: "usage",
+          usage: {
+            prompt_tokens: Number(data.usage.prompt_tokens ?? data.usage.input_tokens) || 0,
+            completion_tokens: Number(data.usage.completion_tokens ?? data.usage.output_tokens) || 0,
+            total_tokens: Number(data.usage.total_tokens) || 0,
+          },
+        });
+      }
+    },
+
+    // 提供商是 API Key 直连：没有刷新链路，也没有"余额"这个概念。
+    // 刻意不定义 queryCredits —— credits.refreshAll/refreshChannel 靠它缺席来跳过，别补一个假的。
+    async refreshToken() {
+      return { ok: false, noRefresh: true, message: "该渠道为 API Key 直连，无自动刷新；Key 失效请换新" };
+    },
+    async userInfo() {
+      return { uid: "", name: "" };
+    },
+  };
+}
+
+// 实例缓存按 `${id}:${updated_at}`：store.saveProvider 会前进 updated_at，于是改完配置自然换实例，
+// 不必重启网关。上限防的是"反复编辑同一个提供商"堆积——每次编辑一个新时间戳、旧实例永不复用。
+const compatCache = new Map();
+function compatAdapter(id) {
+  const row = store.channelList().find((c) => c.id === id && c.kind !== "builtin");
+  if (!row) return null;
+  const key = `${row.id}:${row.updatedAt}`;
+  let ad = compatCache.get(key);
+  if (!ad) {
+    if (compatCache.size > 64) compatCache.clear();
+    ad = makeOpenaiCompat(row);
+    compatCache.set(key, ad);
+  }
+  return ad;
+}
+
 const ADAPTERS = { trae, workbuddy, workbuddy_ai, raccoon };
 
+/** 渠道 → 适配器：内置 4 家查静态表，未命中再试动态提供商。
+ *  ADAPTERS 本身保持只含内置 —— mergedModels()/modelOwners() 靠这个前提把裸模型名
+ *  的归属判定完全留给内置渠道（提供商的模型只以 slug/model 出现），见那里的注释。 */
 function get(channel) {
-  return ADAPTERS[channel] || null;
+  return ADAPTERS[channel] || compatAdapter(channel) || null;
 }
 
 // ===== 刷新并发互斥（single-flight） =====
@@ -1757,10 +2056,35 @@ function mergedModels() {
       if (!entry.maxOutputTokens && meta.maxOutputTokens) entry.maxOutputTokens = Number(meta.maxOutputTokens) || 0;
     }
   }
+  // 自定义提供商的模型**只以 slug/model 出现**，绝不列出裸名：这是防静默遮蔽的结构保证——
+  // 用户建一个名叫 claude-sonnet-5 的提供商，也不会让 /v1/models 里出现第二条同名裸条目去顶掉内置池。
+  for (const row of store.channelList()) {
+    if (row.kind === "builtin") continue;
+    for (const e of compatModelEntries(row)) {
+      const id = `${row.id}/${e.client}`;
+      if (seen.has(id.toLowerCase())) continue;
+      seen.set(id.toLowerCase(), {
+        id,
+        object: "model",
+        created: 0,
+        owned_by: row.id,
+        sources: [row.id],
+        name: String((e.entry && e.entry.name) || e.client),
+        rate: e.entry && e.entry.rate != null ? Number(e.entry.rate) : null,
+        capabilities: (e.entry && e.entry.capabilities) || {},
+        contextLength: Number((e.entry && e.entry.contextLength) || 0),
+        maxOutputTokens: Number((e.entry && e.entry.maxOutputTokens) || 0),
+        upstream: e.upstream,
+      });
+    }
+  }
   return [...seen.values()];
 }
 
-/** 模型 → 渠道归属：返回拥有该模型的渠道列表（模型完全不存在 → 空数组） */
+/** 模型 → 渠道归属：**只算内置渠道**（ADAPTERS 静态表）。
+ *  提供商的归属判定走 provider.parseModelRef() 的 slug/ 前缀，或 allowBareProviderModel 的兜底，
+ *  两者都在此函数之外——把提供商掺进来就等于让一个裸名可能同时属于内置池和某个中转站，
+ *  那时"谁赢"就必须靠优先级配置回答，而这里刻意不给它那个可能。 */
 function modelOwners(model) {
   const id = String(model || "").toLowerCase();
   const owners = [];
@@ -1770,4 +2094,13 @@ function modelOwners(model) {
   return owners;
 }
 
-module.exports = { get, ADAPTERS, mergedModels, modelOwners, httpJson, refreshTokenLocked };
+module.exports = {
+  get,
+  ADAPTERS,
+  mergedModels,
+  modelOwners,
+  httpJson,
+  refreshTokenLocked,
+  // 提供商管理面要拿一份「尚未落库的表单值」建临时适配器做连通性探测，故导出工厂本身
+  makeOpenaiCompat,
+};

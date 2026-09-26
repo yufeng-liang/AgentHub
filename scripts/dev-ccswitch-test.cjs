@@ -202,6 +202,34 @@ const ccswitch = require("../electron/backend/proxy/ccswitch.cjs");
   assert.ok(/默认模型/.test(ccswitch.register({ appType: "claude", apiKey: "k", model: "" }).message), "空 model 报错文案");
   console.log("✓ 参数校验报错分支");
 
+  // 5.5) ccSwitchNativeFormat：网关自己会讲 /v1/messages 与 /v1/responses 之后，
+  //      「让 CC Switch 翻译」从必需变成可选。开关默认关，开时不得再写 apiFormat
+  //      （写了就等于把客户端又绕回翻译链路）。配置读真实 config.json，这里打桩不动用户文件。
+  const appConfig = require("../electron/backend/config.cjs");
+  const rawLoad = appConfig.loadConfig;
+  try {
+    appConfig.loadConfig = () => ({ proxy: { port: 9527, ccSwitchNativeFormat: true } });
+    ccswitch.register({ appType: "claude", apiKey: "sk-native", model: "deepseek-v4-flash", port: 9527 });
+    ccswitch.register({ appType: "codex", apiKey: "sk-native", model: "deepseek-v4-flash", port: 9527 });
+    const dbN = new Database(dbFile);
+    const rowsN = dbN.prepare("SELECT app_type, meta FROM providers").all();
+    dbN.close();
+    const metaNC = JSON.parse(rowsN.find((r) => r.app_type === "claude").meta);
+    const metaNX = JSON.parse(rowsN.find((r) => r.app_type === "codex").meta);
+    assert.strictEqual(metaNC.apiFormat, undefined, "原生直连时 claude 不得再声明 openai_chat");
+    assert.strictEqual(metaNX.apiFormat, undefined, "原生直连时 codex 不得再声明 openai_chat");
+    assert.strictEqual(metaNX.codexChatReasoning, undefined, "不翻译时 codexChatReasoning 无作用，不应写入");
+    assert.strictEqual(metaNX.commonConfigEnabled, true, "通用配置并入与协议无关，开关两侧都要有");
+    // claude-desktop 只能走 CC Switch 本地网关做角色映射，原生开关不该影响它
+    const dbD = new Database(dbFile);
+    const metaND = JSON.parse(dbD.prepare("SELECT meta FROM providers WHERE app_type='claude-desktop'").get().meta);
+    dbD.close();
+    assert.strictEqual(metaND.apiFormat, "openai_chat", "claude-desktop 恒走 CC Switch 映射，不受原生开关影响");
+    console.log("✓ ccSwitchNativeFormat=true 时不写 apiFormat（claude-desktop 除外）");
+  } finally {
+    appConfig.loadConfig = rawLoad;
+  }
+
   // 7) 备份：至少 4 份（两次 claude + 一次 codex + 一次 claude-desktop）
   let backups = fs.readdirSync(path.join(tmp, "backups"));
   assert.ok(backups.length >= 4, "备份数量应 >=4，实际 " + backups.length + " -> " + backups.join(","));
