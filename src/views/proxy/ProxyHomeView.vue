@@ -318,11 +318,15 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
-/* 页头标题化已去除：地址条/端点/DPAPI 与状态、开关固定一行，不换行 */
+/* 地址条/端点/DPAPI 与状态、开关同行排放；空间不足时整体折行。
+   这里绝不能回到强制单行：flex 子项的 min-width:auto 会拿 nowrap 的
+   min-content 撑破 .page，整页出横向滚动条。white-space: nowrap 只留给
+   每个 chip 自己，保证「DPAPI 凭证加密」这类带空格的文案不在 chip 内断行 */
 .toolbar {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
   white-space: nowrap;
 }
 .toolbar-right {
@@ -500,11 +504,12 @@ onUnmounted(() => {
   }
 }
 
-/* 示例 tab 切换 */
+/* 示例 tab 切换：窄窗口时说明文字折到下一行，不跟 tab 挤一行 */
 .ex-tabs {
   display: flex;
   align-items: center;
   gap: 6px;
+  flex-wrap: wrap;
   margin-bottom: 8px;
 }
 .ex-tab {
@@ -543,6 +548,11 @@ onUnmounted(() => {
 .ex-note b {
   color: var(--text-2);
   font-weight: 600;
+}
+/* ex-note 贴着卡片右缘：气泡改为向左展开，向右展开会探出页面右缘、把 .page 撑出横向滚动 */
+.ex-note .qpop {
+  left: auto;
+  right: -10px;
 }
 
 /* 客户端配置步骤 */
