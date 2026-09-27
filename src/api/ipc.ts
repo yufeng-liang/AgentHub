@@ -5,7 +5,7 @@ import type {
   ReportRow, ToolRow, TrashRow, UpdateStatus, ProbeRow, RemoveToolPlan,
   WebDavStatus, RemoteDevice, WebDavLog, HubExtraRow, WatchStatus,
   ProxyGatewayStatus, ProxyKeyRow, ProxyChannelView, ProxyAccount, ProxyStatsOverview, ProxyStatsDetail,
-  ProxyUsageRow, ProxyModel, ProxyScanCandidate, ProxyRuleFile, ProxyRoute, ProxyChannelId,
+  ProxyUsageRow, ProxyUsageDetail, ProxyModel, ProxyScanCandidate, ProxyRuleFile, ProxyRoute, ProxyChannelId,
   ProxyBuiltinChannelId, ProxyPoolStrategy,
   ProxyCheckinRow, ProxyProvider, ProxyProviderKind, ProxyProviderModel, ProxyProviderTestResult,
   CcSwitchStatus, CcSwitchRegisterResult, CcSwitchAppType,
@@ -19,7 +19,7 @@ export type {
   ReportRow, ToolRow, TrashRow, UpdateStatus, UpdateEvent, ProbeRow, RemoveToolPlan,
   WebDavStatus, RemoteDevice, WebDavLog, WebDavEvent, HubExtraRow, WatchStatus,
   ProxyGatewayStatus, ProxyKeyRow, ProxyChannelView, ProxyAccount, ProxyStatsOverview, ProxyStatsDetail,
-  ProxyUsageRow, ProxyModel, ProxyScanCandidate, ProxyRuleFile, ProxyRoute, ProxyChannelId,
+  ProxyUsageRow, ProxyUsageDetail, ProxyModel, ProxyScanCandidate, ProxyRuleFile, ProxyRoute, ProxyChannelId,
   ProxyBuiltinChannelId, ProxyPoolStrategy,
   ProxyAccountStatus, ProxyEvent, ProxyCheckinRow,
   ProxyProvider, ProxyProviderKind, ProxyProviderModel, ProxyProviderTestResult,
@@ -280,8 +280,10 @@ export const proxyIdeStatus = () => call<{ workbuddyInstalled: boolean; workbudd
 export const proxyStatsOverview = (days?: number) => call<ProxyStatsOverview>("proxy_stats_overview", { days });
 export const proxyStatsTop = (dim: "channel" | "model" | "key" | "account", days?: number) =>
   call<{ name: string; req: number; tokens: number }[]>("proxy_stats_top", { dim, days });
-export const proxyStatsDetail = (opts: { page?: number; pageSize?: number; channel?: string; keyId?: string; model?: string }) =>
+export const proxyStatsDetail = (opts: { page?: number; pageSize?: number; channel?: string; keyId?: string; model?: string; status?: "ok" | "fail" | ""; sinceTs?: number }) =>
   call<ProxyStatsDetail>("proxy_stats_detail", opts as Record<string, unknown>);
+export const proxyStatsRequest = (id: number) => call<ProxyUsageDetail | null>("proxy_stats_request", { id });
+export const proxyStatsCleanup = (days?: number) => call<{ deleted: number }>("proxy_stats_cleanup", { days });
 export const proxyRecent = (limit?: number) => call<ProxyUsageRow[]>("proxy_recent", { limit });
 export const proxyRulesList = () => call<ProxyRuleFile[]>("proxy_rules_list");
 export const proxyOpenRulesDir = () => call<{ ok: boolean }>("proxy_open_rules_dir");

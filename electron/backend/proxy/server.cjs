@@ -276,6 +276,16 @@ async function handleChat(req, res, settings, surface) {
   });
   const usageRow = { ts: startedAt, reqId, keyId: "", keyName: "", channel: "", accountId: "", accountName: "", model: String(body.model || ""), status: 0 };
 
+  /** 上游错误响应体 → 落库字符串（≤2KB，只对失败请求）：WAF 拦截页是 HTML、业务错误是
+   *  JSON body——排障时「详细报错」指的就是它，光有 message 里抽出的一句不够 */
+  const errBodyOf = (e) => {
+    if (!e) return "";
+    const raw = e.body != null ? e.body : e.data != null ? e.data : "";
+    if (!raw) return "";
+    const text = typeof raw === "string" ? raw : (() => { try { return JSON.stringify(raw); } catch { return String(raw); } })();
+    return text.slice(0, 2000);
+  };
+
   const record = (extra) => {
     usageRow.latencyMs = Date.now() - startedAt;
     Object.assign(usageRow, extra || {});
@@ -428,10 +438,11 @@ async function handleChat(req, res, settings, surface) {
     };
 
     // ===== PoolService：号池选号，单请求最多换号 2 次（402/429/401 触发）；模型回退链外层 =====
-    let done = false;
-    let lastErr = null;
-    let fatalErr = null;
-    let usedModel = actualModel;
+  let done = false;
+  let lastErr = null;
+  let fatalErr = null;
+  let usedModel = actualModel;
+  let attemptsUsed = 0; // 实际发出的上游请求次数（换号/限流重试都会 +1；模型负缓存跳过不算——没真发）
     for (const chainModel of modelChain) {
       if (done || fatalErr) break;
       const resolved = resolveChannel(key, chainModel, settings);
@@ -475,6 +486,7 @@ async function handleChat(req, res, settings, surface) {
         try {
           let r = null;
           resetAttemptState(); // 上一次尝试的输出不得带进本轮（详见函数注释）
+          attemptsUsed += 1;
           try {
             r = await attemptChat(resolved.channel, acc, chainModel, body, emitTimed, chatMeta);
           } finally {
@@ -503,6 +515,7 @@ async function handleChat(req, res, settings, surface) {
             lastErr = Object.assign(new Error(String(streamErr.message || "上游返回错误")), {
               status: streamErr.status || 502,
               code: streamErr.code || 0,
+              body: streamErr.body, data: streamErr.data, // 带给 errBodyOf：流中错误的响应体也要能落库
             });
             applyCool(acc.id, chainModel, classifyUpstream(lastErr, false, resolved.channel), lastErr.message);
             streamErr = null;
@@ -579,6 +592,9 @@ async function handleChat(req, res, settings, surface) {
           : actualModel !== requestedModel
             ? "alias→" + actualModel
             : "",
+        // 缓存字段由适配器归一成 cached_tokens/cache_write_tokens（未上报时缺省 → 落库 -1 哨兵）
+        cachedTokens: usage.cached_tokens, cacheWriteTokens: usage.cache_write_tokens,
+        attempts: attemptsUsed, modelUpstream: usedModel,
       });
       return;
     }
@@ -593,12 +609,12 @@ async function handleChat(req, res, settings, surface) {
     } else {
       sink.endErr(st, msg);
     }
-    record({ status: st, ttftMs, error: msg.slice(0, 200) });
+    record({ status: st, ttftMs, error: msg.slice(0, 200), attempts: attemptsUsed, modelUpstream: usedModel, errorBody: errBodyOf(lastErr) });
   } catch (e) {
     const msg = String((e && e.message) || e);
     // 头已发出就只能把错误写进流（endErr 内部按 headersSent 分流），否则回 502 JSON
     sink.endErr(502, msg, "server_error");
-    record({ status: 502, error: msg.slice(0, 200) });
+    record({ status: 502, error: msg.slice(0, 200), attempts: attemptsUsed, modelUpstream: usedModel, errorBody: errBodyOf(e) });
   } finally {
     if (keepAliveTimer) clearInterval(keepAliveTimer);
     rt.active -= 1;

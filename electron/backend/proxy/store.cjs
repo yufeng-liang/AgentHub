@@ -107,7 +107,12 @@ CREATE TABLE IF NOT EXISTS usage_requests (
   ttft_ms INTEGER NOT NULL DEFAULT 0,
   latency_ms INTEGER NOT NULL DEFAULT 0,
   status INTEGER NOT NULL DEFAULT 0,
-  error TEXT NOT NULL DEFAULT ''
+  error TEXT NOT NULL DEFAULT '',
+  cached_tokens INTEGER NOT NULL DEFAULT -1,
+  cache_write_tokens INTEGER NOT NULL DEFAULT -1,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  model_upstream TEXT NOT NULL DEFAULT '',
+  error_body TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_requests(ts);
 CREATE INDEX IF NOT EXISTS idx_usage_key ON usage_requests(key_id, ts);
@@ -151,6 +156,18 @@ function open() {
   try {
     db.exec("ALTER TABLE keys ADD COLUMN key_enc TEXT NOT NULL DEFAULT ''");
   } catch { /* 已存在 */ }
+  // 在线迁移：usage_requests 五列（请求日志流增强，2026-09-27）。
+  // cached/cache_write 用 -1 做「上游未上报」哨兵（与 agent2api 的「-」口径一致）：
+  // 0 = 上报了但确实为 0，-1 = 这个渠道根本不给缓存字段——两者在界面上必须区分开
+  for (const c of [
+    "cached_tokens INTEGER NOT NULL DEFAULT -1",
+    "cache_write_tokens INTEGER NOT NULL DEFAULT -1",
+    "attempts INTEGER NOT NULL DEFAULT 0",
+    "model_upstream TEXT NOT NULL DEFAULT ''",
+    "error_body TEXT NOT NULL DEFAULT ''",
+  ]) {
+    try { db.exec(`ALTER TABLE usage_requests ADD COLUMN ${c}`); } catch { /* 已存在 */ }
+  }
   migrateProviders(db);
   const ins = db.prepare("INSERT OR IGNORE INTO agents (id, display, domain, pool_strategy, updated_at, kind) VALUES (?,?,?,?,?,?)");
   for (const c of BUILTIN_CHANNELS) ins.run(c.id, c.display, c.domain, "expire_first", Date.now(), "builtin");
@@ -176,9 +193,17 @@ function migrateProviders(d) {
   }
 }
 
-/** 流水保留 90 天，启动时 GC；余额历史同步清理 */
+/** 流水保留期（天）：设置页可调（proxy.usageRetentionDays），open() 启动 GC 按它清理；
+ *  register() 启动时从设置灌入。默认 90 天（历史上写死的值）。 */
+let usageRetentionDays = 90;
+function setUsageRetention(days) {
+  const n = Math.round(Number(days) || 0);
+  if (n >= 1 && n <= 3650) usageRetentionDays = n;
+}
+
+/** 流水按保留期 GC，启动时执行；余额历史同步清理 */
 function gc() {
-  const cutoff = Date.now() - 90 * 86400000;
+  const cutoff = Date.now() - Math.max(1, usageRetentionDays) * 86400000;
   db.prepare("DELETE FROM usage_requests WHERE ts < ?").run(cutoff);
   const dayCut = dayStr(cutoff);
   db.prepare("DELETE FROM credits_history WHERE day < ?").run(dayCut);
@@ -703,8 +728,8 @@ function snapshotCredits(channel, accountId, credits, expiresAt) {
 function insertUsage(row) {
   open();
   db.prepare(
-    `INSERT INTO usage_requests (ts, req_id, key_id, key_name, channel, account_id, account_name, model, prompt_tokens, completion_tokens, ttft_ms, latency_ms, status, error)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    `INSERT INTO usage_requests (ts, req_id, key_id, key_name, channel, account_id, account_name, model, prompt_tokens, completion_tokens, ttft_ms, latency_ms, status, error, cached_tokens, cache_write_tokens, attempts, model_upstream, error_body)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     row.ts || Date.now(),
     row.reqId || "",
@@ -719,24 +744,35 @@ function insertUsage(row) {
     row.ttftMs || 0,
     row.latencyMs || 0,
     row.status || 0,
-    String(row.error || "").slice(0, 300)
+    String(row.error || "").slice(0, 300),
+    Number.isFinite(row.cachedTokens) ? Math.round(row.cachedTokens) : -1,
+    Number.isFinite(row.cacheWriteTokens) ? Math.round(row.cacheWriteTokens) : -1,
+    Math.max(0, Math.round(row.attempts || 0)),
+    String(row.modelUpstream || "").slice(0, 200),
+    String(row.errorBody || "").slice(0, 2000)
   );
 }
 
-/** 总览指标：今日请求/token/成功率/TTFT 均值 */
+/** 总览指标：今日请求/token/成功率/TTFT 均值/缓存命中率 */
 function statsToday() {
   open();
   const r = db.prepare(
     `SELECT COUNT(*) AS req, SUM(prompt_tokens + completion_tokens) AS tokens,
             SUM(CASE WHEN status >= 200 AND status < 300 THEN 1 ELSE 0 END) AS ok,
-            AVG(CASE WHEN ttft_ms > 0 THEN ttft_ms END) AS ttft
+            AVG(CASE WHEN ttft_ms > 0 THEN ttft_ms END) AS ttft,
+            SUM(CASE WHEN cached_tokens >= 0 THEN cached_tokens END) AS cached,
+            SUM(CASE WHEN cached_tokens >= 0 THEN prompt_tokens END) AS cachePrompt
      FROM usage_requests WHERE ts >= ?`
   ).get(dayStartMs());
+  // 命中率只按「上游确实回报了缓存字段」的请求算（cached_tokens >= 0）：
+  // 渠道不给缓存字段的行（-1）混进分母会把命中率稀释成假低
+  const hitRate = r.cached != null && r.cachePrompt > 0 ? Math.round((r.cached / r.cachePrompt) * 1000) / 10 : -1;
   return {
     req: r.req || 0,
     tokens: r.tokens || 0,
     successRate: r.req ? Math.round(((r.ok || 0) / r.req) * 1000) / 10 : 100,
     ttftAvg: Math.round(r.ttft || 0),
+    cacheHitRate: hitRate,
   };
 }
 
@@ -771,8 +807,8 @@ function statsTop(dim, days) {
   ).all(from);
 }
 
-/** 明细分页（保留 90 天） */
-function statsDetail({ page, pageSize, channel, keyId, model }) {
+/** 明细分页（筛选：渠道 / KEY / 模型 等值 + 状态成功失败 + ts 下限；全部可选） */
+function statsDetail({ page, pageSize, channel, keyId, model, status, sinceTs }) {
   open();
   const size = Math.min(100, Math.max(5, pageSize || 20));
   const p = Math.max(1, page || 1);
@@ -781,12 +817,32 @@ function statsDetail({ page, pageSize, channel, keyId, model }) {
   if (channel) { where.push("channel = ?"); vals.push(channel); }
   if (keyId) { where.push("key_id = ?"); vals.push(keyId); }
   if (model) { where.push("model = ?"); vals.push(model); }
+  if (status === "ok") where.push("status >= 200 AND status < 300");
+  else if (status === "fail") where.push("NOT (status >= 200 AND status < 300)");
+  const since = Math.round(Number(sinceTs) || 0);
+  if (since > 0) { where.push("ts >= ?"); vals.push(since); }
   const w = where.length ? "WHERE " + where.join(" AND ") : "";
   const total = db.prepare(`SELECT COUNT(*) AS c FROM usage_requests ${w}`).get(...vals).c;
   const rows = db.prepare(
     `SELECT * FROM usage_requests ${w} ORDER BY ts DESC LIMIT ? OFFSET ?`
   ).all(...vals, size, (p - 1) * size);
   return { total, page: p, pageSize: size, rows: rows.map(usageView) };
+}
+
+/** 单条请求详情（详情弹窗数据源；含 error_body——列表不带它，2KB/条拖累列表载荷） */
+function usageRequestById(id) {
+  open();
+  const r = db.prepare("SELECT * FROM usage_requests WHERE id = ?").get(Math.round(Number(id) || 0));
+  return r ? { ...usageView(r), errorBody: r.error_body || "" } : null;
+}
+
+/** 手动清理：删保留线之前的流水，返回删除条数（设置页保留期 + 统计页清理按钮共用） */
+function cleanupUsage(days) {
+  open();
+  const n = Math.min(3650, Math.max(1, Math.round(Number(days) || 0)));
+  const cutoff = Date.now() - n * 86400000;
+  const r = db.prepare("DELETE FROM usage_requests WHERE ts < ?").run(cutoff);
+  return { deleted: r.changes, cutoff };
 }
 
 function recentRequests(limit) {
@@ -801,6 +857,8 @@ function usageView(r) {
     channel: r.channel, accountId: r.account_id, accountName: r.account_name, model: r.model,
     promptTokens: r.prompt_tokens, completionTokens: r.completion_tokens,
     ttftMs: r.ttft_ms, latencyMs: r.latency_ms, status: r.status, error: r.error,
+    cachedTokens: r.cached_tokens, cacheWriteTokens: r.cache_write_tokens,
+    attempts: r.attempts, modelUpstream: r.model_upstream, hasErrorBody: !!r.error_body,
   };
 }
 
@@ -961,4 +1019,5 @@ module.exports = {
   listModelCooldowns, upsertModelCooldown, deleteModelCooldowns,
   snapshotCredits,
   insertUsage, statsToday, statsTrend, statsTop, statsDetail, recentRequests,
+  usageRequestById, cleanupUsage, setUsageRetention,
 };

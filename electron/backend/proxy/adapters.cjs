@@ -431,6 +431,7 @@ const trae = {
           for (const [k, v] of Object.entries(data)) {
             if (typeof v === "number" && !(k in usage)) usage[k] = v;
           }
+          Object.assign(usage, util.openaiCacheTokens(data)); // 缓存字段归一（trae 上游字段名不定，认全三种命名）
           if (!usage.total_tokens) usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
           emit({ type: "usage", usage });
         } else if (ev === "done" || ev === "turn_completion") {
@@ -1132,6 +1133,7 @@ function makeWorkBuddy(channelId) {
                 prompt_tokens: Number(data.usage.prompt_tokens) || 0,
                 completion_tokens: Number(data.usage.completion_tokens) || 0,
                 total_tokens: Number(data.usage.total_tokens) || 0,
+                ...util.openaiCacheTokens(data.usage),
               },
             });
           }
@@ -1586,6 +1588,7 @@ const raccoon = {
               prompt_tokens: Number(data.usage.prompt_tokens ?? data.usage.input_tokens) || 0,
               completion_tokens: Number(data.usage.completion_tokens ?? data.usage.output_tokens) || 0,
               total_tokens: Number(data.usage.total_tokens) || 0,
+              ...util.openaiCacheTokens(data.usage),
             },
           });
         }
@@ -1816,6 +1819,7 @@ function makeCline(pool) {
               prompt_tokens: Number(data.usage.prompt_tokens) || 0,
               completion_tokens: Number(data.usage.completion_tokens) || 0,
               total_tokens: Number(data.usage.total_tokens) || 0,
+              ...util.openaiCacheTokens(data.usage),
             } });
           }
         });
@@ -2020,6 +2024,7 @@ function makeAutoClaw(region) {
               prompt_tokens: Number(data.usage.prompt_tokens) || 0,
               completion_tokens: Number(data.usage.completion_tokens) || 0,
               total_tokens: Number(data.usage.total_tokens) || 0,
+              ...util.openaiCacheTokens(data.usage),
             } });
           }
         });
@@ -2388,7 +2393,7 @@ function makeQoder() {
             if (Object.keys(delta).length) emit({ type: "delta", delta });
           }
           if (choice && choice.finish_reason) { flushUsage(); emit({ type: "finish", reason: choice.finish_reason }); }
-          if (chunk.usage) usage = { prompt_tokens: Number(chunk.usage.prompt_tokens) || 0, completion_tokens: Number(chunk.usage.completion_tokens) || 0, total_tokens: Number(chunk.usage.total_tokens) || 0 };
+          if (chunk.usage) usage = { prompt_tokens: Number(chunk.usage.prompt_tokens) || 0, completion_tokens: Number(chunk.usage.completion_tokens) || 0, total_tokens: Number(chunk.usage.total_tokens) || 0, ...util.openaiCacheTokens(chunk.usage) };
         });
         const tail = splitter.flush();
         if (tail) emit({ type: "delta", delta: { content: tail } }); // 不 flush 会丢末尾文字
@@ -2668,6 +2673,7 @@ function makeOpenaiCompat(row) {
                 prompt_tokens: Number(data.usage.prompt_tokens ?? data.usage.input_tokens) || 0,
                 completion_tokens: Number(data.usage.completion_tokens ?? data.usage.output_tokens) || 0,
                 total_tokens: Number(data.usage.total_tokens) || 0,
+                ...util.openaiCacheTokens(data.usage),
               },
             });
           }
@@ -2740,6 +2746,7 @@ function makeOpenaiCompat(row) {
             prompt_tokens: Number(data.usage.prompt_tokens ?? data.usage.input_tokens) || 0,
             completion_tokens: Number(data.usage.completion_tokens ?? data.usage.output_tokens) || 0,
             total_tokens: Number(data.usage.total_tokens) || 0,
+            ...util.openaiCacheTokens(data.usage),
           },
         });
       }

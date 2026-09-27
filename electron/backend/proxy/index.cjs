@@ -329,6 +329,8 @@ function startBackgroundJobs() {
 }
 
 function register(ipcMain) {
+  // 请求流水保留期从设置灌入（open() 的启动 GC 在首次摸库时才跑，register 先行不踩空）
+  store.setUsageRetention(settings().usageRetentionDays);
   // ===== 服务启停 / 状态（主进程侧的薄包装见 gateway-client.cjs：转发 + 成功后写 restoreOnLaunch） =====
   ipcMain.handle("proxy_status", handle(() => gatewayStatus()));
   ipcMain.handle("proxy_start", handle(async () => {
@@ -649,8 +651,13 @@ function register(ipcMain) {
     },
   })));
   ipcMain.handle("proxy_stats_top", handle(({ dim, days }) => store.statsTop(dim, days)));
-  ipcMain.handle("proxy_stats_detail", handle(({ page, pageSize, channel, keyId, model }) =>
-    store.statsDetail({ page, pageSize, channel, keyId, model })));
+  ipcMain.handle("proxy_stats_detail", handle(({ page, pageSize, channel, keyId, model, status, sinceTs }) =>
+    store.statsDetail({ page, pageSize, channel, keyId, model, status, sinceTs })));
+  // 单条详情（详情弹窗）：列表不带 2KB 级的 error_body，点开按 id 再取
+  ipcMain.handle("proxy_stats_request", handle(({ id }) => store.usageRequestById(id)));
+  // 手动清理保留线之前的流水（days 缺省取设置里的保留期）
+  ipcMain.handle("proxy_stats_cleanup", handle(({ days }) =>
+    store.cleanupUsage(Math.round(Number(days) || Number(settings().usageRetentionDays) || 90))));
   ipcMain.handle("proxy_recent", handle(({ limit }) => store.recentRequests(limit)));
 
   // ===== 规则文件 / 目录 / 安全 =====

@@ -69,6 +69,7 @@ async function save() {
     app.config.proxy.port = port;
     app.config.proxy.rateLimitPerMin = Math.max(0, Math.round(Number(app.config.proxy.rateLimitPerMin) || 0));
     app.config.proxy.concurrency = Math.max(1, Math.round(Number(app.config.proxy.concurrency) || 1));
+    app.config.proxy.usageRetentionDays = Math.min(3650, Math.max(1, Math.round(Number(app.config.proxy.usageRetentionDays) || 90)));
     const r = await app.save();
     if (r && r.ok === false) {
       msg.value = r.message || "保存失败";
@@ -185,6 +186,14 @@ function openDataDir() {
           <div class="set-info"><div class="set-name">上游并发上限</div></div>
           <input v-model.number="app.config.proxy.concurrency" class="input mono" style="width: 90px" type="number" min="1" />
           <span style="font-size: 11px; color: var(--text-3)">并发</span>
+        </div>
+        <div class="set-row">
+          <div class="set-info">
+            <div class="set-name">请求流水保留期</div>
+            <div class="set-desc">用量统计的请求明细保留天数（1~3650），启动时按它清理旧流水；统计页「清理」按钮也按这个值立即删一轮</div>
+          </div>
+          <input v-model.number="app.config.proxy.usageRetentionDays" class="input mono" style="width: 90px" type="number" min="1" max="3650" />
+          <span style="font-size: 11px; color: var(--text-3)">天</span>
         </div>
         <div class="set-row">
           <div class="set-info">

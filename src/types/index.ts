@@ -274,6 +274,8 @@ export interface ProxyConfig {
   rateLimitPerMin: number;
   concurrency: number;
   creditsRefreshMin: number;
+  /** 请求流水保留期（天，1~3650）：启动 GC 与统计页「清理」共用 */
+  usageRetentionDays: number;
   debugStatus: boolean;
   /** 模型 → 渠道 id 的 per-model 覆盖（渠道可扩充，故为字符串值） */
   modelOverrides: Record<string, string>;
@@ -499,10 +501,24 @@ export interface ProxyUsageRow {
   latencyMs: number;
   status: number;
   error: string;
+  /** 读缓存命中 tokens；-1 = 上游未上报（0 = 上报了但确实为 0），展示层据此区分「-」与「0%」 */
+  cachedTokens: number;
+  cacheWriteTokens: number;
+  /** 实际发出的上游请求次数（换号/限流重试累计；0 = 未到上游就被拦下） */
+  attempts: number;
+  /** 上游实际收到的模型名（别名/回退解析后）；空 = 未到上游 */
+  modelUpstream: string;
+  /** 失败请求是否落了上游错误响应体（详情弹窗按 id 再取） */
+  hasErrorBody: boolean;
+}
+
+/** 单条请求详情（详情弹窗）：列表行 + 完整上游错误响应体（≤2KB） */
+export interface ProxyUsageDetail extends ProxyUsageRow {
+  errorBody: string;
 }
 
 export interface ProxyStatsOverview {
-  today: { req: number; tokens: number; successRate: number; ttftAvg: number };
+  today: { req: number; tokens: number; successRate: number; ttftAvg: number; /** 缓存命中率 %；-1 = 今日无回报缓存字段的请求 */ cacheHitRate: number };
   trend: { day: string; req: number; tokens: number }[];
   tops: Record<"channel" | "model" | "key" | "account", { name: string; req: number; tokens: number }[]>;
 }

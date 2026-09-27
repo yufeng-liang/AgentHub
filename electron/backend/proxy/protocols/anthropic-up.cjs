@@ -166,12 +166,33 @@ function mergeConsecutive(msgs, notes) {
  * @param nameMap 请求侧改写过的工具名，在这里还原回客户端认识的名字——
  *                不还原的话客户端收到一个自己没声明过的工具名，工具调用回环直接断。
  */
+/** Anthropic usage → 内部规范 usage。两个归一：
+ *  ① prompt_tokens = input_tokens + cache_read + cache_creation——Claude 的 input_tokens 不含
+ *     缓存段而 OpenAI/DeepSeek 的 prompt_tokens 含，不归一的话命中率分母两种口径没法共用一个公式；
+ *  ② 带上 cached_tokens / cache_write_tokens（上游没给就不带 → 记账落 -1「未上报」哨兵） */
+function normalizeAnthropicUsage(u) {
+  const read = Number(u.cache_read_input_tokens);
+  const write = Number(u.cache_creation_input_tokens);
+  const hasRead = Number.isFinite(read);
+  const hasWrite = Number.isFinite(write);
+  return {
+    prompt_tokens: (Number(u.input_tokens) || 0)
+      + (hasRead ? Math.max(0, Math.round(read)) : 0)
+      + (hasWrite ? Math.max(0, Math.round(write)) : 0),
+    completion_tokens: Number(u.output_tokens) || 0,
+    total_tokens: 0,
+    ...(hasRead ? { cached_tokens: Math.max(0, Math.round(read)) } : {}),
+    ...(hasWrite ? { cache_write_tokens: Math.max(0, Math.round(write)) } : {}),
+  };
+}
+
 function makeTranslator(emit, nameMap, statusOf) {
   const restore = (n) => (nameMap && nameMap[n]) || String(n || "");
   const mapStatus = statusOf || upstreamErrorStatus;
   let toolSeq = 0;
   const blockToTool = new Map(); // Anthropic content block index → OpenAI tool_calls index
   let sawFinish = false;
+  let startUsage = null; // message_start 的 usage 原件：message_delta 只带 output，prompt/缓存段要靠这里补全
   return {
     push(data) {
       const type = data && data.type;
@@ -185,7 +206,8 @@ function makeTranslator(emit, nameMap, statusOf) {
       if (type === "message_start") {
         const u = (data.message && data.message.usage) || {};
         if (u.input_tokens != null || u.output_tokens != null) {
-          emit({ type: "usage", usage: { prompt_tokens: Number(u.input_tokens) || 0, completion_tokens: Number(u.output_tokens) || 0, total_tokens: 0 } });
+          startUsage = { ...u };
+          emit({ type: "usage", usage: normalizeAnthropicUsage(u) });
         }
         return;
       }
@@ -213,7 +235,13 @@ function makeTranslator(emit, nameMap, statusOf) {
       if (type === "message_delta") {
         const d = data.delta || {};
         const u = data.usage || {};
-        if (u.output_tokens != null) emit({ type: "usage", usage: { prompt_tokens: 0, completion_tokens: Number(u.output_tokens) || 0, total_tokens: 0 } });
+        // 合并 start 帧后再发：sink 侧是「最后一条 usage 覆盖」语义，只发 output 会把
+        // prompt_tokens 记成 0（原实现如此，账面上 prompt 全部丢失）；上游在 delta 里
+        // 重复给出的 input/缓存段以新值为准
+        const merged = { ...(startUsage || {}), ...u };
+        if (merged.input_tokens != null || merged.output_tokens != null) {
+          emit({ type: "usage", usage: normalizeAnthropicUsage(merged) });
+        }
         if (d.stop_reason) {
           sawFinish = true;
           emit({ type: "finish", reason: STOP_TO_FINISH[d.stop_reason] || "stop" });
@@ -272,7 +300,7 @@ function emitWhole(data, emit, nameMap, statusOf) {
   }
   const u = data.usage || {};
   if (u.input_tokens != null || u.output_tokens != null) {
-    emit({ type: "usage", usage: { prompt_tokens: Number(u.input_tokens) || 0, completion_tokens: Number(u.output_tokens) || 0, total_tokens: 0 } });
+    emit({ type: "usage", usage: normalizeAnthropicUsage(u) });
   }
   emit({ type: "finish", reason: data.stop_reason ? STOP_TO_FINISH[data.stop_reason] || "stop" : "" });
 }

@@ -381,10 +381,30 @@ function appVersion() {
   try { return require("../../../package.json").version || ""; } catch { return ""; }
 }
 
+/** 上游 usage → 内部规范的缓存字段：cached_tokens（读缓存命中）/ cache_write_tokens（缓存写入）。
+ *  认三种命名：OpenAI/DeepSeek 系 usage.prompt_tokens_details.cached_tokens、DeepSeek 直发的
+ *  prompt_cache_hit_tokens、Claude 系 cache_read_input_tokens；写缓存只有 Claude 系有。
+ *  上游没给的字段不出现在返回对象里——server 记账据此落 -1（未上报）而不是假 0，
+ *  「这个渠道不报缓存」和「上报了但命中为 0」在界面上必须区分开 */
+function openaiCacheTokens(u) {
+  if (!u || typeof u !== "object") return {};
+  const out = {};
+  const read = Number(
+    (u.prompt_tokens_details && u.prompt_tokens_details.cached_tokens) ??
+    u.prompt_cache_hit_tokens ??
+    u.cache_read_input_tokens
+  );
+  if (Number.isFinite(read)) out.cached_tokens = Math.max(0, Math.round(read));
+  const write = Number(u.cache_creation_input_tokens);
+  if (Number.isFinite(write)) out.cache_write_tokens = Math.max(0, Math.round(write));
+  return out;
+}
+
 module.exports = {
   uuid, traceId, jwtDecode, dig, toMs,
   isCompleteJson, parseRetryAfterHeaders, stableConvId, promptCacheKey,
   isDeepSeekModel, injectThinking, normalizeReasoningEffort, backfillReasoningContent, EFFORT_LEVELS,
   SseScanner, stripEmptyDelta, hasConsumableDelta, chunk, DONE, Aggregator, openaiError, validateChatBody, estimateTokens,
+  openaiCacheTokens,
   appVersion,
 };

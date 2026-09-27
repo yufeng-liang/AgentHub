@@ -46,6 +46,7 @@ function defaultConfig(): AppConfig {
       rateLimitPerMin: 120,
       concurrency: 8,
       creditsRefreshMin: 30,
+      usageRetentionDays: 90,
       debugStatus: false,
       modelOverrides: {},
       humanizeJitter: true,
@@ -314,11 +315,11 @@ const MOCK_PROVIDERS: {
 ];
 
 const PROXY_USAGE = [
-  { id: 5, ts: NOW - 60000, reqId: "r5", keyId: "k1", keyName: "本地主 Key", channel: "trae", accountId: "a1", accountName: "主账号 · 沐", model: "deepseek-v4-flash", promptTokens: 1204, completionTokens: 3841, ttftMs: 820, latencyMs: 1200, status: 200, error: "" },
-  { id: 4, ts: NOW - 89000, reqId: "r4", keyId: "k2", keyName: "Trae 专用", channel: "trae", accountId: "a1", accountName: "主账号 · 沐", model: "glm-4.6", promptTokens: 2010, completionTokens: 6233, ttftMs: 1500, latencyMs: 2800, status: 200, error: "" },
-  { id: 3, ts: NOW - 140000, reqId: "r3", keyId: "k3", keyName: "WorkBuddy 专用", channel: "workbuddy", accountId: "a3", accountName: "工作号", model: "claude-sonnet-4.5", promptTokens: 890, completionTokens: 2210, ttftMs: 640, latencyMs: 1900, status: 200, error: "" },
-  { id: 2, ts: NOW - 220000, reqId: "r2", keyId: "k1", keyName: "本地主 Key", channel: "workbuddy_ai", accountId: "a5", accountName: "Trial 加油包", model: "gpt-5", promptTokens: 312, completionTokens: 0, ttftMs: 0, latencyMs: 300, status: 429, error: "rate limited" },
-  { id: 1, ts: NOW - 310000, reqId: "r1", keyId: "k1", keyName: "本地主 Key", channel: "trae", accountId: "a2", accountName: "备用号", model: "kimi-k2", promptTokens: 1560, completionTokens: 4120, ttftMs: 910, latencyMs: 2400, status: 200, error: "" },
+  { id: 5, ts: NOW - 60000, reqId: "r5", keyId: "k1", keyName: "本地主 Key", channel: "trae", accountId: "a1", accountName: "主账号 · 沐", model: "deepseek-v4-flash", promptTokens: 1204, completionTokens: 3841, ttftMs: 820, latencyMs: 1200, status: 200, error: "", cachedTokens: 903, cacheWriteTokens: -1, attempts: 1, modelUpstream: "deepseek-v4-flash", hasErrorBody: false },
+  { id: 4, ts: NOW - 89000, reqId: "r4", keyId: "k2", keyName: "Trae 专用", channel: "trae", accountId: "a1", accountName: "主账号 · 沐", model: "glm-4.6", promptTokens: 2010, completionTokens: 6233, ttftMs: 1500, latencyMs: 2800, status: 200, error: "", cachedTokens: 0, cacheWriteTokens: -1, attempts: 2, modelUpstream: "glm-4.6", hasErrorBody: false },
+  { id: 3, ts: NOW - 140000, reqId: "r3", keyId: "k3", keyName: "WorkBuddy 专用", channel: "workbuddy", accountId: "a3", accountName: "工作号", model: "claude-sonnet-4.5", promptTokens: 890, completionTokens: 2210, ttftMs: 640, latencyMs: 1900, status: 200, error: "", cachedTokens: -1, cacheWriteTokens: -1, attempts: 1, modelUpstream: "claude-sonnet-4.5", hasErrorBody: false },
+  { id: 2, ts: NOW - 220000, reqId: "r2", keyId: "k1", keyName: "本地主 Key", channel: "workbuddy_ai", accountId: "a5", accountName: "Trial 加油包", model: "gpt-5", promptTokens: 312, completionTokens: 0, ttftMs: 0, latencyMs: 300, status: 429, error: "rate limited", cachedTokens: -1, cacheWriteTokens: -1, attempts: 3, modelUpstream: "gpt-5", hasErrorBody: true },
+  { id: 1, ts: NOW - 310000, reqId: "r1", keyId: "k1", keyName: "本地主 Key", channel: "trae", accountId: "a2", accountName: "备用号", model: "kimi-k2", promptTokens: 1560, completionTokens: 4120, ttftMs: 910, latencyMs: 2400, status: 200, error: "", cachedTokens: 1248, cacheWriteTokens: -1, attempts: 1, modelUpstream: "kimi-k2", hasErrorBody: false },
 ];
 
 const PROXY_TREND = Array.from({ length: 7 }, (_, i) => {
@@ -1089,7 +1090,7 @@ export const mock = {
         return { workbuddyInstalled: true, workbuddyAiInstalled: true, traeInstalled: false, raccoonInstalled: true, currentUid: "wb_7c21" };
       case "proxy_stats_overview":
         return {
-          today: { req: 1284, tokens: 312400, successRate: 99.4, ttftAvg: 820 },
+          today: { req: 1284, tokens: 312400, successRate: 99.4, ttftAvg: 820, cacheHitRate: 63.8 },
           trend: PROXY_TREND,
           tops: {
             channel: [
@@ -1121,6 +1122,12 @@ export const mock = {
         ];
       case "proxy_stats_detail":
         return { total: PROXY_USAGE.length, page: 1, pageSize: 20, rows: JSON.parse(JSON.stringify(PROXY_USAGE)) };
+      case "proxy_stats_request": {
+        const row = PROXY_USAGE.find((r) => r.id === Number((args as { id?: number })?.id));
+        return row ? { ...JSON.parse(JSON.stringify(row)), errorBody: row.hasErrorBody ? 'HTTP 429 {"code":4008,"msg":"rate limited, retry after 3s"}' : "" } : null;
+      }
+      case "proxy_stats_cleanup":
+        return { deleted: 0 };
       case "proxy_recent":
         return JSON.parse(JSON.stringify(PROXY_USAGE));
       case "proxy_rules_list":

@@ -358,7 +358,7 @@ const ALL_PROXY_CMDS = [
   "proxy_account_import_json", "proxy_account_import_file",
   "proxy_models", "proxy_models_sync",
   "proxy_ide_switch", "proxy_ide_status",
-  "proxy_stats_overview", "proxy_stats_top", "proxy_stats_detail", "proxy_recent",
+  "proxy_stats_overview", "proxy_stats_top", "proxy_stats_detail", "proxy_stats_request", "proxy_stats_cleanup", "proxy_recent",
   "proxy_rules_list", "proxy_open_rules_dir", "proxy_open_data_dir", "proxy_vault_status",
   "proxy_poolsync_status", "proxy_poolsync_run", "proxy_poolsync_cancel",
   "proxy_ccswitch_status", "proxy_ccswitch_register",

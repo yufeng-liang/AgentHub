@@ -2,15 +2,24 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import * as api from "../../api/ipc";
-import type { ProxyGatewayStatus, ProxyUsageRow } from "../../types";
+import type { ProxyGatewayStatus, ProxyUsageDetail, ProxyUsageRow } from "../../types";
 import { useAppStore } from "../../stores/app";
-import { fmtInt, fmtK, fmtMs, fmtTime, statusCls } from "./format";
+import { fmtInt, fmtK, fmtMs } from "./format";
+import RequestLogTable from "./RequestLogTable.vue";
+import RequestDetailDialog from "./RequestDetailDialog.vue";
 
 const app = useAppStore();
 const st = ref<ProxyGatewayStatus | null>(null);
 const recent = ref<ProxyUsageRow[]>([]);
 const busy = ref(false);
 const err = ref("");
+// 详情弹窗：行上点「详情」或失败徽标/错误摘要 → 按 id 取单条（含上游错误响应体）
+const detailReq = ref<ProxyUsageDetail | null>(null);
+async function openDetail(row: ProxyUsageRow) {
+  try {
+    detailReq.value = await api.proxyStatsRequest(row.id);
+  } catch { /* 网关不在时取不到：弹窗不开，不打断页面 */ }
+}
 // 后台网关起不来的显式错误态（Task 5 §七.1）：转发体回 {ok:false, message:"后台网关未能启动：…"}，
 // 此时绝不能把状态对象当 gatewayStatus 塞进 st 让页面停在假死的空态——单独亮错误卡 + 重试按钮
 const gwErr = ref("");
@@ -32,6 +41,17 @@ async function refresh() {
   } catch (e) {
     err.value = String((e as Error).message || e);
   }
+}
+
+/** 只刷实时流：request 事件高频（2s 节流合并），全量 refresh 会连带 KPI 反复触发数字补间 */
+let lastReqRefresh = 0;
+async function refreshRecent() {
+  const now = Date.now();
+  if (now - lastReqRefresh < 2000) return;
+  lastReqRefresh = now;
+  try {
+    recent.value = await api.proxyRecent(8);
+  } catch { /* 网关掉线时静默：5s 轮询的 refresh() 会把错误亮出来 */ }
 }
 
 /** 重试启动：转发体在子进程不在时会对任意命令先拉起网关，重发一次 status 即完成拉起 */
@@ -175,9 +195,13 @@ onMounted(() => {
   offEvent = api.onUpdateEvent((e) => {
     const p = e as { event?: string; type?: string };
     if (p.event !== "proxy") return;
-    // request 是每条代理请求就发一条的高频事件：实时性已由 5s 轮询兜底，
-    // 这里若也跟着刷，高流量时页面会被逐条全量刷新打满（KPI 还会反复触发全局数字补间）
-    if (p.type === "request") return;
+    // request 事件（主进程 2s 节流合并）驱动实时流追加；本地再压一道 2s 间隔，
+    // 且只刷流水区不刷 KPI——高流量下全量刷新会把页面打满（原实现直接忽略该事件，靠 5s 轮询）
+    if (p.type === "request") {
+      if (!active.value) return;
+      refreshRecent();
+      return;
+    }
     if (!active.value) return;
     refresh();
   });
@@ -249,30 +273,12 @@ onUnmounted(() => {
         </div>
       </div>
       <div class="card" style="margin-top: 12px">
-        <div class="card-title">实时请求流 <span class="right">最近 {{ recent.length }} 条</span></div>
-        <div class="tbl-wrap">
-          <table class="tbl">
-            <tbody>
-              <tr><th>时间</th><th>路径</th><th>模型</th><th>KEY</th><th>渠道</th><th>状态</th><th>TTFT</th><th>耗时</th></tr>
-              <tr v-for="r in recent" :key="r.id">
-                <td class="mono">{{ fmtTime(r.ts) }}</td>
-                <td class="mono">/v1/chat/completions</td>
-                <td class="mono">{{ r.model || "-" }}</td>
-                <td class="mono">{{ r.keyName || "-" }}</td>
-                <td>{{ r.channel || "-" }}</td>
-                <td><span class="tag" :class="statusCls(r.status)">{{ r.status || "-" }}</span></td>
-                <td class="mono">{{ fmtMs(r.ttftMs) }}</td>
-                <td class="mono">{{ fmtMs(r.latencyMs) }}</td>
-              </tr>
-              <tr v-if="!recent.length">
-                <td colspan="8" style="text-align: center; color: var(--text-3); padding: 18px">
-                  暂无请求记录 —— 用上方地址发起第一个请求即出现在这里
-                </td>
-              </tr>
-            </tbody>
-          </table>
+        <div class="card-title">
+          实时请求流 <span class="right">最近 {{ recent.length }} 条</span>
         </div>
+        <RequestLogTable :rows="recent" scope="home" @detail="openDetail" />
       </div>
+      <RequestDetailDialog :req="detailReq" @close="detailReq = null" />
       <div class="card">
         <div class="card-title">快速上手 <span class="right">四步完成接入</span></div>
         <div class="steps">

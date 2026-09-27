@@ -127,6 +127,9 @@ const extraUserCmds = [
   { name: "proxy_provider_remove_key", why: "自定义提供商：删 Key（写号池 accounts）" },
   { name: "proxy_provider_test", why: "自定义提供商：连通性探测（读号池凭据）" },
   { name: "proxy_provider_fetch_models", why: "自定义提供商：拉上游模型列表（读号池凭据）" },
+  // 请求日志流增强（2026-09-27）新增的两条：读流水明细（stats.db usage_requests）故必须归子进程
+  { name: "proxy_stats_request", why: "请求日志详情弹窗：按 id 取单条（含 error_body，读 stats.db）" },
+  { name: "proxy_stats_cleanup", why: "请求日志手动清理：按保留期删 usage_requests（写 stats.db）" },
 ];
 const upstreamUserNames = extraUserCmds.map((c) => c.name);
 check("④ 子进程表含 proxy_account_import_blob（import_file 拆两段的子进程半段）",
