@@ -1,5 +1,6 @@
 // 生态接入 · CC Switch 假库自测：造临时库（对齐真实 schema：BOOLEAN 标志列 + 复合主键 (id, app_type)），
-// 用 CCSWITCH_DB_PATH 把模块指到它上面，验证 status / register 幂等 / 备份与轮换 / 条目内容 / 校验报错 / 版本不兼容。
+// 用 CCSWITCH_DB_PATH 把模块指到它上面，验证 status / register 幂等 / 备份与轮换 / 条目内容 / 校验报错 / 版本不兼容 /
+// live 链路探测（fixture 家目录 + classifyLiveTarget 边界）。
 // 用法：node scripts/dev-ccswitch-test.cjs
 "use strict";
 const fs = require("node:fs");
@@ -39,8 +40,9 @@ CREATE TABLE providers (
 );
 `;
 
-// 真实库另有 proxy_config 表：enabled 为该应用是否接管，proxy_enabled 为全局代理网关在线
-// （Claude Desktop 映射模式无独立行，借 claude 行 proxy_enabled 判断）
+// 真实库另有 proxy_config 表（2026-09-27 本机实测语义）：enabled 为接管开关的持久化意图
+// （CC Switch 退出仍为 1，下次启动自动恢复接管），proxy_enabled 为当前是否接管中（退出时归零）。
+// Claude Desktop 无独立行，借 claude 行 proxy_enabled 判断当前接管状态
 const PROXY_CONFIG_SQL = `
 CREATE TABLE proxy_config (
   app_type TEXT NOT NULL PRIMARY KEY,
@@ -283,6 +285,42 @@ const ccswitch = require("../electron/backend/proxy/ccswitch.cjs");
   const rNoDb = ccswitch.register({ appType: "claude", apiKey: "k", model: "m" });
   assert.strictEqual(rNoDb.ok, false, "无库时 register 应失败");
   console.log("✓ 缺库状态与报错");
+
+  // 13) live 链路探测：USERPROFILE/HOME 指到 fixture 家目录（模块读 os.homedir()），
+  //     验证 Claude Code（settings.json 的 ANTHROPIC_BASE_URL）与 Codex（config.toml 的 base_url）的指向分类；
+  //     网关端口用显式入参钉死 9527，不依赖真实配置与网关运行状态。
+  const fakeHome = path.join(tmp, "home");
+  fs.mkdirSync(path.join(fakeHome, ".claude"), { recursive: true });
+  fs.mkdirSync(path.join(fakeHome, ".codex"), { recursive: true });
+  fs.writeFileSync(path.join(fakeHome, ".claude", "settings.json"),
+    JSON.stringify({ env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:9527" } }));
+  fs.writeFileSync(path.join(fakeHome, ".codex", "config.toml"),
+    'model_provider = "custom"\n\n[model_providers.custom]\nbase_url = "http://127.0.0.1:15721/v1"\n');
+  const prevUserProfile = process.env.USERPROFILE;
+  const prevHome = process.env.HOME;
+  process.env.USERPROFILE = fakeHome;
+  process.env.HOME = fakeHome;
+  try {
+    const sLive = ccswitch.status({ port: 9527 });
+    assert.strictEqual(sLive.live.claude.target, "gateway", "claude live 指向 9527 应分类为直连网关");
+    assert.strictEqual(sLive.live.claude.url, "http://127.0.0.1:9527", "claude live 应回传原始地址");
+    assert.strictEqual(sLive.live.codex.target, "ccswitch", "codex live 指向 15721 应分类为经 CC Switch");
+    console.log("✓ live 链路探测：claude=直连网关 / codex=经 CC Switch");
+
+    // 读不到配置文件 → unset；分类纯函数边界
+    fs.unlinkSync(path.join(fakeHome, ".claude", "settings.json"));
+    const sUnset = ccswitch.status({ port: 9527 });
+    assert.strictEqual(sUnset.live.claude.target, "unset", "读不到 settings.json 应按未配置处理");
+    const cls = ccswitch.classifyLiveTarget;
+    assert.strictEqual(cls("", 9527).target, "unset", "空地址应为 unset");
+    assert.strictEqual(cls("https://api.example.com/v1", 9527).target, "other", "非本地地址应为 other");
+    assert.strictEqual(cls("http://localhost:9527", 9527).target, "gateway", "localhost 同样算直连");
+    assert.strictEqual(cls("not a url", 9527).target, "other", "解析失败应为 other");
+    console.log("✓ live 分类边界：unset / other / localhost 直连 / 坏地址");
+  } finally {
+    if (prevUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = prevUserProfile;
+    if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
+  }
 
   fs.rmSync(tmp, { recursive: true, force: true });
   console.log("\n全部通过 ✓");

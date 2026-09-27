@@ -336,14 +336,23 @@ export interface CcSwitchEntry {
   registered: boolean;
   name?: string;
 }
+/** live 配置的实际指向（真实流量路径的地面真相）：gateway=直连 AgentHub 网关；
+ *  ccswitch=经 CC Switch 本地代理（需其运行）；other=指向其它地址；unset=未配置服务地址 */
+export interface CcSwitchLiveRoute {
+  url: string;
+  target: "gateway" | "ccswitch" | "other" | "unset";
+}
 export interface CcSwitchStatus {
   installed: boolean;
   /** 库在但 providers 表缺失等异常（按未注册展示，注册时会被更准确的报错拦截） */
   incompatible?: boolean;
   dbPath?: string;
-  /** 各应用的本地代理接管状态：只有开启接管，OpenAI Chat 上游才会被 CC Switch 转换协议；
-   *  claudeDesktop 表示 CC Switch 全局代理网关在线（Desktop 映射模式依赖它常驻，借 claude 行 proxy_enabled 判断） */
+  /** proxy_config 两列语义（实测）：enabled=接管开关的持久化意图（CC Switch 退出仍为 1，下次启动自动恢复）；
+   *  claudeDesktop 借 claude 行 proxy_enabled=当前是否接管中（Desktop 映射依赖它常驻）。
+   *  即 enabled=1 而 CC Switch 未运行时，live 已被恢复为直连，此开关不代表流量正经过它 */
   takeover?: { claude: boolean; codex: boolean; claudeDesktop: boolean };
+  /** 各应用 live 配置当前实际指向（Claude Code 读 ~/.claude/settings.json，Codex 读 ~/.codex/config.toml） */
+  live?: { claude: CcSwitchLiveRoute; codex: CcSwitchLiveRoute };
   entries?: CcSwitchEntry[];
 }
 export interface CcSwitchRegisterResult {
