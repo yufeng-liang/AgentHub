@@ -11,6 +11,10 @@
 
 /* ===== 统一 token：暗色（默认） ===== */
 :root {
+  /* 原生控件弹出层（select 选项列表 / time 面板 / 滚动条）由 Chromium 按
+     color-scheme 渲染：不声明时一律走浅色，暗色主题下 select 弹层白底配
+     浅灰字几乎不可读。亮色主题在下方 token 块里翻回 light */
+  color-scheme: dark;
   --bg: #0a0c0f;
   /* 卡片/表格底：叠在玻璃壳上的轻纱（半透明白，深度靠堆叠自然形成） */
   --bg-soft: rgba(255, 255, 255, 0.03);
@@ -105,6 +109,7 @@
 }
 /* ===== 亮色 token ===== */
 :root[data-theme="light"] {
+  color-scheme: light;
   --bg: #f4f6f9;
   --bg-soft: #ffffff;
   --panel: #ffffff;
@@ -2305,6 +2310,14 @@ html.fx-off .ambient i {
 .f-select:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* 原生 select 弹出的选项列表：color-scheme 已把弹层切到暗色（见 :root），
+   这里再把行底/行字显式对齐 token 色（--panel 是实色；半透明 token 在弹层里
+   会和 Chromium 的底混色）。选中/悬停高亮仍走原生，保持系统行为 */
+select option {
+  background: var(--panel);
+  color: var(--text);
 }
 
 /* 下拉选择器（Element 版）：全站下拉一律用 el-select + popper-class="glass-popper" + 本类，
