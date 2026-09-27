@@ -468,8 +468,12 @@ function register(ipcMain) {
     const found = discovery.scanAll();
     let c = found[Number(index)];
     if (file || uid) {
-      // 身份核对：以 file/uid 为准回查，防止两次扫描之间候选增减导致按下标导错账号
-      const hit = found.find((x) => (file && x.file === file) || (uid && x.uid === uid && (!channel || x.channel === channel)));
+      // 身份核对：三个约束**同时**成立才算同一条候选。旧写法是 `file || uid` 的或，而两个渠道的本机
+      // 登录文件可以同名（小浣熊与 AutoClaw 都叫 auth.json），scanAll() 里小浣熊又排在 AutoClaw 前面
+      // ⇒ 点 AutoClaw 那行会命中排前的小浣熊，把别家凭据静默挂到所点渠道下（真机 2026-09-27 抓到，
+      // 闸见 scripts/dev-autoclaw-test.cjs「proxy_scan_import 身份复核」节）。
+      const hit = found.find((x) =>
+        (!channel || x.channel === channel) && (!file || x.file === file) && (!uid || x.uid === uid));
       if (!hit) return fail("候选已变化（本地登录态可能刚被更新），请重新扫描后再导入");
       c = hit;
     }

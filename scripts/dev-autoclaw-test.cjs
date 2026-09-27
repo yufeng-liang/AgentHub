@@ -571,6 +571,56 @@ const calls = [];
   timers = [];
 
   globalThis.fetch = realFetch;
+
+  // —— 导入身份复核：小浣熊与 AutoClaw 的候选 file 都是字面量 "auth.json" ——
+  // 真机 2026-09-27 抓到的缺陷：proxy_scan_import 用 `file || uid` 的**或**去回查候选，
+  // 而 scanAll() 里 raccoon 排在 autoclaw 前面 ⇒ 在两台桌面端都登录过的机器上点 AutoClaw 那行，
+  // 落库的是小浣熊的 token 挂在 autoclaw 渠道下。UI 传满四参（ProxyAgentsView.vue），必然命中。
+  console.log("proxy_scan_import 身份复核（两渠道共用 file=\"auth.json\"）:");
+  {
+    const store = require("../electron/backend/proxy/store.cjs");
+    const proxy = require("../electron/backend/proxy/index.cjs");
+    const handlers = new Map();
+    proxy.register({ handle: (name, fn) => handlers.set(name, fn) });
+    const call = (name, args) => handlers.get(name)(null, args);
+    ok("① 处理体可从 register() 收集到（判据不是空转）", typeof handlers.get("proxy_scan_import") === "function");
+
+    const realScanAll = discovery.scanAll;
+    const CLAW = { channel: "autoclaw", uid: "user-9", name: "AutoClaw 账号", token: "AUTOC-1", refreshToken: "AUTOC-RT", expiresAt: 0, meta: {}, source: "scan", file: "auth.json" };
+    const RAC = { channel: "raccoon", uid: "70ece0", name: "RaccoonAubrey", token: "RAC-1", refreshToken: "RAC-RT", expiresAt: 0, meta: {}, source: "scan", file: "auth.json" };
+    discovery.scanAll = () => [RAC, CLAW]; // 顺序与 scanAll 真实现一致：raccoon 在 autoclaw 之前
+    try {
+      const r = await call("proxy_scan_import", { index: 1, channel: "autoclaw", file: "auth.json", uid: "user-9" });
+      const acct = r && r.id ? store.getAccount(r.id) : null;
+      const sec = acct ? store.accountSecrets(acct) : {};
+      ok("点 AutoClaw 那行导入，落库渠道是 autoclaw", r.ok === true && !!acct && acct.channel === "autoclaw" && acct.uid === "user-9",
+        { r, got: acct && { channel: acct.channel, uid: acct.uid, name: acct.name } });
+      ok("落库的 token 是 AutoClaw 的凭据（不是小浣熊的）", sec.token === "AUTOC-1", { token: sec.token });
+      ok("小浣熊渠道没有因此多出账号", store.listAccounts("raccoon").length === 0, store.listAccounts("raccoon").map(a => a.uid));
+
+      const r2 = await call("proxy_scan_import", { index: 0, channel: "raccoon", file: "auth.json", uid: "70ece0" });
+      const a2 = r2 && r2.id ? store.getAccount(r2.id) : null;
+      ok("反向同理：点小浣熊那行落的是小浣熊（AND 之后不能退化成永远取下标 1）",
+        r2.ok === true && !!a2 && a2.channel === "raccoon" && a2.uid === "70ece0" && store.accountSecrets(a2).token === "RAC-1",
+        { r2, got: a2 && { ch: a2.channel, uid: a2.uid } });
+
+      // 只传下标（本轮真机的绕行调用）仍按字面下标走
+      const r3 = await call("proxy_scan_import", { index: 1 });
+      ok("只传 {index} 时仍按下标取候选", r3.ok === true && r3.updated === true, r3);
+
+      // 三个约束都必须是**可选**的：老调用方不传 channel 时，只靠 uid 也要能唯一命中
+      const r5 = await call("proxy_scan_import", { index: 0, file: "auth.json", uid: "user-9" });
+      ok("不传 channel、只给 file+uid 时按 uid 命中 autoclaw（约束不得变成硬性三必填）",
+        r5.ok === true && r5.updated === true, r5);
+
+      // 身份核对的本意要保住：文件里那一行消失 ⇒ 明确报「候选已变化」，不得静默导成别家
+      discovery.scanAll = () => [RAC];
+      const r4 = await call("proxy_scan_import", { index: 1, channel: "autoclaw", file: "auth.json", uid: "user-9" });
+      ok("候选真消失了 → 报「候选已变化」而不是导成小浣熊", r4.ok === false && /候选已变化/.test(r4.message || ""), r4);
+    } finally {
+      discovery.scanAll = realScanAll;
+    }
+  }
 })().then(() => {
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
