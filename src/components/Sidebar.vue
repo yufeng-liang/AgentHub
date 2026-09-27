@@ -199,7 +199,7 @@ const MODULE_META = computed<Record<ModuleKey, { state: string; level: "ok" | "w
 type ProxyChannelRow = {
   id: string;
   display: string;
-  summary: { totalCredits: number; accountCount: number; onlineCount: number; earliestExpire: number; expiringSoon: boolean };
+  summary: { totalCredits: number; accountCount: number; onlineCount: number; earliestExpire: number; expired: boolean; expiringSoon: boolean };
 };
 const channels = ref<ProxyChannelRow[]>([]);
 async function refreshChannels() {
@@ -497,7 +497,7 @@ const TOOLS = computed<{ name: string; meta: string; label: string; ok: boolean 
           <div v-for="c in channels" :key="c.id" class="ov-row">
             <div class="grow">
               <div class="ov-name">
-                {{ c.display }}<span v-if="c.summary.expiringSoon" class="ov-tag warn">即将到期</span>
+                {{ c.display }}<span v-if="c.summary.expired" class="ov-tag danger">已过期</span><span v-else-if="c.summary.expiringSoon" class="ov-tag warn">即将到期</span>
               </div>
               <div class="ov-meta">
                 {{ c.summary.accountCount ? `${c.summary.onlineCount}/${c.summary.accountCount} 可用` : "空号池" }}<template v-if="c.summary.earliestExpire"> · 最早到期 {{ fmtDay(c.summary.earliestExpire) }}</template>
@@ -922,6 +922,10 @@ const TOOLS = computed<{ name: string; meta: string; label: string; ok: boolean 
 .ov-tag.warn {
   background: var(--warn-dim);
   color: var(--warn);
+}
+.ov-tag.danger {
+  background: var(--danger-dim);
+  color: var(--danger);
 }
 /* 可选中行（「全部电脑」与各设备行共用同一套指针/过渡/选中高亮，样式完全一致） */
 .ov-pick {

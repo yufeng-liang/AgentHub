@@ -395,6 +395,7 @@ export interface ProxyPoolSummary {
   accountCount: number;
   onlineCount: number;
   earliestExpire: number;
+  expired: boolean;
   expiringSoon: boolean;
   todayReq: number;
   todayTokens: number;

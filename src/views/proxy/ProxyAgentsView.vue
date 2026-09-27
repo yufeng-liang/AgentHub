@@ -971,7 +971,8 @@ onUnmounted(() => {
           <span class="tag" :class="ch.summary.onlineCount > 0 ? 'tag-ok' : 'tag-dim'">
             {{ ch.summary.accountCount ? `${ch.summary.onlineCount}/${ch.summary.accountCount} 可用` : "空号池" }}
           </span>
-          <span v-if="ch.summary.expiringSoon" class="tag tag-warn">24h 内有到期</span>
+          <span v-if="ch.summary.expired" class="tag tag-err">有账号已过期</span>
+          <span v-else-if="ch.summary.expiringSoon" class="tag tag-warn">24h 内有到期</span>
           <!-- 工具栏：只属于当前渠道（策略 / 添加 / 签到或加油包 / 刷新），与其他渠道互不关联 -->
           <span class="panel-tools">
             <select

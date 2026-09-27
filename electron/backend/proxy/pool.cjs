@@ -296,7 +296,10 @@ function poolSummary(channel) {
     accountCount: accs.length,
     onlineCount: online.length,
     earliestExpire: expires.length ? Math.min(...expires) : 0,
-    expiringSoon: accs.some((a) => a.expiresAt > 0 && a.expiresAt - now < 86400000),
+    // 已过期必须单独出标志：expiresAt - now 对过期账号是负数，按旧的「< 86400000」判定会把
+    // 过期一周的号也标成「即将到期」（2026-09-27 Trae 渠道侧栏实测）
+    expired: accs.some((a) => a.expiresAt > 0 && a.expiresAt <= now),
+    expiringSoon: accs.some((a) => a.expiresAt > now && a.expiresAt - now < 86400000),
     todayReq: accs.reduce((s, a) => s + a.todayReq, 0),
     todayTokens: accs.reduce((s, a) => s + a.todayTokens, 0),
     lastCreditsAt: accs.reduce((m, a) => Math.max(m, a.creditsAt || 0), 0),
