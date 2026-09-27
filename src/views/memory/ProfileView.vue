@@ -14,16 +14,18 @@ import * as api from "../../api/ipc";
 import { formatInteger, timeAgo } from "../../composables/useFormat";
 import MemHelp from "../../components/memory/MemHelp.vue";
 import MemProgressDialog from "../../components/memory/MemProgressDialog.vue";
+import MemoryDetailDrawer from "../../components/memory/MemoryDetailDrawer.vue";
 
 const app = useAppStore();
 const mem = useMemoryStore();
 const active = computed(() => app.activeModule === "memory" && app.activePage === "profile");
 
+/* 分区图标沿用全站 ph 图标体系（与配置页分组同源），不再用 emoji */
 const SECTION_META: Record<string, { title: string; icon: string; field: string }> = {
-  persona: { title: "人格特质", icon: "🧠", field: "结论" },
-  preferences: { title: "沟通偏好", icon: "💬", field: "偏好" },
-  tech: { title: "技术偏好", icon: "⚙️", field: "偏好" },
-  habits: { title: "工作习惯", icon: "🔄", field: "习惯" },
+  persona: { title: "人格特质", icon: "ph-brain", field: "结论" },
+  preferences: { title: "沟通偏好", icon: "ph-chats", field: "偏好" },
+  tech: { title: "技术偏好", icon: "ph-gear-six", field: "偏好" },
+  habits: { title: "工作习惯", icon: "ph-arrows-clockwise", field: "习惯" },
 };
 
 type Section = { name: string; path: string; text: string; exists: boolean };
@@ -99,7 +101,7 @@ function startEdit(name: string) {
 async function saveEdit() {
   try {
     await api.memoryProfileSave(editing.value, draft.value);
-    ElMessage.success("已保存（手改内容请以 [pinned] 开头，下次生成不会覆盖）");
+    ElMessage.success("已保存");
     editing.value = "";
     await refresh();
   } catch (e) {
@@ -112,13 +114,13 @@ function openHistory() {
   void api.memoryOpenDir("profile/.history");
 }
 
-async function showEvidence(id: string) {
-  try {
-    const r = await api.memoryGet(id);
-    ElMessage.success(`证据原文：${r.memory.title}`);
-  } catch {
-    ElMessage.warning("该证据记忆已不存在（可能被删除或失效）");
-  }
+/** 证据链点击 = 打开记忆详情抽屉（原来只 toast 标题，看不到正文/标签/相关记忆） */
+const drawerOpen = ref(false);
+const drawerId = ref("");
+function showEvidence(id: string) {
+  if (!id) return;
+  drawerId.value = id;
+  drawerOpen.value = true;
 }
 
 onMounted(refresh);
@@ -136,7 +138,7 @@ watch(active, (v) => {
         <MemHelp text="画像＝跨项目归纳出的「你是谁」：人格特质、沟通偏好、技术偏好、工作习惯。每条结论都必须附它依据的记忆 id（证据链），点证据可回原文，防止模型编造人格。" />
       </p>
       <div class="mem-head-actions">
-        <button v-if="supersedeCount" class="mem-chip click warn" @click="mem.gotoReview('supersede')">{{ supersedeCount }} 条待确认失效 →</button>
+        <button v-if="supersedeCount" class="btn-outline" @click="mem.gotoReview('supersede')">{{ supersedeCount }} 条待确认失效 →</button>
         <button class="btn btn-ghost" @click="openHistory">历史版本目录</button>
         <button class="btn btn-cta" :disabled="generating" @click="generate">
           {{ generating ? "生成中…" : "重新生成画像" }}
@@ -148,15 +150,19 @@ watch(active, (v) => {
     <div class="mem-grid mem-grid-2">
       <div v-for="s in sections" :key="s.name" class="mem-card">
         <div class="mem-card-title">
-          {{ SECTION_META[s.name]?.icon }} {{ SECTION_META[s.name]?.title || s.name }}
+          <i class="ph" :class="SECTION_META[s.name]?.icon || 'ph-file-text'"></i>
+          {{ SECTION_META[s.name]?.title || s.name }}
           <span class="mem-row" style="gap: 6px">
-            <button class="mem-chip click" @click="startEdit(s.name)">✏️ 编辑</button>
+            <button class="btn btn-ghost" @click="startEdit(s.name)">✏️ 编辑</button>
             <MemHelp text="手改后写回该分区的 md 文件；想让它下次生成不被覆盖，就以 [pinned] 开头写一行。" />
           </span>
         </div>
 
         <template v-if="editing === s.name">
           <textarea v-model="draft" class="el-textarea__inner" rows="8"></textarea>
+          <div class="mem-hint" style="margin-top: 4px">
+            以 <code>[pinned]</code> 开头的手改内容，下次重新生成不会被覆盖
+          </div>
           <div class="mem-row" style="margin-top: 8px">
             <button class="btn btn-cta" @click="saveEdit">保存</button>
             <button class="btn btn-ghost" @click="editing = ''">取消</button>
@@ -169,17 +175,26 @@ watch(active, (v) => {
               <span>{{ item.text }}</span>
               <span v-if="item.evidence.length" style="display: flex; gap: 6px; flex-wrap: wrap; align-items: center">
                 <span class="mem-hint">证据 [{{ item.evidence.length }}]</span>
-                <button v-for="e in item.evidence.slice(0, 5)" :key="e" class="mem-chip click" @click="showEvidence(e)">{{ e }}</button>
+                <button v-for="e in item.evidence.slice(0, 5)" :key="e" class="btn-link" @click="showEvidence(e)">{{ e }}</button>
               </span>
             </div>
           </div>
           <div v-else class="mem-empty">
-            还没有内容 —— 点右上「重新生成画像」（需要先配置模型；素材至少
-            {{ formatInteger(Number(mem.cfg("deep.personaMinMemories", 30))) }} 条记忆）
+            还没有内容 —— 当前 {{ formatInteger(mem.stats?.total || 0) }} 条 / 需要
+            {{ formatInteger(Number(mem.cfg("deep.personaMinMemories", 30))) }} 条记忆才能生成
           </div>
         </template>
       </div>
     </div>
+
+    <!-- 证据链查看：复用统一的记忆详情抽屉（含正文/标签/演化链/相关记忆） -->
+    <MemoryDetailDrawer
+      :show="drawerOpen"
+      :id="drawerId"
+      @close="drawerOpen = false"
+      @open="(id: string) => { drawerId = id; }"
+      @changed="refresh"
+    />
 
     <!-- 重新生成画像的进度弹窗：读素材 + 调模型，耗时较长，结果也在这里看 -->
     <MemProgressDialog

@@ -30,6 +30,12 @@ const verifyResults = ref<Record<string, MemoryAgentVerify>>({});
 const verifyOpen = ref<Record<string, boolean>>({});
 const snippetFor = ref<string>("zcode");
 const snippetFormat = ref<"json" | "toml" | "cli">("json");
+/** 接入片段格式三选一（分段控件用：固定顺序，滑块位置按它算） */
+const SNIPPET_FORMATS: { value: "json" | "toml" | "cli"; label: string }[] = [
+  { value: "json", label: "JSON" },
+  { value: "toml", label: "TOML" },
+  { value: "cli", label: "命令行" },
+];
 const snippet = ref<{ json: string; toml: string; cli: string; instruction: string; hint: string; configPath: string; instructionPath: string } | null>(null);
 const manualOpen = ref(false);
 const customOpen = ref(false);
@@ -183,11 +189,11 @@ watch([snippetFor, snippetFormat], () => void loadSnippet());
   <div class="memory-scope">
     <div class="mem-head">
       <p class="mem-sub">
-        MCP stdio 桥 + 本地 HTTP 单写者；三级校验区分「配置了」与「真的连上了」
+        让你的 AI 编程助手能读写这个记忆仓库
         <MemHelp text="接入分两件事：给 Agent 的配置加一条 MCP 启动项（让它能拉起本地桥），再往它的指令文件（AGENTS.md/CLAUDE.md）写一段受控块（告诉它什么时候读写记忆）。两步都能一键回退。" />
       </p>
       <div class="mem-head-actions">
-        <button class="btn btn-ghost" :disabled="busy === 'bridge'" @click="restartBridge">
+        <button v-if="precheckBad" class="btn btn-ghost" :disabled="busy === 'bridge'" @click="restartBridge">
           {{ busy === "bridge" ? "重启中…" : "重启本地服务" }}
         </button>
       </div>
@@ -197,7 +203,12 @@ watch([snippetFor, snippetFormat], () => void loadSnippet());
       <div class="mem-card-title">
         本地 MCP 服务状态
         <span class="mem-hint">仅绑 127.0.0.1 + 一次性 token</span>
-        <MemHelp text="所有 Agent 的记忆调用都经这个本地服务转手，好处是「只有一个写者」——不会出现两个 Agent 同时写同一个文件而互相覆盖。只监听本机回环地址，token 每次启动轮换。" />
+        <span class="mem-inline-ctl">
+          <button class="btn-outline" :disabled="busy === 'bridge'" @click="restartBridge">
+            {{ busy === "bridge" ? "重启中…" : "重启本地服务" }}
+          </button>
+          <MemHelp text="所有 Agent 的记忆调用都经这个本地服务转手，好处是「只有一个写者」——不会出现两个 Agent 同时写同一个文件而互相覆盖。只监听本机回环地址，token 每次启动轮换。" />
+        </span>
       </div>
       <div class="mem-kv">
         <span class="k">运行状态</span>
@@ -226,11 +237,16 @@ watch([snippetFor, snippetFormat], () => void loadSnippet());
             <span class="mem-chip" :class="levelClass[verifyResults[a.id]?.level || (a.beat ? 'verified' : a.injected ? 'handshaked' : 'detected')]">
               {{ levelText[verifyResults[a.id]?.level || (a.beat ? "verified" : a.injected ? "handshaked" : "detected")] }}
             </span>
+            <span v-if="a.beat" class="mem-chip accent">真实调用 {{ a.beat.calls }} 次</span>
             <MemHelp text="三级校验：① 配置文件里条目在不在、路径可达不可达 → ② 真拉起桥发 initialize + tools/list → ③ 观察这个 Agent 有没有真的调用过。只有 ③ 有心跳才说明它真的在用。" />
+            <button class="btn btn-ghost" @click="verifyOpen = { ...verifyOpen, [a.id + ':path']: !verifyOpen[a.id + ':path'] }">
+              {{ verifyOpen[a.id + ":path"] ? "收起详情" : "详情" }}
+            </button>
           </span>
         </div>
 
-        <div class="mem-kv">
+        <!-- 卡面主显：连接状态 + 真实调用计数；两行长路径收进「详情」 -->
+        <div v-if="verifyOpen[a.id + ':path']" class="mem-kv">
           <span class="k">配置文件</span>
           <span class="v">
             <span class="mem-mono">{{ a.configPath }}</span>
@@ -247,6 +263,9 @@ watch([snippetFor, snippetFormat], () => void loadSnippet());
           <span class="v">
             {{ a.beat ? `最近 ${timeAgo(a.beat.lastCall)} · 共 ${a.beat.calls} 次（写 ${a.beat.writes} / 检索 ${a.beat.searches} / 错误 ${a.beat.errors}）` : "尚未观察到调用（若长期未调用，检查 Agent 是否重启过）" }}
           </span>
+        </div>
+        <div v-else class="mem-row" style="font-size: 12px; color: var(--text-3); padding: 4px 0">
+          <span>{{ a.beat ? `最近调用 ${timeAgo(a.beat.lastCall)} · 共 ${a.beat.calls} 次` : "尚未观察到真实调用" }}</span>
         </div>
 
         <div v-if="verifyResults[a.id] && verifyOpen[a.id]" class="mem-kv" style="margin-top: 8px">
@@ -267,8 +286,8 @@ watch([snippetFor, snippetFormat], () => void loadSnippet());
           <button class="btn btn-cta" @click="inject(a.id)">一键注入</button>
           <MemHelp text="注入 = 往它的配置文件加 MCP 条目 + 往指令文件追加受控块（都在写前自动备份）。卸载时只删自己的块并把条目停用，不动你原有的配置。「测试连接」会真启动一次桥（约 1 秒）。" />
           <span class="mem-inline-ctl">
-            <button class="mem-chip click" @click="() => { manualOpen = true; snippetFor = a.id; }">手动接入片段</button>
-            <button class="mem-chip click" @click="uninject(a.id)">卸载</button>
+            <button class="btn btn-ghost" @click="() => { manualOpen = true; snippetFor = a.id; }">手动接入片段</button>
+            <button class="btn-outline danger" @click="uninject(a.id)">卸载</button>
           </span>
           <span v-if="a.note" class="mem-hint" style="margin-left: auto">{{ a.note }}</span>
         </div>
@@ -280,16 +299,25 @@ watch([snippetFor, snippetFormat], () => void loadSnippet());
       <div class="mem-card-title">
         手动接入
         <span class="mem-hint">{{ snippet?.hint }}</span>
-        <button class="mem-chip click" @click="manualOpen = !manualOpen">{{ manualOpen ? "收起" : "展开" }}</button>
+        <button class="btn btn-ghost" @click="manualOpen = !manualOpen">{{ manualOpen ? "收起" : "展开" }}</button>
       </div>
       <template v-if="manualOpen">
         <div class="mem-row" style="margin-bottom: 10px">
           <MemSelect v-model="snippetFor" :options="agents.map((a) => ({ value: a.id, label: a.name }))" width="210px" />
-          <div class="mem-seg" style="flex: 0 0 auto">
-            <button class="btn" :class="snippetFormat === 'json' ? 'btn-outline' : 'btn-ghost'" @click="snippetFormat = 'json'">JSON</button>
-            <button class="btn" :class="snippetFormat === 'toml' ? 'btn-outline' : 'btn-ghost'" @click="snippetFormat = 'toml'">TOML</button>
-            <button class="btn" :class="snippetFormat === 'cli' ? 'btn-outline' : 'btn-ghost'" @click="snippetFormat = 'cli'">命令行</button>
-          </div>
+          <span class="mem-switch is-3" :style="{ '--sw-i': SNIPPET_FORMATS.findIndex((f) => f.value === snippetFormat) }" role="radiogroup" aria-label="片段格式">
+            <span class="sw-thumb"></span>
+            <button
+              v-for="f in SNIPPET_FORMATS"
+              :key="f.value"
+              class="sw-item"
+              :class="{ active: snippetFormat === f.value }"
+              role="radio"
+              :aria-checked="snippetFormat === f.value"
+              @click="snippetFormat = f.value"
+            >
+              {{ f.label }}
+            </button>
+          </span>
           <button class="btn btn-ghost" @click="copy(snippetFormat === 'json' ? snippet?.json || '' : snippetFormat === 'toml' ? snippet?.toml || '' : snippet?.cli || '', '配置片段')">复制配置</button>
           <button class="btn btn-ghost" @click="copy(snippet?.instruction || '', '指令块')">复制指令块</button>
           <button class="btn btn-ghost" @click="copy(`${command?.command || ''} ${(command?.args || []).join(' ')}`, '启动命令行')">复制启动命令</button>
@@ -310,7 +338,7 @@ watch([snippetFor, snippetFormat], () => void loadSnippet());
       <div class="mem-card-title">
         自定义 Agent（扩展位）
         <span class="mem-hint">填名称 + 配置文件路径即可生成同样的接入片段</span>
-        <button class="mem-chip click" @click="customOpen = !customOpen">{{ customOpen ? "收起" : "＋ 添加" }}</button>
+        <button class="btn-outline" @click="customOpen = !customOpen">{{ customOpen ? "收起" : "＋ 添加" }}</button>
       </div>
       <div v-if="customOpen" class="mem-row">
         <input v-model="custom.name" class="f-input" style="max-width: 180px" placeholder="名称，如 Cline" />
