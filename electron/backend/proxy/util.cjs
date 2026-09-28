@@ -147,18 +147,25 @@ function injectThinking(obj, defaultEffort) {
 const EFFORT_RANK = { off: 0, minimal: 1, low: 2, medium: 3, high: 4, xhigh: 5, max: 6 };
 // 档位词表的唯一出处：提供商侧配置要校验用户填的档位，必须用同一份而不是再抄一个字面量数组
 const EFFORT_LEVELS = Object.keys(EFFORT_RANK);
+// 档位别名归一（移植 Repo1）：Repo1 的 "none" 语义等同本项目的 "off"（关思考）。
+// 只做别名折叠 + lowercase，非法值原样返回交由调用方（normalizeReasoningEffort / 各适配器）判空。
+function normalizeEffortName(effort) {
+  const s = String(effort == null ? "" : effort).trim().toLowerCase();
+  return s === "none" ? "off" : s;
+}
 
 /** reasoning_effort 档位降级（参考项目 normalizeReasoningEffort）：模型目录声明 supportedEfforts
  *  时按其收敛——请求档不在支持集则降到 ≤ 请求档的最高支持档；支持档全高于请求档取最低档。 */
 function normalizeReasoningEffort(obj, reasoningMeta) {
   const supported = (reasoningMeta && Array.isArray(reasoningMeta.supportedEfforts))
-    ? reasoningMeta.supportedEfforts.map(String).filter((s) => EFFORT_RANK[s] != null)
+    ? reasoningMeta.supportedEfforts.map(normalizeEffortName).filter((s) => EFFORT_RANK[s] != null)
     : [];
   if (!supported.length || !obj) return;
-  const cur = typeof obj.reasoning_effort === "string" ? obj.reasoning_effort : "";
+  // "none"→"off" 别名折叠后再判档（Repo1 词表兼容）；折叠后写回 obj，保证发往上游的是本项目词表
+  const cur = typeof obj.reasoning_effort === "string" ? normalizeEffortName(obj.reasoning_effort) : "";
   if (!cur || EFFORT_RANK[cur] == null) return;
   const sorted = [...new Set(supported)].sort((a, b) => EFFORT_RANK[a] - EFFORT_RANK[b]);
-  if (sorted.includes(cur)) return;
+  if (sorted.includes(cur)) { obj.reasoning_effort = cur; return; }
   const curRank = EFFORT_RANK[cur];
   const lower = sorted.filter((s) => EFFORT_RANK[s] <= curRank);
   obj.reasoning_effort = lower.length ? lower[lower.length - 1] : sorted[0];
@@ -418,7 +425,7 @@ function upstreamCredit(u) {
 module.exports = {
   uuid, traceId, jwtDecode, dig, toMs,
   isCompleteJson, parseRetryAfterHeaders, stableConvId, promptCacheKey,
-  isDeepSeekModel, injectThinking, normalizeReasoningEffort, backfillReasoningContent, EFFORT_LEVELS,
+  isDeepSeekModel, injectThinking, normalizeReasoningEffort, backfillReasoningContent, EFFORT_LEVELS, EFFORT_RANK, normalizeEffortName,
   SseScanner, stripEmptyDelta, hasConsumableDelta, chunk, DONE, Aggregator, openaiError, validateChatBody, estimateTokens,
   openaiCacheTokens, upstreamCredit,
   appVersion,

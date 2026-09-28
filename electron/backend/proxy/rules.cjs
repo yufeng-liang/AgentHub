@@ -133,6 +133,77 @@ const DEFAULTS = {
       ],
     },
   },
+  // 各渠道 effort 兜底 seed（方案 §3.2，移植 workbuddy2api-panel per-realm 表 + 收编 Qoder 内联 QODER_FALLBACK 档位）：
+  // ModelMeta 三源合并的最低优先层（seed < 拉取 < 用户覆盖）。渠道 → 模型 id（大小写不敏感）→
+  // { efforts:[...], default:"...", capabilities?:{images,video,reasoning,tools}, contextLength?, maxOutputTokens? }。
+  // 未知渠道/模型不写入（读取回落拉取值）；解析失败 → 空表（adapters.effortCatalog 兜底，不崩）。
+  "effort_catalog.json": {
+    // WorkBuddy CN（copilot.tencent.com/v3/config 全量实测快照 2026-09-28；单档 {effort:x} 已归一为 efforts:[x]）
+    workbuddy: {
+      auto: { efforts: ["high"], default: "high" },
+      "fast-model": { efforts: ["medium"], default: "medium" },
+      "balanced-model": { efforts: ["medium"], default: "medium" },
+      "deep-model": { efforts: ["medium"], default: "medium" },
+      hy3: { efforts: ["low", "high"], default: "high" },
+      "hy3-b": { efforts: ["low", "high"], default: "high" },
+      "hy3-c": { efforts: ["low", "high"], default: "high" },
+      "hy3-x": { efforts: ["low", "high"], default: "high" },
+      "hy4-preview": { efforts: ["high"], default: "high" },
+      "hy4-preview-dev": { efforts: ["high"], default: "high" },
+      "hy4-preview-x": { efforts: ["high"], default: "high" },
+      "minimax-m2.5": { efforts: ["medium"], default: "medium" },
+      "glm-5v-turbo": { efforts: ["medium"], default: "medium" },
+      "glm-5.3": { efforts: ["low", "high", "max"], default: "high" },
+      "glm-5.3-flash": { efforts: ["low", "high", "max"], default: "high" },
+      "glm-5.2": { efforts: ["high", "xhigh"], default: "high" },
+      "glm-5.1": { efforts: ["medium"], default: "medium" },
+      "glm-5.0-turbo": { efforts: ["medium"], default: "medium" },
+      "glm-4.6v": { efforts: ["medium"], default: "medium" },
+      "kimi-k3-1": { efforts: ["low", "high", "xhigh"], default: "high" },
+      "kimi-k2.8-preview": { efforts: ["low", "high", "max"], default: "high" },
+      "kimi-k2.7": { efforts: ["medium"], default: "medium" },
+      "kimi-k2.6": { efforts: ["medium"], default: "medium" },
+      "kimi-k2.5": { efforts: ["medium"], default: "medium" },
+      "kimi-k2-thinking": { efforts: ["medium"], default: "medium" },
+      "minimax-m3": { efforts: ["medium"], default: "medium" },
+      "minimax-m2.7": { efforts: ["medium"], default: "medium" },
+      "deepseek-v4-flash": { efforts: ["high", "xhigh"], default: "high" },
+      "deepseek-v4.1-flash": { efforts: ["high"], default: "high" },
+      "deepseek-v4-pro": { efforts: ["high", "xhigh"], default: "high" },
+      "deepseek-v3-2-volc": { efforts: ["medium"], default: "medium" },
+      "hunyuan-2.0-instruct": { efforts: ["medium"], default: "medium" },
+    },
+    // WorkBuddy AI（www.workbuddy.ai/v3/config 全量实测快照）
+    workbuddy_ai: {
+      "fast-model": { efforts: ["medium"], default: "medium" },
+      "balanced-model": { efforts: ["medium"], default: "medium" },
+      "primary-model": { efforts: ["high"], default: "high" },
+      "kimi-k2.8-preview": { efforts: ["low", "high", "max"], default: "high" },
+      "deepseek-v4.1-flash": { efforts: ["high"], default: "high" },
+      "deepseek-v4.1-flash-sg": { efforts: ["high"], default: "high" },
+      "glm-5.3-flash": { efforts: ["low", "high", "max"], default: "high" },
+      "gpt-6-astra": { efforts: ["low", "medium", "high", "xhigh", "max"], default: "high" },
+      "hy4-preview-f": { efforts: ["high"], default: "high" },
+      "hy4-preview": { efforts: ["high"], default: "high" },
+      hy3: { efforts: ["low", "high"], default: "high" },
+      "gpt-5.6-sol": { efforts: ["low", "medium", "high", "xhigh", "max"], default: "high" },
+      "gpt-5.6-terra": { efforts: ["low", "medium", "high", "xhigh", "max"], default: "high" },
+      "gpt-5.6-luna": { efforts: ["low", "medium", "high", "xhigh", "max"], default: "high" },
+      "gpt-5.5": { efforts: ["low", "medium", "high", "xhigh"], default: "high" },
+      "gpt-5.4": { efforts: ["low", "medium", "high", "xhigh"], default: "high" },
+      "gemini-3.5-flash": { efforts: ["medium"], default: "medium" },
+      "glm-5.3": { efforts: ["low", "high", "max"], default: "high" },
+      "glm-5.2": { efforts: ["high", "xhigh"], default: "high" },
+      "kimi-k3": { efforts: ["medium"], default: "medium" },
+      "kimi-k2.6": { efforts: ["medium"], default: "medium" },
+      "grok-4.7": { efforts: ["low", "medium", "high", "xhigh"], default: "high" },
+    },
+    // Qoder：收编 adapters.cjs QODER_FALLBACK 的档位数据（快照 2026-09-20 实测，两区仅这两个模型带档位）
+    qoder: {
+      "qwen3.8-flash": { efforts: ["low", "medium", "xhigh"] },
+      "qwen3.8-max": { efforts: ["low", "medium", "xhigh"] },
+    },
+  },
   // Trae function 字段按模型分发（TraeWorkAssistant models_sync.rs 实证：
   // 部分模型仅在 solo_agent 下可用，其余走 solo_work_lite；未命中默认 solo_work_lite）
   "function_map.json": {
@@ -260,6 +331,7 @@ const DESC = {
   "function_map.json": "Trae function 字段按模型分发（solo_agent / solo_work_lite）",
   "wb_models.json": "WorkBuddy 双区模型目录（兜底，catalog.json 优先）",
   "catalog.json": "模型权威目录（拉取模型写回：倍率/能力/上下文，可手编）",
+  "effort_catalog.json": "各渠道 effort 档位兜底 seed（ModelMeta 三源合并最低层，可手编）",
   "wb_template_map.json": "WorkBuddy 审核模板最小改写表",
   "headers.json": "渠道默认头 / UA / 上游域",
 };

@@ -121,6 +121,130 @@ function parseJson(s) {
   try { return JSON.parse(s); } catch { return null; }
 }
 
+// ===== ModelMeta 统一层（方案 §2：seed(effort_catalog) < 拉取(catalog) < 用户覆盖(modelMeta) 三源合并） =====
+const EFFORT_CATALOG_FILE = "effort_catalog.json";
+const CAP_KEYS = ["images", "video", "reasoning", "tools"]; // tri-state 能力键（含新增 video，默认未声明）
+
+/** effort_catalog.json seed（解析失败/非对象 → 空表，不崩、回落拉取值）。纯函数版，测试可直调。 */
+function coerceEffortCatalog(raw) {
+  if (typeof raw === "string") { try { raw = JSON.parse(raw); } catch { return {}; } }
+  return raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+}
+function effortCatalog() { return coerceEffortCatalog(rules.get(EFFORT_CATALOG_FILE)); }
+
+/** 某渠道某模型的 seed 条目（大小写不敏感），无则 null */
+function seedEntryFor(channel, modelId) {
+  const sec = effortCatalog()[channel];
+  if (!sec || typeof sec !== "object") return null;
+  const want = String(modelId || "").toLowerCase();
+  for (const [k, v] of Object.entries(sec)) {
+    if (String(k).toLowerCase() === want && v && typeof v === "object") return v;
+  }
+  return null;
+}
+
+/** seed 条目 → 规范 ModelMeta 片段（efforts→reasoning.supportedEfforts、default→defaultEffort，均过 none→off 归一） */
+function seedToMeta(seed) {
+  const out = {};
+  if (!seed || typeof seed !== "object") return out;
+  if (seed.capabilities && typeof seed.capabilities === "object") out.capabilities = { ...seed.capabilities };
+  const ctx = Number(seed.contextLength); if (Number.isFinite(ctx) && ctx > 0) out.contextLength = ctx;
+  const mo = Number(seed.maxOutputTokens); if (Number.isFinite(mo) && mo > 0) out.maxOutputTokens = mo;
+  const efforts = Array.isArray(seed.efforts)
+    ? seed.efforts.map(util.normalizeEffortName).filter((e) => util.EFFORT_RANK[e] != null) : [];
+  const dft = util.normalizeEffortName(seed.default);
+  if (efforts.length || (dft && util.EFFORT_RANK[dft] != null)) {
+    out.reasoning = {};
+    if (efforts.length) out.reasoning.supportedEfforts = efforts;
+    if (dft && util.EFFORT_RANK[dft] != null) out.reasoning.defaultEffort = dft;
+  }
+  return out;
+}
+
+/** 三源分层合并（方案 §2.1，优先级 seed < pulled < override）。
+ *  · capabilities 逐键合并：高优先层显式 true/false 覆盖，undefined（未声明）不覆盖；
+ *  · supportedEfforts / defaultEffort / contextLength / maxOutputTokens：取「最高优先级非空源」整体取代，
+ *    绝不并集（并集会造出模型不认的档位 → 上游 400）。 */
+function mergeModelMeta(seed, pulled, override) {
+  const lowToHigh = [seed || {}, pulled || {}, override || {}];
+  const highToLow = [override || {}, pulled || {}, seed || {}];
+  const capabilities = {};
+  for (const layer of lowToHigh) {
+    const cap = layer.capabilities;
+    if (!cap || typeof cap !== "object") continue;
+    for (const key of CAP_KEYS) if (typeof cap[key] === "boolean") capabilities[key] = cap[key];
+  }
+  const pickNum = (field) => {
+    for (const layer of highToLow) {
+      const v = Number(layer[field]);
+      if (Number.isFinite(v) && v > 0) return v;
+    }
+    return 0;
+  };
+  const contextLength = pickNum("contextLength");
+  const maxOutputTokens = pickNum("maxOutputTokens");
+  let supportedEfforts = null;
+  let defaultEffort = "";
+  for (const layer of highToLow) {
+    const r = layer.reasoning;
+    if (!r || typeof r !== "object") continue;
+    // 单档形态（实测 v3/config 存在）：上游只给 reasoning.effort、无 supportedEfforts 数组，
+    // 表示该模型固定单档，须视作 supportedEfforts:[effort]，否则降级不收敛、越档请求会 400。
+    const single = util.normalizeEffortName(r.effort);
+    const singleOk = !!single && util.EFFORT_RANK[single] != null;
+    if (supportedEfforts == null) {
+      let norm = Array.isArray(r.supportedEfforts)
+        ? r.supportedEfforts.map(util.normalizeEffortName).filter((e) => util.EFFORT_RANK[e] != null) : [];
+      if (!norm.length && singleOk) norm = [single];
+      if (norm.length) supportedEfforts = norm;
+    }
+    if (!defaultEffort) {
+      const d = util.normalizeEffortName(r.defaultEffort);
+      if (d && util.EFFORT_RANK[d] != null) defaultEffort = d;
+      else if (singleOk) defaultEffort = single;
+    }
+  }
+  const out = { capabilities };
+  if (contextLength) out.contextLength = contextLength;
+  if (maxOutputTokens) out.maxOutputTokens = maxOutputTokens;
+  if (supportedEfforts || defaultEffort) {
+    out.reasoning = {};
+    if (supportedEfforts) out.reasoning.supportedEfforts = supportedEfforts;
+    if (defaultEffort) out.reasoning.defaultEffort = defaultEffort;
+  }
+  return out;
+}
+
+/** 用户 per-model 覆盖 map（proxy.modelMeta）。可注入（setModelMetaSource，主进程/测试用），
+ *  否则惰性读 config——config 只依赖 secretbox，运行期 require 不成环。读失败 → 空表。 */
+let _modelMetaSource = null;
+function setModelMetaSource(fn) { _modelMetaSource = typeof fn === "function" ? fn : null; }
+function userModelMeta() {
+  try {
+    if (_modelMetaSource) return _modelMetaSource() || {};
+    return require("../config.cjs").loadConfig().proxy.modelMeta || {};
+  } catch { return {}; }
+}
+
+/** 请求管线用的合并 reasoning meta（seed+pull+override，方案 §2.3/§3.3）：
+ *  normalizeReasoningEffort 收敛用 supportedEfforts，injectThinking 补默认档用 defaultEffort。 */
+function mergedMetaFor(channel, model) {
+  const seed = seedToMeta(seedEntryFor(channel, model));
+  const pulled = catalogMap(channel).get(String(model || "").toLowerCase()) || null;
+  const override = userModelMeta()[String(model)] || null;
+  return mergeModelMeta(seed, pulled, override);
+}
+
+/** 覆盖来源标记（方案 §2.2 稀疏写入的回溯口径）：override 对象里显式给了哪几块 */
+function metaOverriddenKeys(override) {
+  if (!override || typeof override !== "object") return [];
+  const keys = [];
+  if ("capabilities" in override && override.capabilities && typeof override.capabilities === "object") keys.push("capabilities");
+  if (override.maxOutputTokens != null) keys.push("maxOutputTokens");
+  if ("reasoning" in override && override.reasoning && typeof override.reasoning === "object") keys.push("reasoning");
+  return keys;
+}
+
 /** 按 key 深度优先找数组（util.dig 只取标量，包列表这类结构要单独挖） */
 function findList(node, key, depth) {
   if (!node || typeof node !== "object" || (depth || 0) > 5) return null;
@@ -1036,14 +1160,15 @@ function makeWorkBuddy(channelId) {
       // 会话 id：客户端已传则保留；否则按前 3 条消息指纹稳定派生——同一会话多轮复用，
       // 结合 prompt_cache_key 使上游前缀缓存可命中（参考项目实证：命中后 credit≈0.02 vs 0.34）
       if (!out.conversation_id) out.conversation_id = util.stableConvId(body.messages) || util.uuid();
-      // deepseek 思维链管线（参考项目 thinking.go）：注入 thinking 开关 → effort 按目录档位
-      // 降级 → 多轮 reasoning_content 回填（缺失会 400）。显式空 reasoning_effort 最后删除
-      const catEntry = catalogMap(channelId).get(String(model).toLowerCase());
+      // deepseek 思维链管线（参考项目 thinking.go）：注入 thinking 开关 → effort 按合并后档位
+      // 降级 → 多轮 reasoning_content 回填（缺失会 400）。显式空 reasoning_effort 最后删除。
+      // 喂入合并后 ModelMeta（seed+拉取+用户覆盖，方案 §2.3/§3.3），而非仅拉取的目录条目。
+      const mergedMeta = mergedMetaFor(channelId, model);
       if (util.isDeepSeekModel(model)) {
-        util.injectThinking(out, (catEntry && catEntry.reasoning && catEntry.reasoning.defaultEffort) || "");
+        util.injectThinking(out, (mergedMeta.reasoning && mergedMeta.reasoning.defaultEffort) || "");
         util.backfillReasoningContent(out);
       }
-      util.normalizeReasoningEffort(out, catEntry && catEntry.reasoning);
+      util.normalizeReasoningEffort(out, mergedMeta.reasoning);
       if (out.reasoning_effort != null && !out.reasoning_effort) delete out.reasoning_effort;
       // prompt_cache_key（参考项目 cache_key.go：账号段硬隔离，跨账号绝不碰撞——防命中错账号前缀缓存）
       if (!out.prompt_cache_key) {
@@ -2333,9 +2458,13 @@ function makeQoder() {
       const seen = new Map();
       for (const region of ["global", "cn"]) {
         for (const [id, key, reasoning, efforts, vision, rate] of QODER_FALLBACK[region]) {
-          if (!seen.has(id.toLowerCase())) seen.set(id.toLowerCase(), {
+          if (seen.has(id.toLowerCase())) continue;
+          // 档位数据已收编进 rules/effort_catalog.json（统一 seed loader）；内联 efforts 仅作解析失败时的兜底
+          const seedEff = seedEntryFor("qoder", id);
+          const eff = (seedEff && Array.isArray(seedEff.efforts)) ? seedEff.efforts : efforts;
+          seen.set(id.toLowerCase(), {
             client: id, upstream: key,
-            entry: { id, name: id, rate: Number(rate) || 0, capabilities: { images: vision, reasoning, tools: true }, contextLength: 200000, maxOutputTokens: 0, _key: key, _efforts: efforts },
+            entry: { id, name: id, rate: Number(rate) || 0, capabilities: { images: vision, reasoning, tools: true }, contextLength: 200000, maxOutputTokens: 0, _key: key, _efforts: eff },
           });
         }
       }
@@ -2664,9 +2793,12 @@ function makeOpenaiCompat(row) {
       if (!isPlainObj(out.stream_options)) out.stream_options = {};
       out.stream_options.include_usage = true;
       // 思考档位按该模型声明的支持集降级（与内置渠道同一个 util，档位词表也同源）：
-      // 客户端要 low 而上游只有 medium/high 时，透传过去是一个 400，降级才可用
+      // 客户端要 low 而上游只有 medium/high 时，透传过去是一个 400，降级才可用。
+      // 喂入合并后 ModelMeta（拉取 + 用户覆盖，方案 §2.3）——提供商无 seed 层，seed 传 null。
       const entry = this.entryFor(model);
-      util.normalizeReasoningEffort(out, entry && entry.entry && entry.entry.reasoning);
+      const ovr = userModelMeta()[`${row.id}/${(entry && entry.client) || model}`] || null;
+      const mergedMeta = mergeModelMeta(null, entry && entry.entry, ovr);
+      util.normalizeReasoningEffort(out, mergedMeta.reasoning);
       // 网关自己注入的内部字段，上游不认（raccoon 同款剔除清单）
       delete out.conversation_id;
       delete out.conversationId;
@@ -2856,7 +2988,8 @@ function refreshTokenLocked(channel, account, secrets, extraOrigins) {
 }
 
 /** 合并模型目录（/v1/models）：canonical id 归并 + 来源标记 + 目录元数据（倍率/能力/上下文） */
-function mergedModels() {
+function mergedModels(modelMetaOverrides) {
+  const modelMeta = (modelMetaOverrides && typeof modelMetaOverrides === "object") ? modelMetaOverrides : userModelMeta();
   const seen = new Map();
   const catMaps = {};
   for (const channel of Object.keys(ADAPTERS)) catMaps[channel] = catalogMap(channel);
@@ -2874,19 +3007,31 @@ function mergedModels() {
   for (const entry of seen.values()) {
     entry.name = entry.id;
     entry.rate = null;
-    entry.capabilities = {};
-    entry.contextLength = 0;
-    entry.maxOutputTokens = 0;
-    // 多源模型按来源顺序取第一个有值条目（catalog 顺序即渠道优先级）
+    // 拉取层：多源按来源顺序累积（capabilities 首源优先、数值取首个非零、reasoning 取首个有值源）
+    const pulled = { capabilities: {} };
     for (const channel of entry.sources) {
       const meta = catMaps[channel].get(entry.id.toLowerCase());
       if (!meta) continue;
       if (meta.name && meta.name !== entry.id && entry.name === entry.id) entry.name = String(meta.name);
       if (entry.rate == null && meta.rate != null && !Number.isNaN(Number(meta.rate))) entry.rate = Number(meta.rate);
-      entry.capabilities = { ...entry.capabilities, ...(meta.capabilities || {}) };
-      if (!entry.contextLength && meta.contextLength) entry.contextLength = Number(meta.contextLength) || 0;
-      if (!entry.maxOutputTokens && meta.maxOutputTokens) entry.maxOutputTokens = Number(meta.maxOutputTokens) || 0;
+      pulled.capabilities = { ...(meta.capabilities || {}), ...pulled.capabilities }; // 首源优先
+      if (!pulled.contextLength && meta.contextLength) pulled.contextLength = Number(meta.contextLength) || 0;
+      if (!pulled.maxOutputTokens && meta.maxOutputTokens) pulled.maxOutputTokens = Number(meta.maxOutputTokens) || 0;
+      if (!pulled.reasoning && meta.reasoning && typeof meta.reasoning === "object") pulled.reasoning = meta.reasoning;
     }
+    // seed 层：按来源顺序取第一个有 seed 的渠道
+    let seedMeta = {};
+    for (const channel of entry.sources) {
+      const s = seedToMeta(seedEntryFor(channel, entry.id));
+      if (Object.keys(s).length) { seedMeta = s; break; }
+    }
+    const override = modelMeta[entry.id] || null;
+    const merged = mergeModelMeta(seedMeta, pulled, override);
+    entry.capabilities = merged.capabilities;
+    entry.contextLength = merged.contextLength || 0;
+    entry.maxOutputTokens = merged.maxOutputTokens || 0;
+    if (merged.reasoning) entry.reasoning = merged.reasoning;
+    entry.metaOverridden = metaOverriddenKeys(override);
   }
   // 自定义提供商的模型**只以 slug/model 出现**，绝不列出裸名：这是防静默遮蔽的结构保证——
   // 用户建一个名叫 claude-sonnet-5 的提供商，也不会让 /v1/models 里出现第二条同名裸条目去顶掉内置池。
@@ -2895,6 +3040,15 @@ function mergedModels() {
     for (const e of compatModelEntries(row)) {
       const id = `${row.id}/${e.client}`;
       if (seen.has(id.toLowerCase())) continue;
+      // 提供商无 seed 层（effort_catalog 不按提供商 id 键）；拉取 = 提供商条目，叠加用户覆盖（按 canonical id）
+      const pulled = {
+        capabilities: (e.entry && e.entry.capabilities) || {},
+        contextLength: Number((e.entry && e.entry.contextLength) || 0),
+        maxOutputTokens: Number((e.entry && e.entry.maxOutputTokens) || 0),
+        reasoning: (e.entry && e.entry.reasoning) || null,
+      };
+      const override = modelMeta[id] || null;
+      const merged = mergeModelMeta(null, pulled, override);
       seen.set(id.toLowerCase(), {
         id,
         object: "model",
@@ -2903,9 +3057,11 @@ function mergedModels() {
         sources: [row.id],
         name: String((e.entry && e.entry.name) || e.client),
         rate: e.entry && e.entry.rate != null ? Number(e.entry.rate) : null,
-        capabilities: (e.entry && e.entry.capabilities) || {},
-        contextLength: Number((e.entry && e.entry.contextLength) || 0),
-        maxOutputTokens: Number((e.entry && e.entry.maxOutputTokens) || 0),
+        capabilities: merged.capabilities,
+        contextLength: merged.contextLength || 0,
+        maxOutputTokens: merged.maxOutputTokens || 0,
+        reasoning: merged.reasoning || undefined,
+        metaOverridden: metaOverriddenKeys(override),
         upstream: e.upstream,
       });
     }
@@ -2933,6 +3089,12 @@ module.exports = {
   modelOwners,
   httpJson,
   refreshTokenLocked,
+  setModelMetaSource,
+  // ModelMeta 统一层窥视口（dev-effort-catalog-test 直测）：三源合并 / seed 解析容错 / 覆盖标记
+  _coerceEffortCatalog: coerceEffortCatalog,
+  _seedToMeta: seedToMeta,
+  _mergeModelMeta: mergeModelMeta,
+  _metaOverriddenKeys: metaOverriddenKeys,
   // 提供商管理面要拿一份「尚未落库的表单值」建临时适配器做连通性探测，故导出工厂本身
   makeOpenaiCompat,
   // 测试窥视口（下划线前缀 = 非公共契约）：cline 错误分类的纯函数，dev-cline-test 直测

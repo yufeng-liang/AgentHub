@@ -159,6 +159,7 @@ function defaultConfig() {
       disabledModels: [],       // 禁用的模型（请求直接 400 model_disabled）
       modelFallback: {},        // 模型 → 回退模型（旧版 per-model 配置，优先于全局回退）
       modelAliases: {},         // 自定义模型映射：别名 → 目标模型 id（请求入口先解析再路由）
+      modelMeta: {},            // per-model 元数据覆盖（能力 tri-state / maxOutputTokens / reasoning 档位）：ModelMeta 三源合并最高优先层
       autoFallbackEnabled: true, // 不可用时自动切换模型（统一设置，默认开）
       fallbackModel: "",        // 全局统一回退模型（模型未知/号池耗尽时自动切换）
       checkinAuto: false,       // 定时自动签到（默认关）：每天到点自动跑全渠道签到/领加油包

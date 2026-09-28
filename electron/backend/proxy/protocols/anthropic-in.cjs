@@ -15,6 +15,30 @@ const DROP_REQUEST_HEADERS = new Set([
   "accept-encoding", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "upgrade",
 ]);
 
+// Anthropic thinking.budget_tokens → reasoning_effort 换算阈值（方案 §3.1，可调常量，对齐 util.EFFORT_RANK）。
+// 加法语义：派生出的 effort 供 effort 档位型上游（WorkBuddy 等）用，原始 thinking.budget_tokens 仍保留给
+// Anthropic 原生上游（见 toInternal 的 extraBody.thinking 透传）。派生后一样过 util.normalizeReasoningEffort 收敛。
+const THINKING_BUDGET_THRESHOLDS = [
+  { max: 4096, effort: "low" },      // 1 – 4096
+  { max: 16384, effort: "medium" },  // 4097 – 16384
+  { max: 32768, effort: "high" },    // 16385 – 32768
+  { max: Infinity, effort: "max" },  // > 32768
+];
+
+/** thinking → 派生 effort。返回：
+ *  · "off"        —— type=disabled 或 budget=0（调用方据此删除档位，不发思考预算）
+ *  · "low/medium/high/max" —— 按预算落桶
+ *  · undefined    —— 无 thinking / 非法（负数、NaN）：当 enabled 无档，不派生（保留默认档路径） */
+function budgetToEffort(thinking) {
+  if (!thinking || typeof thinking !== "object") return undefined;
+  if (String(thinking.type || "").trim().toLowerCase() === "disabled") return "off";
+  const budget = Number(thinking.budget_tokens);
+  if (budget === 0) return "off";
+  if (!Number.isFinite(budget) || budget < 0) return undefined; // 非法/负 → enabled 无档，不派生
+  for (const t of THINKING_BUDGET_THRESHOLDS) if (budget <= t.max) return t.effort;
+  return "max";
+}
+
 /** 客户端可原样带过去的头。注意：**只有④的 Anthropic 形态上游才用得上**——
  *  内置 4 家渠道的头矩阵是逐家逆向出来的指纹（UA/设备 id 缺一不可），掺进客户端随机头
  *  只会破坏伪装；通用 openai_compat 上游同理不需要。所以这里提供能力，不做默认转发。 */
@@ -175,7 +199,13 @@ function toInternal(raw) {
 
   // 采样之外的 Anthropic 私有字段进 extraBody 原样带上：中转站若支持就生效，不支持也只是多个未知字段
   const extraBody = {};
-  if (raw.thinking) extraBody.thinking = raw.thinking;
+  if (raw.thinking) {
+    // 加法语义（方案 §3.1）：原始 thinking 透传给 Anthropic 原生上游；同时派生 reasoning_effort 给 effort 档位型上游。
+    extraBody.thinking = raw.thinking;
+    const eff = budgetToEffort(raw.thinking);
+    if (eff === "off") { delete body.reasoning_effort; notes.push("thinking disabled/budget=0：思考档位置 off（删除档位）"); }
+    else if (eff) { body.reasoning_effort = eff; notes.push(`thinking.budget_tokens 派生 reasoning_effort=${eff}`); }
+  }
   if (raw.metadata) extraBody.metadata = raw.metadata;
   if (raw.top_k != null) extraBody.top_k = raw.top_k;
   if (Object.keys(extraBody).length) body.extraBody = extraBody;
@@ -236,4 +266,4 @@ function countTokens(raw) {
   return { input_tokens: n };
 }
 
-module.exports = { readKey, toInternal, countTokens, forwardableHeaders };
+module.exports = { readKey, toInternal, countTokens, forwardableHeaders, _budgetToEffort: budgetToEffort };

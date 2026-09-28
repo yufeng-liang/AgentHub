@@ -764,11 +764,33 @@ function buildApp(settings) {
   // 所以必须同步返回、绝不打上游；② 任何 redirect 都被它判失败，故连尾斜杠都单独注册；
   // ③ 有 anthropic-version 头时按 Messages 形状回，否则按 OpenAI 形状回。
   const modelsPayload = (req) => {
-    const list = adapters.mergedModels();
-    if (!req.headers["anthropic-version"]) return { object: "list", data: list };
+    const list = adapters.mergedModels((settings() || {}).modelMeta || {});
+    if (req.headers["anthropic-version"]) {
+      // Anthropic 形状维持精简（Claude Code 只读 id/display_name），不追加扁平字段
+      return {
+        data: list.map((m) => ({ type: "model", id: m.id, display_name: m.name || m.id, created_at: m.created || 0 })),
+        has_more: false, first_id: list.length ? list[0].id : null, last_id: list.length ? list[list.length - 1].id : null,
+      };
+    }
+    // OpenAI 形状：保留嵌套 capabilities，追加标准扁平字段（方案 §4.2）
     return {
-      data: list.map((m) => ({ type: "model", id: m.id, display_name: m.name || m.id, created_at: m.created || 0 })),
-      has_more: false, first_id: list.length ? list[0].id : null, last_id: list.length ? list[list.length - 1].id : null,
+      object: "list",
+      data: list.map((m) => {
+        const cap = m.capabilities || {};
+        const modalities = ["text"];
+        if (cap.images) modalities.push("image");
+        if (cap.video) modalities.push("video");
+        return {
+          ...m,
+          supports_images: !!cap.images,
+          supports_video: !!cap.video,
+          supports_reasoning: !!cap.reasoning,
+          supports_tool_call: !!cap.tools,
+          max_input_tokens: Number(m.contextLength) || 0,
+          max_output_tokens: Number(m.maxOutputTokens) || 0,
+          input_modalities: modalities,
+        };
+      }),
     };
   };
   app.get("/v1/models", (_req, res) => res.json(modelsPayload(_req)));

@@ -584,7 +584,9 @@ function register(ipcMain) {
   // 合并视图 + 管理态（启停/渠道覆盖/回退模型）；管理态由渲染层写回整体配置（app.save），服务端每请求读盘热生效
   ipcMain.handle("proxy_models", handle(() => {
     const cfg = settings();
-    return adapters.mergedModels().map((m) => ({
+    // 合并视图已内含 ModelMeta 三源合并结果（capabilities 含 video / contextLength / maxOutputTokens /
+    // reasoning:{supportedEfforts,defaultEffort} / metaOverridden），传入用户覆盖 map 作最高优先层
+    return adapters.mergedModels(cfg.modelMeta || {}).map((m) => ({
       ...m,
       enabled: !(cfg.disabledModels || []).includes(m.id),
       override: (cfg.modelOverrides || {})[m.id] || "",
