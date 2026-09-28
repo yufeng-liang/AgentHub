@@ -204,6 +204,24 @@ function openDataDir() {
         </div>
         <div class="set-row">
           <div class="set-info">
+            <div class="set-name">系统提示词策略</div>
+            <div class="set-desc">passthrough=原样透传客户端 system（默认，行为不变）；custom=用下方提示词替换客户端 system；append=在客户端 system 后追加下方提示词。内容审核误杀时网关会自动降级重试一次</div>
+          </div>
+          <select class="f-select" v-model="app.config.proxy.promptMode" style="width: 208px">
+            <option value="passthrough">passthrough（透传）</option>
+            <option value="custom">custom（替换）</option>
+            <option value="append">append（追加）</option>
+          </select>
+        </div>
+        <div class="set-row" v-if="app.config.proxy.promptMode !== 'passthrough'">
+          <div class="set-info">
+            <div class="set-name">网关系统提示词</div>
+            <div class="set-desc">custom/append 用；留空则用内置默认（简短中性提示词）</div>
+          </div>
+          <textarea v-model="app.config.proxy.promptText" class="input" style="width: 320px; height: 72px" placeholder="留空 = 内置默认"></textarea>
+        </div>
+        <div class="set-row">
+          <div class="set-info">
             <div class="set-name">不可用时自动切换模型</div>
             <div class="set-desc">统一设置（默认开）：模型未知或号池耗尽时自动切到下方回退模型，客户端无感（响应模型字段保持请求值）</div>
           </div>

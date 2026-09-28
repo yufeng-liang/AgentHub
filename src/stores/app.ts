@@ -41,6 +41,8 @@ const defaultConfig: AppConfig = {
     checkinAutoTime: "09:00",
     fallbackModel: "",
     ccSwitchModel: "",
+    promptMode: "passthrough",
+    promptText: "",
   },
   // 记忆仓库指针（其余配置在 <仓库>/config/memory.config.json，由 memory 模块页读取）
   memory: { enabled: true, rootDir: "" },

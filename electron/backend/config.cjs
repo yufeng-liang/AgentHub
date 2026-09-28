@@ -164,6 +164,10 @@ function defaultConfig() {
       checkinAuto: false,       // 定时自动签到（默认关）：每天到点自动跑全渠道签到/领加油包
       checkinAutoTime: "09:00", // 每日自动签到时间（HH:mm）
       ccSwitchModel: "",        // 生态接入默认模型（注册进 CC Switch 时使用，缺省取 fallbackModel）
+      // 系统提示词策略（借鉴 workbuddy2api-panel）：passthrough=原样透传（默认，行为不变）/
+      // custom=用网关提示词替换客户端 system / append=在客户端 system 后追加网关提示词。见 promptPolicy.cjs
+      promptMode: "passthrough",
+      promptText: "",           // custom/append 用的网关系统提示词；空则用 promptPolicy 内置默认
     },
   };
 }

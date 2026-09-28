@@ -297,6 +297,10 @@ export interface ProxyConfig {
   checkinAutoTime: string;
   /** 生态接入默认模型（注册进 CC Switch 时使用，缺省取 fallbackModel） */
   ccSwitchModel: string;
+  /** 系统提示词策略：passthrough=原样透传（默认）/ custom=替换客户端 system / append=追加网关 system */
+  promptMode: "passthrough" | "custom" | "append";
+  /** custom/append 用的网关系统提示词；空则用内置默认 */
+  promptText: string;
 }
 
 // ===== 反代网关：数据结构（跟 electron/backend/proxy/* 返回一一对应） =====

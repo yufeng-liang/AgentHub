@@ -58,6 +58,8 @@ function defaultConfig(): AppConfig {
       ccSwitchModel: "",
       checkinAuto: false,
       checkinAutoTime: "09:00",
+      promptMode: "passthrough",
+      promptText: "",
     },
   };
 }

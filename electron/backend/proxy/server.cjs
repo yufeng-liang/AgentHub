@@ -14,6 +14,7 @@ const anthropicOut = require("./protocols/anthropic-out.cjs");
 const responsesIn = require("./protocols/responses-in.cjs");
 const responsesOut = require("./protocols/responses-out.cjs");
 const util = require("./util.cjs");
+const promptPolicy = require("./promptPolicy.cjs");
 const events = require("./events.cjs");
 
 let runtime = null; // { server, startedAt, port, bind, active }
@@ -199,6 +200,37 @@ function channelCooling(channel) {
     return null;
   }
   return hit;
+}
+
+// ===== 内容审核拦截识别 + 提示词降级窗口（借鉴 workbuddy2api-panel 的内容拦截降级重试） =====
+// 与 WAF/渠道白名单（isChannelBlock）不同：这类拦截是「上游内容策略按 system 指纹逐字误杀」，
+// 换号照拦、罚号更是错的。正确反应是同请求内换中性提示词（promptPolicy.degradeMessages）重试一次；
+// 触发后把该渠道标进「降级窗口」（到次日 00:00 CST 重置），窗口内后续请求直接走降级 system，
+// 不再先撞一次 400/502。降级仍被拦 → 是消息内容本身触发审核，如实报错、不罚号。
+function isContentBlocked(e) {
+  const s = String((e && e.message) || (e && e.body) || "");
+  return /blocked by security policy|unapproved channel|illegal api invocation/i.test(s);
+}
+
+const contentDegradeWindow = new Map(); // channel → untilMs（次日 00:00 CST）
+
+/** 下一个 00:00 CST（UTC+8）的毫秒时间戳，与本机时区无关 */
+function nextMidnightCST() {
+  const dayMs = 86400000;
+  const cstNow = Date.now() + 8 * 3600000;
+  const nextCstMidnight = (Math.floor(cstNow / dayMs) + 1) * dayMs;
+  return nextCstMidnight - 8 * 3600000;
+}
+
+function markContentDegrade(channel) {
+  if (channel) contentDegradeWindow.set(channel, nextMidnightCST());
+}
+
+function contentDegrading(channel) {
+  const until = contentDegradeWindow.get(channel);
+  if (!until) return false;
+  if (until <= Date.now()) { contentDegradeWindow.delete(channel); return false; }
+  return true;
 }
 
 /** 按分类落冷却（账号级或账号×模型级）；429 优先对齐上游明示时间（墙钟/Retry-After），
@@ -443,6 +475,10 @@ async function handleChat(req, res, settings, surface) {
   let fatalErr = null;
   let usedModel = actualModel;
   let attemptsUsed = 0; // 实际发出的上游请求次数（换号/限流重试都会 +1；模型负缓存跳过不算——没真发）
+  // 系统提示词策略（渠道无关，出站分发前一次性施加于规范化后的 body.messages）：
+  // passthrough=不改（默认）；custom/append 见 promptPolicy。degrade 标记供内容审核降级重试复用。
+  promptPolicy.applyPromptMode(body, settings.promptMode, settings.promptText);
+  let promptDegraded = false;
     for (const chainModel of modelChain) {
       if (done || fatalErr) break;
       const resolved = resolveChannel(key, chainModel, settings);
@@ -452,6 +488,11 @@ async function handleChat(req, res, settings, surface) {
       }
       usedModel = chainModel;
       usageRow.channel = resolved.channel;
+      // 内容审核降级窗口：该渠道今日已确认误杀过，后续请求直接走中性 system，不再先撞一次拦截
+      if (!promptDegraded && contentDegrading(resolved.channel)) {
+        promptPolicy.degradeMessages(body);
+        promptDegraded = true;
+      }
       // 渠道级退避（WAF Block / 渠道白名单 11128）：拦的是 IP/指纹/渠道本身，换号照拦。
       // 退避窗口内直接 503 如实报错，不把号池逐个刷成冷却中
       const chCool = channelCooling(resolved.channel);
@@ -512,6 +553,21 @@ async function handleChat(req, res, settings, surface) {
               streamErr = null;
               break;
             }
+            // 内容审核误杀（system 指纹逐字匹配）：不罚号、不换号——换中性 system 同号重试一次；
+            // 触发即标该渠道降级窗口（到次日 00:00 CST）。降级后仍被拦 = 消息内容本身触发，如实报错。
+            if (isContentBlocked(streamErr)) {
+              markContentDegrade(resolved.channel);
+              streamErr = null;
+              if (!promptDegraded) {
+                promptDegraded = true;
+                promptPolicy.degradeMessages(body);
+                tried.delete(acc.id); // 允许重选同号
+                attempt--;            // 本次降级重试不计入换号次数
+                continue;
+              }
+              fatalErr = Object.assign(new Error("上游内容审核拦截：降级系统提示词后仍被拦，可能是消息内容本身触发审核"), { status: 400 });
+              break;
+            }
             lastErr = Object.assign(new Error(String(streamErr.message || "上游返回错误")), {
               status: streamErr.status || 502,
               code: streamErr.code || 0,
@@ -528,6 +584,19 @@ async function handleChat(req, res, settings, surface) {
           // 就地收尾，本轮以错误结束，由客户端下一次请求自然重试
           if (sentDelta || ttftMs) {
             fatalErr = Object.assign(new Error(`上游流已输出后中断：${String((e && e.message) || "未知错误").slice(0, 200)}`), { status: 502 });
+            break;
+          }
+          // 内容审核误杀（同 streamErr 路径）：换中性 system 同号重试一次，不罚号；标降级窗口
+          if (isContentBlocked(e)) {
+            markContentDegrade(resolved.channel);
+            if (!promptDegraded) {
+              promptDegraded = true;
+              promptPolicy.degradeMessages(body);
+              tried.delete(acc.id);
+              attempt--;
+              continue;
+            }
+            fatalErr = Object.assign(new Error("上游内容审核拦截：降级系统提示词后仍被拦，可能是消息内容本身触发审核"), { status: 400 });
             break;
           }
           // WAF Block / 渠道白名单 11128：渠道级故障——短退避整个渠道，不换号不罚号，如实报错
