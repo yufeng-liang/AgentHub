@@ -287,6 +287,17 @@ export interface ProxyConfig {
   modelFallback: Record<string, string>;
   /** 自定义模型映射：别名 → 目标模型 id（请求入口先解析别名再路由，响应 model 字段保持请求值） */
   modelAliases: Record<string, string>;
+  /** per-model 元数据用户覆盖（稀疏 map，与 disabledModels/modelAliases/modelOverrides 同套路，按归并后的 canonical 模型 id 键）：
+   *  能力 tri-state（true/false=显式覆盖，键缺失=未声明回落）/ 输出上限 / 推理档位（取代式，非并集）。
+   *  未覆盖的键不落盘，读取时回落拉取 / seed。 */
+  modelMeta?: Record<
+    string,
+    {
+      capabilities?: { images?: boolean; video?: boolean; reasoning?: boolean; tools?: boolean };
+      maxOutputTokens?: number;
+      reasoning?: { supportedEfforts?: string[]; defaultEffort?: string };
+    }
+  >;
   /** 不可用时自动切换模型（统一设置，默认开）：模型未知或号池耗尽时切到 fallbackModel */
   autoFallbackEnabled: boolean;
   /** 全局统一回退模型（autoFallbackEnabled 开启且 per-model 未配置时生效） */
@@ -547,9 +558,14 @@ export interface ProxyModel {
   /** 目录元数据（catalog.json）：显示名 / 倍率（积分倍率，null=未知）/ 能力 / 上下文长度 */
   name?: string;
   rate?: number | null;
-  capabilities?: { images?: boolean; reasoning?: boolean; tools?: boolean };
+  /** 生效（三源合并后）能力：拉取 / seed / 用户覆盖逐键合并的结果 */
+  capabilities?: { images?: boolean; video?: boolean; reasoning?: boolean; tools?: boolean };
   contextLength?: number;
   maxOutputTokens?: number;
+  /** 生效（合并后）推理档位：supportedEfforts 取代式合并、defaultEffort 最高优先非空源胜出 */
+  reasoning?: { supportedEfforts?: string[]; defaultEffort?: string };
+  /** 元数据来源标记：哪些组来自 proxy.modelMeta 用户覆盖（"capabilities"|"maxOutputTokens"|"reasoning"），用于「已覆盖」徽标与「清除覆盖」 */
+  metaOverridden?: string[];
   /** 管理态（proxy_models 返回时合并）：启用 / per-model 渠道覆盖 / 回退模型 */
   enabled: boolean;
   override: "" | ProxyChannelId;

@@ -80,13 +80,19 @@ export const statusCls = (s: number) => (s >= 200 && s < 300 ? "tag-ok" : s >= 5
 /** 模型倍率 → 展示文案（null/undefined = 未知） */
 export const fmtRate = (r: number | null | undefined) => (r == null || Number.isNaN(Number(r)) ? "—" : `×${Number(r)}`);
 
-/** 模型能力 → 紧凑标签列表：图=图片输入 / 思=思考链 / 工=工具调用；加上下文长度 */
-export function capabilityTags(m: { capabilities?: { images?: boolean; reasoning?: boolean; tools?: boolean }; contextLength?: number }): string[] {
+/** 模型能力 → 紧凑标签列表：图=图片输入 / 视=视频输入 / 思=思考链 / 工=工具调用；加上下文长度与输出上限（↑ 前缀区分） */
+export function capabilityTags(m: {
+  capabilities?: { images?: boolean; video?: boolean; reasoning?: boolean; tools?: boolean };
+  contextLength?: number;
+  maxOutputTokens?: number;
+}): string[] {
   const out: string[] = [];
   const c = m.capabilities || {};
   if (c.images) out.push("图");
+  if (c.video) out.push("视");
   if (c.reasoning) out.push("思");
   if (c.tools) out.push("工");
   if (m.contextLength) out.push(fmtK(m.contextLength));
+  if (m.maxOutputTokens) out.push("↑" + fmtK(m.maxOutputTokens));
   return out;
 }

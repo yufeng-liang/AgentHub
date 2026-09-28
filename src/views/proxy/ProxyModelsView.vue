@@ -6,6 +6,7 @@ import * as api from "../../api/ipc";
 import type { ProxyChannelId, ProxyModel } from "../../types";
 import { useAppStore } from "../../stores/app";
 import { capabilityTags, channelName, fmtRate } from "./format";
+import ModelMetaEditor from "../../components/proxy/ModelMetaEditor.vue";
 
 const app = useAppStore();
 const models = ref<ProxyModel[]>([]);
@@ -83,6 +84,47 @@ async function setOverride(m: ProxyModel, v: string) {
   app.config.proxy.modelOverrides = ov;
   await persist(v ? `${m.id} → 固定走 ${channelName(v)}` : `${m.id} 恢复自动路由`);
   await refresh();
+}
+
+// ===== 模型元数据编辑（能力 / 档位 / 输出上限覆盖）=====
+type MetaOverride = {
+  capabilities?: { images?: boolean; video?: boolean; reasoning?: boolean; tools?: boolean };
+  maxOutputTokens?: number;
+  reasoning?: { supportedEfforts?: string[]; defaultEffort?: string };
+};
+const editing = ref<ProxyModel | null>(null);
+// 当前模型的稀疏覆盖（喂给编辑器回填草稿）；modelMeta 在浏览器 mock 里可能缺省
+const editingOverride = computed<MetaOverride | undefined>(() => (editing.value ? (app.config.proxy.modelMeta || {})[editing.value.id] : undefined));
+const openMetaEditor = (m: ProxyModel) => (editing.value = m);
+const closeMetaEditor = () => (editing.value = null);
+const META_GROUP_LABEL: Record<string, string> = { capabilities: "能力", maxOutputTokens: "输出上限", reasoning: "推理档位" };
+
+/** 保存整键覆盖：空覆盖则删键（回落拉取 / seed）；复用现有 persist + refresh，不新增 IPC */
+async function saveMeta(payload: MetaOverride) {
+  const id = editing.value?.id;
+  if (!id) return;
+  const mm = { ...(app.config.proxy.modelMeta || {}) };
+  if (payload && Object.keys(payload).length) mm[id] = payload;
+  else delete mm[id];
+  app.config.proxy.modelMeta = mm;
+  await persist(`已保存 ${id} 的元数据覆盖`);
+  editing.value = null;
+  await refresh();
+}
+
+/** 清除某一组覆盖（删子键）：组清空后整键也删；保持编辑器打开并重指刷新后的行 */
+async function clearMetaGroup(group: "capabilities" | "maxOutputTokens" | "reasoning") {
+  const id = editing.value?.id;
+  if (!id) return;
+  const mm = { ...(app.config.proxy.modelMeta || {}) };
+  const cur = { ...(mm[id] || {}) };
+  delete cur[group];
+  if (Object.keys(cur).length) mm[id] = cur;
+  else delete mm[id];
+  app.config.proxy.modelMeta = mm;
+  await persist(`已清除 ${id} 的${META_GROUP_LABEL[group]}覆盖`);
+  await refresh();
+  editing.value = models.value.find((x) => x.id === id) || null;
 }
 
 async function addAlias() {
@@ -209,6 +251,7 @@ onMounted(refresh);
                 <th>能力</th>
                 <th v-if="!activeTab">来源渠道</th>
                 <th>渠道覆盖</th>
+                <th>元数据</th>
                 <th>状态</th>
               </tr>
               <tr v-for="m in rows" :key="m.id">
@@ -241,6 +284,12 @@ onMounted(refresh);
                   </select>
                 </td>
                 <td>
+                  <button class="btn btn-sm meta-edit" :aria-label="`编辑 ${m.id} 的能力与档位`" @click="openMetaEditor(m)">
+                    <i class="ph ph-sliders-horizontal"></i>编辑
+                  </button>
+                  <span v-if="m.metaOverridden && m.metaOverridden.length" class="tag tag-warn meta-badge" title="含用户覆盖">覆盖</span>
+                </td>
+                <td>
                   <div
                     class="switch"
                     :class="{ on: m.enabled }"
@@ -251,7 +300,7 @@ onMounted(refresh);
                 </td>
               </tr>
               <tr v-if="!rows.length">
-                <td :colspan="activeTab ? 5 : 6" style="text-align: center; color: var(--text-3); padding: 18px">
+                <td :colspan="activeTab ? 6 : 7" style="text-align: center; color: var(--text-3); padding: 18px">
                   无匹配模型 —— 点上方「拉取模型」从官方目录云端同步（用号池账号 token，不依赖本地软件）
                 </td>
               </tr>
@@ -293,6 +342,13 @@ onMounted(refresh);
 切换命中会在用量明细的备注列标记 alias→实际模型 / fallback→实际模型。</div>
       </div>
     </div>
+    <ModelMetaEditor
+      :model="editing"
+      :override="editingOverride"
+      @close="closeMetaEditor"
+      @save="saveMeta"
+      @clear="clearMetaGroup"
+    />
   </section>
 </template>
 
@@ -488,5 +544,16 @@ onMounted(refresh);
 }
 .alias-del:hover {
   color: var(--err, #e05555);
+}
+.meta-edit {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.meta-edit .ph {
+  font-size: 13px;
+}
+.meta-badge {
+  margin-left: 6px;
 }
 </style>
