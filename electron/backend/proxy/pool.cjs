@@ -6,11 +6,14 @@ const store = require("./store.cjs");
 /** 派生有效状态：cooling 到期自动回 online；exhausted 到次日 04:00 后给复活机会 */
 function effectiveStatus(acc, now) {
   now = now || Date.now();
-  if (acc.status === "cooling" && acc.cool_until && acc.cool_until <= now) {
+  // 冷却截止时间：poolAccounts 传入的是 accountView（驼峰 coolUntil），原始行是 cool_until——两者都认，
+  // 否则「cooling 到期自动复活」这条会因字段名不匹配（读到 undefined）永不触发（软冷却账号只能等额度刷新翻身）。
+  const coolUntil = Number(acc.coolUntil ?? acc.cool_until) || 0;
+  if (acc.status === "cooling" && coolUntil && coolUntil <= now) {
     store.updateAccount(acc.id, { status: "online", coolUntil: 0, coolReason: "" });
     return "online";
   }
-  if (acc.status === "exhausted" && acc.cool_until && acc.cool_until <= now) return "online";
+  if (acc.status === "exhausted" && coolUntil && coolUntil <= now) return "online";
   return acc.status;
 }
 
@@ -23,6 +26,59 @@ function poolAccounts(channel) {
     if (before !== eff) store.updateAccount(a.id, { status: eff, coolUntil: 0, coolReason: "" });
     return { ...a, status: eff };
   });
+}
+
+// ===== 选号权重常量（②闲置补偿权重，参考项目 weight 语义：负载摊开）=====
+// 权重语义：weight = (credits 比例)×CREDIT_WEIGHT + idleWeight；idleWeight = min(闲置小时×PER_HOUR, CAP)。
+const CREDIT_WEIGHT = 10;          // credits 占满（=候选最大值）时贡献的权重上限
+const IDLE_WEIGHT_PER_HOUR = 0.5; // 每闲置 1 小时累加的权重
+const IDLE_WEIGHT_CAP = 5;        // 闲置补偿封顶（约 10 小时到顶），防止久眠号权重无限膨胀
+
+/** 闲置补偿权重：越久没被选中权重越高（摊开负载）。lastUsed=0（从未用）直接给满值 CAP。 */
+function idleWeight(acc, now) {
+  const last = Number(acc.lastUsed) || 0;
+  if (last <= 0) return IDLE_WEIGHT_CAP;
+  const hours = Math.max(0, (now - last) / 3600000);
+  return Math.min(hours * IDLE_WEIGHT_PER_HOUR, IDLE_WEIGHT_CAP);
+}
+
+/** 按权重随机取一个（普通 Math.random）；总权重<=0（全零）时退化为取第一个，保持确定不崩。 */
+function weightedPick(list, weightFn) {
+  if (list.length <= 1) return list[0];
+  const weights = list.map((a) => Math.max(0, Number(weightFn(a)) || 0));
+  const total = weights.reduce((s, w) => s + w, 0);
+  if (total <= 0) return list[0];
+  let r = Math.random() * total;
+  for (let i = 0; i < list.length; i++) {
+    r -= weights[i];
+    if (r < 0) return list[i];
+  }
+  return list[list.length - 1];
+}
+
+/** ① 全冷却顶班兜底：正常候选（online）为空时的最后一搏。
+ *  可顶班集合 = hasToken && !exclude 且"软性可恢复"的账号。判定口径直接看派生后的 status：
+ *  只有 status==="cooling" 才可能顶班成功——coolAccount 对 429 软限流(kind rate)、5xx 熔断/网络
+ *  退避(kind server)、404/默认退避(default) 与 coolAccountMs 全部写 status="cooling"；
+ *  而 exhausted（402 余额耗尽/余额已到期，见 coolAccount kind credit 与 pickAccount 的两处标记）、
+ *  relogin（401 凭证失效）、disabled（人工停用）顶班必然失败或无额度，一律排除。
+ *  从可顶班集合里取 coolUntil 升序（最早恢复者优先）第一个返回；集合空返回 null。
+ *  注意：不把它的 status 改成 online（只是本次选它顶班），也不做任何特殊标记。
+ *  边界（保守）：顶班的前提是"有个班可顶"——即这是**多账号号池**被临时全部冷却（spec 原文
+ *  "全部账号...都在 cooling/熔断"本就是复数语义）。单账号渠道被冷却时没有"别人的班"可顶，
+ *  只是它自己在退避，此时保持既有的"返回 null → readyz/请求 503"信号不变（429 的同号退避重试
+ *  由 server 层 rateRetried 负责，不必在选号层强行赌一个孤号）。故渠道有 token 的账号 < 2 时不顶班。 */
+function fallbackPick(channel, exclude, now) {
+  const accs = poolAccounts(channel);
+  if (accs.filter((a) => a.hasToken).length < 2) return null;
+  let best = null;
+  let bestUntil = Infinity;
+  for (const a of accs) {
+    if (!a.hasToken || exclude.has(a.id) || a.status !== "cooling") continue;
+    const until = Number(a.coolUntil) || 0;
+    if (until < bestUntil) { best = a; bestUntil = until; }
+  }
+  return best;
 }
 
 /**
@@ -54,7 +110,9 @@ function pickAccount(channel, strategy, excludeIds, maxInFlight) {
     }
     candidates.push(a);
   }
-  if (!candidates.length) return null;
+  // ① 全冷却顶班兜底：正常候选（online）为空——号池全在 cooling/熔断——时，与其硬失败(返回 null)
+  // 不如从"软性可恢复"账号里赌一个最早恢复的顶班。集合仍空才真正返回 null。详见 fallbackPick。
+  if (!candidates.length) return fallbackPick(channel, exclude, now);
   // 并发租约：在途数达上限的账号让位；全忙时取在途最小者（不过载拒绝，参考项目语义）
   let pool2 = candidates;
   const limit = Number(maxInFlight) > 0 ? Number(maxInFlight) : 0;
@@ -70,21 +128,38 @@ function pickAccount(channel, strategy, excludeIds, maxInFlight) {
       }
     }
   }
+  let picked;
   switch (strategy) {
-    case "credit_first":
-      pool2.sort((a, b) => b.credits - a.credits);
+    case "credit_first": {
+      // ② 加权随机（负载摊开）：权重 = (credits/候选最大credits)×CREDIT_WEIGHT + idleWeight。
+      // 偏向高余额号消耗，同时用闲置补偿把负载摊到久未使用的号；credits 全 0 时退化为纯 idleWeight。
+      const maxCredits = pool2.reduce((m, a) => Math.max(m, a.credits > 0 ? a.credits : 0), 0);
+      picked = weightedPick(pool2, (a) => {
+        const ratio = maxCredits > 0 ? (a.credits > 0 ? a.credits : 0) / maxCredits : 0;
+        return ratio * CREDIT_WEIGHT + idleWeight(a, now);
+      });
       break;
+    }
     case "round_robin":
+      // 现状：lastUsed 升序本身即摊开负载，保持确定性不叠加权重
       pool2.sort((a, b) => a.lastUsed - b.lastUsed);
+      picked = pool2[0];
       break;
     case "expire_first":
-    default:
+    default: {
       // 先到期的先用；没查过到期时间的排最后（不失效优先消耗快过期的）
       pool2.sort((a, b) => (a.expiresAt || Number.MAX_SAFE_INTEGER) - (b.expiresAt || Number.MAX_SAFE_INTEGER));
+      // ② 保持"最早到期优先"的确定性：仅当排序后头部存在多个 expiresAt 并列（同一到期批次，
+      // 含都无到期时间即都为 MAX 的情况）时，才在这批并列账号内用"闲置补偿加权随机"摊开负载；
+      // 非并列时行为与原实现完全一致（取下标 0）。credits 不参与——expire_first 本意是烧到期批次。
+      const headExp = pool2[0].expiresAt || Number.MAX_SAFE_INTEGER;
+      const tiedHead = pool2.filter((a) => (a.expiresAt || Number.MAX_SAFE_INTEGER) === headExp);
+      picked = tiedHead.length > 1 ? weightedPick(tiedHead, (a) => idleWeight(a, now)) : pool2[0];
       break;
+    }
   }
-  let picked = pool2[0];
-  // 防惊群：100ms 内刚选中过同一账号且还有其他候选 → 让位重选（并发突发不再集中打一个号）
+  // 防惊群：100ms 内刚选中过同一账号且还有其他候选 → 让位重选（并发突发不再集中打一个号）。
+  // 作用在加权/排序选出的结果之后，语义不变。
   if (pool2.length > 1 && now - (lastPickAt.get(picked.id) || 0) < 100) {
     const alt = pool2.find((a) => now - (lastPickAt.get(a.id) || 0) >= 100);
     if (alt) picked = alt;
