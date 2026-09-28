@@ -274,6 +274,8 @@ export interface ProxyConfig {
   rateLimitPerMin: number;
   concurrency: number;
   creditsRefreshMin: number;
+  /** 积分包「即将到期」预警阈值（天，0~3650，默认 7）：号池到期徽标与到期总览分级共用 */
+  expiringSoonDays: number;
   /** 请求流水保留期（天，1~3650）：启动 GC 与统计页「清理」共用 */
   usageRetentionDays: number;
   debugStatus: boolean;
@@ -317,7 +319,7 @@ export interface ProxyConfig {
 // ===== 反代网关：数据结构（跟 electron/backend/proxy/* 返回一一对应） =====
 
 /** 内置生态渠道：有 OAuth / 本机扫描 / 签到 / 号池同步这些"生态"概念（自建提供商没有） */
-export type ProxyBuiltinChannelId = "trae" | "workbuddy" | "workbuddy_ai" | "raccoon" | "cline_free" | "cline_pass" | "autoclaw" | "autoclaw_intl" | "qoder";
+export type ProxyBuiltinChannelId = "trae" | "workbuddy" | "workbuddy_ai" | "raccoon" | "cline_free" | "cline_pass" | "autoclaw" | "autoclaw_intl" | "qoder" | "zcode" | "zcode_intl";
 /** 渠道 id = 内置渠道 + 用户自建提供商的 slug。
  *  自建 slug 是运行期数据，编译期无从枚举，所以这里放宽成普通字符串（同 ProxyRoute 的既有做法），
  *  保留字面量联合只为了 IDE 补全。**需要"仅内置"约束的地方请用 ProxyBuiltinChannelId。** */
@@ -383,6 +385,26 @@ export interface CcSwitchRegisterResult {
   message?: string;
 }
 
+/** 单个积分包/加油包明细（方案 Q6）：上游按包发放，逐包各有总额/已用/到期。
+ *  expired/expiringSoon 由主进程按 expiringSoonDays 阈值派生（时间态，不落库）。 */
+export interface ProxyCreditPackage {
+  /** 包唯一标识（同账号内稳定，用于列表 key）；上游缺失时回落 pack{i} */
+  code: string;
+  /** 包名/来源（Trae group_name·display_desc / WorkBuddy PackageName·SubProductName） */
+  name: string;
+  /** 总额（-1 = 不限哨兵） */
+  total: number;
+  /** 已用 */
+  used: number;
+  /** 剩余（-1 = 不限哨兵） */
+  remaining: number;
+  /** 到期时间戳（ms）；0 = 无到期 / 长期有效 */
+  expiresAt: number;
+  /** 已过期（expiresAt>0 且 <= now） */
+  expired?: boolean;
+  /** 即将到期（now < expiresAt < now + expiringSoonDays） */
+  expiringSoon?: boolean;
+}
 export interface ProxyAccount {
   id: string;
   channel: ProxyChannelId;
@@ -406,6 +428,8 @@ export interface ProxyAccount {
   creditsToday: number;
   createdAt: number;
   hasToken: boolean;
+  /** 逐积分包明细（Q6）：仅生态渠道且已刷新过的账号有；未刷新/无包概念的账号为空或缺省 */
+  packages?: ProxyCreditPackage[];
 }
 
 export interface ProxyPoolSummary {
@@ -693,6 +717,7 @@ export const MODULES: ModuleDef[] = [
       { id: "keys", name: "API Keys" },
       { id: "providers", name: "提供商" },
       { id: "agents", name: "号池" },
+      { id: "expiry", name: "积分到期" },
       { id: "models", name: "模型目录" },
       { id: "stats", name: "用量统计" },
       { id: "poolsync", name: "号池同步" },

@@ -86,6 +86,18 @@ CREATE TABLE IF NOT EXISTS credits_history (
   expires_at INTEGER NOT NULL DEFAULT 0,
   UNIQUE(channel, account_id, day)
 );
+CREATE TABLE IF NOT EXISTS credit_packages (
+  account_id TEXT NOT NULL,
+  channel TEXT NOT NULL DEFAULT '',
+  code TEXT NOT NULL DEFAULT '',
+  name TEXT NOT NULL DEFAULT '',
+  total INTEGER NOT NULL DEFAULT 0,
+  used INTEGER NOT NULL DEFAULT 0,
+  remaining INTEGER NOT NULL DEFAULT 0,
+  expires_at INTEGER NOT NULL DEFAULT 0,
+  ord INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_credit_pkg_acc ON credit_packages(account_id);
 CREATE TABLE IF NOT EXISTS model_cooldowns (
   acc_id TEXT NOT NULL,
   model TEXT NOT NULL,
@@ -121,7 +133,6 @@ CREATE INDEX IF NOT EXISTS idx_usage_key ON usage_requests(key_id, ts);
 CREATE INDEX IF NOT EXISTS idx_usage_channel ON usage_requests(channel, ts);
 CREATE INDEX IF NOT EXISTS idx_usage_model ON usage_requests(model, ts);
 `;
-
 /** 内置渠道：代码常量是它们 display/domain 的唯一真相源（agents 表里的内置行只承载调度策略）。
  *  用户自建提供商不在这张表里，走 agents 表的 kind != 'builtin' 行；两者合并视图见 channelList()。 */
 const BUILTIN_CHANNELS = [
@@ -134,6 +145,9 @@ const BUILTIN_CHANNELS = [
   { id: "autoclaw", display: "智谱 AutoClaw（国内）", domain: "autoglm-acceleration-api.zhipuai.cn" },
   { id: "autoclaw_intl", display: "智谱 AutoClaw（国际）", domain: "autoglm-api.autoglm.ai" },
   { id: "qoder", display: "Qoder", domain: "api3.qoder.sh" },
+  // ZCode（智谱 / Z.AI 编码套餐订阅登录态；两地区两 provider，见 adapters.makeZcode / discovery.beginZcodeOAuth）
+  { id: "zcode", display: "ZCode 智谱（国内）", domain: "open.bigmodel.cn" },
+  { id: "zcode_intl", display: "ZCode 智谱（国际）", domain: "api.z.ai" },
 ];
 const BUILTIN_IDS = new Set(BUILTIN_CHANNELS.map((c) => c.id));
 
@@ -744,6 +758,7 @@ function removeAccount(id) {
   open();
   db.prepare("DELETE FROM credits_history WHERE account_id = ?").run(String(id));
   db.prepare("DELETE FROM model_cooldowns WHERE acc_id = ?").run(String(id));
+  db.prepare("DELETE FROM credit_packages WHERE account_id = ?").run(String(id));
   return db.prepare("DELETE FROM accounts WHERE id = ?").run(String(id)).changes > 0;
 }
 
@@ -755,6 +770,66 @@ function snapshotCredits(channel, accountId, credits, expiresAt) {
     `INSERT INTO credits_history (channel, account_id, day, credits, expires_at) VALUES (?,?,?,?,?)
      ON CONFLICT(channel, account_id, day) DO UPDATE SET credits=excluded.credits, expires_at=excluded.expires_at`
   ).run(String(channel), String(accountId), dayStr(), Math.max(0, Math.round(credits || 0)), Math.max(0, Number(expiresAt) || 0));
+}
+
+// ===== 积分包明细（Q2 持久化：按账号整体替换该账号包集，单一事实源供派生/展示/同步） =====
+
+/** 归一单个包对象为落库行：字段宽容、-1 保留为"不限"哨兵、负值归 0 */
+function normPackageRow(p, i) {
+  const n = (v) => {
+    const x = Number(v);
+    if (!Number.isFinite(x)) return 0;
+    return x < -1 ? 0 : Math.round(x);
+  };
+  return {
+    code: String((p && p.code) || "").slice(0, 128),
+    name: String((p && p.name) || "").slice(0, 128),
+    total: n(p && p.total),
+    used: n(p && p.used),
+    remaining: n(p && p.remaining),
+    expiresAt: Math.max(0, Number(p && p.expiresAt) || 0),
+    ord: Number.isFinite(Number(p && p.ord)) ? Math.round(Number(p.ord)) : i,
+  };
+}
+
+/** 整体替换某账号的包集（DELETE + 批量 INSERT，一个事务内原子完成）。
+ *  传空数组 = 清空该账号包集。刷新链路与 poolsync 合并都走这一个入口，语义唯一。 */
+function setCreditPackages(accountId, channel, packages) {
+  open();
+  const id = String(accountId || "");
+  if (!id) return;
+  const list = Array.isArray(packages) ? packages : [];
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.prepare("DELETE FROM credit_packages WHERE account_id = ?").run(id);
+    const ins = db.prepare(
+      `INSERT INTO credit_packages (account_id, channel, code, name, total, used, remaining, expires_at, ord)
+       VALUES (?,?,?,?,?,?,?,?,?)`
+    );
+    list.forEach((p, i) => {
+      const r = normPackageRow(p, i);
+      ins.run(id, String(channel || ""), r.code, r.name, r.total, r.used, r.remaining, r.expiresAt, r.ord);
+    });
+    db.exec("COMMIT");
+  } catch (e) {
+    try { db.exec("ROLLBACK"); } catch { /* ignore */ }
+    throw e;
+  }
+}
+
+/** 列出某账号的包集（按 ord 升序；展示/派生/导出共用）。expired/expiringSoon 是时间派生量，
+ *  不落库，在序列化给 UI 时按配置阈值计算（见 index.cjs poolView）。 */
+function listCreditPackages(accountId) {
+  open();
+  const rows = db.prepare("SELECT * FROM credit_packages WHERE account_id = ? ORDER BY ord, rowid").all(String(accountId || ""));
+  return rows.map((r) => ({
+    code: r.code,
+    name: r.name,
+    total: r.total,
+    used: r.used,
+    remaining: r.remaining,
+    expiresAt: r.expires_at,
+  }));
 }
 
 // ===== 请求流水与统计 =====
@@ -1056,6 +1131,7 @@ module.exports = {
   listAccounts, accountRows, getAccount, accountSecrets, addAccount, updateAccount, bumpAccountUsage, setCreditsToday, removeAccount, noteError,
   listModelCooldowns, upsertModelCooldown, deleteModelCooldowns,
   snapshotCredits,
+  setCreditPackages, listCreditPackages,
   insertUsage, statsToday, statsTrend, statsTop, statsDetail, recentRequests,
   usageRequestById, cleanupUsage, setUsageRetention,
 };

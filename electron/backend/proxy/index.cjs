@@ -277,9 +277,23 @@ function poolChannels() {
 /** 号池全量视图：各渠道聚合 + 账号明细 + 调度策略（号池页数据源） */
 function poolView() {
   const agents = store.listAgents();
+  // 阈值随设置热生效（无需重启网关）：每次取号池视图前对齐一次（廉价的模块级 setter）
+  pool.setExpiringSoonDays(settings().expiringSoonDays);
+  const soonMs = Math.max(0, Number(settings().expiringSoonDays) || 0) * 86400000;
+  const now = Date.now();
+  // 逐包明细（Q6）：从持久化的 credit_packages 读取并附 expired/expiringSoon 派生量（时间态不落库）
+  const withPackages = (a) => ({
+    ...a,
+    modelCool: pool.accountModelCool(a.id),
+    packages: store.listCreditPackages(a.id).map((p) => ({
+      ...p,
+      expired: p.expiresAt > 0 && p.expiresAt <= now,
+      expiringSoon: p.expiresAt > now && p.expiresAt - now < soonMs,
+    })),
+  });
   return poolChannels().map((c) => {
     const summary = pool.poolSummary(c.id);
-    const accounts = pool.poolAccounts(c.id).map((a) => ({ ...a, modelCool: pool.accountModelCool(a.id) }));
+    const accounts = pool.poolAccounts(c.id).map(withPackages);
     return {
       ...c,
       poolStrategy: (agents.find((a) => a.id === c.id) || {}).poolStrategy || "expire_first",
@@ -331,6 +345,8 @@ function startBackgroundJobs() {
 function register(ipcMain) {
   // 请求流水保留期从设置灌入（open() 的启动 GC 在首次摸库时才跑，register 先行不踩空）
   store.setUsageRetention(settings().usageRetentionDays);
+  // 积分包「即将到期」阈值灌入号池模块（Q4）：poolSummary 的 expiringSoon 与到期总览分级共用
+  pool.setExpiringSoonDays(settings().expiringSoonDays);
   // ===== 服务启停 / 状态（主进程侧的薄包装见 gateway-client.cjs：转发 + 成功后写 restoreOnLaunch） =====
   ipcMain.handle("proxy_status", handle(() => gatewayStatus()));
   ipcMain.handle("proxy_start", handle(async () => {
@@ -361,6 +377,7 @@ function register(ipcMain) {
     }
     const r = await server.start(settings);
     credits.startScheduler(() => settings().creditsRefreshMin); // 刷新周期一并热生效
+    pool.setExpiringSoonDays(settings().expiringSoonDays); // 到期预警阈值一并热生效
     events.emit({ type: "status" });
     return r.ok ? ok({ port: r.port }) : fail(r.message);
   }));
@@ -640,6 +657,12 @@ function register(ipcMain) {
   // ===== 本地 IDE 快捷切换账号 =====
   ipcMain.handle("proxy_ide_switch", handle(({ accountId }) => ideswitch.switchIdeAccount(accountId)));
   ipcMain.handle("proxy_ide_status", handle(() => ideswitch.ideSwitchStatus()));
+
+  // ===== ZCode 活动领取（额度套餐领取；preview 列可领 / captcha 拿滑块配置 / claim 领取） =====
+  ipcMain.handle("proxy_zcode_claim_preview", handle(({ accountId }) => discovery.zcodeClaimPreview(accountId)));
+  ipcMain.handle("proxy_zcode_claim_captcha_config", handle(() => discovery.zcodeClaimCaptchaConfig()));
+  ipcMain.handle("proxy_zcode_claim", handle(({ accountId, planId, captchaParam, captchaRegion }) =>
+    discovery.zcodeClaim(accountId, planId, captchaParam, captchaRegion)));
 
   // ===== 统计 =====
   ipcMain.handle("proxy_stats_overview", handle(({ days }) => ({

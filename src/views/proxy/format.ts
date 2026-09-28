@@ -54,6 +54,8 @@ export const CHANNEL_NAMES: Record<string, string> = {
   autoclaw: "智谱 AutoClaw（国内）",
   autoclaw_intl: "智谱 AutoClaw（国际）",
   qoder: "Qoder",
+  zcode: "ZCode 智谱（国内）",
+  zcode_intl: "ZCode 智谱（国际）",
 };
 export const channelName = (id: string) => CHANNEL_NAMES[id] || id || "-";
 

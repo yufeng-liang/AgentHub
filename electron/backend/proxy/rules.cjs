@@ -132,6 +132,39 @@ const DEFAULTS = {
         { id: "MiniMax-M3", name: "MiniMax-M3", rate: 0.2, capabilities: { images: true, reasoning: false, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
       ],
     },
+    // ZCode 双区静态兜底（智谱/Z.AI 编码套餐；与 adapters.cjs ZCODE_MODELS 逐条对齐，两区同一份目录，无远程同步）
+    zcode: {
+      syncedAt: 0,
+      models: [
+        { id: "glm-5.3", name: "GLM-5.3", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 128000 },
+        { id: "glm-5.3-flash", name: "GLM-5.3 Flash", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 128000 },
+        { id: "glm-5.2", name: "GLM-5.2", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 128000 },
+        { id: "glm-5.1", name: "GLM-5.1", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 64000 },
+        { id: "glm-5", name: "GLM-5", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 64000 },
+        { id: "glm-5-turbo", name: "GLM-5 Turbo", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 64000 },
+        { id: "glm-4.7", name: "GLM-4.7", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 131072 },
+        { id: "glm-4.6", name: "GLM-4.6", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 131072 },
+        { id: "glm-4.5-air", name: "GLM-4.5 Air", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 131072, maxOutputTokens: 98304 },
+        { id: "glm-4.6v", name: "GLM-4.6V", rate: null, capabilities: { images: true, reasoning: false, tools: true }, contextLength: 131072, maxOutputTokens: 32768 },
+        { id: "glm-5v-turbo", name: "GLM-5V Turbo", rate: null, capabilities: { images: true, reasoning: false, tools: true }, contextLength: 200000, maxOutputTokens: 131072 },
+      ],
+    },
+    zcode_intl: {
+      syncedAt: 0,
+      models: [
+        { id: "glm-5.3", name: "GLM-5.3", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 128000 },
+        { id: "glm-5.3-flash", name: "GLM-5.3 Flash", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 128000 },
+        { id: "glm-5.2", name: "GLM-5.2", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 128000 },
+        { id: "glm-5.1", name: "GLM-5.1", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 64000 },
+        { id: "glm-5", name: "GLM-5", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 64000 },
+        { id: "glm-5-turbo", name: "GLM-5 Turbo", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 64000 },
+        { id: "glm-4.7", name: "GLM-4.7", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 131072 },
+        { id: "glm-4.6", name: "GLM-4.6", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 131072 },
+        { id: "glm-4.5-air", name: "GLM-4.5 Air", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 131072, maxOutputTokens: 98304 },
+        { id: "glm-4.6v", name: "GLM-4.6V", rate: null, capabilities: { images: true, reasoning: false, tools: true }, contextLength: 131072, maxOutputTokens: 32768 },
+        { id: "glm-5v-turbo", name: "GLM-5V Turbo", rate: null, capabilities: { images: true, reasoning: false, tools: true }, contextLength: 200000, maxOutputTokens: 131072 },
+      ],
+    },
   },
   // 各渠道 effort 兜底 seed（方案 §3.2，移植 workbuddy2api-panel per-realm 表 + 收编 Qoder 内联 QODER_FALLBACK 档位）：
   // ModelMeta 三源合并的最低优先层（seed < 拉取 < 用户覆盖）。渠道 → 模型 id（大小写不敏感）→

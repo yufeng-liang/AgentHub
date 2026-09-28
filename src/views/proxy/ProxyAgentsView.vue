@@ -14,6 +14,38 @@ const pool = ref<ProxyChannelView[]>([]);
 const refreshingChannel = ref(false);
 const refreshingId = ref("");
 
+// ===== 积分包明细展开（Q6）=====
+const expandedIds = ref<Set<string>>(new Set());
+function togglePkg(id: string) {
+  const next = new Set(expandedIds.value);
+  next.has(id) ? next.delete(id) : next.add(id);
+  expandedIds.value = next;
+}
+/** 已用占比（进度条宽度 %）：total<=0 或不限时不画条（模板已 v-if 拦） */
+function pkgUsedPct(pkg: { used: number; total: number }): number {
+  if (!pkg.total || pkg.total <= 0) return 0;
+  const used = pkg.used === -1 ? 0 : Math.max(0, pkg.used);
+  return Math.min(100, Math.round((used / pkg.total) * 100));
+}
+/** 剩余天数文案：expiresAt=0→长期；已过期→已过期；否则「剩 N 天」（不足一天按 1 天） */
+function pkgDaysText(pkg: { expiresAt: number; expired?: boolean }): string {
+  if (!pkg.expiresAt) return "长期";
+  if (pkg.expired) return "已过期";
+  const d = Math.max(1, Math.ceil((pkg.expiresAt - Date.now()) / 86400000));
+  return `剩 ${d} 天`;
+}
+/** 状态徽标：已过期(红) / 即将到期(琥珀) / 生效中(灰) —— 阈值由主进程按 expiringSoonDays 派生 */
+function pkgStatusCls(pkg: { expired?: boolean; expiringSoon?: boolean }): string {
+  if (pkg.expired) return "tag-err";
+  if (pkg.expiringSoon) return "tag-warn";
+  return "tag-dim";
+}
+function pkgStatusText(pkg: { expired?: boolean; expiringSoon?: boolean }): string {
+  if (pkg.expired) return "已过期";
+  if (pkg.expiringSoon) return "即将到期";
+  return "生效中";
+}
+
 // ===== Toast 悬浮提示（右上角、自动消失）：替代常驻页面的提示卡片 =====
 const toasts = ref<{ id: number; text: string; kind: "info" | "err" }[]>([]);
 let toastSeq = 0;
@@ -29,7 +61,7 @@ function toast(text: string, kind: "info" | "err" = "info") {
 // 渠道主按钮：顶部三个大按钮切换，下方整块区域只显示当前渠道号池
 const activeChannel = ref<ProxyChannelId>("trae");
 // 本地 IDE 快捷切换
-const ideStatus = ref<{ workbuddyInstalled: boolean; workbuddyAiInstalled?: boolean; traeInstalled?: boolean; raccoonInstalled?: boolean; currentUid: string } | null>(null);
+const ideStatus = ref<{ workbuddyInstalled: boolean; workbuddyAiInstalled?: boolean; traeInstalled?: boolean; raccoonInstalled?: boolean; zcodeInstalled?: boolean; currentUid: string } | null>(null);
 const ideSwitching = ref("");
 let offEvent: (() => void) | undefined;
 
@@ -46,6 +78,8 @@ const CHANNEL_META: Record<ProxyBuiltinChannelId, { icon: string; hint: string }
   autoclaw: { icon: "ph-robot", hint: "粘贴 · 本机导入（官方无网页登录）" },
   autoclaw_intl: { icon: "ph-globe", hint: "OAuth 登录（滑块验证）· 粘贴" },
   qoder: { icon: "ph-cursor", hint: "设备授权登录 · 粘贴" },
+  zcode: { icon: "ph-sparkle", hint: "OAuth 登录（订阅额度）· 粘贴" },
+  zcode_intl: { icon: "ph-sparkle", hint: "OAuth 登录（订阅额度）· 粘贴" },
 };
 // 自定义提供商只有 API Key：没有登录态、没有签到、没有余额概念，措辞要与生态渠道明确区分
 const PROVIDER_META = { icon: "ph-plugs-connected", hint: "API Key 轮转 · 无余额概念" };
@@ -64,12 +98,14 @@ const CHECKIN_CAPABLE: Record<ProxyBuiltinChannelId, boolean> = {
   autoclaw: false,
   autoclaw_intl: false,
   qoder: false,
+  zcode: false,
+  zcode_intl: false,
 };
 // 写回本地客户端登录态：主进程 ideswitch.cjs 只认这三家（WB 双区 auth 文件 + 小浣熊 config/auth.json），
 // Trae 是 ByteCrypto 加密信封、明确不做。必须是白名单而不是"内置渠道里排除 trae"——
 // 先前那样写让 cline_*/autoclaw*/qoder 的按钮全点亮、标题还承诺"写为本地当前登录态"，
 // 点下去才被主进程拒掉（后端那道门禁保留，这里是纵深不是替代）。
-const IDE_WRITEBACK_CHANNELS: ProxyBuiltinChannelId[] = ["workbuddy", "workbuddy_ai", "raccoon"];
+const IDE_WRITEBACK_CHANNELS: ProxyBuiltinChannelId[] = ["workbuddy", "workbuddy_ai", "raccoon", "zcode", "zcode_intl"];
 
 /** 提供商 id 是运行期字符串，查不到这张表 → undefined → 一律按"无此能力"处理 */
 function checkinCapable(id: ProxyChannelId) {
@@ -210,6 +246,14 @@ const OAUTH_HELP: Record<string, { title: string; desc: string }> = {
     title: "用 Qoder 账号设备授权登录",
     desc: "跳转 Qoder 授权页登录并选择账号，本机每 2 秒轮询自动完成。<br />国际版 / 中国版在下方切换；也可「粘贴 JSON」导入。",
   },
+  zcode: {
+    title: "用 ZCode 智谱（国内）订阅登录态登录",
+    desc: "跳转 ZCode 授权页（智谱账号）登录，本机按上游节奏轮询自动完成。<br />登录后自动换取编码套餐 API Key 入池，用的是订阅额度、不消耗开放平台 API Key。<br />也可「粘贴 JSON」导入 coding key。",
+  },
+  zcode_intl: {
+    title: "用 ZCode 智谱（国际 / Z.AI）订阅登录态登录",
+    desc: "跳转 ZCode 授权页（Z.AI 账号）登录，本机轮询自动完成并换取编码套餐 API Key 入池。<br />需已在 z.ai 控制台开通编码套餐；也可「粘贴 JSON」导入 coding key。",
+  },
 };
 
 // 「打开登录页」之后的等待文案：超时窗口按渠道各不相同，写死一个数会把用户钉在假等待里干等——
@@ -223,6 +267,8 @@ const OAUTH_WAIT_MSG: Record<string, string> = {
   cline_pass: "已在浏览器打开 Cline 授权页，页面已自动带上验证码，点确认后本机自动轮询入池（有效期以上游下发为准，约 5 分钟）…",
   qoder: "已在浏览器打开 Qoder 授权页，登录并选择账号后本机每 2 秒轮询自动入池（6 分钟无响应即超时）…",
   autoclaw_intl: "已在浏览器打开授权页，完成登录与账号选择后自动回到本应用入池（6 分钟无响应即超时）…",
+  zcode: "已在浏览器打开 ZCode 授权页，完成登录后本机自动轮询、换取编码套餐 Key 并入池（3 分钟无响应即超时）…",
+  zcode_intl: "已在浏览器打开 ZCode 授权页，完成登录后本机自动轮询、换取编码套餐 Key 并入池（3 分钟无响应即超时）…",
 };
 const OAUTH_WAIT_DEFAULT = "已在浏览器打开官方登录页，完成授权后自动加入号池…";
 // 滑块阶段的提示（还没开浏览器，绝不能复用上面的「已在浏览器打开」文案）
@@ -238,6 +284,8 @@ const PASTE_HINT: Record<string, string> = {
   autoclaw: "粘贴 access_token（可带 Bearer 前缀自动剥）与 refresh_token；刷新要用的 device_id 由本应用从 token 声明里解",
   autoclaw_intl: "粘贴国际版 access_token（可带 Bearer 前缀自动剥）与 refresh_token；刷新要用的 device_id 由本应用从 token 声明里解",
   qoder: "粘贴 accessToken；refreshToken 粘打包串（oauth刷新令牌|userId|machineId 或 pat|PAT|…|userId|machineId）",
+  zcode: "粘贴编码套餐 API Key（coding key，形如 {apiKey} 或 {apiKey}.{secret}）；无 refresh 概念，失效请重新登录",
+  zcode_intl: "粘贴编码套餐 API Key（coding key，国际版一般为 {apiKey}.{secret}）；无 refresh 概念，失效请重新登录",
 };
 const pasteHint = computed(() => PASTE_HINT[addChannel.value] || "");
 
@@ -388,6 +436,7 @@ function ideSupported(acc: ProxyAccount) {
   if (!ideWritebackCapable(acc.channel)) return false;
   if (!ideStatus.value) return true;
   if (acc.channel === "raccoon") return ideStatus.value.raccoonInstalled !== false;
+  if (acc.channel === "zcode" || acc.channel === "zcode_intl") return ideStatus.value.zcodeInstalled !== false;
   return acc.channel === "workbuddy_ai" ? ideStatus.value.workbuddyAiInstalled !== false : ideStatus.value.workbuddyInstalled !== false;
 }
 
@@ -395,10 +444,127 @@ function ideTitle(acc: ProxyAccount) {
   if (channelKind(acc.channel) !== "builtin") return "自定义提供商只有一把 API Key，本机没有对应的客户端登录态可写回";
   if (acc.channel === "trae") return "Trae 本地登录态为 ByteCrypto 加密信封（绑定设备密钥），无法构造合法信封，暂不支持写回";
   // 新渠道（Cline / AutoClaw / Qoder）本机就没有这套登录文件，别说成"未安装"
-  if (!ideWritebackCapable(acc.channel)) return "该渠道的客户端登录态不在本工具的写回范围内，请在客户端内自行登录";
+  if (acc.channel === "raccoon") return "把该账号写为本机 ~/.box-agent/config/auth.json（小浣熊登录态，明文 JSON，需重启客户端生效）";
+  if (acc.channel === "zcode" || acc.channel === "zcode_intl") return "把该账号写为本机 ~/.zcode/v2/credentials.json（ZCode 客户端登录态，明文 JSON，需重启客户端生效；仅本应用 OAuth 登录的账号可写回）";
   if (acc.channel === "raccoon") return "把该账号写为本机 ~/.box-agent/config/auth.json（小浣熊登录态，明文 JSON，需重启客户端生效）";
   if (!ideSupported(acc)) return "本机未找到对应客户端的登录文件（未安装或从未登录过）";
   return `把该账号写为本地 ${channelName(acc.channel)} 当前登录态（需重启客户端）`;
+}
+
+// ===== ZCode 活动领取（额度套餐领取）=====
+const claimOpen = ref(false);
+const claimAcc = ref<ProxyAccount | null>(null);
+const claimPlans = ref<api.ZcodeClaimPlan[]>([]);
+const claimLoading = ref(false);
+const claimBusy = ref(false);
+const claimingPlanId = ref("");
+const claimMsg = ref("");
+const claimErr = ref(false);
+
+function openClaim(acc: ProxyAccount) {
+  claimAcc.value = acc;
+  claimOpen.value = true;
+  claimPlans.value = [];
+  claimMsg.value = "";
+  claimErr.value = false;
+  loadClaimPreview();
+}
+function closeClaim() {
+  claimOpen.value = false;
+  claimAcc.value = null;
+  if (aclawCaptchaTimer) { clearTimeout(aclawCaptchaTimer); aclawCaptchaTimer = undefined; }
+  aclawInstance?.hide?.();
+  aclawInstance = null;
+}
+async function loadClaimPreview() {
+  if (!claimAcc.value) return;
+  claimLoading.value = true;
+  claimMsg.value = "";
+  claimErr.value = false;
+  try {
+    const r = await api.proxyZcodeClaimPreview(claimAcc.value.id);
+    if (!r.ok) { claimMsg.value = r.message || "获取可领套餐失败"; claimErr.value = true; claimPlans.value = []; }
+    else claimPlans.value = r.plans || [];
+  } catch (e) {
+    claimMsg.value = String((e as Error).message || e); claimErr.value = true;
+  } finally {
+    claimLoading.value = false;
+  }
+}
+
+/** 领取一个套餐：先拿滑块配置，需要验证就弹阿里云滑块拿 param，再调 claim */
+async function claimPlan(plan: api.ZcodeClaimPlan) {
+  if (!claimAcc.value || claimBusy.value) return;
+  claimBusy.value = true;
+  claimingPlanId.value = plan.planId;
+  claimMsg.value = "";
+  claimErr.value = false;
+  try {
+    const cfg = await api.proxyZcodeClaimCaptchaConfig();
+    let captchaParam = "";
+    let captchaRegion = "";
+    if (cfg.ok && cfg.enabled && cfg.sceneId) {
+      captchaRegion = cfg.region || "";
+      captchaParam = await runZcodeCaptcha(cfg.region || "", cfg.prefix || "", cfg.sceneId);
+      if (!captchaParam) { claimMsg.value = "滑块验证未完成，已取消领取"; claimErr.value = true; return; }
+    } else {
+      // 上游把滑块关了：极少见，仍需一个非空参数，用占位符尝试（后端会据上游结果回报）
+      claimMsg.value = "上游未启用滑块验证，无法构造领取所需的验证参数，请稍后再试"; claimErr.value = true; return;
+    }
+    const r = await api.proxyZcodeClaim({ accountId: claimAcc.value.id, planId: plan.planId, captchaParam, captchaRegion });
+    if (r.ok) {
+      const win = r.endsAt ? `，有效期至 ${fmtDate(r.endsAt)}` : "";
+      toast(`已领取「${r.planName || plan.name}」${win}`, "info");
+      claimMsg.value = `领取成功：${r.planName || plan.name}${win}`;
+      claimErr.value = false;
+      await refresh();
+      await loadClaimPreview();
+    } else {
+      claimMsg.value = r.message || "领取失败";
+      claimErr.value = true;
+      toast(r.message || "领取失败", "err");
+    }
+  } catch (e) {
+    claimMsg.value = String((e as Error).message || e); claimErr.value = true;
+  } finally {
+    claimBusy.value = false;
+    claimingPlanId.value = "";
+  }
+}
+
+/** 领取专用阿里云滑块：复用 loadAliyunCaptcha，挂到 zclaim-captcha-* 节点，回调返回 verify param */
+function runZcodeCaptcha(region: string, prefix: string, sceneId: string): Promise<string> {
+  return new Promise<string>(async (resolve) => {
+    try {
+      await loadAliyunCaptcha(region, prefix);
+    } catch (e) {
+      claimMsg.value = String((e as Error).message || e); claimErr.value = true;
+      resolve(""); return;
+    }
+    const w = window as unknown as AliyunCaptchaWindow;
+    if (typeof w.initAliyunCaptcha !== "function") { resolve(""); return; }
+    let done = false;
+    const finish = (v: string) => { if (done) return; done = true; if (aclawCaptchaTimer) { clearTimeout(aclawCaptchaTimer); aclawCaptchaTimer = undefined; } resolve(v); };
+    const mount = document.getElementById("zclaim-captcha-element");
+    if (mount) mount.innerHTML = "";
+    w.initAliyunCaptcha!({
+      SceneId: sceneId,
+      mode: "popup",
+      element: "#zclaim-captcha-element",
+      button: "#zclaim-captcha-trigger",
+      slideStyle: { width: 360, height: 40 },
+      language: "cn",
+      captchaVerifyCallback: async (param: string) => {
+        finish(param);
+        return { captchaResult: true, bizResult: true }; // 领取结果由 claim 请求判定，这里只负责取到 param
+      },
+      onBizResultCallback: () => {},
+      getInstance: (inst) => { aclawInstance = inst || null; },
+      onError: () => finish(""),
+    });
+    setTimeout(() => (document.getElementById("zclaim-captcha-trigger") as HTMLButtonElement | null)?.click(), 2100);
+    aclawCaptchaTimer = window.setTimeout(() => finish(""), ACLAW_CAPTCHA_TIMEOUT_MS);
+  });
 }
 
 async function refreshOne(acc: ProxyAccount) {
@@ -1023,8 +1189,16 @@ onUnmounted(() => {
                 <template v-if="isBuiltin(ch)"><th>余额</th><th>到期</th></template>
                 <th>今日</th><th>操作</th>
               </tr>
-              <tr v-for="acc in ch.accounts" :key="acc.id">
+              <template v-for="acc in ch.accounts" :key="acc.id">
+              <tr>
                 <td class="acc-cell">
+                  <button
+                    v-if="isBuiltin(ch) && acc.packages && acc.packages.length"
+                    class="pkg-caret"
+                    :class="{ open: expandedIds.has(acc.id) }"
+                    :title="expandedIds.has(acc.id) ? '收起积分包明细' : '展开积分包明细'"
+                    @click="togglePkg(acc.id)"
+                  ><i class="ph ph-caret-right" /></button>
                   <span v-if="renamingId !== acc.id" class="acc-name" :title="acc.name + '（点击重命名）'" @click="startRename(acc)">{{ acc.name || "（未命名账号）" }}</span>
                   <input
                     v-else
@@ -1078,6 +1252,15 @@ onUnmounted(() => {
                     签到
                   </button>
                   <button
+                    v-if="acc.hasToken && (ch.id === 'zcode' || ch.id === 'zcode_intl')"
+                    class="btn-link btn-sm"
+                    :disabled="claimBusy"
+                    title="领取 ZCode 活动额度套餐（需完成滑块验证）"
+                    @click="openClaim(acc)"
+                  >
+                    领取
+                  </button>
+                  <button
                     v-if="isBuiltin(ch)"
                     class="btn-link btn-sm"
                     :disabled="ideSwitching === acc.id || !ideSupported(acc)"
@@ -1101,6 +1284,37 @@ onUnmounted(() => {
                   <button class="btn-link btn-sm danger" @click="delRow = acc; delOpen = true">移出</button>
                 </td>
               </tr>
+              <!-- 展开：该账号逐积分包明细（Q6）—— 包名 / 已用 / 总额 / 剩余 / 到期 / 剩余天数 / 状态 + 进度条 -->
+              <tr v-if="isBuiltin(ch) && expandedIds.has(acc.id) && acc.packages && acc.packages.length" class="pkg-row" :key="acc.id + '-pkg'">
+                <td :colspan="isBuiltin(ch) ? 6 : 4" class="pkg-cell">
+                  <table class="pkg-tbl">
+                    <tbody>
+                      <tr>
+                        <th>积分包</th><th>已用</th><th>总额</th><th>剩余</th><th>到期</th><th>剩余天数</th><th>状态</th>
+                      </tr>
+                      <tr v-for="(pkg, pi) in acc.packages" :key="pkg.code || pi">
+                        <td class="pkg-name" :title="pkg.name">
+                          {{ pkg.name || "积分包" }}
+                          <div v-if="pkg.total > 0" class="pkg-bar" :title="`已用 ${fmtInt(pkg.used)} / 总额 ${fmtInt(pkg.total)}`">
+                            <span class="pkg-bar-used" :style="{ width: pkgUsedPct(pkg) + '%' }" />
+                          </div>
+                        </td>
+                        <td class="mono num">{{ pkg.used === -1 ? "不限" : fmtInt(pkg.used) }}</td>
+                        <td class="mono num">{{ pkg.total === -1 ? "不限" : fmtInt(pkg.total) }}</td>
+                        <td class="mono num">{{ pkg.remaining === -1 ? "不限" : fmtInt(pkg.remaining) }}</td>
+                        <td class="mono">{{ pkg.expiresAt ? fmtDate(pkg.expiresAt) : "长期" }}</td>
+                        <td class="mono num">{{ pkgDaysText(pkg) }}</td>
+                        <td><span class="tag" :class="pkgStatusCls(pkg)">{{ pkgStatusText(pkg) }}</span></td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </td>
+              </tr>
+              <!-- 已刷新过但无包 / 尚未刷新：给一句可操作提示（builtin 且有 token） -->
+              <tr v-else-if="isBuiltin(ch) && acc.hasToken && (!acc.packages || !acc.packages.length)" class="pkg-hint-row" :key="acc.id + '-hint'">
+                <td :colspan="6" class="pkg-hint">未刷新，点「刷新」获取积分包明细</td>
+              </tr>
+              </template>
               <tr v-if="!ch.accounts.length">
                 <td colspan="6" style="text-align: center; color: var(--text-3); padding: 14px">
                   号池为空 —— 点「添加账号」：OAuth 登录 / 从本机软件导入 / 文件导入 / 手动粘贴
@@ -1334,6 +1548,36 @@ onUnmounted(() => {
           </div>
           <div class="p-actions">
             <button class="btn btn-primary" @click="checkinOpen = false">完成</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ZCode 活动领取：列可领套餐 + 阿里云滑块验证 + 领取（复用 autoclaw_intl 那套 Aliyun SDK） -->
+      <div v-if="claimOpen" class="p-mask" @click.self="closeClaim">
+        <div class="p-dlg glass">
+          <div class="p-title"><i class="ph ph-gift"></i> 领取 ZCode 活动额度 · {{ claimAcc?.name || claimAcc?.uid || "" }}</div>
+          <div class="set-desc">领取后额度自动入号池。领取需完成阿里云滑块验证；每期套餐领过后需等本期结束再领。</div>
+          <div v-if="claimLoading" class="checkin-empty">加载可领套餐中…</div>
+          <div v-else-if="!claimPlans.length" class="checkin-empty">当前没有可领取的活动套餐（活动未开始或已领完）</div>
+          <div v-else class="checkin-rows">
+            <div v-for="p in claimPlans" :key="p.planId" class="checkin-row">
+              <div class="checkin-name">
+                {{ p.name || p.planId }}
+                <span v-for="(g, i) in p.grants" :key="i" class="tag tag-ok">{{ g }}</span>
+              </div>
+              <span class="checkin-msg">{{ p.description }}</span>
+              <button class="btn-link btn-sm" :disabled="claimBusy" @click="claimPlan(p)">
+                {{ claimBusy && claimingPlanId === p.planId ? "领取中…" : "领取" }}
+              </button>
+            </div>
+          </div>
+          <div v-if="claimMsg" class="set-desc" :class="{ 'err-text': claimErr }" style="margin-top:8px">{{ claimMsg }}</div>
+          <!-- 领取专用滑块挂载点（与添加账号弹窗的 aliyun-captcha-element 分开，避免同页重复 id） -->
+          <div id="zclaim-captcha-element" class="captcha-mount"></div>
+          <button id="zclaim-captcha-trigger" class="captcha-trigger" type="button" aria-hidden="true" tabindex="-1"></button>
+          <div class="p-actions">
+            <button class="btn" @click="closeClaim">关闭</button>
+            <button class="btn" :disabled="claimLoading || claimBusy" @click="loadClaimPreview">刷新可领列表</button>
           </div>
         </div>
       </div>
@@ -2037,6 +2281,65 @@ onUnmounted(() => {
 .pool-tbl th:nth-child(5),
 .pool-tbl td.num {
   text-align: right;
+}
+/* ===== 积分包展开明细（Q6）===== */
+.pkg-caret {
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: var(--text-3);
+  padding: 0 4px 0 0;
+  font-size: 12px;
+  transition: transform 0.15s;
+  display: inline-block;
+}
+.pkg-caret.open {
+  transform: rotate(90deg);
+  color: var(--text-1);
+}
+.pkg-row > .pkg-cell {
+  padding: 0 0 8px 26px;
+  background: var(--bg-2, rgba(127, 127, 127, 0.05));
+}
+.pkg-tbl {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.pkg-tbl th {
+  text-align: left;
+  font-weight: 500;
+  color: var(--text-3);
+  padding: 4px 8px;
+}
+.pkg-tbl td {
+  padding: 4px 8px;
+  border-top: 1px solid var(--border, rgba(127, 127, 127, 0.15));
+}
+.pkg-tbl td.num {
+  text-align: right;
+}
+.pkg-name {
+  min-width: 140px;
+  max-width: 240px;
+}
+.pkg-bar {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border, rgba(127, 127, 127, 0.25));
+  margin-top: 3px;
+  overflow: hidden;
+}
+.pkg-bar-used {
+  display: block;
+  height: 100%;
+  background: var(--accent, #4c8bf5);
+  border-radius: 2px;
+}
+.pkg-hint-row > .pkg-hint {
+  padding: 4px 8px 6px 26px;
+  font-size: 12px;
+  color: var(--text-3);
 }
 .acc-cell {
   line-height: 1.3;

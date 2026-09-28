@@ -367,6 +367,8 @@ const ALL_PROXY_CMDS = [
   // 「未授权的 IPC 命令：proxy_provider_*」（AGENTS.md 第四节），parity 闸会盯住。
   "proxy_provider_list", "proxy_provider_create", "proxy_provider_update", "proxy_provider_delete",
   "proxy_provider_add_key", "proxy_provider_remove_key", "proxy_provider_test", "proxy_provider_fetch_models",
+  // ZCode 活动领取（额度套餐领取）：实现体在 index.cjs register() 内、随 dispatchTable() 进子进程；主进程只转发
+  "proxy_zcode_claim_preview", "proxy_zcode_claim_captcha_config", "proxy_zcode_claim",
 ];
 
 // 4 条真 UI 依赖（规格 §5.7 归属定案）：实现体在本文件，不经管道（dialog/shell 子进程拿不到）。

@@ -604,15 +604,26 @@ const trae = {
         if (packs.length) {
           let credits = 0;
           let expiresAt = 0;
+          const packages = [];
           for (const p of packs) {
             const limit = Number(util.dig(p, /^credits_limit$/i)) || 0;
             if (limit <= 0) continue;
             const used = Number(util.dig(p, /^credits_amount$/i)) || 0;
-            credits += Math.max(limit - used, 0);
-            const end = util.toMs(util.dig(p, /end_time|expire|deadline|valid_until/i));
+            const remaining = Math.max(limit - used, 0);
+            credits += remaining;
+            const end = util.normalizeExpiryMs(util.dig(p, /end_time|expire|deadline|valid_until/i));
             if (end && end > Date.now() && (!expiresAt || end < expiresAt)) expiresAt = end;
+            packages.push({
+              code: String(util.dig(p, /^entitlement_pack_id$|^pack_id$|^group_type$|^id$/i) || `pack${packages.length}`),
+              name: String(util.dig(p, /^group_name$|^display_desc$|^display_name$|^name$/i) || "积分包"),
+              total: limit,
+              used,
+              remaining,
+              expiresAt: end,
+            });
           }
-          if (credits > 0) return { credits, expiresAt };
+          // 有解析出的包就带回逐包明细（含已用完但仍在有效期内的包，供到期展示）
+          if (packages.length) return { credits, expiresAt, packages };
           // 新版字段缺失时退回旧档位口径（单一包 remain）
           const best = pickEntitlementPack(packs);
           if (best.credits > 0) return { credits: best.credits, expiresAt: best.expiresAt };
@@ -794,6 +805,7 @@ function parseWbResource(data, isEnterprise) {
   let used = 0;
   let size = 0;
   let earliestEnd = 0;
+  const packages = [];
   const num = (a, re) => Number(util.dig(a, re)) || 0;
   for (const a of accounts) {
     // 单包口径（参考项目 packageRemainUsed）：Cycle 期套餐优先，缺 Cycle 退回 Capacity 三字段
@@ -813,9 +825,18 @@ function parseWbResource(data, isEnterprise) {
     remain += r;
     used += u;
     size += s;
-    const end = util.toMs(util.dig(a, /^PackageEndTime$|^CycleEndTime$|^CycleResetTime$/i));
+    // 到期宽容取值链（Q10）：DeductionEndTime/ExpiredTime 优先，其后 PackageEndTime/CycleEndTime；normalizeExpiryMs 处理脏值/秒毫秒/纯日期
+    const end = util.normalizeExpiryMs(util.dig(a, /^DeductionEndTime$|^ExpiredTime$|^PackageEndTime$|^CycleEndTime$|^CycleResetTime$/i));
     // 只取未来的到期时间：响应里混着已过期的历史包（Status=3），取其到期会把账号误判成「余额已到期」
     if (end && end > Date.now() && (!earliestEnd || end < earliestEnd)) earliestEnd = end;
+    packages.push({
+      code: String(util.dig(a, /^PackageCode$|^SubProductCode$|^ProductCode$/i) || `pack${packages.length}`),
+      name: String(util.dig(a, /^PackageName$|^SubProductName$|^ProductName$/i) || "加油包"),
+      total: s,
+      used: u,
+      remaining: r,
+      expiresAt: end,
+    });
   }
   // TotalDosage 作 size 下限（已消耗的总量不该小于套餐总量）
   const dosage = Number(util.dig(data, /^TotalDosage$/i)) || 0;
@@ -825,7 +846,7 @@ function parseWbResource(data, isEnterprise) {
   } else if (size > 0 && size - remain > used) {
     used = size - remain;
   }
-  return { credits: Math.max(remain, 0), used, expiresAt: earliestEnd };
+  return { credits: Math.max(remain, 0), used, expiresAt: earliestEnd, packages };
 }
 
 /** 官方客户端会话头族（参考项目 ChatMeta 实证：后台按 X-Conversation-Request-ID 聚合请求，
@@ -2657,6 +2678,197 @@ function qoderMachineId() {
 }
 const qoder = makeQoder();
 
+// ===== ZCode（智谱 / Z.AI 编码套餐订阅登录态；makeZcode(region) 两地区参数化，协议参考 agent2api zcode/*） =====
+// 与 AutoClaw 的关系：AutoClaw 是「autoclaw 客户端」的登录态，ZCode 是「Z Code 编码客户端」的
+// 订阅登录态——两条不同的产品线、不同的域名与换取链路。ZCode 登录换回的是一把**编码套餐 API Key**
+// （coding key），推理走 OpenAI 兼容 /chat/completions，body 原样透传（不改模型名、不注入思考档）。
+const ZCODE_APP_VERSION = "3.14.0"; // Z Code 客户端版本；ZCODE_APP_VERSION 可覆盖（上游按客户端形态识别）
+const ZCODE_ORIGIN = "https://zcode.z.ai"; // zcode 平面（登录/领取/客户端配置）两地相同
+const ZCODE_REGIONS = {
+  cn: { channel: "zcode", region: "cn", openaiBase: "https://open.bigmodel.cn/api/coding/paas/v4", bizHost: "https://bigmodel.cn", upstreamProvider: "bigmodel", uidPrefix: "zcode-user-", envKey: "ZCODE_OPENAI_BASE_URL" },
+  intl: { channel: "zcode_intl", region: "intl", openaiBase: "https://api.z.ai/api/coding/paas/v4", bizHost: "https://api.z.ai", upstreamProvider: "zai", uidPrefix: "zcode-intl-user-", envKey: "ZCODE_INTL_OPENAI_BASE_URL" },
+};
+// 静态模型表（两地共用一份，与 agent2api zcode/models.rs 逐条对齐）。id 即上游真名，无别名映射。
+const ZCODE_MODELS = [
+  { id: "glm-5.3", name: "GLM-5.3", contextLength: 1000000, maxOutputTokens: 128000, capabilities: { images: false, reasoning: true, tools: true } },
+  { id: "glm-5.3-flash", name: "GLM-5.3 Flash", contextLength: 1000000, maxOutputTokens: 128000, capabilities: { images: false, reasoning: true, tools: true } },
+  { id: "glm-5.2", name: "GLM-5.2", contextLength: 1000000, maxOutputTokens: 128000, capabilities: { images: false, reasoning: true, tools: true } },
+  { id: "glm-5.1", name: "GLM-5.1", contextLength: 200000, maxOutputTokens: 64000, capabilities: { images: false, reasoning: true, tools: true } },
+  { id: "glm-5", name: "GLM-5", contextLength: 200000, maxOutputTokens: 64000, capabilities: { images: false, reasoning: true, tools: true } },
+  { id: "glm-5-turbo", name: "GLM-5 Turbo", contextLength: 200000, maxOutputTokens: 64000, capabilities: { images: false, reasoning: true, tools: true } },
+  { id: "glm-4.7", name: "GLM-4.7", contextLength: 200000, maxOutputTokens: 131072, capabilities: { images: false, reasoning: true, tools: true } },
+  { id: "glm-4.6", name: "GLM-4.6", contextLength: 200000, maxOutputTokens: 131072, capabilities: { images: false, reasoning: true, tools: true } },
+  { id: "glm-4.5-air", name: "GLM-4.5 Air", contextLength: 131072, maxOutputTokens: 98304, capabilities: { images: false, reasoning: true, tools: true } },
+  { id: "glm-4.6v", name: "GLM-4.6V", contextLength: 131072, maxOutputTokens: 32768, capabilities: { images: true, reasoning: false, tools: true } },
+  { id: "glm-5v-turbo", name: "GLM-5V Turbo", contextLength: 200000, maxOutputTokens: 131072, capabilities: { images: true, reasoning: false, tools: true } },
+];
+function zcodeRegionByChannel(channel) { return channel === "zcode_intl" ? ZCODE_REGIONS.intl : ZCODE_REGIONS.cn; }
+function zcodeAppVersion() { return String(process.env.ZCODE_APP_VERSION || "").trim() || ZCODE_APP_VERSION; }
+
+/** 推理请求上的「客户端身份头」（agent2api adapter.rs identity_headers 移植；unknown 是上游文档化兜底值）。 */
+function zcodeIdentityHeaders() {
+  const v = zcodeAppVersion();
+  return {
+    "http-referer": ZCODE_ORIGIN,
+    "user-agent": `ZCode/${v}`,
+    "x-zcode-app-version": v,
+    "x-title": "Z Code@cli",
+    "x-release-channel": "production",
+    "x-client-language": "unknown",
+    "x-client-timezone": "unknown",
+    "x-zcode-agent": "glm",
+    "x-platform": "win32-x64",
+    "x-os-category": "windows",
+  };
+}
+function makeZcode(region) {
+  const cfg = ZCODE_REGIONS[region];
+  // 推理基址（ZCODE_OPENAI_BASE_URL / ZCODE_INTL_OPENAI_BASE_URL 可覆盖：上游域名历史上换过，
+  // 发版跟不上时用户能自己改环境变量救急，与 autoclaw/raccoon 同一取舍）。
+  function baseUrl() {
+    const o = String(process.env[cfg.envKey] || "").trim().replace(/\/+$/, "");
+    return o || cfg.openaiBase;
+  }
+  const label = region === "intl" ? "国际版" : "国内版";
+  return {
+    id: cfg.channel,
+    refreshWindowSec: 0, // coding key 是长效 API Key，无临期刷新概念
+
+    models() { return ZCODE_MODELS.map((m) => m.id); },
+    modelEntries() { return ZCODE_MODELS.map((m) => ({ client: m.id, upstream: m.id, entry: m })); },
+    upstreamFor(model) { return String(model || "").trim(); }, // id 即上游真名
+
+    rewriteBody(model, body) {
+      const out = { ...(body || {}) };
+      out.model = String(model || out.model || "");
+      out.stream = true;
+      if (!out.stream_options || typeof out.stream_options !== "object") out.stream_options = {};
+      out.stream_options.include_usage = true;
+      delete out.conversation_id; delete out.conversationId; delete out.prompt_cache_key;
+      return out;
+    },
+
+    async chat({ secrets, model, body, emit }) {
+      const token = (secrets && secrets.token) || "";
+      const prepared = this.rewriteBody(model, body);
+      const headers = { "content-type": "application/json", accept: "*/*", authorization: `Bearer ${token}`, ...zcodeIdentityHeaders() };
+      const { resp, cancelTimer } = await fetchStream(`${baseUrl()}/chat/completions`, { method: "POST", headers, body: JSON.stringify(prepared) });
+      const result = { status: 200, planLimit: false };
+      try {
+        await pumpSse(resp, (_event, raw) => {
+          if (raw === "[DONE]") { emit({ type: "finish", reason: "" }); return; }
+          const data = parseJson(raw);
+          if (!data) return;
+          if (data.error) {
+            // 401→登录态失效（刷新），429→套餐额度（402 换号），其余透传 502（协议参考 adapter.rs classify_error）
+            const msg = String((data.error && data.error.message) || data.error);
+            const st = Number((data.error && data.error.status) || 0);
+            const s = st === 401 ? 401 : st === 429 ? 402 : (st || 502);
+            if (s === 402) result.planLimit = true;
+            emit({ type: "error", status: s, code: Number(data.error && data.error.code) || 0, message: msg.slice(0, 300) });
+            return;
+          }
+          const choice = Array.isArray(data.choices) && data.choices[0];
+          if (choice) {
+            if (choice.delta && Object.keys(choice.delta).length) emit({ type: "delta", delta: choice.delta });
+            if (choice.finish_reason) emit({ type: "finish", reason: choice.finish_reason });
+          }
+          if (data.usage) {
+            emit({ type: "usage", usage: {
+              prompt_tokens: Number(data.usage.prompt_tokens ?? data.usage.input_tokens) || 0,
+              completion_tokens: Number(data.usage.completion_tokens ?? data.usage.output_tokens) || 0,
+              total_tokens: Number(data.usage.total_tokens) || 0,
+              ...util.openaiCacheTokens(data.usage),
+              ...util.upstreamCredit(data.usage),
+            } });
+          }
+        });
+      } finally { cancelTimer(); }
+      return result;
+    },
+
+    // billing/领取域头（zcode-switch zai_headers_with_version 移植）：X-Title 是 "Z Code@electron"、
+    // X-Release-Channel=stable（与对话域的 @cli/production 不同，逐字照 billing 平面）；token 空则 Bearer 后为空
+    _billingHeaders(token, mid) {
+      const v = zcodeAppVersion();
+      const h = {
+        "user-agent": `ZCode/${v}`,
+        "http-referer": ZCODE_ORIGIN,
+        "x-title": "Z Code@electron",
+        "x-zcode-app-version": v,
+        "x-platform": "win32-x64",
+        "x-release-channel": "stable",
+        "x-client-language": "zh-CN",
+        "x-client-timezone": "Asia/Shanghai",
+        "x-os-category": "windows",
+        authorization: `Bearer ${token || ""}`,
+        "x-request-id": util.uuid(),
+      };
+      if (mid) h["x-device-mid"] = String(mid);
+      return h;
+    },
+
+    // 额度查询（zcode-switch billing/balance 移植）：用套餐 JWT（meta.jwt）打 zcode 平面，返回逐套餐明细。
+    // credits.cjs 的通用刷新链路据此写 credit_packages 并派生账号级 credits/expiresAt（多套餐分组展示）。
+    // 契约：{credits,expiresAt,packages} 正常；{authError} 触发刷新/relogin；{unavailable,message} 无 JWT（粘贴 coding key）。
+    async queryCredits(account, secrets) {
+      let meta = {};
+      try { meta = account && account.meta ? (typeof account.meta === "string" ? JSON.parse(account.meta) : account.meta) : {}; } catch { meta = {}; }
+      const jwt = String(meta.jwt || "").trim();
+      if (!jwt) return { unavailable: true, message: "该账号无套餐令牌（粘贴 coding key 导入的账号不查额度），额度以对话时上游为准" };
+      const url = `${ZCODE_ORIGIN}/api/v1/zcode-plan/billing/balance?app_version=${encodeURIComponent(zcodeAppVersion())}`;
+      const r = await httpJson(url, { method: "GET", headers: this._billingHeaders(jwt, meta.device_mid) })
+        .catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
+      if (r.status === 401 || r.status === 403 || (r.data && Number(r.data.code) === 401)) return { authError: true, message: "套餐令牌失效，请重新登录该账号" };
+      if (!r.ok || !r.data) return { error: `额度查询失败（HTTP ${r.status}）${(r.data && (r.data.msg || r.data.message)) || r.message || ""}` };
+      if (r.data.code != null && Number(r.data.code) !== 0) return { error: `额度查询被拒：${r.data.msg || r.data.message || r.data.code}` };
+      // data 可能多层 data/result 包裹（zcode-switch unwrap 同款）：向内剥到出现 plans/balances 为止
+      let d = r.data.data != null ? r.data.data : r.data;
+      for (let i = 0; i < 4 && d && typeof d === "object" && !d.plans && !d.balances; i++) {
+        d = d.data != null ? d.data : (d.result != null ? d.result : null);
+      }
+      d = d || {};
+      const planName = {};
+      for (const pl of Array.isArray(d.plans) ? d.plans : []) {
+        const pid = String((pl && (pl.plan_id || pl.planId)) || "");
+        if (pid) planName[pid] = String((pl && pl.name) || pid);
+      }
+      const packages = [];
+      for (const it of Array.isArray(d.balances) ? d.balances : []) {
+        if (!it || typeof it !== "object") continue;
+        const total = Number(it.total_units);
+        const used = Number(it.used_units);
+        const remaining = it.remaining_units != null ? Number(it.remaining_units) : (it.available_units != null ? Number(it.available_units) : NaN);
+        const pid = String(it.plan_id || it.planId || it.entitlement_id || "");
+        const expSec = Number(it.expires_at || it.period_end || 0);
+        packages.push({
+          code: pid,
+          name: String(it.show_name || it.name || planName[pid] || pid || "套餐额度"),
+          total: Number.isFinite(total) ? total : 0,
+          used: Number.isFinite(used) ? used : 0,
+          remaining: Number.isFinite(remaining) ? remaining : (Number.isFinite(total) && Number.isFinite(used) ? Math.max(0, total - used) : 0),
+          expiresAt: expSec > 1e12 ? expSec : (expSec > 0 ? expSec * 1000 : 0),
+        });
+      }
+      return { credits: 0, expiresAt: 0, packages };
+    },
+
+    // coding key 长效、上游无续期端点：如实报错让用户重新登录，不留「刷了但没变」的假实现
+    async refreshToken() {
+      return { ok: false, noRefresh: true, message: `ZCode ${label}登录态无法自动续期（编码套餐 API Key 长效）；失效请在「账号」页重新登录` };
+    },
+    // 落库时 uid 已由登录链路按 user_id 定好（见 discovery.beginZcodeOAuth）；这里仅服务粘贴兜底：
+    // 粘的多是不透明 coding key（非 JWT），解不出就回空 uid，账号仍可落一条可用记录
+    async userInfo(token) {
+      const c = util.jwtDecode(token).payload || {};
+      const id = String(c.user_id || c.id || "");
+      return { uid: id ? `${cfg.uidPrefix}${id}` : "", name: id ? `ZCode ${label} · ${id}` : `ZCode ${label}` };
+    },
+  };
+}
+const zcode = makeZcode("cn");
+const zcode_intl = makeZcode("intl");
+
 // ===== 自定义提供商：通用 OpenAI 兼容适配器（按 agents 行动态实例化，一张表行 = 一个上游端点） =====
 
 /** extraBody 深合并：只递归普通对象，数组与标量整体替换。
@@ -2959,7 +3171,9 @@ function compatAdapter(id) {
   return ad;
 }
 
-const ADAPTERS = { trae, workbuddy, workbuddy_ai, raccoon, cline_free, cline_pass, autoclaw, autoclaw_intl, qoder };
+// zcode / zcode_intl 追加在**末尾**：modelOwners 按此顺序返回，glm-5.3 等既有 owner（autoclaw/qoder）
+// 的默认归属不变——新家只是多一个来源，不抢既有裸名路由。
+const ADAPTERS = { trae, workbuddy, workbuddy_ai, raccoon, cline_free, cline_pass, autoclaw, autoclaw_intl, qoder, zcode, zcode_intl };
 
 /** 渠道 → 适配器：内置 8 家查静态表，未命中再试动态提供商。
  *  ADAPTERS 本身保持只含内置 —— mergedModels()/modelOwners() 靠这个前提把裸模型名
@@ -3110,4 +3324,8 @@ module.exports = {
   _qoderUnpack: qoderUnpack,
   _qoderMachineId: qoderMachineId,
   _TagSplitter: TagSplitter,
+  // zcode 窥视口：地区配置 / 客户端版本 / zcode 平面基址，供 discovery.beginZcodeOAuth 复用单一真相源
+  _zcodeRegionByChannel: zcodeRegionByChannel,
+  _zcodeAppVersion: zcodeAppVersion,
+  _zcodeOrigin: ZCODE_ORIGIN,
 };

@@ -27,6 +27,8 @@ const CHANNELS: { id: ProxyBuiltinChannelId | ""; label: string }[] = [
   { id: "autoclaw", label: "智谱 AutoClaw（国内）" },
   { id: "autoclaw_intl", label: "智谱 AutoClaw（国际）" },
   { id: "qoder", label: "Qoder" },
+  { id: "zcode", label: "ZCode 智谱（国内）" },
+  { id: "zcode_intl", label: "ZCode 智谱（国际）" },
 ];
 
 const running = computed(() => !!st.value?.running);

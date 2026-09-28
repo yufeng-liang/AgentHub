@@ -40,6 +40,146 @@ function raccoonAuthFile() {
   return raccoonAuth.authFile();
 }
 
+/** ZCode 桌面客户端登录态目录解析（协议参考 zcode-switch store.rs resolve_data_root）。
+ *  home = USERPROFILE/HOME（ZCODE_SWITCH_HOME 覆盖，供测试隔离）；
+ *  dataRoot = ZCODE_SWITCH_DATA_ROOT env → home/.zcode/v2/setting.json 的 dataBaseDir → ZCODE_DATA_BASE_DIR env → home。
+ *  凭据文件 = dataRoot/.zcode/v2/credentials.json（明文 JSON），设备标识写 dataRoot/.zcode/v2/telemetry-state.json。 */
+function zcodeHome() {
+  return process.env.ZCODE_SWITCH_HOME || process.env.USERPROFILE || process.env.HOME || os.homedir();
+}
+function zcodeAbsEnv(name) {
+  const v = String(process.env[name] || "").trim();
+  return v && path.isAbsolute(v) ? v : "";
+}
+function zcodeDataRoot(home) {
+  const e1 = zcodeAbsEnv("ZCODE_SWITCH_DATA_ROOT");
+  if (e1) return e1;
+  try {
+    const raw = fs.readFileSync(path.join(home, ".zcode", "v2", "setting.json"), "utf8");
+    const d = JSON.parse(raw);
+    const base = d && typeof d.dataBaseDir === "string" ? d.dataBaseDir.trim() : "";
+    if (base && path.isAbsolute(base)) return base;
+  } catch { /* 无 setting.json 或无 dataBaseDir：回落 home */ }
+  const e2 = zcodeAbsEnv("ZCODE_DATA_BASE_DIR");
+  if (e2) return e2;
+  return home;
+}
+function zcodeCredFile() {
+  return path.join(zcodeDataRoot(zcodeHome()), ".zcode", "v2", "credentials.json");
+}
+function zcodeTelemetryFile() {
+  return path.join(zcodeDataRoot(zcodeHome()), ".zcode", "v2", "telemetry-state.json");
+}
+
+/** 由号池账号的 meta 重建 ZCode 客户端 credentials.json 所需键（协议参考 store.rs / oauth.rs）。
+ *  缺 oauthAccessToken（老账号或粘贴导入）返回 null —— 无法构造合法登录态，宁可不写。 */
+function buildZcodeCredentials(meta) {
+  const jwt = String(meta.jwt || "").trim();
+  const provider = String(meta.upstreamProvider || (meta.region === "intl" ? "zai" : "bigmodel")).trim();
+  const access = String(meta.oauthAccessToken || "").trim();
+  if (!jwt || !access) return null;
+  const out = {
+    zcodejwttoken: jwt,
+    "oauth:active_provider": provider,
+    [`oauth:${provider}:access_token`]: access,
+  };
+  const refresh = String(meta.oauthRefreshToken || "").trim();
+  if (refresh) out[`oauth:${provider}:refresh_token`] = refresh;
+  // user_info 客户端按「JSON 字符串」存取（store.rs 读它是 .as_str() 再解析）
+  const ui = String(meta.userInfo || "").trim();
+  if (ui) out[`oauth:${provider}:user_info`] = ui;
+  return out;
+}
+
+/** 写回本机 ZCode 客户端登录态：合并式只改凭据键（保留其余），原子写 + 备份 + 回读校验 + 失败回滚。
+ *  与 WB/小浣熊同一套安全闸；device_mid 顺带写进 telemetry-state.json（活动领取的设备指纹要跨端一致）。 */
+function switchZcodeAccount(acc) {
+  let meta = {};
+  try { meta = acc.meta ? (typeof acc.meta === "string" ? JSON.parse(acc.meta) : acc.meta) : {}; } catch { meta = {}; }
+  const creds = buildZcodeCredentials(meta);
+  if (!creds) {
+    return { ok: false, channel: acc.channel, message: "该账号缺少可写回的登录凭据（仅支持在本应用内 OAuth 登录得到的 ZCode 账号；粘贴 coding key 导入的不支持写回）" };
+  }
+  const file = zcodeCredFile();
+  const dir = path.dirname(file);
+  try { fs.mkdirSync(dir, { recursive: true }); } catch { /* 已存在 */ }
+
+  let json = {};
+  let raw = "";
+  if (fs.existsSync(file)) {
+    try {
+      raw = fs.readFileSync(file, "utf8");
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) json = parsed;
+    } catch (e) {
+      return { ok: false, channel: acc.channel, message: `ZCode 登录文件解析失败：${(e && e.message) || e}` };
+    }
+  }
+
+  const beforeHash = raw ? sha256(raw) : "";
+  let backup = "";
+  if (fs.existsSync(file)) {
+    backup = `${file}.bak-${Date.now()}`;
+    fs.copyFileSync(file, backup);
+    try {
+      const base = path.basename(file) + ".bak-";
+      const olds = fs.readdirSync(dir).filter((n) => n.startsWith(base)).sort();
+      for (const n of olds.slice(0, Math.max(0, olds.length - 5))) fs.rmSync(path.join(dir, n), { force: true });
+    } catch { /* 清理失败不阻断切换 */ }
+    // 写时再比对哈希：客户端在切号期间回写过就作废本次
+    let nowRaw = "";
+    try { nowRaw = fs.readFileSync(file, "utf8"); } catch (e) { return { ok: false, channel: acc.channel, message: `读取登录文件失败：${(e && e.message) || e}` }; }
+    if (sha256(nowRaw) !== beforeHash) {
+      return { ok: false, channel: acc.channel, message: "登录信息在切号期间被 ZCode 客户端更新，已停止覆盖，请稍后重试" };
+    }
+  }
+
+  const merged = { ...json, ...creds };
+  const tmp = `${file}.tmp-${process.pid}`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(merged, null, 2) + "\n", "utf8");
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* 残留临时文件不影响原文件 */ }
+    return { ok: false, channel: acc.channel, message: `写入登录文件失败：${(e && e.message) || e}` };
+  }
+
+  // 回读校验：三个关键键落位
+  try {
+    const back = JSON.parse(fs.readFileSync(file, "utf8"));
+    const provider = creds["oauth:active_provider"];
+    if (String(back.zcodejwttoken || "") !== creds.zcodejwttoken || String(back[`oauth:${provider}:access_token`] || "") !== creds[`oauth:${provider}:access_token`]) {
+      if (backup) { try { fs.copyFileSync(backup, file); } catch { /* 回滚失败也如实报告 */ } }
+      return { ok: false, channel: acc.channel, backup, file, message: "写入校验未通过（凭据未落位），已自动回滚到切换前状态" };
+    }
+  } catch (e) {
+    return { ok: false, channel: acc.channel, message: `回读校验失败：${(e && e.message) || e}` };
+  }
+
+  // 设备标识同步进 telemetry-state.json（合并式，只改 deviceMid）
+  if (meta.device_mid) {
+    const tf = zcodeTelemetryFile();
+    try {
+      let tj = {};
+      if (fs.existsSync(tf)) { try { tj = JSON.parse(fs.readFileSync(tf, "utf8")) || {}; } catch { tj = {}; } }
+      if (!tj || typeof tj !== "object" || Array.isArray(tj)) tj = {};
+      tj.deviceMid = String(meta.device_mid);
+      const ttmp = `${tf}.tmp-${process.pid}`;
+      fs.writeFileSync(ttmp, JSON.stringify(tj, null, 2) + "\n", "utf8");
+      fs.renameSync(ttmp, tf);
+    } catch { /* telemetry 非关键，写不上不阻断 */ }
+  }
+
+  const label = acc.channel === "zcode_intl" ? "ZCode 智谱（国际）" : "ZCode 智谱（国内）";
+  return {
+    ok: true,
+    channel: acc.channel,
+    file,
+    backup,
+    message: `已把「${acc.name || acc.uid || acc.id}」写为${label}本机客户端登录态。请完全退出并重启 ZCode 客户端生效；若正在运行，可能回写覆盖，建议先关闭再切换。${backup ? `原文件已备份：${path.basename(backup)}` : ""}`,
+  };
+}
+
 /** 小浣熊 IDE 写回：合并式只改凭据三键（保留其余字段），原子写 + 回读校验 + 失败回滚 */
 function switchRaccoonAccount(acc) {
   const file = raccoonAuthFile();
@@ -214,6 +354,7 @@ function switchIdeAccount(accountId) {
       message: "Trae 本地登录态为 ByteCrypto 加密信封（绑定设备密钥），无官方密钥无法构造合法信封，暂不支持直接写回；请在 Trae SOLO CN 客户端内重新登录该账号。号池侧对话转发不受影响。",
     };
   }
+  if (acc.channel === "zcode" || acc.channel === "zcode_intl") return switchZcodeAccount(acc);
   const file = wbAuthFile(acc.channel);
   if (!file) return { ok: false, channel: acc.channel, message: `渠道 ${acc.channel} 不支持写回本地客户端` };
   if (!fs.existsSync(file)) {
@@ -321,7 +462,7 @@ function verifyWritten(file, token, uid, beforeKeys) {
 
 /** IDE 切换能力探测（决定号池页按钮是否可用）：逐渠道报本机登录文件与当前 uid */
 function ideSwitchStatus() {
-  const out = { traeInstalled: false, workbuddyInstalled: false, workbuddyAiInstalled: false, raccoonInstalled: false, currentUid: "", channels: {} };
+  const out = { traeInstalled: false, workbuddyInstalled: false, workbuddyAiInstalled: false, raccoonInstalled: false, zcodeInstalled: false, currentUid: "", channels: {} };
   for (const [channel, name] of Object.entries(WB_AUTH_FILES)) {
     const file = path.join(discovery.wbAuthDir(), name);
     let uid = "";
@@ -355,6 +496,19 @@ function ideSwitchStatus() {
     out.raccoonInstalled = fs.existsSync(rf);
     out.channels.raccoon = { file: rf, installed: out.raccoonInstalled, uid: ruid };
   } catch { /* 未安装 / 未登录 */ }
+  // ZCode 客户端：dataRoot/.zcode/v2/credentials.json 存在即视为已安装；uid 取 active_provider 的 user_info.id
+  try {
+    const zf = zcodeCredFile();
+    let zuid = "";
+    const zjson = JSON.parse(fs.readFileSync(zf, "utf8"));
+    const prov = String((zjson && zjson["oauth:active_provider"]) || "").trim();
+    const uiRaw = prov ? zjson[`oauth:${prov}:user_info`] : "";
+    if (uiRaw) { try { const ui = typeof uiRaw === "string" ? JSON.parse(uiRaw) : uiRaw; zuid = String((ui && (ui.id || ui.user_id)) || ""); } catch { /* user_info 非 JSON */ } }
+    const zinstalled = fs.existsSync(zf);
+    out.zcodeInstalled = zinstalled;
+    out.channels.zcode = { file: zf, installed: zinstalled, uid: zuid };
+    out.channels.zcode_intl = { file: zf, installed: zinstalled, uid: zuid };
+  } catch { out.zcodeInstalled = false; /* 未安装 / 未登录 */ }
   return out;
 }
 
