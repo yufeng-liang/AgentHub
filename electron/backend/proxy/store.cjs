@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS accounts (
   today_day TEXT NOT NULL DEFAULT '',
   today_req INTEGER NOT NULL DEFAULT 0,
   today_tokens INTEGER NOT NULL DEFAULT 0,
+  credits_today INTEGER NOT NULL DEFAULT -1,
   created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS credits_history (
@@ -110,6 +111,7 @@ CREATE TABLE IF NOT EXISTS usage_requests (
   error TEXT NOT NULL DEFAULT '',
   cached_tokens INTEGER NOT NULL DEFAULT -1,
   cache_write_tokens INTEGER NOT NULL DEFAULT -1,
+  credits_used INTEGER NOT NULL DEFAULT -1,
   attempts INTEGER NOT NULL DEFAULT 0,
   model_upstream TEXT NOT NULL DEFAULT '',
   error_body TEXT NOT NULL DEFAULT ''
@@ -152,6 +154,10 @@ function open() {
   try {
     db.exec("ALTER TABLE accounts ADD COLUMN meta TEXT NOT NULL DEFAULT ''");
   } catch { /* 已存在 */ }
+  // 在线迁移：accounts.credits_today（账号今日消耗积分，-1=今日尚无上报积分的请求；随 today_day 滚动）
+  try {
+    db.exec("ALTER TABLE accounts ADD COLUMN credits_today INTEGER NOT NULL DEFAULT -1");
+  } catch { /* 已存在 */ }
   // 在线迁移：keys.key_enc（完整 Key 的 DPAPI 加密信封，供列表随时查看 / 复制）
   try {
     db.exec("ALTER TABLE keys ADD COLUMN key_enc TEXT NOT NULL DEFAULT ''");
@@ -162,6 +168,7 @@ function open() {
   for (const c of [
     "cached_tokens INTEGER NOT NULL DEFAULT -1",
     "cache_write_tokens INTEGER NOT NULL DEFAULT -1",
+    "credits_used INTEGER NOT NULL DEFAULT -1",
     "attempts INTEGER NOT NULL DEFAULT 0",
     "model_upstream TEXT NOT NULL DEFAULT ''",
     "error_body TEXT NOT NULL DEFAULT ''",
@@ -564,6 +571,7 @@ function accountView(r) {
     lastUsed: r.last_used,
     todayReq: r.today_day === dayStr() ? r.today_req : 0,
     todayTokens: r.today_day === dayStr() ? r.today_tokens : 0,
+    creditsToday: r.today_day === dayStr() ? (r.credits_today ?? -1) : -1,
     createdAt: r.created_at,
     /** 最近一次改名时刻（三期 fork 侧修复）：meta.renamedAt。参与 LWW 时间戳的计算，
      *  否则「改名不推进任何可比时间戳」会让改名永远输给任何因无关原因动过的对端（见 poolsync.accountStamp） */
@@ -690,17 +698,23 @@ function noteError(id, message) {
   updateAccount(id, { meta });
 }
 
-/** 记录账号一次消耗的滚动计数（跨天自动清零） */
-function bumpAccountUsage(id, tokens) {
+/** 记录账号一次消耗的滚动计数（跨天自动清零）；credits 为上游实报积分（缺省/-1 = 未上报，
+ *  不动计数器——「没上报」和「上报了 0」必须区分，与流水 credits_used 的哨兵约定一致） */
+function bumpAccountUsage(id, tokens, credits) {
   open();
   const cur = getAccount(id);
   if (!cur) return;
   const today = dayStr();
   const sameDay = cur.today_day === today;
-  db.prepare("UPDATE accounts SET today_day=?, today_req=?, today_tokens=?, last_used=? WHERE id=?").run(
+  const c = Number.isFinite(credits) && credits >= 0 ? Math.round(credits) : -1;
+  const nextCredits = c < 0
+    ? (sameDay ? (cur.credits_today ?? -1) : -1)
+    : (sameDay ? Math.max(cur.credits_today ?? -1, 0) + c : c);
+  db.prepare("UPDATE accounts SET today_day=?, today_req=?, today_tokens=?, credits_today=?, last_used=? WHERE id=?").run(
     today,
     sameDay ? cur.today_req + 1 : 1,
     sameDay ? cur.today_tokens + (tokens || 0) : (tokens || 0),
+    nextCredits,
     Date.now(),
     id
   );
@@ -728,8 +742,8 @@ function snapshotCredits(channel, accountId, credits, expiresAt) {
 function insertUsage(row) {
   open();
   db.prepare(
-    `INSERT INTO usage_requests (ts, req_id, key_id, key_name, channel, account_id, account_name, model, prompt_tokens, completion_tokens, ttft_ms, latency_ms, status, error, cached_tokens, cache_write_tokens, attempts, model_upstream, error_body)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    `INSERT INTO usage_requests (ts, req_id, key_id, key_name, channel, account_id, account_name, model, prompt_tokens, completion_tokens, ttft_ms, latency_ms, status, error, cached_tokens, cache_write_tokens, credits_used, attempts, model_upstream, error_body)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     row.ts || Date.now(),
     row.reqId || "",
@@ -747,6 +761,7 @@ function insertUsage(row) {
     String(row.error || "").slice(0, 300),
     Number.isFinite(row.cachedTokens) ? Math.round(row.cachedTokens) : -1,
     Number.isFinite(row.cacheWriteTokens) ? Math.round(row.cacheWriteTokens) : -1,
+    Number.isFinite(row.creditsUsed) ? Math.round(row.creditsUsed) : -1,
     Math.max(0, Math.round(row.attempts || 0)),
     String(row.modelUpstream || "").slice(0, 200),
     String(row.errorBody || "").slice(0, 2000)
@@ -761,7 +776,8 @@ function statsToday() {
             SUM(CASE WHEN status >= 200 AND status < 300 THEN 1 ELSE 0 END) AS ok,
             AVG(CASE WHEN ttft_ms > 0 THEN ttft_ms END) AS ttft,
             SUM(CASE WHEN cached_tokens >= 0 THEN cached_tokens END) AS cached,
-            SUM(CASE WHEN cached_tokens >= 0 THEN prompt_tokens END) AS cachePrompt
+            SUM(CASE WHEN cached_tokens >= 0 THEN prompt_tokens END) AS cachePrompt,
+            SUM(CASE WHEN credits_used >= 0 THEN credits_used END) AS credits
      FROM usage_requests WHERE ts >= ?`
   ).get(dayStartMs());
   // 命中率只按「上游确实回报了缓存字段」的请求算（cached_tokens >= 0）：
@@ -773,6 +789,7 @@ function statsToday() {
     successRate: r.req ? Math.round(((r.ok || 0) / r.req) * 1000) / 10 : 100,
     ttftAvg: Math.round(r.ttft || 0),
     cacheHitRate: hitRate,
+    creditsUsed: r.credits != null ? Math.round(r.credits) : -1,
   };
 }
 
@@ -858,6 +875,7 @@ function usageView(r) {
     promptTokens: r.prompt_tokens, completionTokens: r.completion_tokens,
     ttftMs: r.ttft_ms, latencyMs: r.latency_ms, status: r.status, error: r.error,
     cachedTokens: r.cached_tokens, cacheWriteTokens: r.cache_write_tokens,
+    creditsUsed: r.credits_used,
     attempts: r.attempts, modelUpstream: r.model_upstream, hasErrorBody: !!r.error_body,
   };
 }

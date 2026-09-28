@@ -290,7 +290,7 @@ async function handleChat(req, res, settings, surface) {
     usageRow.latencyMs = Date.now() - startedAt;
     Object.assign(usageRow, extra || {});
     store.insertUsage(usageRow);
-    if (usageRow.accountId) store.bumpAccountUsage(usageRow.accountId, (usageRow.promptTokens || 0) + (usageRow.completionTokens || 0));
+    if (usageRow.accountId) store.bumpAccountUsage(usageRow.accountId, (usageRow.promptTokens || 0) + (usageRow.completionTokens || 0), usageRow.creditsUsed);
     emitRequestThrottled();
   };
 
@@ -585,6 +585,9 @@ async function handleChat(req, res, settings, surface) {
           store.updateAccount(usageRow.accountId, { credits: Math.max(0, cur.credits - creditUsed), creditsAt: Date.now() });
         }
       }
+      // 积分落库用「实报值」：上游给了 credit/total_credit 字段才记（0 也是有效值），
+      // 没给就不记（落库 -1 = 未上报）——估算会造假数据，宁缺勿假
+      const creditReported = usage.credit ?? usage.total_credit;
       record({
         status: 200, ttftMs, promptTokens: usage.prompt_tokens, completionTokens: usage.completion_tokens,
         error: usedModel !== actualModel
@@ -594,6 +597,7 @@ async function handleChat(req, res, settings, surface) {
             : "",
         // 缓存字段由适配器归一成 cached_tokens/cache_write_tokens（未上报时缺省 → 落库 -1 哨兵）
         cachedTokens: usage.cached_tokens, cacheWriteTokens: usage.cache_write_tokens,
+        creditsUsed: creditReported != null && Number.isFinite(Number(creditReported)) ? Math.max(0, Math.round(Number(creditReported))) : undefined,
         attempts: attemptsUsed, modelUpstream: usedModel,
       });
       return;

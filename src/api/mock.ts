@@ -233,30 +233,30 @@ const PROXY_POOL = [
     id: "trae", display: "Trae SOLO CN", domain: "api.trae.cn", poolStrategy: "expire_first",
     summary: { channel: "trae", totalCredits: 72480, accountCount: 2, onlineCount: 2, earliestExpire: NOW + 48 * 86400000, expired: false, expiringSoon: false, todayReq: 412, todayTokens: 96400, lastCreditsAt: NOW - 25 * 60000 },
     accounts: [
-      { id: "a1", channel: "trae", uid: "88213476", name: "主账号 · 沐", status: "online", credits: 51230, creditsAt: NOW - 25 * 60000, expiresAt: NOW + 48 * 86400000, coolUntil: 0, coolReason: "", source: "oauth", lastUsed: NOW - 3 * 60000, todayReq: 301, todayTokens: 70200, createdAt: NOW - 20 * 86400000, hasToken: true },
-      { id: "a2", channel: "trae", uid: "90247811", name: "备用号", status: "online", credits: 21250, creditsAt: NOW - 25 * 60000, expiresAt: NOW + 21 * 86400000, coolUntil: 0, coolReason: "", source: "paste", lastUsed: NOW - 40 * 60000, todayReq: 111, todayTokens: 26200, createdAt: NOW - 6 * 86400000, hasToken: true },
+      { id: "a1", channel: "trae", uid: "88213476", name: "主账号 · 沐", status: "online", credits: 51230, creditsAt: NOW - 25 * 60000, expiresAt: NOW + 48 * 86400000, coolUntil: 0, coolReason: "", source: "oauth", lastUsed: NOW - 3 * 60000, todayReq: 301, todayTokens: 70200, creditsToday: 21, createdAt: NOW - 20 * 86400000, hasToken: true },
+      { id: "a2", channel: "trae", uid: "90247811", name: "备用号", status: "online", credits: 21250, creditsAt: NOW - 25 * 60000, expiresAt: NOW + 21 * 86400000, coolUntil: 0, coolReason: "", source: "paste", lastUsed: NOW - 40 * 60000, todayReq: 111, todayTokens: 26200, creditsToday: 21, createdAt: NOW - 6 * 86400000, hasToken: true },
     ],
   },
   {
     id: "workbuddy", display: "WorkBuddy（中国区）", domain: "copilot.tencent.com", poolStrategy: "credit_first",
     summary: { channel: "workbuddy", totalCredits: 34120, accountCount: 2, onlineCount: 1, earliestExpire: NOW + 12 * 86400000, expired: false, expiringSoon: false, todayReq: 203, todayTokens: 41200, lastCreditsAt: NOW - 40 * 60000 },
     accounts: [
-      { id: "a3", channel: "workbuddy", uid: "wb_7c21", name: "工作号", status: "online", credits: 34120, creditsAt: NOW - 40 * 60000, expiresAt: NOW + 12 * 86400000, coolUntil: 0, coolReason: "", source: "scan", lastUsed: NOW - 8 * 60000, todayReq: 203, todayTokens: 41200, createdAt: NOW - 15 * 86400000, hasToken: true },
-      { id: "a4", channel: "workbuddy", uid: "wb_9e05", name: "历史快照", status: "cooling", credits: 0, creditsAt: NOW - 300 * 60000, expiresAt: 0, coolUntil: NOW + 42000, coolReason: "上游限流", source: "scan", lastUsed: NOW - 55 * 60000, todayReq: 0, todayTokens: 0, createdAt: NOW - 15 * 86400000, hasToken: true },
+      { id: "a3", channel: "workbuddy", uid: "wb_7c21", name: "工作号", status: "online", credits: 34120, creditsAt: NOW - 40 * 60000, expiresAt: NOW + 12 * 86400000, coolUntil: 0, coolReason: "", source: "scan", lastUsed: NOW - 8 * 60000, todayReq: 203, todayTokens: 41200, creditsToday: 21, createdAt: NOW - 15 * 86400000, hasToken: true },
+      { id: "a4", channel: "workbuddy", uid: "wb_9e05", name: "历史快照", status: "cooling", credits: 0, creditsAt: NOW - 300 * 60000, expiresAt: 0, coolUntil: NOW + 42000, coolReason: "上游限流", source: "scan", lastUsed: NOW - 55 * 60000, todayReq: 0, todayTokens: 0, creditsToday: -1, createdAt: NOW - 15 * 86400000, hasToken: true },
     ],
   },
   {
     id: "workbuddy_ai", display: "WorkBuddy AI（国际版）", domain: "www.workbuddy.ai", poolStrategy: "expire_first",
     summary: { channel: "workbuddy_ai", totalCredits: 8120, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 33 * 86400000, expired: false, expiringSoon: false, todayReq: 66, todayTokens: 14800, lastCreditsAt: NOW - 70 * 60000 },
     accounts: [
-      { id: "a5", channel: "workbuddy_ai", uid: "wba_3d88", name: "Trial 加油包", status: "online", credits: 8120, creditsAt: NOW - 70 * 60000, expiresAt: NOW + 33 * 86400000, coolUntil: 0, coolReason: "", source: "paste", lastUsed: NOW - 30 * 60000, todayReq: 66, todayTokens: 14800, createdAt: NOW - 4 * 86400000, hasToken: true },
+      { id: "a5", channel: "workbuddy_ai", uid: "wba_3d88", name: "Trial 加油包", status: "online", credits: 8120, creditsAt: NOW - 70 * 60000, expiresAt: NOW + 33 * 86400000, coolUntil: 0, coolReason: "", source: "paste", lastUsed: NOW - 30 * 60000, todayReq: 66, todayTokens: 14800, creditsToday: 21, createdAt: NOW - 4 * 86400000, hasToken: true },
     ],
   },
   {
     id: "raccoon", display: "商汤小浣熊", domain: "xiaohuanxiong.com", poolStrategy: "expire_first",
     summary: { channel: "raccoon", totalCredits: 9800, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 29 * 86400000, expired: false, expiringSoon: true, todayReq: 18, todayTokens: 5200, lastCreditsAt: NOW - 12 * 60000 },
     accounts: [
-      { id: "a6", channel: "raccoon", uid: "rc_88213", name: "小浣熊 1 号", status: "online", credits: 9800, creditsAt: NOW - 12 * 60000, expiresAt: NOW + 29 * 86400000, coolUntil: 0, coolReason: "", source: "json", lastUsed: NOW - 9 * 60000, todayReq: 18, todayTokens: 5200, createdAt: NOW - 3 * 86400000, hasToken: true },
+      { id: "a6", channel: "raccoon", uid: "rc_88213", name: "小浣熊 1 号", status: "online", credits: 9800, creditsAt: NOW - 12 * 60000, expiresAt: NOW + 29 * 86400000, coolUntil: 0, coolReason: "", source: "json", lastUsed: NOW - 9 * 60000, todayReq: 18, todayTokens: 5200, creditsToday: 21, createdAt: NOW - 3 * 86400000, hasToken: true },
     ],
   },
   // 新增的五个生态渠道：预览态一律空号池，只为让「添加账号」弹窗里的设备码 / 滑块 / edition 切换
@@ -294,8 +294,8 @@ const PROXY_POOL = [
     extraHeaders: {}, extraBody: {}, updatedAt: NOW - 30 * 60000,
     summary: { channel: "myrelay", totalCredits: 0, accountCount: 2, onlineCount: 2, earliestExpire: 0, expired: false, expiringSoon: false, todayReq: 96, todayTokens: 21400, lastCreditsAt: 0 },
     accounts: [
-      { id: "m1", channel: "myrelay", uid: "", name: "Key 1", status: "online", credits: 0, creditsAt: 0, expiresAt: 0, coolUntil: 0, coolReason: "", source: "paste", lastUsed: NOW - 2 * 60000, todayReq: 51, todayTokens: 12200, createdAt: NOW - 2 * 86400000, hasToken: true },
-      { id: "m2", channel: "myrelay", uid: "", name: "Key 2", status: "cooling", credits: 0, creditsAt: 0, expiresAt: 0, coolUntil: NOW + 40000, coolReason: "上游限流", source: "paste", lastUsed: NOW - 6 * 60000, todayReq: 45, todayTokens: 9200, createdAt: NOW - 2 * 86400000, hasToken: true },
+      { id: "m1", channel: "myrelay", uid: "", name: "Key 1", status: "online", credits: 0, creditsAt: 0, expiresAt: 0, coolUntil: 0, coolReason: "", source: "paste", lastUsed: NOW - 2 * 60000, todayReq: 51, todayTokens: 12200, creditsToday: 21, createdAt: NOW - 2 * 86400000, hasToken: true },
+      { id: "m2", channel: "myrelay", uid: "", name: "Key 2", status: "cooling", credits: 0, creditsAt: 0, expiresAt: 0, coolUntil: NOW + 40000, coolReason: "上游限流", source: "paste", lastUsed: NOW - 6 * 60000, todayReq: 45, todayTokens: 9200, creditsToday: 21, createdAt: NOW - 2 * 86400000, hasToken: true },
     ],
   },
 ];
@@ -315,11 +315,11 @@ const MOCK_PROVIDERS: {
 ];
 
 const PROXY_USAGE = [
-  { id: 5, ts: NOW - 60000, reqId: "r5", keyId: "k1", keyName: "本地主 Key", channel: "trae", accountId: "a1", accountName: "主账号 · 沐", model: "deepseek-v4-flash", promptTokens: 1204, completionTokens: 3841, ttftMs: 820, latencyMs: 1200, status: 200, error: "", cachedTokens: 903, cacheWriteTokens: -1, attempts: 1, modelUpstream: "deepseek-v4-flash", hasErrorBody: false },
-  { id: 4, ts: NOW - 89000, reqId: "r4", keyId: "k2", keyName: "Trae 专用", channel: "trae", accountId: "a1", accountName: "主账号 · 沐", model: "glm-4.6", promptTokens: 2010, completionTokens: 6233, ttftMs: 1500, latencyMs: 2800, status: 200, error: "", cachedTokens: 0, cacheWriteTokens: -1, attempts: 2, modelUpstream: "glm-4.6", hasErrorBody: false },
-  { id: 3, ts: NOW - 140000, reqId: "r3", keyId: "k3", keyName: "WorkBuddy 专用", channel: "workbuddy", accountId: "a3", accountName: "工作号", model: "claude-sonnet-4.5", promptTokens: 890, completionTokens: 2210, ttftMs: 640, latencyMs: 1900, status: 200, error: "", cachedTokens: -1, cacheWriteTokens: -1, attempts: 1, modelUpstream: "claude-sonnet-4.5", hasErrorBody: false },
-  { id: 2, ts: NOW - 220000, reqId: "r2", keyId: "k1", keyName: "本地主 Key", channel: "workbuddy_ai", accountId: "a5", accountName: "Trial 加油包", model: "gpt-5", promptTokens: 312, completionTokens: 0, ttftMs: 0, latencyMs: 300, status: 429, error: "rate limited", cachedTokens: -1, cacheWriteTokens: -1, attempts: 3, modelUpstream: "gpt-5", hasErrorBody: true },
-  { id: 1, ts: NOW - 310000, reqId: "r1", keyId: "k1", keyName: "本地主 Key", channel: "trae", accountId: "a2", accountName: "备用号", model: "kimi-k2", promptTokens: 1560, completionTokens: 4120, ttftMs: 910, latencyMs: 2400, status: 200, error: "", cachedTokens: 1248, cacheWriteTokens: -1, attempts: 1, modelUpstream: "kimi-k2", hasErrorBody: false },
+  { id: 5, ts: NOW - 60000, reqId: "r5", keyId: "k1", keyName: "本地主 Key", channel: "trae", accountId: "a1", accountName: "主账号 · 沐", model: "deepseek-v4-flash", promptTokens: 1204, completionTokens: 3841, ttftMs: 820, latencyMs: 1200, status: 200, error: "", cachedTokens: 903, cacheWriteTokens: -1, creditsUsed: 3, attempts: 1, modelUpstream: "deepseek-v4-flash", hasErrorBody: false },
+  { id: 4, ts: NOW - 89000, reqId: "r4", keyId: "k2", keyName: "Trae 专用", channel: "trae", accountId: "a1", accountName: "主账号 · 沐", model: "glm-4.6", promptTokens: 2010, completionTokens: 6233, ttftMs: 1500, latencyMs: 2800, status: 200, error: "", cachedTokens: 0, cacheWriteTokens: -1, creditsUsed: 3, attempts: 2, modelUpstream: "glm-4.6", hasErrorBody: false },
+  { id: 3, ts: NOW - 140000, reqId: "r3", keyId: "k3", keyName: "WorkBuddy 专用", channel: "workbuddy", accountId: "a3", accountName: "工作号", model: "claude-sonnet-4.5", promptTokens: 890, completionTokens: 2210, ttftMs: 640, latencyMs: 1900, status: 200, error: "", cachedTokens: -1, cacheWriteTokens: -1, creditsUsed: -1, attempts: 1, modelUpstream: "claude-sonnet-4.5", hasErrorBody: false },
+  { id: 2, ts: NOW - 220000, reqId: "r2", keyId: "k1", keyName: "本地主 Key", channel: "workbuddy_ai", accountId: "a5", accountName: "Trial 加油包", model: "gpt-5", promptTokens: 312, completionTokens: 0, ttftMs: 0, latencyMs: 300, status: 429, error: "rate limited", cachedTokens: -1, cacheWriteTokens: -1, creditsUsed: -1, attempts: 3, modelUpstream: "gpt-5", hasErrorBody: true },
+  { id: 1, ts: NOW - 310000, reqId: "r1", keyId: "k1", keyName: "本地主 Key", channel: "trae", accountId: "a2", accountName: "备用号", model: "kimi-k2", promptTokens: 1560, completionTokens: 4120, ttftMs: 910, latencyMs: 2400, status: 200, error: "", cachedTokens: 1248, cacheWriteTokens: -1, creditsUsed: 3, attempts: 1, modelUpstream: "kimi-k2", hasErrorBody: false },
 ];
 
 const PROXY_TREND = Array.from({ length: 7 }, (_, i) => {
@@ -1090,7 +1090,7 @@ export const mock = {
         return { workbuddyInstalled: true, workbuddyAiInstalled: true, traeInstalled: false, raccoonInstalled: true, currentUid: "wb_7c21" };
       case "proxy_stats_overview":
         return {
-          today: { req: 1284, tokens: 312400, successRate: 99.4, ttftAvg: 820, cacheHitRate: 63.8 },
+          today: { req: 1284, tokens: 312400, successRate: 99.4, ttftAvg: 820, cacheHitRate: 63.8, creditsUsed: 1287 },
           trend: PROXY_TREND,
           tops: {
             channel: [

@@ -14,13 +14,13 @@ const COLS: Record<"home" | "stats", ColDef[]> = {
   home: [
     { id: "time", label: "时间" }, { id: "model", label: "模型" }, { id: "channel", label: "渠道" },
     { id: "key", label: "KEY" }, { id: "status", label: "状态" }, { id: "usage", label: "用量" },
-    { id: "ttft", label: "TTFT" }, { id: "latency", label: "耗时" },
+    { id: "credits", label: "积分" }, { id: "ttft", label: "TTFT" }, { id: "latency", label: "耗时" },
   ],
   stats: [
     { id: "time", label: "时间" }, { id: "model", label: "模型" }, { id: "channel", label: "渠道" },
     { id: "key", label: "KEY" }, { id: "account", label: "账号" }, { id: "status", label: "状态" },
-    { id: "usage", label: "用量" }, { id: "ttft", label: "TTFT" }, { id: "latency", label: "耗时" },
-    { id: "attempts", label: "重试" }, { id: "error", label: "错误" },
+    { id: "usage", label: "用量" }, { id: "credits", label: "积分" }, { id: "ttft", label: "TTFT" },
+    { id: "latency", label: "耗时" }, { id: "attempts", label: "重试" }, { id: "error", label: "错误" },
   ],
 };
 
@@ -107,6 +107,9 @@ const modelTip = (r: ProxyUsageRow) =>
               <td v-else-if="c.id === 'usage'" class="mono usage-cell">
                 <div>in {{ fmtInt(r.promptTokens) }} / out {{ fmtInt(r.completionTokens) }}</div>
                 <div class="usage-sub" :class="{ na: r.cachedTokens < 0 }">缓存 {{ r.cachedTokens < 0 ? "-" : fmtInt(r.cachedTokens) }} · 命中 {{ cacheRate(r) }}</div>
+              </td>
+              <td v-else-if="c.id === 'credits'" class="mono" :title="r.creditsUsed < 0 ? '上游未上报消耗积分' : '上游实报消耗积分'">
+                {{ r.creditsUsed < 0 ? "-" : fmtInt(r.creditsUsed) }}
               </td>
               <td v-else-if="c.id === 'ttft'" class="mono">{{ fmtMs(r.ttftMs) }}</td>
               <td v-else-if="c.id === 'latency'" class="mono">{{ fmtMs(r.latencyMs) }}</td>

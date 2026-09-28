@@ -387,6 +387,8 @@ export interface ProxyAccount {
   lastUsed: number;
   todayReq: number;
   todayTokens: number;
+  /** 今日消耗积分（上游实报累计；-1 = 今日尚无上报积分的请求） */
+  creditsToday: number;
   createdAt: number;
   hasToken: boolean;
 }
@@ -504,6 +506,8 @@ export interface ProxyUsageRow {
   /** 读缓存命中 tokens；-1 = 上游未上报（0 = 上报了但确实为 0），展示层据此区分「-」与「0%」 */
   cachedTokens: number;
   cacheWriteTokens: number;
+  /** 上游实报消耗积分；-1 = 上游未上报 */
+  creditsUsed: number;
   /** 实际发出的上游请求次数（换号/限流重试累计；0 = 未到上游就被拦下） */
   attempts: number;
   /** 上游实际收到的模型名（别名/回退解析后）；空 = 未到上游 */
@@ -518,7 +522,7 @@ export interface ProxyUsageDetail extends ProxyUsageRow {
 }
 
 export interface ProxyStatsOverview {
-  today: { req: number; tokens: number; successRate: number; ttftAvg: number; /** 缓存命中率 %；-1 = 今日无回报缓存字段的请求 */ cacheHitRate: number };
+  today: { req: number; tokens: number; successRate: number; ttftAvg: number; /** 缓存命中率 %；-1 = 今日无回报缓存字段的请求 */ cacheHitRate: number; /** 今日消耗积分（实报累计）；-1 = 今日无上报 */ creditsUsed: number };
   trend: { day: string; req: number; tokens: number }[];
   tops: Record<"channel" | "model" | "key" | "account", { name: string; req: number; tokens: number }[]>;
 }

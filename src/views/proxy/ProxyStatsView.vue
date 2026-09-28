@@ -165,7 +165,7 @@ onMounted(async () => {
         <button class="btn" @click="app.setPage('poolsync')">号池同步</button>
         <span class="pill">范围 近 {{ DAYS }} 日</span>
       </div>
-      <div class="kpis kpis-5" style="margin-top: 12px">
+      <div class="kpis kpis-6" style="margin-top: 12px">
         <div class="kpi"><span>今日请求</span><b class="acc">{{ fmtInt(ov?.today.req || 0) }}</b></div>
         <div class="kpi"><span>今日 Token</span><b>{{ fmtK(ov?.today.tokens || 0) }}</b></div>
         <div class="kpi"><span>成功率</span><b>{{ (ov?.today.successRate ?? 100).toFixed(1) }}%</b></div>
@@ -174,6 +174,12 @@ onMounted(async () => {
           <span>缓存命中率</span>
           <b :title="ov?.today.cacheHitRate != null && ov.today.cacheHitRate < 0 ? '今日暂无回报缓存字段的请求' : '读缓存 tokens ÷ prompt tokens（按上报缓存字段的请求计）'">
             {{ ov?.today.cacheHitRate != null && ov.today.cacheHitRate >= 0 ? ov.today.cacheHitRate.toFixed(1) + "%" : "-" }}
+          </b>
+        </div>
+        <div class="kpi">
+          <span>今日消耗积分</span>
+          <b :title="ov?.today.creditsUsed != null && ov.today.creditsUsed < 0 ? '今日暂无回报积分的请求' : '上游实报积分累计'">
+            {{ ov?.today.creditsUsed != null && ov.today.creditsUsed >= 0 ? fmtInt(ov.today.creditsUsed) : "-" }}
           </b>
         </div>
       </div>
@@ -292,8 +298,8 @@ onMounted(async () => {
   margin-bottom: 12px;
   border-color: var(--accent);
 }
-.kpis-5 {
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+.kpis-6 {
+  grid-template-columns: repeat(6, minmax(0, 1fr));
 }
 .trend {
   width: 100%;

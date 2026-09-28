@@ -1062,7 +1062,7 @@ onUnmounted(() => {
                   <td class="mono num">{{ acc.hasToken ? (acc.credits === -1 ? "不限" : fmtInt(acc.credits)) : "-" }}</td>
                   <td class="mono">{{ acc.expiresAt ? fmtDate(acc.expiresAt) : "-" }}</td>
                 </template>
-                <td class="mono num">{{ acc.todayReq }} 次 · {{ fmtK(acc.todayTokens) }}</td>
+                <td class="mono num">{{ acc.todayReq }} 次 · {{ fmtK(acc.todayTokens) }} · {{ acc.creditsToday < 0 ? "-" : fmtInt(acc.creditsToday) }} 积分</td>
                 <td>
                   <!-- 单行「刷新」= 查一次余额，对只有 API Key 的提供商没有对象（主进程会明确拒答），故隐藏 -->
                   <button v-if="isBuiltin(ch)" class="btn-link btn-sm" :disabled="refreshingId === acc.id" @click="refreshOne(acc)">

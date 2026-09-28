@@ -54,6 +54,7 @@ function cacheRate(r: ProxyUsageDetail): string {
             <b class="mono">
               in {{ fmtInt(req.promptTokens) }} · out {{ fmtInt(req.completionTokens) }}
               <span class="usage-sub">缓存 {{ req.cachedTokens < 0 ? "-" : fmtInt(req.cachedTokens) }}（{{ cacheRate(req) }}）· 写缓存 {{ req.cacheWriteTokens < 0 ? "-" : fmtInt(req.cacheWriteTokens) }}</span>
+              <span class="usage-sub">消耗积分 {{ req.creditsUsed < 0 ? "-" : fmtInt(req.creditsUsed) }}<template v-if="req.creditsUsed < 0">（上游未上报）</template></span>
             </b>
           </div>
         </div>
