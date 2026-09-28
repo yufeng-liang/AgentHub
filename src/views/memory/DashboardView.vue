@@ -1,10 +1,10 @@
 <!--
-  AgentHub · 记忆仓库（Memory Hub）
+  AgentHub · 记忆中枢（Memory Hub）
   Copyright (c) 2026 沐辉 (HUIdada1)
   https://github.com/HUIdada1/AgentHub
   本文件为开源项目 AgentHub 的组成部分，作者保留署名权；依据开源协议使用时禁止删除本声明。
 -->
-<!-- 记忆仓库 · 仪表盘：4 张 KPI + 增长趋势 + Agent 连接状态 + 实时记忆流 + 系统健康（一行结论）+ AI 花费
+<!-- 记忆中枢 · 仪表盘：4 张 KPI + 增长趋势 + Agent 连接状态 + 实时记忆流 + 系统健康（一行结论）+ AI 花费
      重动作（同步 / 重建索引 / 生成画像）不常驻在这里——各自页面有入口，索引异常时才出现「一键修复」 -->
 <script setup lang="ts">
 import { computed, defineAsyncComponent, onMounted, onUnmounted, ref, watch } from "vue";
@@ -18,6 +18,8 @@ import EmptyState from "../../components/sync/EmptyState.vue";
 import MemoryDetailDrawer from "../../components/memory/MemoryDetailDrawer.vue";
 import LlmUsagePanel from "../../components/memory/LlmUsagePanel.vue";
 import MemHelp from "../../components/memory/MemHelp.vue";
+import MemFirstRun from "../../components/memory/MemFirstRun.vue";
+import MemMorePanel from "../../components/memory/MemMorePanel.vue";
 import { agentLabel } from "../../components/memory/labels";
 
 // 本页是首屏落点候选（moduleOrder 可把「记忆仓库」排到首位）、整体保持静态，唯独图表按需加载：
@@ -146,8 +148,7 @@ async function repairIndex() {
 }
 
 function openDrawer(id: string) {
-  drawerId.value = id;
-  drawerOpen.value = true;
+  mem.openDetail(id);
 }
 
 function goto(page: string) {
@@ -157,7 +158,7 @@ function goto(page: string) {
   }
   // 去浏览页时明确落到列表视图：浏览页是保活的，不指定视图会停在用户上次看的那个视图上
   if (page === "browse") mem.browseViewHint = "list";
-  app.activePage = page;
+  app.setPage(page);
 }
 
 /** 模型与网关现为配置页的子板块：先留跳转提示（配置页消费后清空），再进配置页 */
@@ -194,19 +195,22 @@ watch(active, (v) => {
     <!-- 模块未启用/读取失败时整页只渲染空态（原来在模板末尾，会先闪一屏「-」骨架） -->
     <EmptyState
       v-if="mem.loadError"
-      title="记忆仓库未启用"
+      title="记忆中枢未启用"
       :desc="mem.loadError"
     />
     <template v-else>
     <div class="mem-head">
       <p class="mem-sub">
-        仓库目录：<span class="mem-mono" :title="mem.root">{{ mem.root || "—" }}</span>
+        仓库目录：<span class="mem-mono mem-path-text" :title="mem.root">{{ mem.root || "—" }}</span>
         <span class="mem-hint">上次同步 {{ lastSyncAt ? timeAgo(lastSyncAt) : "尚未同步" }}</span>
       </p>
       <div class="mem-head-actions">
         <button class="btn btn-ghost" @click="api.memoryOpenDir()">打开仓库目录</button>
       </div>
     </div>
+
+    <!-- 首启新手引导：记忆总数 0 时提示 3 步上手 -->
+    <MemFirstRun />
 
     <!-- 索引异常才出现的提示条（正常时完全不占位置）；修复 = 按目录重算，不动记忆文件 -->
     <div v-if="healthy && !healthyOk" class="mem-banner">
@@ -343,6 +347,9 @@ watch(active, (v) => {
       </div>
       <LlmUsagePanel compact />
     </div>
+
+    <!-- 更多扩展功能（深层画像/Agent接入/检索索引/自动化/导入/WebDAV） -->
+    <MemMorePanel />
 
     <MemoryDetailDrawer
       :show="drawerOpen"

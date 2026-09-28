@@ -468,7 +468,8 @@ if (!gotLock) {
         if (!win.isDestroyed()) win.webContents.send("app:event", payload);
       }
     });
-    // 记忆仓库：仓库初始化 + 本地 HTTP API（供 MCP 桥转发）+ 目录监听；失败只影响本模块
+    // 记忆中枢：仓库初始化 + 本地 HTTP API（供 MCP 桥转发）+ 目录监听；失败只影响本模块
+
     memory.boot().catch(() => {});
     // 启动即进托盘：首帧不建窗，GPU 侧连建窗残留都不产生（一期打包版实测私有 166.05 MB / GPU 32.2，
     // 对比「建过再销毁」的 215.47 MB，再省 49.42 MB）。

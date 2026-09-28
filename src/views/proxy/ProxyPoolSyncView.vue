@@ -18,8 +18,8 @@ let offEvent: (() => void) | undefined;
 const CHANNELS: { id: ProxyBuiltinChannelId | ""; label: string }[] = [
   { id: "", label: "全部渠道" },
   { id: "trae", label: "Trae SOLO CN" },
-  { id: "workbuddy", label: "WorkBuddy（中国区）" },
-  { id: "workbuddy_ai", label: "WorkBuddy AI（国际版）" },
+  { id: "workbuddy", label: "WorkBuddy CN" },
+  { id: "workbuddy_ai", label: "WorkBuddy AI" },
   { id: "raccoon", label: "商汤小浣熊" },
   // targetChannel 是同步范围而非显示筛选（传给 proxyPoolsyncRun），缺项的渠道无法单独同步
   { id: "cline_free", label: "Cline 免费池" },
@@ -27,8 +27,9 @@ const CHANNELS: { id: ProxyBuiltinChannelId | ""; label: string }[] = [
   { id: "autoclaw", label: "智谱 AutoClaw（国内）" },
   { id: "autoclaw_intl", label: "智谱 AutoClaw（国际）" },
   { id: "qoder", label: "Qoder" },
-  { id: "zcode", label: "ZCode 智谱（国内）" },
-  { id: "zcode_intl", label: "ZCode 智谱（国际）" },
+  { id: "zcode", label: "ZCode（智谱）" },
+  { id: "zcode_intl", label: "ZCode（智谱·国际）" },
+
 ];
 
 const running = computed(() => !!st.value?.running);

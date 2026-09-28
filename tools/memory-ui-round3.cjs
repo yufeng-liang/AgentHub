@@ -1,18 +1,18 @@
 /**
- * AgentHub · 记忆仓库（Memory Hub）
+ * AgentHub · 记忆中枢（Memory Hub）
  * Copyright (c) 2026 沐辉 (HUIdada1)
  * https://github.com/HUIdada1/AgentHub
  * 本文件为开源项目 AgentHub 的组成部分，作者保留署名权；依据开源协议使用时禁止删除本声明。
  */
 
-// 记忆仓库 · 本轮整改的 DOM 校验（无头，不截图）：把 dist 装进隐藏窗口，真实点击 + 真实样式断言：
+// 记忆中枢 · 本轮整改的 DOM 校验（无头，不截图）：把 dist 装进隐藏窗口，真实点击 + 真实样式断言：
 //   ① 顶部页签：「待确认」已移除、「WebDAV同步」已改名、待处理页签带红点；
 //   ② 记忆浏览：四个视图（列表/热力图/待确认/回收站）、等级 tab、筛选行常显无展开按钮；
 //   ③ 新增记忆是弹窗（.el-dialog.mem-dialog），不再是就地展开的卡片；
 //   ④ 仪表盘实时记忆流高度≈5 条（超出滚动）；
 //   ⑤ 弹窗与「设置」弹窗同款：玻璃底 + 幽灵关闭钮（自绘弹窗与 el-dialog 命中同一份规则）；
 //   ⑥ 自动化总控卡两列布局 + 小问号紧贴文字；
-//   ⑦ 记忆仓库里已无原生 select（下拉全部换成用量统计同款 el-select）；
+//   ⑦ 记忆中枢里已无原生 select（下拉全部换成用量统计同款 el-select）；
 //   ⑧ 全程无 JS 报错。
 //
 // 用法（必须用 Electron 本体跑，不能加 ELECTRON_RUN_AS_NODE）：
@@ -76,6 +76,12 @@ async function setUiTabs(page, sleep2, wanted) {
     if (sub) sub.click();
   });
   await sleep2(800);
+  // v1.29.0 起配置项按后端 schema 的 tier 渲染：「显示的页签」(ui.tabs) 归 advanced 档，默认收在「高级项」里，先展开再找
+  await page(() => {
+    const btn = [...document.querySelectorAll("button")].find((b) => b.textContent.trim().startsWith("高级项") && !b.textContent.includes("收起"));
+    if (btn) btn.click();
+  });
+  await sleep2(700);
   const adjusted = await page((wantedJson) => {
     const wantedSet = new Set(JSON.parse(wantedJson));
     const field = [...document.querySelectorAll(".mem-field")].find((f) => ((f.querySelector(".f-label") || {}).textContent || "").includes("显示的页签"));
@@ -126,7 +132,7 @@ async function main() {
   const page = (fn, ...args) =>
     win.webContents.executeJavaScript(`(${fn.toString()})(${args.map((a) => JSON.stringify(a)).join(",")})`, true);
 
-  /** 记忆仓库是保活多页：DOM 里同时躺着好几个 .memory-scope，
+  /** 记忆中枢是保活多页：DOM 里同时躺着好几个 .memory-scope，
    *  必须只取当前可见的那一个（所在 .page 没被 v-show 隐藏），否则断言会打在别的页上 */
   const VISIBLE_SCOPE = `
     [...document.querySelectorAll(".memory-scope")].find((s) => {
@@ -146,12 +152,12 @@ async function main() {
   // ===== 1) 顶部页签结构 =====
   console.log("[1] 顶部页签：待确认已并入记忆浏览 / WebDAV 改名 / 待处理红点");
   const switched = await page(() => {
-    const mem = [...document.querySelectorAll(".module-card")].find((c) => c.textContent.includes("记忆仓库"));
+    const mem = [...document.querySelectorAll(".module-card")].find((c) => c.textContent.includes("记忆中枢"));
     if (!mem) return false;
     mem.click();
     return true;
   });
-  check("能切换到记忆仓库模块", switched === true);
+  check("能切换到记忆中枢模块", switched === true);
   await sleep(1200);
 
   const tabs = await page(() =>
@@ -512,7 +518,8 @@ async function main() {
     await sleep(700);
   }
 
-  // 蒸馏 L2 藏在项目卡的 ⋯ 菜单里，单独走一遍菜单 -> 弹窗
+  // 蒸馏 L2 藏在项目列表行的 ⋯ 菜单里，单独走一遍菜单 -> 弹窗
+  // v1.28.0 起项目归档从卡片网格改为表格，⋯ 按钮位于行内「操作」列（.mem-table-list 的 .actions 单元格）
   await clickTab("项目归档");
   await sleep(1500);
   const distillClicked = await page(() => {
@@ -520,12 +527,14 @@ async function main() {
       const p = s.closest(".page");
       return !p || (p.offsetParent !== null && getComputedStyle(p).display !== "none");
     });
-    const menuBtn = scope ? scope.querySelector(".mem-tile-foot button.btn-link") : null;
+    const menuBtn = scope
+      ? [...scope.querySelectorAll("button.btn-link")].find((b) => /^[⋯…]$/.test(b.textContent.trim()))
+      : null;
     if (!menuBtn) return false;
     menuBtn.click();
     return true;
   });
-  check("项目卡：⋯ 菜单可点", distillClicked === true);
+  check("项目行：⋯ 菜单可点", distillClicked === true);
   await sleep(700);
   const distillItem = await page(() => {
     const item = [...document.querySelectorAll(".el-dropdown-menu__item")].find((i) => i.textContent.includes("蒸馏 L2"));
@@ -669,7 +678,7 @@ async function main() {
   });
   await sleep(700);
 
-  // ===== 9) 记忆仓库全模块无原生 select =====
+  // ===== 9) 记忆中枢全模块无原生 select =====
   console.log("[9] 全模块下拉统一（无原生 select）");
   const leftovers = [];
   for (const label of ["记忆浏览", "项目归档", "深层画像", "Agent 接入", "检索与索引", "自动化", "导入与去重", "WebDAV同步"]) {

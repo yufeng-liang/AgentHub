@@ -1,10 +1,10 @@
 <!--
-  AgentHub · 记忆仓库（Memory Hub）
+  AgentHub · 记忆中枢（Memory Hub）
   Copyright (c) 2026 沐辉 (HUIdada1)
   https://github.com/HUIdada1/AgentHub
   本文件为开源项目 AgentHub 的组成部分，作者保留署名权；依据开源协议使用时禁止删除本声明。
 -->
-<!-- 记忆仓库 · 导入与去重：点「导入」自动先干跑再确认（无需两步走）+ 去重强度三档 + 人工裁决在「待确认」收件箱 -->
+<!-- 记忆中枢 · 导入与去重：点「导入」自动先干跑再确认（无需两步走）+ 去重强度三档 + 人工裁决在「待确认」收件箱 -->
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { ElMessageBox } from "element-plus";
@@ -362,6 +362,9 @@ watch(active, (v) => {
         <MemHelp text="导入是幂等的：同一个来源重复导入不会写入重复内容（按内容指纹判重）。去重分四层——精确哈希、文本近似、候选召回、AI 判定；层数越深越花 token，所以按强度一键切换。" />
       </p>
       <div class="mem-head-actions">
+        <button v-if="dedup?.pending || queueCount" class="btn-outline" @click="mem.gotoReview('dedup')">
+          {{ (dedup?.pending || queueCount) }} 条去重待确认 →
+        </button>
         <button class="btn btn-ghost" :disabled="busy === 'dedup'" @click="scanDedup">{{ busy === "dedup" ? "巡检中…" : "全库去重巡检" }}</button>
         <button class="btn btn-cta" :disabled="busy === 'import' || busy === 'preview'" @click="runImport()">
           {{ busy === "import" ? "导入中…" : busy === "preview" ? "干跑中…" : "导入全部来源" }}

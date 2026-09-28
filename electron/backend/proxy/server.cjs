@@ -65,6 +65,7 @@ function resolveChannel(key, model, settings) {
   if (slug) return { channel: slug };
   // 钉渠道排在单归属之前：key.route 是用户显式意图。排在后面的话，某个通用模型名
   // （auto/ultimate 这类）一旦被别家目录收走，钉着 trae 的客户端会被静默改投且无从察觉。
+
   if (key.route !== "auto") return { channel: key.route };
   const owners = adapters.modelOwners(model);
   if (owners.length === 1) return { channel: owners[0] }; // auto 模式下模型仅存在于单渠道目录 → 直达
@@ -389,7 +390,7 @@ async function handleChat(req, res, settings, surface) {
   }
 
   if (!resolveChannel(key, actualModel, settings).channel && !fallback) {
-    const hint = adapters.mergedModels().map((m) => m.id).join(", ");
+    const hint = adapters.mergedModels(settings).map((m) => m.id).join(", ");
     record({ status: 400, error: "unknown model" });
     return sink.endErr(400, `模型 "${actualModel}" 不在任何渠道目录中。可用模型：${hint}`, "invalid_request_error", "model_not_found");
   }
@@ -453,6 +454,18 @@ async function handleChat(req, res, settings, surface) {
     }
   };
 
+  // ===== PoolService：号池选号，单请求最多换号 2 次（402/429/401 触发）；模型回退链外层 =====
+  let done = false;
+  let lastErr = null;
+  let fatalErr = null;
+  let usedModel = actualModel;
+  let attemptsUsed = 0; // 实际发出的上游请求次数（换号/限流重试都会 +1；模型负缓存跳过不算——没真发）
+  let targetModel = actualModel; // 反向映射后的渠道实际模型名（每轮 chain 循环刷新；done 收尾的 record 引用它）
+  // 系统提示词策略（渠道无关，出站分发前一次性施加于规范化后的 body.messages）：
+  // passthrough=不改（默认）；custom/append 见 promptPolicy。degrade 标记供内容审核降级重试复用。
+  promptPolicy.applyPromptMode(body, settings.promptMode, settings.promptText);
+  let promptDegraded = false;
+
   try {
     sink.writeHead();
     // 静默 15s 补一个保活帧（防中间层回收，方案 §2.2 联调坑）；有真实输出时静默。
@@ -469,17 +482,7 @@ async function handleChat(req, res, settings, surface) {
       emit(ev);
     };
 
-    // ===== PoolService：号池选号，单请求最多换号 2 次（402/429/401 触发）；模型回退链外层 =====
-  let done = false;
-  let lastErr = null;
-  let fatalErr = null;
-  let usedModel = actualModel;
-  let attemptsUsed = 0; // 实际发出的上游请求次数（换号/限流重试都会 +1；模型负缓存跳过不算——没真发）
-  // 系统提示词策略（渠道无关，出站分发前一次性施加于规范化后的 body.messages）：
-  // passthrough=不改（默认）；custom/append 见 promptPolicy。degrade 标记供内容审核降级重试复用。
-  promptPolicy.applyPromptMode(body, settings.promptMode, settings.promptText);
-  let promptDegraded = false;
-    for (const chainModel of modelChain) {
+      for (const chainModel of modelChain) {
       if (done || fatalErr) break;
       const resolved = resolveChannel(key, chainModel, settings);
       if (!resolved.channel) {
@@ -488,6 +491,19 @@ async function handleChat(req, res, settings, surface) {
       }
       usedModel = chainModel;
       usageRow.channel = resolved.channel;
+      // 反向映射：统一请求模型名 → 对应渠道的实际模型名（上游 v1.31）
+      targetModel = chainModel;
+      const revAliases = settings.modelReverseAliases || {};
+      let revEntry = revAliases[chainModel];
+      if (!revEntry) {
+        const lowerChain = chainModel.toLowerCase();
+        for (const [k, v] of Object.entries(revAliases)) {
+          if (k.toLowerCase() === lowerChain) { revEntry = v; break; }
+        }
+      }
+      if (revEntry && typeof revEntry === "object" && revEntry[resolved.channel]) {
+        targetModel = revEntry[resolved.channel];
+      }
       // 内容审核降级窗口：该渠道今日已确认误杀过，后续请求直接走中性 system，不再先撞一次拦截
       if (!promptDegraded && contentDegrading(resolved.channel)) {
         promptPolicy.degradeMessages(body);
@@ -509,14 +525,15 @@ async function handleChat(req, res, settings, surface) {
         const acc = pool.pickAccount(resolved.channel, strategy, [...tried], perAccountLimit);
         if (!acc) break;
         tried.add(acc.id);
-        pool.acquireAccount(acc.id);
         // 模型级负缓存（6004 模型级限流 / 11102 该号不支持此模型）：直接换号，不浪费一次上游请求。
-        // 不计入换号次数（attempt--）：已 tried 集合单调增长，全 cooled 时 pickAccount 返回 null 自然 break，不会死循环
-        if (pool.isModelCooled(acc.id, chainModel)) {
-          lastErr = Object.assign(new Error(`模型 "${chainModel}" 在该账号冷却中`), { status: 429 });
+        // 不计入换号次数（attempt--）：已 tried 集合单调增长，全 cooled 时 pickAccount 返回 null 自然 break，不会死循环。
+        // 注意：负缓存跳过分支绝不能提前占用租约（上游 v1.31 修的在途计数泄漏死锁），先查缓存再 acquire
+        if (pool.isModelCooled(acc.id, targetModel)) {
+          lastErr = Object.assign(new Error(`模型 "${targetModel}" 在该账号冷却中`), { status: 429 });
           attempt--;
           continue;
         }
+        pool.acquireAccount(acc.id);
         usageRow.accountId = acc.id;
         usageRow.accountName = acc.name;
         // 拟人抖动（方案 §9：不超单人使用强度的限速与随机抖动）：每次上游请求前随机停 40~220ms，
@@ -528,8 +545,31 @@ async function handleChat(req, res, settings, surface) {
           let r = null;
           resetAttemptState(); // 上一次尝试的输出不得带进本轮（详见函数注释）
           attemptsUsed += 1;
+          // 自定义模型参数覆盖（modelCustom：上下文长度 / 最大输出 Token / 思考强度，上游 v1.31）
+          const custom = (settings.modelCustom || {})[chainModel] || (settings.modelCustom || {})[targetModel] || null;
+          let effectiveBody = body;
+          if (custom && typeof custom === "object") {
+            effectiveBody = { ...body };
+            if (typeof custom.maxOutputTokens === "number" && custom.maxOutputTokens > 0) {
+              effectiveBody.max_tokens = custom.maxOutputTokens;
+              effectiveBody.max_completion_tokens = custom.maxOutputTokens;
+            }
+            if (typeof custom.contextLength === "number" && custom.contextLength > 0) {
+              effectiveBody.prompt_max_tokens = custom.contextLength;
+              effectiveBody.context_length = custom.contextLength;
+            }
+            if (custom.reasoningEffort) {
+              if (custom.reasoningEffort === "off") {
+                effectiveBody.reasoning_effort = "off";
+                effectiveBody.thinking = { type: "disabled" };
+              } else {
+                effectiveBody.reasoning_effort = custom.reasoningEffort;
+                effectiveBody.thinking = { type: "enabled" };
+              }
+            }
+          }
           try {
-            r = await attemptChat(resolved.channel, acc, chainModel, body, emitTimed, chatMeta);
+            r = await attemptChat(resolved.channel, acc, targetModel, effectiveBody, emitTimed, chatMeta);
           } finally {
             pool.releaseAccount(acc.id);
           }
@@ -573,7 +613,7 @@ async function handleChat(req, res, settings, surface) {
               code: streamErr.code || 0,
               body: streamErr.body, data: streamErr.data, // 带给 errBodyOf：流中错误的响应体也要能落库
             });
-            applyCool(acc.id, chainModel, classifyUpstream(lastErr, false, resolved.channel), lastErr.message);
+            applyCool(acc.id, targetModel, classifyUpstream(lastErr, false, resolved.channel), lastErr.message);
             streamErr = null;
             continue;
           }
@@ -661,13 +701,16 @@ async function handleChat(req, res, settings, surface) {
         status: 200, ttftMs, promptTokens: usage.prompt_tokens, completionTokens: usage.completion_tokens,
         error: usedModel !== actualModel
           ? "fallback→" + usedModel
-          : actualModel !== requestedModel
-            ? "alias→" + actualModel
-            : "",
+          : targetModel !== usedModel
+            ? "rev→" + targetModel
+            : actualModel !== requestedModel
+              ? "alias→" + actualModel
+              : "",
         // 缓存字段由适配器归一成 cached_tokens/cache_write_tokens（未上报时缺省 → 落库 -1 哨兵）
         cachedTokens: usage.cached_tokens, cacheWriteTokens: usage.cache_write_tokens,
         creditsUsed: creditReported != null && Number.isFinite(Number(creditReported)) ? Math.max(0, Math.round(Number(creditReported))) : undefined,
         attempts: attemptsUsed, modelUpstream: usedModel,
+
       });
       return;
     }
@@ -757,6 +800,7 @@ function buildApp(settings) {
     return handleChat(req, res, settings(), RESPONSES_SURFACE).catch((e) => {
       if (!res.headersSent) res.status(500).json({ error: { message: String((e && e.message) || e), type: "api_error", param: null, code: null } });
     });
+
   });
 
   // 模型目录：全渠道合并视图（含自定义提供商的 标识/模型名）。
@@ -764,7 +808,7 @@ function buildApp(settings) {
   // 所以必须同步返回、绝不打上游；② 任何 redirect 都被它判失败，故连尾斜杠都单独注册；
   // ③ 有 anthropic-version 头时按 Messages 形状回，否则按 OpenAI 形状回。
   const modelsPayload = (req) => {
-    const list = adapters.mergedModels((settings() || {}).modelMeta || {});
+    const list = adapters.mergedModels(settings() || {});
     if (req.headers["anthropic-version"]) {
       // Anthropic 形状维持精简（Claude Code 只读 id/display_name），不追加扁平字段
       return {

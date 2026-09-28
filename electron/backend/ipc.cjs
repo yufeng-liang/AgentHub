@@ -484,7 +484,8 @@ function register(ctx) {
   // ===== 反代网关（Task 5：proxy_* 命令注册面在 gateway-client，实现体经管道在子进程 proxy/index.cjs） =====
   gatewayClient.register(ipcMain);
 
-  // ===== 记忆仓库（命令实现见 backend/memory/index.cjs；不 require proxy 域，只经 HTTP 探本机网关） =====
+  // ===== 记忆中枢（命令实现见 backend/memory/index.cjs；不 require proxy 域，只经 HTTP 探本机网关） =====
+
   memory.register(ipcMain);
 }
 

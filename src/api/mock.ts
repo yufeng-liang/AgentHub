@@ -54,6 +54,8 @@ function defaultConfig(): AppConfig {
       disabledModels: [],
       modelFallback: {},
       modelAliases: { "gpt-4o": "kimi-k3" },
+      modelReverseAliases: {},
+      modelCustom: {},
       autoFallbackEnabled: true,
       fallbackModel: "glm-5.2",
       ccSwitchModel: "",
@@ -243,6 +245,7 @@ const PROXY_POOL = [
   {
     id: "workbuddy", display: "WorkBuddy（中国区）", domain: "copilot.tencent.com", poolStrategy: "credit_first",
     summary: { channel: "workbuddy", totalCredits: 34120, accountCount: 2, onlineCount: 1, earliestExpire: NOW + 12 * 86400000, expired: false, expiringSoon: false, todayReq: 203, todayTokens: 41200, lastCreditsAt: NOW - 40 * 60000 },
+
     accounts: [
       { id: "a3", channel: "workbuddy", uid: "wb_7c21", name: "工作号", status: "online", credits: 34120, creditsAt: NOW - 40 * 60000, expiresAt: NOW + 12 * 86400000, coolUntil: 0, coolReason: "", source: "scan", lastUsed: NOW - 8 * 60000, todayReq: 203, todayTokens: 41200, creditsToday: 21, createdAt: NOW - 15 * 86400000, hasToken: true },
       { id: "a4", channel: "workbuddy", uid: "wb_9e05", name: "历史快照", status: "cooling", credits: 0, creditsAt: NOW - 300 * 60000, expiresAt: 0, coolUntil: NOW + 42000, coolReason: "上游限流", source: "scan", lastUsed: NOW - 55 * 60000, todayReq: 0, todayTokens: 0, creditsToday: -1, createdAt: NOW - 15 * 86400000, hasToken: true },
@@ -251,6 +254,7 @@ const PROXY_POOL = [
   {
     id: "workbuddy_ai", display: "WorkBuddy AI（国际版）", domain: "www.workbuddy.ai", poolStrategy: "expire_first",
     summary: { channel: "workbuddy_ai", totalCredits: 8120, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 33 * 86400000, expired: false, expiringSoon: false, todayReq: 66, todayTokens: 14800, lastCreditsAt: NOW - 70 * 60000 },
+
     accounts: [
       { id: "a5", channel: "workbuddy_ai", uid: "wba_3d88", name: "Trial 加油包", status: "online", credits: 8120, creditsAt: NOW - 70 * 60000, expiresAt: NOW + 33 * 86400000, coolUntil: 0, coolReason: "", source: "paste", lastUsed: NOW - 30 * 60000, todayReq: 66, todayTokens: 14800, creditsToday: 21, createdAt: NOW - 4 * 86400000, hasToken: true },
     ],
@@ -299,6 +303,13 @@ const PROXY_POOL = [
     accounts: [
       { id: "m1", channel: "myrelay", uid: "", name: "Key 1", status: "online", credits: 0, creditsAt: 0, expiresAt: 0, coolUntil: 0, coolReason: "", source: "paste", lastUsed: NOW - 2 * 60000, todayReq: 51, todayTokens: 12200, creditsToday: 21, createdAt: NOW - 2 * 86400000, hasToken: true },
       { id: "m2", channel: "myrelay", uid: "", name: "Key 2", status: "cooling", credits: 0, creditsAt: 0, expiresAt: 0, coolUntil: NOW + 40000, coolReason: "上游限流", source: "paste", lastUsed: NOW - 6 * 60000, todayReq: 45, todayTokens: 9200, creditsToday: 21, createdAt: NOW - 2 * 86400000, hasToken: true },
+    ],
+  },
+  {
+    id: "zcode", display: "ZCode（智谱）", domain: "zcode.z.ai", poolStrategy: "expire_first",
+    summary: { channel: "zcode", totalCredits: 150000000, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 90 * 86400000, expired: false, expiringSoon: false, todayReq: 12, todayTokens: 250000, lastCreditsAt: NOW - 10 * 60000 },
+    accounts: [
+      { id: "a7", channel: "zcode", uid: "zc_1001", name: "智谱主号", status: "online", credits: 150000000, creditsAt: NOW - 10 * 60000, expiresAt: NOW + 90 * 86400000, coolUntil: 0, coolReason: "", source: "json", lastUsed: NOW - 5 * 60000, todayReq: 12, todayTokens: 250000, creditsToday: 62000, createdAt: NOW - 5 * 86400000, hasToken: true },
     ],
   },
 ];
@@ -423,7 +434,7 @@ function mockRunning() {
   };
 }
 
-// ===== 记忆仓库：浏览器预览样例（结构对齐 electron/backend/memory 的真实返回） =====
+// ===== 记忆中枢：浏览器预览样例（结构对齐 electron/backend/memory 的真实返回） =====
 const MEM_PROJECTS = [
   { slug: "HUIdada1--AgentHub", name: "AgentHub", remotes: ["HUIdada1/AgentHub"], aliases: [], localPaths: ["D:\\private\\AgentHub"], origin: "git", updated: NOW - 3600000, count: 42, l2: 6, latest: NOW - 600000, agents: ["zcode", "codex"] },
   { slug: "wechat-mini-order", name: "微信小程序-订单", remotes: [], aliases: ["wx-order"], localPaths: ["E:\\code\\wx-order"], origin: "fuzzy-auto", updated: NOW - 86400000 * 5, count: 12, l2: 1, latest: NOW - 86400000 * 5, agents: ["zcode"] },
@@ -431,7 +442,7 @@ const MEM_PROJECTS = [
 
 const MEM_ROWS = [
   { id: "mem_20260924_ab12cd", path: "projects/HUIdada1--AgentHub/l2/decisions/mem_20260924_ab12cd.md", anchor: null, type: "decision", layer: "l2", title: "索引方案选型", summary: "决定下个版本把索引换成 FTS5，配合 bigram 预分词与外部分量表，检索用 ORDER BY rank。", tags: ["索引", "性能", "FTS5"], project: "HUIdada1--AgentHub", agent: "zcode", created: NOW - 3600000, updated: NOW - 3600000, importance: 4, pinned: true, starred: false, superseded: false, validTo: null, supersededBy: null },
-  { id: "mem_20260924_cd34ef", path: "projects/HUIdada1--AgentHub/l1/zcode/2026-09-24.md", anchor: "mem_20260924_cd34ef", type: "daily", layer: "l1", title: "记忆仓库方案讨论", summary: "今天讨论了记忆仓库的架构：MCP 接入、WebDAV 同步、两层记忆与渐进式披露。", tags: ["记忆仓库", "MCP"], project: "HUIdada1--AgentHub", agent: "zcode", created: NOW - 7200000, updated: NOW - 7200000, importance: 3, pinned: false, starred: true, superseded: false, validTo: null, supersededBy: null },
+  { id: "mem_20260924_cd34ef", path: "projects/HUIdada1--AgentHub/l1/zcode/2026-09-24.md", anchor: "mem_20260924_cd34ef", type: "daily", layer: "l1", title: "记忆中枢方案讨论", summary: "今天讨论了记忆中枢的架构：MCP 接入、WebDAV 同步、两层记忆与渐进式披露。", tags: ["记忆中枢", "MCP"], project: "HUIdada1--AgentHub", agent: "zcode", created: NOW - 7200000, updated: NOW - 7200000, importance: 3, pinned: false, starred: true, superseded: false, validTo: null, supersededBy: null },
   { id: "mem_20260920_ef56gh", path: "projects/HUIdada1--AgentHub/l1/codex/2026-09-20.md", anchor: "mem_20260920_ef56gh", type: "daily", layer: "l1", title: "MCP 配置注入踩坑", summary: "codex 的 config.toml 已有 [mcp_servers] 父表，注入不能重复写父表，只能文本级行增删。", tags: ["MCP", "Codex"], project: "HUIdada1--AgentHub", agent: "codex", created: NOW - 86400000 * 4, updated: NOW - 86400000 * 4, importance: 3, pinned: false, starred: false, superseded: false, validTo: null, supersededBy: null },
   { id: "mem_20260910_ij78kl", path: "projects/HUIdada1--AgentHub/l2/decisions/mem_20260910_ij78kl.md", anchor: null, type: "decision", layer: "l2", title: "早期索引方案（已失效）", summary: "最初打算用 LIKE 模糊查询做检索。", tags: ["索引"], project: "HUIdada1--AgentHub", agent: "zcode", created: NOW - 86400000 * 14, updated: NOW - 86400000 * 14, importance: 2, pinned: false, starred: false, superseded: true, validTo: NOW - 3600000, supersededBy: "mem_20260924_ab12cd" },
 ];
@@ -442,7 +453,7 @@ const MEM_DIGEST_TEXT = [
   "",
   "## HUIdada1--AgentHub（42 条，最近 2026-09-24）",
   "- 索引方案选型 — 决定下个版本把索引换成 FTS5…（2026-09-24）",
-  "- 记忆仓库方案讨论 — 今天讨论了记忆仓库的架构…（2026-09-24）",
+  "- 记忆中枢方案讨论 — 今天讨论了记忆中枢的架构…（2026-09-24）",
   "## wechat-mini-order（12 条，最近 2026-09-19）",
   "- 订单页重构 — 把结算逻辑抽成 composable…（2026-09-19）",
 ].join("\n");
@@ -490,7 +501,7 @@ export const mock = {
       case "get_is_portable":
         return false;
 
-      // ===== 记忆仓库（浏览器预览：样例数据，结构对齐真实返回） =====
+      // ===== 记忆中枢（浏览器预览：样例数据，结构对齐真实返回） =====
       case "memory_config_get":
         // 浏览器预览也要有 schema：配置页的自动表单由元数据驱动，空 schema 会只剩「模型与网关」一个子板块。
         // config 深拷贝返回：调用方拿到的改动不会污染 MOCK_CFG（真实后端每次也是新对象）
@@ -611,7 +622,7 @@ export const mock = {
       case "memory_project_assign":
         return { ok: true, moved: 0 };
       case "memory_project_suggest":
-        return { items: [{ id: "rq_1", slug: "HUIdada1--AgentHub", name: "AgentHub", score: 0.79, candidate: "记忆仓库设计", memoryId: MEM_ROWS[1].id, title: MEM_ROWS[1].title, path: MEM_ROWS[1].path }] };
+        return { items: [{ id: "rq_1", slug: "HUIdada1--AgentHub", name: "AgentHub", score: 0.79, candidate: "记忆中枢设计", memoryId: MEM_ROWS[1].id, title: MEM_ROWS[1].title, path: MEM_ROWS[1].path }] };
       case "memory_index_status":
         return { rows: MEM_ROWS.length, fts: MEM_ROWS.length, ftsW: MEM_ROWS.length, consistent: true, projects: 2, today: 2, pending: 3, sizeBytes: 1560000, walBytes: 20480, lastBuildAt: NOW - 7200000, lastScanAt: NOW - 60000, rootDir: "C:\\Users\\demo\\AgentHub\\memory" };
       case "memory_index_build":
@@ -656,7 +667,7 @@ export const mock = {
       case "memory_agent_uninject":
         return { ok: true, steps: [] };
       case "memory_agent_snippet":
-        return { ok: true, json: "{\n  \"mcpServers\": {\n    \"agenthub-memory\": {\n      \"type\": \"stdio\",\n      \"command\": \"C:\\\\Program Files\\\\AgentHub\\\\AgentHub.exe\",\n      \"args\": [\"C:\\\\Program Files\\\\AgentHub\\\\resources\\\\mcp\\\\mcp-memory-server.cjs\"],\n      \"env\": { \"ELECTRON_RUN_AS_NODE\": \"1\" }\n    }\n  }\n}", toml: "[mcp_servers.agenthub-memory]\ncommand = \"AgentHub.exe\"\nargs = [\"mcp-memory-server.cjs\"]", cli: "AgentHub.exe mcp-memory-server.cjs", instruction: "<!-- agenthub-memory:begin -->\n## 记忆仓库（AgentHub · 本机项目记忆）\n- 会话开始先调用 memory_core。\n<!-- agenthub-memory:end -->", command: { command: "AgentHub.exe", args: [], hostExists: true, bridgeExists: true }, configPath: "", instructionPath: "", hint: "写入 ~/.zcode/cli/config.json 的 mcp.servers" };
+        return { ok: true, json: "{\n  \"mcpServers\": {\n    \"agenthub-memory\": {\n      \"type\": \"stdio\",\n      \"command\": \"C:\\\\Program Files\\\\AgentHub\\\\AgentHub.exe\",\n      \"args\": [\"C:\\\\Program Files\\\\AgentHub\\\\resources\\\\mcp\\\\mcp-memory-server.cjs\"],\n      \"env\": { \"ELECTRON_RUN_AS_NODE\": \"1\" }\n    }\n  }\n}", toml: "[mcp_servers.agenthub-memory]\ncommand = \"AgentHub.exe\"\nargs = [\"mcp-memory-server.cjs\"]", cli: "AgentHub.exe mcp-memory-server.cjs", instruction: "<!-- agenthub-memory:begin -->\n## 记忆中枢（AgentHub · 本机项目记忆）\n- 会话开始先调用 memory_core。\n<!-- agenthub-memory:end -->", command: { command: "AgentHub.exe", args: [], hostExists: true, bridgeExists: true }, configPath: "", instructionPath: "", hint: "写入 ~/.zcode/cli/config.json 的 mcp.servers" };
       case "memory_agent_custom_save":
         return { ok: true, id: "custom-preview" };
       case "memory_agents_tools":
@@ -683,7 +694,7 @@ export const mock = {
       case "memory_open_dir":
         return { path: "C:\\Users\\demo\\AgentHub\\memory" };
 
-      // ===== 记忆仓库：模型与网关 / 自动化 / 同步 / 去重 / 导入（预览样例） =====
+      // ===== 记忆中枢：模型与网关 / 自动化 / 同步 / 去重 / 导入（预览样例） =====
       case "memory_provider_list":
         // 与真实后端同口径：gw-local 不在此返回，本机网关由 memory_gateway_list 单独下发
         return { providers: [
@@ -793,7 +804,7 @@ export const mock = {
         return { processed: 3, updated: 2, tokens: 3041, detail: "（预览模式）蒸馏/画像已完成" };
       case "memory_profile_get":
         return { sections: [
-          { name: "persona", path: "profile/persona.md", exists: true, text: "<!-- 本文件由 AgentHub 记忆仓库生成；手改内容请加 [pinned] 前缀，下次生成不会覆盖 -->\n- 偏好第一性原理\n  证据 [3]：mem_20260912_a1, mem_20260918_b3, mem_20260924_c7\n- KISS 至上\n  证据 [5]：mem_20260901_x1, mem_20260902_x2, mem_20260903_x3, mem_20260904_x4, mem_20260905_x5\n- 事实为本\n  证据 [2]：mem_20260910_y1, mem_20260911_y2\n" },
+          { name: "persona", path: "profile/persona.md", exists: true, text: "<!-- 本文件由 AgentHub 记忆中枢生成；手改内容请加 [pinned] 前缀，下次生成不会覆盖 -->\n- 偏好第一性原理\n  证据 [3]：mem_20260912_a1, mem_20260918_b3, mem_20260924_c7\n- KISS 至上\n  证据 [5]：mem_20260901_x1, mem_20260902_x2, mem_20260903_x3, mem_20260904_x4, mem_20260905_x5\n- 事实为本\n  证据 [2]：mem_20260910_y1, mem_20260911_y2\n" },
           { name: "preferences", path: "profile/preferences.md", exists: true, text: "- 要求中文输出、简洁\n  证据 [2]：mem_20260901_z1, mem_20260902_z2\n- 方案先行，评审通过才开发\n  证据 [4]：mem_20260903_w1, mem_20260904_w2, mem_20260905_w3, mem_20260906_w4\n" },
           { name: "tech", path: "profile/tech.md", exists: true, text: "- Vue3 + Electron + TS\n  证据 [3]：mem_20260907_v1, mem_20260908_v2, mem_20260909_v3\n- 零第三方依赖\n  证据 [2]：mem_20260910_u1, mem_20260911_u2\n" },
           { name: "habits", path: "profile/habits.md", exists: true, text: "- 多轮迭代，先调研后动手\n  证据 [2]：mem_20260912_t1, mem_20260913_t2\n- 喜欢看实测数据\n  证据 [3]：mem_20260914_s1, mem_20260915_s2, mem_20260916_s3\n" },
@@ -871,7 +882,7 @@ export const mock = {
       case "memory_import_source_detect":
         return { detect: { ok: true, kind: "jsonl", sizeBytes: 81920, sampleKeys: ["role", "content", "timestamp", "sessionId"], sample: [{ role: "user", content: "样例消息" }] } };
       case "memory_import_preview":
-        return { wouldCreate: 1842, wouldMerge: 317, skipDuplicate: 462, classifyFailed: 28, sensitive: 7, estimatedBytes: 88121344, estimatedTokens: 29373781, groups: [{ project: "HUIdada1--AgentHub", count: 612, source: "zcode-db" }, { project: "wechat-mini-order", count: 388, source: "claude" }, { project: "(未归类)", count: 28, source: "codex" }], samples: [{ title: "记忆仓库要用 FTS5 双索引", created: NOW - 4 * 86400000, source: "zcode-db", project: "HUIdada1--AgentHub" }, { title: "订单页重构结论", created: NOW - 9 * 86400000, source: "claude", project: "wechat-mini-order" }], note: "干跑未写入任何文件；确认后再执行导入" };
+        return { wouldCreate: 1842, wouldMerge: 317, skipDuplicate: 462, classifyFailed: 28, sensitive: 7, estimatedBytes: 88121344, estimatedTokens: 29373781, groups: [{ project: "HUIdada1--AgentHub", count: 612, source: "zcode-db" }, { project: "wechat-mini-order", count: 388, source: "claude" }, { project: "(未归类)", count: 28, source: "codex" }], samples: [{ title: "记忆中枢要用 FTS5 双索引", created: NOW - 4 * 86400000, source: "zcode-db", project: "HUIdada1--AgentHub" }, { title: "订单页重构结论", created: NOW - 9 * 86400000, source: "claude", project: "wechat-mini-order" }], note: "干跑未写入任何文件；确认后再执行导入" };
       case "memory_import_apply":
         return { ok: true, created: 1842, merged: 317, skipped: 462, sensitive: 7, failed: 0, report: "C:\\Users\\demo\\AgentHub\\memory\\_import\\report-2026-09-24T02-14-00.md", verify: { files: 2140, indexed: 2140, coverage: 100, sampleRead: "20/20", orphan: 0, ftsConsistent: true } };
       case "memory_import_cancel":
@@ -1206,6 +1217,9 @@ export const mock = {
       case "proxy_poolsync_cancel":
         return { ok: true };
       default:
+        if (String(cmd).startsWith("memory_")) {
+          throw new Error(`记忆中枢命令 ${cmd} 在浏览器预览下未实现`);
+        }
         // 未造的命令走 null 降级（页面按“未检测到后端”处理）
         return null;
     }

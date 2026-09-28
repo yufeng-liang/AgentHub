@@ -1,11 +1,11 @@
 /**
- * AgentHub · 记忆仓库（Memory Hub）
+ * AgentHub · 记忆中枢（Memory Hub）
  * Copyright (c) 2026 沐辉 (HUIdada1)
  * https://github.com/HUIdada1/AgentHub
  * 本文件为开源项目 AgentHub 的组成部分，作者保留署名权；依据开源协议使用时禁止删除本声明。
  */
 
-// 记忆仓库 · 自动化调度器：9 个任务注册表 + 60s tick + 记账持久化 + 时间回拨保护 +
+// 记忆中枢 · 自动化调度器：9 个任务注册表 + 60s tick + 记账持久化 + 时间回拨保护 +
 // 追赶式补跑 + 忙时跳过不推进记账 + 串行任务队列 + 单日 token 预算闸门 + 可取消。
 // 结构照搬 usage-scheduler.cjs（可行性复核 §4.1 已验证的五个设计）。
 "use strict";
@@ -149,7 +149,7 @@ class MemoryScheduler {
     const db = this.service.index.db;
     const unprocessed = db.prepare("SELECT COUNT(*) AS c FROM mem WHERE ai_processed = 0 AND (valid_to IS NULL OR valid_to > ?)").get(Date.now()).c;
     const classified = db.prepare("SELECT COUNT(*) AS c FROM mem WHERE (project IS NULL OR project = '') AND (valid_to IS NULL OR valid_to > ?)").get(Date.now()).c;
-    const review = db.prepare("SELECT COUNT(*) AS c FROM review_queue WHERE status = 'pending'").get().c;
+    const review = db.prepare("SELECT COUNT(*) AS c FROM review_queue WHERE status = 'pending' AND kind IN ('supersede', 'classify', 'dedup')").get().c;
     const pendingDedup = db.prepare("SELECT COUNT(*) AS c FROM mem WHERE dedup_status = 'pending'").get().c;
     return { unprocessed, classified, review, dedup: pendingDedup };
   }

@@ -1,10 +1,10 @@
 <!--
-  AgentHub · 记忆仓库（Memory Hub）
+  AgentHub · 记忆中枢（Memory Hub）
   Copyright (c) 2026 沐辉 (HUIdada1)
   https://github.com/HUIdada1/AgentHub
   本文件为开源项目 AgentHub 的组成部分，作者保留署名权；依据开源协议使用时禁止删除本声明。
 -->
-<!-- 记忆仓库 · 检索与索引：索引状态（异常才出现修复）+ 检索调试（折叠）+ digest 预览（折叠）
+<!-- 记忆中枢 · 检索与索引：索引状态（异常才出现修复）+ 检索调试（折叠）+ digest 预览（折叠）
      索引由增量构建与自愈扫描自动维护，这里不再常驻「增量/全量/诊断/VACUUM」四个按钮 -->
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from "vue";
@@ -178,7 +178,7 @@ watch(active, (v) => {
         </div>
 
         <div v-if="debug" class="mem-section">
-          <div class="s-title">分词结果（bigram 预分词）</div>
+          <div class="s-title">切词结果（中文双字切分）</div>
           <div class="mem-row" style="gap: 6px">
             <span v-for="(t, i) in debug.tokens" :key="i" class="mem-chip">{{ t }}</span>
             <span v-if="!debug.tokens.length" class="mem-hint">（无可分词内容）</span>

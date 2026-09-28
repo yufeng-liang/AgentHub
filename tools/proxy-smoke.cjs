@@ -414,7 +414,7 @@ async function main() {
   assert(!sseText.includes("1005") && !sseText.includes("credits insufficient"), "换号前的错误不泄给客户端");
   assert(store.getAccount(badTrae).status === "exhausted", "1005 → 坏号标耗尽");
   const usageRows = store.recentRequests(1);
-  assert(usageRows[0].status === 200 && usageRows[0].accountName === "好号" && usageRows[0].promptTokens === 7, "流水记录好号 + usage");
+  assert(usageRows[0].status === 200 && usageRows[0].accountName === "好号" && usageRows[0].promptTokens === 7, "流水记录好号 + usage, got: " + JSON.stringify(usageRows[0]));
 
   // 10.2 非流式：本地聚合
   rr = await call({ model: "deepseek-v4-flash", stream: false, messages: [{ role: "user", content: "hi" }] });

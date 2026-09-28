@@ -1,8 +1,8 @@
-/* ===== AgentHub · 记忆仓库（Memory Hub） =====
+/* ===== AgentHub · 记忆中枢（Memory Hub） =====
    Copyright (c) 2026 沐辉 (HUIdada1)
    https://github.com/HUIdada1/AgentHub
    本文件为开源项目 AgentHub 的组成部分，作者保留署名权；依据开源协议使用时禁止删除本声明。 */
-/* ===== 记忆仓库模块样式（命名空间即 mem- 前缀：规则为全局裸类，靠前缀约定与其它模块隔离；
+/* ===== 记忆中枢模块样式（命名空间即 mem- 前缀：规则为全局裸类，靠前缀约定与其它模块隔离；
    新模块起名请避开 mem- 前缀，勿在本文件外复用这些类名）=====
    设计刻度沿用框架 token：圆角 --r-md/--r-lg、控件高度 --ctl-h、间距 --gap-block；主色 --accent。 */
 
@@ -29,7 +29,7 @@
   .memory-scope.page { padding: 10px 16px 16px; }
 }
 
-/* 记忆仓库的配置页（复用框架 .cfg-sec 版式）：纵向节奏交回 .memory-scope 的 gap，
+/* 记忆中枢的配置页（复用框架 .cfg-sec 版式）：纵向节奏交回 .memory-scope 的 gap，
    避免 .cfg-sec > * + * 的 margin 与 gap 叠加成双倍间距 */
 .memory-scope.cfg-sec { gap: var(--gap-block); }
 .memory-scope.cfg-sec > * + * { margin-top: 0; }
@@ -374,10 +374,8 @@ html.fx-off .memory-scope .mem-kpi:hover { transform: none; }
   box-shadow: inset 0 0 0 1px var(--accent-line);
   transition: transform 0.26s var(--ease-spring);
   pointer-events: none;
+  transform: translateX(calc(var(--sw-i, 0) * (100% + 2px)));
 }
-.mem-switch.is-2nd .sw-thumb { transform: translateX(calc(100% + 2px)); }
-.mem-switch.is-3 .sw-thumb { transform: translateX(calc(var(--sw-i, 0) * (100% + 2px))); }
-.mem-switch.is-4 .sw-thumb { transform: translateX(calc(var(--sw-i, 0) * (100% + 2px))); }
 .mem-switch .sw-item {
   position: relative;
   z-index: 1;
@@ -921,3 +919,25 @@ html.fx-off .memory-scope .mem-switch .sw-thumb { transition: none; }
 .p-models { display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap; }
 .p-models .mem-chip { max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .prov-tbl .th-actions, .prov-tbl td.actions { text-align: right; }
+
+/* ---- 可点击联动查看记忆链接 ---- */
+.mem-link {
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: none;
+  transition: color 0.16s var(--ease), text-decoration-color 0.16s var(--ease);
+}
+.mem-link:hover {
+  color: var(--accent-strong);
+  text-decoration: underline;
+}
+
+/* ---- 跨电脑/不同屏幕长路径弹性截断 ---- */
+.mem-path-text {
+  display: inline-block;
+  max-width: min(460px, 45vw);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+}

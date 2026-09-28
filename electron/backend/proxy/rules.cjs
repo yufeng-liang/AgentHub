@@ -132,111 +132,36 @@ const DEFAULTS = {
         { id: "MiniMax-M3", name: "MiniMax-M3", rate: 0.2, capabilities: { images: true, reasoning: false, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
       ],
     },
-    // ZCode 双区静态兜底（智谱/Z.AI 编码套餐；与 adapters.cjs ZCODE_MODELS 逐条对齐，两区同一份目录，无远程同步）
+    // ZCode（智谱 GLM 编码套餐）：pinned 静态兜底（zcode-api 3.11.2 实证目录；
+    // billing/balance 的 balances[].capabilities 可在线刷新出真实可用模型）
     zcode: {
       syncedAt: 0,
       models: [
-        { id: "glm-5.3", name: "GLM-5.3", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 128000 },
-        { id: "glm-5.3-flash", name: "GLM-5.3 Flash", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 128000 },
-        { id: "glm-5.2", name: "GLM-5.2", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 128000 },
-        { id: "glm-5.1", name: "GLM-5.1", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 64000 },
-        { id: "glm-5", name: "GLM-5", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 64000 },
-        { id: "glm-5-turbo", name: "GLM-5 Turbo", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 64000 },
-        { id: "glm-4.7", name: "GLM-4.7", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 131072 },
-        { id: "glm-4.6", name: "GLM-4.6", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 131072 },
-        { id: "glm-4.5-air", name: "GLM-4.5 Air", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 131072, maxOutputTokens: 98304 },
-        { id: "glm-4.6v", name: "GLM-4.6V", rate: null, capabilities: { images: true, reasoning: false, tools: true }, contextLength: 131072, maxOutputTokens: 32768 },
-        { id: "glm-5v-turbo", name: "GLM-5V Turbo", rate: null, capabilities: { images: true, reasoning: false, tools: true }, contextLength: 200000, maxOutputTokens: 131072 },
+        { id: "GLM-5.3", name: "GLM-5.3", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 131072, maxOutputTokens: 8192 },
+        { id: "GLM-5.3-Flash", name: "GLM-5.3-Flash", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 131072, maxOutputTokens: 8192 },
+        { id: "GLM-5.2", name: "GLM-5.2", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 131072, maxOutputTokens: 8192 },
+        { id: "GLM-5.1", name: "GLM-5.1", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 131072, maxOutputTokens: 8192 },
+        { id: "GLM-5-Turbo", name: "GLM-5-Turbo", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 131072, maxOutputTokens: 8192 },
+        { id: "GLM-4.7", name: "GLM-4.7", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 131072, maxOutputTokens: 8192 },
+        { id: "GLM-4.6", name: "GLM-4.6", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 131072, maxOutputTokens: 8192 },
+        { id: "GLM-4.5-Air", name: "GLM-4.5-Air", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 131072, maxOutputTokens: 8192 },
       ],
     },
+    // ZCode 国际区（zai）：目录与国内同源（zcode-api 3.11.2 pinned），渠道是薄别名（同适配器，provider 默认 zai）
     zcode_intl: {
       syncedAt: 0,
       models: [
-        { id: "glm-5.3", name: "GLM-5.3", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 128000 },
-        { id: "glm-5.3-flash", name: "GLM-5.3 Flash", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 128000 },
-        { id: "glm-5.2", name: "GLM-5.2", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 128000 },
-        { id: "glm-5.1", name: "GLM-5.1", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 64000 },
-        { id: "glm-5", name: "GLM-5", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 64000 },
-        { id: "glm-5-turbo", name: "GLM-5 Turbo", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 64000 },
-        { id: "glm-4.7", name: "GLM-4.7", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 131072 },
-        { id: "glm-4.6", name: "GLM-4.6", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 131072 },
-        { id: "glm-4.5-air", name: "GLM-4.5 Air", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 131072, maxOutputTokens: 98304 },
-        { id: "glm-4.6v", name: "GLM-4.6V", rate: null, capabilities: { images: true, reasoning: false, tools: true }, contextLength: 131072, maxOutputTokens: 32768 },
-        { id: "glm-5v-turbo", name: "GLM-5V Turbo", rate: null, capabilities: { images: true, reasoning: false, tools: true }, contextLength: 200000, maxOutputTokens: 131072 },
+        { id: "GLM-5.3", name: "GLM-5.3", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 131072, maxOutputTokens: 8192 },
+        { id: "GLM-5.3-Flash", name: "GLM-5.3-Flash", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 131072, maxOutputTokens: 8192 },
+        { id: "GLM-5.2", name: "GLM-5.2", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 131072, maxOutputTokens: 8192 },
+        { id: "GLM-5.1", name: "GLM-5.1", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 131072, maxOutputTokens: 8192 },
+        { id: "GLM-5-Turbo", name: "GLM-5-Turbo", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 131072, maxOutputTokens: 8192 },
+        { id: "GLM-4.7", name: "GLM-4.7", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 131072, maxOutputTokens: 8192 },
+        { id: "GLM-4.6", name: "GLM-4.6", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 131072, maxOutputTokens: 8192 },
+        { id: "GLM-4.5-Air", name: "GLM-4.5-Air", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 131072, maxOutputTokens: 8192 },
       ],
     },
-  },
-  // 各渠道 effort 兜底 seed（方案 §3.2，移植 workbuddy2api-panel per-realm 表 + 收编 Qoder 内联 QODER_FALLBACK 档位）：
-  // ModelMeta 三源合并的最低优先层（seed < 拉取 < 用户覆盖）。渠道 → 模型 id（大小写不敏感）→
-  // { efforts:[...], default:"...", capabilities?:{images,video,reasoning,tools}, contextLength?, maxOutputTokens? }。
-  // 未知渠道/模型不写入（读取回落拉取值）；解析失败 → 空表（adapters.effortCatalog 兜底，不崩）。
-  "effort_catalog.json": {
-    // WorkBuddy CN（copilot.tencent.com/v3/config 全量实测快照 2026-09-28；单档 {effort:x} 已归一为 efforts:[x]）
-    workbuddy: {
-      auto: { efforts: ["high"], default: "high" },
-      "fast-model": { efforts: ["medium"], default: "medium" },
-      "balanced-model": { efforts: ["medium"], default: "medium" },
-      "deep-model": { efforts: ["medium"], default: "medium" },
-      hy3: { efforts: ["low", "high"], default: "high" },
-      "hy3-b": { efforts: ["low", "high"], default: "high" },
-      "hy3-c": { efforts: ["low", "high"], default: "high" },
-      "hy3-x": { efforts: ["low", "high"], default: "high" },
-      "hy4-preview": { efforts: ["high"], default: "high" },
-      "hy4-preview-dev": { efforts: ["high"], default: "high" },
-      "hy4-preview-x": { efforts: ["high"], default: "high" },
-      "minimax-m2.5": { efforts: ["medium"], default: "medium" },
-      "glm-5v-turbo": { efforts: ["medium"], default: "medium" },
-      "glm-5.3": { efforts: ["low", "high", "max"], default: "high" },
-      "glm-5.3-flash": { efforts: ["low", "high", "max"], default: "high" },
-      "glm-5.2": { efforts: ["high", "xhigh"], default: "high" },
-      "glm-5.1": { efforts: ["medium"], default: "medium" },
-      "glm-5.0-turbo": { efforts: ["medium"], default: "medium" },
-      "glm-4.6v": { efforts: ["medium"], default: "medium" },
-      "kimi-k3-1": { efforts: ["low", "high", "xhigh"], default: "high" },
-      "kimi-k2.8-preview": { efforts: ["low", "high", "max"], default: "high" },
-      "kimi-k2.7": { efforts: ["medium"], default: "medium" },
-      "kimi-k2.6": { efforts: ["medium"], default: "medium" },
-      "kimi-k2.5": { efforts: ["medium"], default: "medium" },
-      "kimi-k2-thinking": { efforts: ["medium"], default: "medium" },
-      "minimax-m3": { efforts: ["medium"], default: "medium" },
-      "minimax-m2.7": { efforts: ["medium"], default: "medium" },
-      "deepseek-v4-flash": { efforts: ["high", "xhigh"], default: "high" },
-      "deepseek-v4.1-flash": { efforts: ["high"], default: "high" },
-      "deepseek-v4-pro": { efforts: ["high", "xhigh"], default: "high" },
-      "deepseek-v3-2-volc": { efforts: ["medium"], default: "medium" },
-      "hunyuan-2.0-instruct": { efforts: ["medium"], default: "medium" },
-    },
-    // WorkBuddy AI（www.workbuddy.ai/v3/config 全量实测快照）
-    workbuddy_ai: {
-      "fast-model": { efforts: ["medium"], default: "medium" },
-      "balanced-model": { efforts: ["medium"], default: "medium" },
-      "primary-model": { efforts: ["high"], default: "high" },
-      "kimi-k2.8-preview": { efforts: ["low", "high", "max"], default: "high" },
-      "deepseek-v4.1-flash": { efforts: ["high"], default: "high" },
-      "deepseek-v4.1-flash-sg": { efforts: ["high"], default: "high" },
-      "glm-5.3-flash": { efforts: ["low", "high", "max"], default: "high" },
-      "gpt-6-astra": { efforts: ["low", "medium", "high", "xhigh", "max"], default: "high" },
-      "hy4-preview-f": { efforts: ["high"], default: "high" },
-      "hy4-preview": { efforts: ["high"], default: "high" },
-      hy3: { efforts: ["low", "high"], default: "high" },
-      "gpt-5.6-sol": { efforts: ["low", "medium", "high", "xhigh", "max"], default: "high" },
-      "gpt-5.6-terra": { efforts: ["low", "medium", "high", "xhigh", "max"], default: "high" },
-      "gpt-5.6-luna": { efforts: ["low", "medium", "high", "xhigh", "max"], default: "high" },
-      "gpt-5.5": { efforts: ["low", "medium", "high", "xhigh"], default: "high" },
-      "gpt-5.4": { efforts: ["low", "medium", "high", "xhigh"], default: "high" },
-      "gemini-3.5-flash": { efforts: ["medium"], default: "medium" },
-      "glm-5.3": { efforts: ["low", "high", "max"], default: "high" },
-      "glm-5.2": { efforts: ["high", "xhigh"], default: "high" },
-      "kimi-k3": { efforts: ["medium"], default: "medium" },
-      "kimi-k2.6": { efforts: ["medium"], default: "medium" },
-      "grok-4.7": { efforts: ["low", "medium", "high", "xhigh"], default: "high" },
-    },
-    // Qoder：收编 adapters.cjs QODER_FALLBACK 的档位与上下文数据（快照 2026-09-20 实测，两区仅这两个模型带档位）。
-    // contextLength 兜底沿内联表同值（上游拉取覆盖 seed）；WorkBuddy 两家暂无实测 context 数据，刻意留空不编造。
-    qoder: {
-      "qwen3.8-flash": { efforts: ["low", "medium", "xhigh"], contextLength: 200000 },
-      "qwen3.8-max": { efforts: ["low", "medium", "xhigh"], contextLength: 200000 },
-    },
+
   },
   // Trae function 字段按模型分发（TraeWorkAssistant models_sync.rs 实证：
   // 部分模型仅在 solo_agent 下可用，其余走 solo_work_lite；未命中默认 solo_work_lite）
@@ -356,6 +281,38 @@ const DEFAULTS = {
       clientVersion: "1.0.35",
       webClientVersion: "v1.0.35",
       clientChannel: "official",
+    },
+    // ===== ZCode（智谱 GLM 编码套餐）=====
+    // 协议事实：上游是 Anthropic Messages（coding-plan 与 start-plan 统一）；
+    // 头组复刻官方 3.12.3 客户端（LLM 面带 X-ZCode-Agent、不带 X-Device-Mid；
+    // billing/claim 控制面反之）。appVersion 上游变更时改这里即热生效，无需发版。
+    zcode: {
+      appVersion: "4.1.10",
+      sourceTitle: "cli",
+      refererOrigin: "https://zcode.z.ai",
+      // coding-plan（付费套餐，凭据 = coding-plan API key "{apiKey}.{secret}"）
+      zaiAnthropicBase: "https://api.z.ai/api/anthropic",
+      bigmodelAnthropicBase: "https://open.bigmodel.cn/api/anthropic",
+      // start-plan（免费/领取的套餐，凭据 = zcodejwttoken）
+      startPlanAnthropicBase: "https://zcode.z.ai/api/v1/zcode-plan/anthropic",
+      // billing / claim / OAuth 控制面
+      billingBase: "https://zcode.z.ai/api/v1/zcode-plan",
+      clientConfigsUrl: "https://zcode.z.ai/api/v1/client/configs",
+      eventReportUrl: "https://zcode.z.ai/api/v1/event/report",
+      oauthInitUrl: "https://zcode.z.ai/api/v1/oauth/cli/init",
+      oauthPollBase: "https://zcode.z.ai/api/v1/oauth/cli/poll",
+      oauthTokenUrl: "https://zcode.z.ai/api/v1/oauth/token",
+      businessLoginUrl: "https://api.z.ai/api/auth/z/login",
+      // zai 业务域（coding-plan API key 解析链：getCustomerInfo / api_keys）
+      zaiBizBase: "https://api.z.ai",
+      bigmodelBizBase: "https://bigmodel.cn",
+      // bigmodel 额度查询（coding-plan API key 路）
+      monitorQuotaUrl: "https://open.bigmodel.cn/api/monitor/usage/quota/limit",
+      subscriptionUrl: "https://open.bigmodel.cn/api/biz/subscription/list",
+      // OAuth 登录的 provider（zai / bigmodel）
+      oauthProvider: "zai",
+      // 平台标识（billing/claim 查询参数 platform 的值）
+      platform: "win32-x64",
     },
   },
 };

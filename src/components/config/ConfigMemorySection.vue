@@ -1,10 +1,10 @@
 <!--
-  AgentHub · 记忆仓库（Memory Hub）
+  AgentHub · 记忆中枢（Memory Hub）
   Copyright (c) 2026 沐辉 (HUIdada1)
   https://github.com/HUIdada1/AgentHub
   本文件为开源项目 AgentHub 的组成部分，作者保留署名权；依据开源协议使用时禁止删除本声明。
 -->
-<!-- 记忆仓库 · 配置页（隐藏页，经顶部「配置」按钮进入）：元数据驱动自动渲染，新增配置项零前端改动 -->
+<!-- 记忆中枢 · 配置页（隐藏页，经顶部「配置」按钮进入）：元数据驱动自动渲染，新增配置项零前端改动 -->
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from "vue";
 import { ElMessageBox } from "element-plus";
@@ -48,42 +48,7 @@ function gotoTiming() {
   app.settingsOpen = true;
 }
 
-/** 高级项：调参与内部参数（权重、阈值、批量、token 上限、内部结构、正则等）——默认不露。
-    普通用户看到的是：开关 / 预算 / 保留天数 / 页大小 / 默认页签 / 启用的 Agent / 同步开关与间隔 / 脱敏总开关。 */
-const ADVANCED_KEYS = new Set([
-  // 索引与检索（权重与召回参数都是算法内部值）
-  "index.dualIndex", "index.titleBoost", "index.debounceMs",
-  "search.weightBm25", "search.weightRecency", "search.weightImportance", "search.weightAffinity",
-  "search.weightLayer", "search.weightGraph", "search.timeDecayHalfLife", "search.recallTopK",
-  "search.finalTopK", "search.graphExpansionDepth", "search.graphExpansionMax",
-  // 归类（阈值细节）
-  "classify.fuzzyThreshold", "classify.pathReverse",
-  // Agent 接入（容量与巡检间隔是规模项）
-  "agents.verifyInterval", "agents.coreMaxTokens", "agents.digestMaxLines", "agents.searchMaxTokens",
-  // 深层记忆（批量、阈值）
-  "deep.batchSize", "deep.personaMinMemories", "deep.distillMaxPerProject",
-  // 双时间轴（细节阈值）
-  "timeline.autoDetect", "timeline.requireConfirm",
-  // 自动化（日志细节、超预算行为已被 AutoView 主开关覆盖）
-  "auto.logKeepDays", "auto.logKeepCount", "auto.overBudgetAction",
-  // 模型与网关（结构化面板已管）；其余内部参数
-  "models.timeout", "models.maxRetries", "models.gatewayUrl", "models.tagDefs", "models.taskEffort", "models.degrade",
-  // 去重（全部子键是调参细节）
-  "dedup.l1.normalizeLevel",
-  "dedup.l2.autoMergeThreshold", "dedup.l2.candidateThreshold",
-  "dedup.l2.wDice", "dedup.l2.wEdit", "dedup.l2.wTitle",
-  "dedup.l3.topK",
-  "dedup.l4.minCandidateScore", "dedup.l4.autoUpdateThreshold", "dedup.l4.batchSize", "dedup.l4.autoDelete",
-  "dedup.duplicateIdentityTypes", "dedup.pendingWarnThreshold",
-  // 导入（批量与解析规则）
-  "import.batchSize", "import.maxBatchBytes", "import.md.observationMarkers", "import.md.extractTags",
-  // 存储（备份与体积阈值细节）
-  "storage.atomicWrite", "storage.backupBeforeWrite", "storage.backupKeep", "storage.maxFileSizeKB",
-  // 同步（间隔被统一到设置 · 同步时间；其余容量细节）
-  "sync.intervalMin", "sync.packSizeLimitMB", "sync.excludeIndex",
-  // 隐私（规则正则是技术细节）
-  "privacy.redactRules",
-]);
+
 
 /** 二级 tab 图标：按分组名映射（未命中回退到通用图标） */
 const GROUP_ICON: Record<string, string> = {
@@ -208,7 +173,7 @@ async function save() {
 
 async function resetAll() {
   try {
-    await ElMessageBox.confirm("把「记忆仓库」的全部配置恢复为默认值？", "恢复默认", { type: "warning" });
+    await ElMessageBox.confirm("把「记忆中枢」的全部配置恢复为默认值？", "恢复默认", { type: "warning" });
   } catch {
     return;
   }
@@ -266,7 +231,7 @@ async function toggleModule(enabled: boolean) {
     // 别再整份 saveConfig（那会把渲染层启动时的旧值写回，重启后开关自己弹回来）
     const r = await api.memoryToggle(enabled);
     if (app.config.memory) app.config.memory.enabled = r.enabled;
-    ElMessage.success(enabled ? "记忆仓库已启用" : "记忆仓库已停用");
+    ElMessage.success(enabled ? "记忆中枢已启用" : "记忆中枢已停用");
     await mem.loadStatus();
   } catch (e) {
     ElMessage.error((e as Error).message || "切换失败");
@@ -297,10 +262,10 @@ watch(
 const tabMeta = computed(() => groups.value.find((g) => g.name === tab.value));
 /** 当前分组里可编辑的键（模型与网关那组已被面板接管，见 buildGroups 的过滤） */
 const visibleKeys = computed(() => (tabMeta.value ? tabMeta.value.keys.filter((k) => mem.schema[k]) : []));
-/** 拆成「常用」与「高级」两批：高级项默认收起 */
-const basicKeys = computed(() => visibleKeys.value.filter((k) => !ADVANCED_KEYS.has(k)));
-const advancedKeys = computed(() => visibleKeys.value.filter((k) => ADVANCED_KEYS.has(k)));
-/** 实际渲染的键：默认只出常用项，点「高级项」把调参项一并带出（不改变原顺序） */
+/** 拆成「常用」与「高级」两批：完全由后端 Schema 的 tier 属性驱动，无前端硬编码 */
+const basicKeys = computed(() => visibleKeys.value.filter((k) => mem.schema[k]?.tier === "basic"));
+const advancedKeys = computed(() => visibleKeys.value.filter((k) => mem.schema[k]?.tier !== "basic"));
+/** 实际渲染的键：默认只出常用项，点「高级设置」把进阶与内部参数一并带出（不改变原顺序） */
 const shownKeys = computed(() => (advancedOpen.value ? visibleKeys.value : basicKeys.value));
 </script>
 
@@ -309,7 +274,7 @@ const shownKeys = computed(() => (advancedOpen.value ? visibleKeys.value : basic
   <div class="cfg-sec memory-scope">
     <div class="cfg-sec-head">
       <div>
-        <div class="cfg-sec-title">配置 · 记忆仓库</div>
+        <div class="cfg-sec-title">配置 · 记忆中枢</div>
         <div class="cfg-sec-sub">
           配置事实源：<span class="mem-mono">{{ mem.root }}/config/memory.config.json</span>（随 WebDAV 同步）· 本机覆盖：memory.config.local.json
         </div>
@@ -385,8 +350,8 @@ const shownKeys = computed(() => (advancedOpen.value ? visibleKeys.value : basic
         {{ tab }}
         <span class="mem-inline-ctl">
           <span class="mem-hint">{{ shownKeys.length }} 项（热生效项改完即用；标 ❄ 的需重启或重建索引）</span>
-          <button v-if="advancedKeys.length" class="btn-ghost" :class="{ 'btn-outline': advancedOpen }" @click="advancedOpen = !advancedOpen">
-            高级项 {{ advancedKeys.length }} {{ advancedOpen ? "▲" : "▼" }}
+          <button v-if="advancedKeys.length" class="btn-ghost" :class="{ 'btn-outline': advancedOpen }" @click="advancedOpen = !advancedOpen" title="默认值已是最优推荐，如需深入调优可展开修改">
+            高级项 {{ advancedKeys.length }} {{ advancedOpen ? "▲ 收起" : "▼ 展开调优" }}
           </button>
         </span>
       </div>

@@ -166,6 +166,7 @@ onMounted(async () => {
         <span class="pill">范围 近 {{ DAYS }} 日</span>
       </div>
       <div class="kpis kpis-6" style="margin-top: 12px">
+
         <div class="kpi"><span>今日请求</span><b class="acc">{{ fmtInt(ov?.today.req || 0) }}</b></div>
         <div class="kpi"><span>今日 Token</span><b>{{ fmtK(ov?.today.tokens || 0) }}</b></div>
         <div class="kpi"><span>成功率</span><b>{{ (ov?.today.successRate ?? 100).toFixed(1) }}%</b></div>

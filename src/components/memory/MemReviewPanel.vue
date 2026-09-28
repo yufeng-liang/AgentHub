@@ -1,10 +1,10 @@
 <!--
-  AgentHub · 记忆仓库（Memory Hub）
+  AgentHub · 记忆中枢（Memory Hub）
   Copyright (c) 2026 沐辉 (HUIdada1)
   https://github.com/HUIdada1/AgentHub
   本文件为开源项目 AgentHub 的组成部分，作者保留署名权；依据开源协议使用时禁止删除本声明。
 -->
-<!-- 记忆仓库 · 待确认收件箱（原独立页签，现为「记忆浏览」的第三个视图）：
+<!-- 记忆中枢 · 待确认收件箱（原独立页签，现为「记忆浏览」的第三个视图）：
      三类人工裁决集中一处（事实失效 / 项目归类 / 去重），AI 只建议不自动改。
      本面板不自带页面头部——页头属于记忆浏览；三个队列各有一枚待处理红点。 -->
 <script setup lang="ts">
@@ -38,9 +38,9 @@ const busy = ref("");
 const loadedOnce = ref(false);
 
 const counts = computed(() => ({
-  supersede: supersede.value.length,
-  classify: classify.value.length,
-  dedup: dedup.value.length,
+  supersede: loadedOnce.value ? supersede.value.length : (mem.reviewCounts?.supersede ?? supersede.value.length),
+  classify: loadedOnce.value ? classify.value.length : (mem.reviewCounts?.classify ?? classify.value.length),
+  dedup: loadedOnce.value ? dedup.value.length : (mem.reviewCounts?.dedup ?? dedup.value.length),
 }));
 const total = computed(() => counts.value.supersede + counts.value.classify + counts.value.dedup);
 /** 三档滑块：0/1/2 对应 tab 顺序，位移用 translateX(calc(N * (100% + 2px))) */
@@ -48,12 +48,20 @@ const tabIndex = computed(() => ({ supersede: 0, classify: 1, dedup: 2 })[tab.va
 
 async function refresh() {
   await Promise.all([
-    api.memoryReviewList("supersede").then((r) => (supersede.value = r.items as unknown as SupersedeItem[])).catch(() => {}),
-    api.memoryReviewList("classify").then((r) => (classify.value = r.items as unknown as ClassifyItem[])).catch(() => {}),
-    api.memoryDedupReviewList().then((r) => (dedup.value = r.items as unknown as DedupItem[])).catch(() => {}),
+    api.memoryReviewList("supersede").then((r) => (supersede.value = (r.items || []) as unknown as SupersedeItem[])).catch(() => {}),
+    api.memoryReviewList("classify").then((r) => (classify.value = (r.items || []) as unknown as ClassifyItem[])).catch(() => {}),
+    api.memoryDedupReviewList().then((r) => (dedup.value = (r.items || []) as unknown as DedupItem[])).catch(() => {}),
   ]);
+  mem.reviewCounts = {
+    supersede: supersede.value.length,
+    classify: classify.value.length,
+    dedup: dedup.value.length,
+  };
+  mem.pending.browse = supersede.value.length + classify.value.length + dedup.value.length;
   loadedOnce.value = true;
 }
+
+const batchBusy = ref(false);
 
 async function resolveSupersede(item: SupersedeItem, action: "confirm" | "dismiss" | "merge") {
   busy.value = item.id;
@@ -62,6 +70,7 @@ async function resolveSupersede(item: SupersedeItem, action: "confirm" | "dismis
     ElMessage.success(action === "confirm" ? "已标记旧事实失效" : action === "merge" ? "已合并两条" : "已判定为并非矛盾");
     await refresh();
     await mem.loadStats();
+    await mem.refreshPending(true);
   } catch (e) {
     ElMessage.error((e as Error).message || "处理失败");
   } finally {
@@ -76,10 +85,217 @@ async function resolveClassify(item: ClassifyItem, slug: string | null) {
     ElMessage.success(slug ? `已归入 ${slug}` : "已标记为独立记忆");
     await refresh();
     await mem.loadStats();
+    await mem.refreshPending(true);
   } catch (e) {
     ElMessage.error((e as Error).message || "处理失败");
   } finally {
     busy.value = "";
+  }
+}
+
+/** 一键按推荐确认事实失效 */
+async function batchConfirmSupersede() {
+  if (!supersede.value.length || batchBusy.value) return;
+  const count = supersede.value.length;
+  try {
+    await ElMessageBox.confirm(
+      `确定将当前待确认的 ${count} 条事实矛盾全部按推荐确认失效？\n（旧事实将被标记失效，不再被默认检索，但原文与演化链完整保留）`,
+      "一键推荐确认失效",
+      {
+        confirmButtonText: "确认失效",
+        cancelButtonText: "取消",
+        type: "warning",
+      }
+    );
+  } catch {
+    return;
+  }
+
+  batchBusy.value = true;
+  let successCount = 0;
+  let failCount = 0;
+  try {
+    for (const item of [...supersede.value]) {
+      try {
+        await api.memoryReviewResolve(item.id, "confirm");
+        successCount++;
+      } catch {
+        failCount++;
+      }
+    }
+    if (failCount > 0) {
+      ElMessage.warning(`处理完成：${successCount} 条成功，${failCount} 条失败`);
+    } else {
+      ElMessage.success(`已一键按推荐确认失效 ${successCount} 条记忆`);
+    }
+    await refresh();
+    await mem.loadStats();
+    await mem.refreshPending(true);
+  } catch (e) {
+    ElMessage.error((e as Error).message || "批量确认失效失败");
+  } finally {
+    batchBusy.value = false;
+  }
+}
+
+/** 一键按推荐确认项目归类 */
+async function batchConfirmClassify() {
+  if (!classify.value.length || batchBusy.value) return;
+  const count = classify.value.length;
+  try {
+    await ElMessageBox.confirm(
+      `确定将当前待确认的 ${count} 条记忆全部按建议归入对应项目？`,
+      "一键推荐归入项目",
+      {
+        confirmButtonText: "确认归入",
+        cancelButtonText: "取消",
+        type: "info",
+      }
+    );
+  } catch {
+    return;
+  }
+
+  batchBusy.value = true;
+  let successCount = 0;
+  let failCount = 0;
+  try {
+    for (const item of [...classify.value]) {
+      const slug = item.payload.slug || null;
+      try {
+        await api.memoryReviewResolve(item.id, slug ? "assign" : "dismiss", slug ? { slug } : undefined);
+        successCount++;
+      } catch {
+        failCount++;
+      }
+    }
+    if (failCount > 0) {
+      ElMessage.warning(`批量处理完成：${successCount} 条成功，${failCount} 条失败`);
+    } else {
+      ElMessage.success(`已一键推荐归入 ${successCount} 条记忆`);
+    }
+    await refresh();
+    await mem.loadStats();
+    await mem.refreshPending(true);
+  } catch (e) {
+    ElMessage.error((e as Error).message || "批量归入失败");
+  } finally {
+    batchBusy.value = false;
+  }
+}
+
+/** 一键按推荐处理去重（采纳新记忆） */
+async function batchConfirmDedup() {
+  if (!dedup.value.length || batchBusy.value) return;
+  const count = dedup.value.length;
+  try {
+    await ElMessageBox.confirm(
+      `确定将当前待确认的 ${count} 条去重建议全部按推荐采纳新记忆？\n（将采纳新记忆生效，旧记忆标记失效并保留追溯）`,
+      "一键推荐采纳新记忆",
+      {
+        confirmButtonText: "确认采纳",
+        cancelButtonText: "取消",
+        type: "info",
+      }
+    );
+  } catch {
+    return;
+  }
+
+  batchBusy.value = true;
+  let successCount = 0;
+  let failCount = 0;
+  try {
+    for (const item of [...dedup.value]) {
+      try {
+        await api.memoryDedupReviewResolve(item.id, "adoptNew");
+        successCount++;
+      } catch {
+        failCount++;
+      }
+    }
+    if (failCount > 0) {
+      ElMessage.warning(`处理完成：${successCount} 条成功，${failCount} 条失败`);
+    } else {
+      ElMessage.success(`已一键按推荐采纳 ${successCount} 条新记忆`);
+    }
+    await refresh();
+    await mem.loadStats();
+    await mem.refreshPending(true);
+  } catch (e) {
+    ElMessage.error((e as Error).message || "批量处理去重失败");
+  } finally {
+    batchBusy.value = false;
+  }
+}
+
+/** 一键按推荐处理全部待确认事项 */
+async function batchConfirmAll() {
+  if (!total.value || batchBusy.value) return;
+  const lines = [
+    `将按各队列推荐方案一键处理全部 ${total.value} 条待确认事项：`,
+    counts.value.supersede ? `• 事实失效（${counts.value.supersede} 条）：按推荐标记旧事实失效` : "",
+    counts.value.classify ? `• 项目归类（${counts.value.classify} 条）：按推荐归入对应项目` : "",
+    counts.value.dedup ? `• 记忆去重（${counts.value.dedup} 条）：按推荐采纳新记忆` : "",
+    "",
+    "所有操作均不物理删除原文（保留完整演化链与追溯）。确定立即执行？",
+  ].filter(Boolean).join("\n");
+
+  try {
+    await ElMessageBox.confirm(lines, "一键推荐处理全部", {
+      confirmButtonText: "全部一键处理",
+      cancelButtonText: "取消",
+      type: "info",
+    });
+  } catch {
+    return;
+  }
+
+  batchBusy.value = true;
+  let successCount = 0;
+  let failCount = 0;
+  try {
+    // 1. 处理事实失效
+    for (const item of [...supersede.value]) {
+      try {
+        await api.memoryReviewResolve(item.id, "confirm");
+        successCount++;
+      } catch {
+        failCount++;
+      }
+    }
+    // 2. 处理项目归类
+    for (const item of [...classify.value]) {
+      const slug = item.payload.slug || null;
+      try {
+        await api.memoryReviewResolve(item.id, slug ? "assign" : "dismiss", slug ? { slug } : undefined);
+        successCount++;
+      } catch {
+        failCount++;
+      }
+    }
+    // 3. 处理记忆去重
+    for (const item of [...dedup.value]) {
+      try {
+        await api.memoryDedupReviewResolve(item.id, "adoptNew");
+        successCount++;
+      } catch {
+        failCount++;
+      }
+    }
+
+    if (failCount > 0) {
+      ElMessage.warning(`一键处理完成：${successCount} 条成功，${failCount} 条失败`);
+    } else {
+      ElMessage.success(`已按推荐一键处理全部 ${successCount} 条待确认事项`);
+    }
+    await refresh();
+    await mem.loadStats();
+    await mem.refreshPending(true);
+  } catch (e) {
+    ElMessage.error((e as Error).message || "一键批量处理失败");
+  } finally {
+    batchBusy.value = false;
   }
 }
 
@@ -110,6 +326,7 @@ async function resolveDedup(item: DedupItem, action: "adoptNew" | "keepOld" | "k
     ElMessage.success("已处理");
     await refresh();
     await mem.loadStats();
+    await mem.refreshPending(true);
   } catch (e) {
     ElMessage.error((e as Error).message || "处理失败");
   } finally {
@@ -149,11 +366,23 @@ defineExpose({ refresh, total });
 <template>
   <div class="mem-col" style="gap: var(--gap-block)">
     <div class="mem-head">
-      <p class="mem-sub">
-        共 {{ total }} 条待你点头，AI 只建议不自动改
-        <MemHelp text="三件事需要你确认：① 事实失效（新记忆推翻了旧的）② 项目归类（名称模糊匹配的结果）③ 去重（低置信的重复判定）。每一项都有明确的取舍说明，选错可恢复（旧记忆只标失效、原文都在）。" />
-      </p>
-      <div class="mem-head-actions">
+      <div class="mem-col" style="gap: 4px">
+        <p class="mem-sub" style="margin: 0">
+          共 {{ total }} 条待你点头，AI 只建议不自动改
+          <MemHelp text="三件事需要你确认：① 事实失效（新记忆推翻了旧的）② 项目归类（名称模糊匹配的结果）③ 去重（低置信的重复判定）。每一项都有明确的取舍说明，选错可恢复（旧记忆只标失效、原文都在）。" />
+        </p>
+      </div>
+      <div class="mem-head-actions" style="display: flex; align-items: center; gap: 10px">
+        <button
+          v-if="total > 0"
+          class="btn btn-cta"
+          style="font-size: 12px; padding: 4px 12px"
+          :disabled="batchBusy || !!busy"
+          title="按各队列推荐方案一次性处理全部待确认事项"
+          @click="batchConfirmAll"
+        >
+          {{ batchBusy ? "处理中…" : `一键推荐处理全部（${total}）` }}
+        </button>
         <div class="mem-switch is-3" :style="{ '--sw-i': tabIndex }" role="tablist">
           <span class="sw-thumb"></span>
           <button class="sw-item" :class="{ active: tab === 'supersede' }" role="tab" :aria-selected="tab === 'supersede'" @click="tab = 'supersede'">
@@ -179,18 +408,30 @@ defineExpose({ refresh, total });
     <!-- ① 事实失效 -->
     <template v-if="tab === 'supersede'">
       <div class="mem-card">
-        <div class="mem-card-title">
-          事实失效（{{ counts.supersede }} 条）
-          <span class="mem-hint">AI 找出互相矛盾的一对并给理由，你点「确认失效」才算数</span>
-          <MemHelp text="记忆会被推翻（「改用 Vue3」推翻「在用 React」）。确认后旧的那条被标记失效、默认不再被检索到，但原文仍在、可随时查看演化链——所以选错的代价只是「检索时少看到一条」。" />
+        <div class="mem-card-title" style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px">
+          <div>
+            事实失效（{{ counts.supersede }} 条）
+            <span class="mem-hint">AI 找出互相矛盾的一对并给理由，你点「确认失效」才算数</span>
+            <MemHelp text="记忆会被推翻（「改用 Vue3」推翻「在用 React」）。确认后旧的那条被标记失效、默认不再被检索到，但原文仍在、可随时查看演化链——所以选错的代价只是「检索时少看到一条」。" />
+          </div>
+          <button
+            v-if="counts.supersede"
+            class="btn btn-cta"
+            style="font-size: 12px; padding: 4px 12px"
+            :disabled="batchBusy || !!busy"
+            title="按推荐将所有矛盾项标记旧记忆失效（保留演化链）"
+            @click="batchConfirmSupersede"
+          >
+            {{ batchBusy ? "处理中…" : `一键推荐确认失效（${counts.supersede}）` }}
+          </button>
         </div>
         <div v-if="counts.supersede" class="mem-col" style="gap: 10px">
           <div v-for="q in supersede" :key="q.id" class="mem-tile">
             <div class="mem-kv">
               <span class="k">旧事实</span>
-              <span class="v" :title="q.payload.oldId">{{ q.payload.oldTitle || q.payload.oldId }}</span>
+              <span class="v mem-link" :title="q.payload.oldId" @click="mem.openDetail(q.payload.oldId)">{{ q.payload.oldTitle || q.payload.oldId }} ↗</span>
               <span class="k">新事实</span>
-              <span class="v" :title="q.payload.newId || ''">{{ q.payload.newTitle || q.payload.newId || "（仅提示，无对应新条）" }}</span>
+              <span class="v" :class="{ 'mem-link': !!q.payload.newId }" :title="q.payload.newId || ''" @click="q.payload.newId && mem.openDetail(q.payload.newId)">{{ q.payload.newTitle || q.payload.newId || "（仅提示，无对应新条）" }}{{ q.payload.newId ? ' ↗' : '' }}</span>
               <span class="k">判定理由</span>
               <span class="v">{{ q.payload.reason || "—" }}</span>
               <span class="k">置信度</span>
@@ -211,20 +452,32 @@ defineExpose({ refresh, total });
     <!-- ② 项目归类 -->
     <template v-else-if="tab === 'classify'">
       <div class="mem-card">
-        <div class="mem-card-title">
-          项目归类（{{ counts.classify }} 条）
-          <span class="mem-hint">没有 Git 地址的记忆，按目录名/标题与已有项目比相似度</span>
-          <MemHelp text="归类只认 Git 远程地址（最可靠）。没有远程地址时才退化为名称模糊匹配，而模糊匹配归错了会污染目录结构且难察觉——所以这一档只给建议，等你点头。" />
+        <div class="mem-card-title" style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px">
+          <div>
+            项目归类（{{ counts.classify }} 条）
+            <span class="mem-hint">没有 Git 地址的记忆，按目录名/标题与已有项目比相似度</span>
+            <MemHelp text="归类只认 Git 远程地址（最可靠）。没有远程地址时才退化为名称模糊匹配，而模糊匹配归错了会污染目录结构且难察觉——所以这一档只给建议，等你点头。" />
+          </div>
+          <button
+            v-if="counts.classify"
+            class="btn btn-cta"
+            style="font-size: 12px; padding: 4px 12px"
+            :disabled="batchBusy || !!busy"
+            title="按建议将所有记忆归入推测的项目"
+            @click="batchConfirmClassify"
+          >
+            {{ batchBusy ? "归入中…" : `一键推荐确认归入（${counts.classify}）` }}
+          </button>
         </div>
         <div v-if="counts.classify" class="mem-col">
           <div v-for="s in classify" :key="s.id" class="mem-chain-node" style="flex-wrap: wrap; gap: 8px">
             <span v-if="s.payload.score !== undefined" class="mem-chip warn">置信 {{ s.payload.score }}</span>
-            <span>「{{ s.payload.candidate || s.payload.title }}」</span>
+            <span class="mem-link" :title="s.payload.memoryId" @click="mem.openDetail(s.payload.memoryId)">「{{ s.payload.candidate || s.payload.title }}」 ↗</span>
             <span style="color: var(--text-3)">疑似属于</span>
             <span class="mem-chip accent">{{ s.payload.name || s.payload.slug }}</span>
             <span style="margin-left: auto; display: flex; gap: 6px">
-              <button class="btn btn-cta" :disabled="busy === s.id" @click="resolveClassify(s, s.payload.slug || null)">确认归入</button>
-              <button class="btn btn-ghost" :disabled="busy === s.id" @click="resolveClassify(s, null)">不是同一项目</button>
+              <button class="btn btn-cta" :disabled="busy === s.id || batchBusy" @click="resolveClassify(s, s.payload.slug || null)">确认归入</button>
+              <button class="btn btn-ghost" :disabled="busy === s.id || batchBusy" @click="resolveClassify(s, null)">不是同一项目</button>
             </span>
           </div>
         </div>
@@ -235,10 +488,22 @@ defineExpose({ refresh, total });
     <!-- ③ 去重 -->
     <template v-else>
       <div class="mem-card">
-        <div class="mem-card-title">
-          去重（{{ counts.dedup }} 条）
-          <span class="mem-hint">低置信 UPDATE 与全部 DELETE 都要人工点头</span>
-          <MemHelp text="四选一：采纳新记忆（旧的标失效、可追溯）／保留旧记忆（新的丢弃并把来源并入旧的）／两条都留（记住这一对不是重复，以后不再问）／编辑后合并（你手动拼一条）。删除永远不会自动执行。" />
+        <div class="mem-card-title" style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px">
+          <div>
+            去重（{{ counts.dedup }} 条）
+            <span class="mem-hint">低置信 UPDATE 与全部 DELETE 都要人工点头</span>
+            <MemHelp text="四选一：采纳新记忆（旧的标失效、可追溯）／保留旧记忆（新的丢弃并把来源并入旧的）／两条都留（记住这一对不是重复，以后不再问）／编辑后合并（你手动拼一条）。删除永远不会自动执行。" />
+          </div>
+          <button
+            v-if="counts.dedup"
+            class="btn btn-cta"
+            style="font-size: 12px; padding: 4px 12px"
+            :disabled="batchBusy || !!busy"
+            title="按推荐将所有重复项采纳新记忆生效并保留旧记忆追溯"
+            @click="batchConfirmDedup"
+          >
+            {{ batchBusy ? "处理中…" : `一键推荐采纳新记忆（${counts.dedup}）` }}
+          </button>
         </div>
         <div v-if="counts.dedup" class="mem-col" style="gap: 10px">
           <div v-for="q in dedup" :key="q.id" class="mem-tile">
@@ -251,12 +516,12 @@ defineExpose({ refresh, total });
             <div class="mem-split-2-1">
               <div class="mem-card" style="background: var(--mem-soft)">
                 <div class="mem-hint">已有记忆（旧）</div>
-                <div style="font-size: 12px; margin-top: 4px">{{ q.payload.targetTitle || q.payload.targetId }}</div>
+                <div class="mem-link" style="font-size: 12px; margin-top: 4px" @click="mem.openDetail(q.payload.targetId)">{{ q.payload.targetTitle || q.payload.targetId }} ↗</div>
                 <div class="mem-hint" style="margin-top: 4px">{{ q.payload.targetSummary || "（无摘要）" }}</div>
               </div>
               <div class="mem-card" style="background: var(--mem-soft)">
                 <div class="mem-hint">新记忆</div>
-                <div style="font-size: 12px; margin-top: 4px">{{ q.payload.newTitle || q.payload.newId }}</div>
+                <div class="mem-link" style="font-size: 12px; margin-top: 4px" @click="mem.openDetail(q.payload.newId)">{{ q.payload.newTitle || q.payload.newId }} ↗</div>
                 <div class="mem-hint" style="margin-top: 4px">{{ q.payload.newSummary || "（无摘要）" }}</div>
               </div>
             </div>

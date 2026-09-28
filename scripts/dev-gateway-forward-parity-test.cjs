@@ -131,9 +131,8 @@ const extraUserCmds = [
   { name: "proxy_stats_request", why: "请求日志详情弹窗：按 id 取单条（含 error_body，读 stats.db）" },
   { name: "proxy_stats_cleanup", why: "请求日志手动清理：按保留期删 usage_requests（写 stats.db）" },
   // ZCode 活动领取（额度套餐领取）：读账号 meta.jwt 打 zcode 平面 billing/claim，实现体归子进程
-  { name: "proxy_zcode_claim_preview", why: "ZCode 活动领取：列可领套餐（读号池账号 meta.jwt）" },
-  { name: "proxy_zcode_claim_captcha_config", why: "ZCode 活动领取：拉滑块配置（无鉴权，子进程出网）" },
-  { name: "proxy_zcode_claim", why: "ZCode 活动领取：领取并回刷额度（读号池账号 + 写 credit_packages）" },
+  { name: "proxy_zcode_switch_rollback", why: "ZCode 切号回滚：切出问题一键还原最近一次切前状态（上游 v1.31）" },
+  { name: "proxy_zcode_solve_captcha", why: "ZCode 领取人机校验：粘贴 verifyParam 解锁账号（上游 v1.31）" },
 ];
 const upstreamUserNames = extraUserCmds.map((c) => c.name);
 check("④ 子进程表含 proxy_account_import_blob（import_file 拆两段的子进程半段）",

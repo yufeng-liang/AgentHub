@@ -38,34 +38,85 @@ const adapters = require("./adapters.cjs");
 const clineAuth = require("./clineAuth.cjs");
 const acCred = require("./autoclawCredentials.cjs");
 const raccoonAuth = require("./raccoonAuth.cjs");
+const zcodeLocal = require("./zcodeLocal.cjs");
+const wbCrypto = require("./wbCrypto.cjs");
 
 const OAUTH_PORT = 17388; // 首选回环端口；被占用时退到系统随机端口（授权地址里会带实际端口）
 const OAUTH_TIMEOUT_MS = 180000;
 const POLL_INTERVAL_MS = 1500;
 
-// ===== 路径工具 =====
+// ===== 路径工具（跨平台适配：Windows / macOS / Linux） =====
 
 function localAppData() {
-  return process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+  if (process.env.LOCALAPPDATA) return process.env.LOCALAPPDATA;
+  if (process.platform === "darwin") return path.join(os.homedir(), "Library", "Application Support");
+  if (process.platform === "linux") return process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share");
+  return path.join(os.homedir(), "AppData", "Local");
 }
+
 function roamingAppData() {
-  return process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
+  if (process.env.APPDATA) return process.env.APPDATA;
+  if (process.platform === "darwin") return path.join(os.homedir(), "Library", "Application Support");
+  if (process.platform === "linux") return process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
+  return path.join(os.homedir(), "AppData", "Roaming");
 }
+
+function wbAuthCandidateDirs() {
+  const dirs = [];
+  if (process.env.LOCALAPPDATA) {
+    dirs.push(path.join(process.env.LOCALAPPDATA, "CodeBuddyExtension", "Data", "Public", "auth"));
+  }
+  if (process.platform === "darwin") {
+    dirs.push(path.join(os.homedir(), "Library", "Application Support", "CodeBuddyExtension", "Data", "Public", "auth"));
+  }
+  if (process.platform === "linux") {
+    if (process.env.XDG_DATA_HOME) dirs.push(path.join(process.env.XDG_DATA_HOME, "CodeBuddyExtension", "Data", "Public", "auth"));
+    dirs.push(path.join(os.homedir(), ".local", "share", "CodeBuddyExtension", "Data", "Public", "auth"));
+    if (process.env.XDG_CONFIG_HOME) dirs.push(path.join(process.env.XDG_CONFIG_HOME, "CodeBuddyExtension", "Data", "Public", "auth"));
+    dirs.push(path.join(os.homedir(), ".config", "CodeBuddyExtension", "Data", "Public", "auth"));
+  }
+  dirs.push(path.join(localAppData(), "CodeBuddyExtension", "Data", "Public", "auth"));
+  return dirs;
+}
+
 function wbAuthDir() {
-  return path.join(localAppData(), "CodeBuddyExtension", "Data", "Public", "auth");
+  const candidates = wbAuthCandidateDirs();
+  for (const d of candidates) {
+    try {
+      if (fs.existsSync(d)) return d;
+    } catch { /* 忽略权限错误继续 */ }
+  }
+  return candidates[0];
 }
 
 /** Trae 四件套的应用目录名（与官方安装目录同名；渠道只认自己那一份） */
 const TRAE_APP_DIRS = {
   // 渠道 trae 代理的就是 Trae SOLO CN；同机上的 Trae / TRAE SOLO 登录态与 SOLO 接口不通用，不混入
-  trae: ["TRAE SOLO CN"],
-  trae_cn: ["Trae CN"],
-  trae_solo_cn: ["TRAE SOLO CN"],
+  trae: ["TRAE SOLO CN", "Trae", "trae"],
+  trae_cn: ["Trae CN", "Trae", "trae"],
+  trae_solo_cn: ["TRAE SOLO CN", "Trae", "trae"],
 };
+
 function traeStoragePaths(appDirs) {
-  return appDirs
-    .map((n) => path.join(roamingAppData(), n, "User", "globalStorage", "storage.json"))
-    .filter((p) => fs.existsSync(p));
+  const roots = [];
+  if (process.env.APPDATA) roots.push(process.env.APPDATA);
+  if (process.platform === "darwin") roots.push(path.join(os.homedir(), "Library", "Application Support"));
+  if (process.platform === "linux") {
+    if (process.env.XDG_CONFIG_HOME) roots.push(process.env.XDG_CONFIG_HOME);
+    roots.push(path.join(os.homedir(), ".config"));
+  }
+  roots.push(roamingAppData());
+
+  const out = [];
+  for (const root of roots) {
+    for (const n of appDirs) {
+      const p = path.join(root, n, "User", "globalStorage", "storage.json");
+      try {
+        if (fs.existsSync(p) && !out.includes(p)) out.push(p);
+      } catch { /* 忽略单个路径异常 */ }
+    }
+  }
+  return out;
 }
 
 // ===== Trae ByteCrypto（storage.json 里 iCubeAuthInfo 的信封格式） =====
@@ -175,26 +226,31 @@ function scanWorkBuddy() {
             return null;
           }
         })();
-        // 官方已启用 $wbEncrypted 加密包装时解不开，如实标记而不是塞一个坏 token
+        // 官方 $wbEncrypted 加密包装：先用内置保护密钥解开（5.6.x 起），解不开才如实标记 encrypted
+        let effective = parsed;
         if (parsed && hasEncryptedWrapper(parsed)) {
-          out.push({ channel, uid: "", name: "", token: "", refreshToken: "", source: "scan", encrypted: true, file: f });
-          continue;
+          const dec = decryptWbFields(parsed);
+          if (!dec) {
+            out.push({ channel, uid: "", name: "", token: "", refreshToken: "", source: "scan", encrypted: true, file: f });
+            continue;
+          }
+          effective = dec;
         }
-        const token = extractWbToken(parsed, raw);
+        const token = extractWbToken(effective, typeof effective === "string" ? effective : "");
         if (!token) continue;
-        const uid = pick(parsed, /^(uid|userId|user_id|sub)$/i) || uidFromJwt(token);
+        const uid = pick(effective, /^(uid|userId|user_id|sub)$/i) || uidFromJwt(token);
         out.push({
           channel,
           uid,
-          name: pick(parsed, /^(nickname|displayName|userName|name)$/i),
+          name: pick(effective, /^(nickname|displayName|userName|name)$/i),
           token,
-          refreshToken: pick(parsed, /^(refreshToken|refresh_token)$/i),
-          expiresAt: util.toMs(pick(parsed, /^(expiresAt|expires_at|expiresAtMs)$/i)),
+          refreshToken: pick(effective, /^(refreshToken|refresh_token)$/i),
+          expiresAt: util.toMs(pick(effective, /^(expiresAt|expires_at|expiresAtMs)$/i)),
           // WB 头矩阵元数据（X-Domain / X-Enterprise-Id 的真值来源）
           meta: {
-            domain: pick(parsed, /^(domain|Domain)$/i),
-            enterpriseId: pick(parsed, /^(enterpriseId|enterprise_id)$/i),
-            editionType: pick(parsed, /^editionType$/i),
+            domain: pick(effective, /^(domain|Domain)$/i),
+            enterpriseId: pick(effective, /^(enterpriseId|enterprise_id)$/i),
+            editionType: pick(effective, /^editionType$/i),
           },
           source: "scan",
           file: isHistory ? `${f}（历史快照）` : f,
@@ -219,6 +275,30 @@ function hasEncryptedWrapper(node) {
   if (!node || typeof node !== "object") return false;
   if (Object.prototype.hasOwnProperty.call(node, "$wbEncrypted")) return true;
   return Object.values(node).some((v) => (v && typeof v === "object" ? hasEncryptedWrapper(v) : false));
+}
+
+/**
+ * 解开官方 $wbEncrypted 字段包装：返回一个「字段已还原为明文」的深度变换结果（原对象不动），
+ * 供扫描/写回前读取凭据。保护密钥不可用时返回 null（上层按 encrypted 诚实降级）。
+ * 注意：嵌套在加密字符串内部的字段不再二次还原（官方包装粒度就是整个字段值）。
+ */
+function decryptWbFields(node) {
+  if (!wbCrypto.protectorKey()) return null;
+  const walk = (n) => {
+    if (wbCrypto.isEncryptedWrapper(n)) {
+      return wbCrypto.decryptField(n);
+    }
+    if (Array.isArray(n)) {
+      return n.map(walk);
+    }
+    if (n && typeof n === "object") {
+      const out = {};
+      for (const [k, v] of Object.entries(n)) out[k] = walk(v);
+      return out;
+    }
+    return n;
+  };
+  return walk(node);
 }
 
 /** 从 auth 文件里取 access token：JSON 走别名递归，裸串走 "<uid>+<token>" 或直接当 token */
@@ -467,15 +547,116 @@ function scanAutoClaw() {
   return out;
 }
 
-/** 全量扫描（本机六渠道候选） */
+/** 全量扫描（本机全渠道候选）：六渠道 = 上游四家 + fork 的 cline/autoclaw + 上游 zcode */
 function scanAll() {
-  return [...scanTrae(), ...scanWorkBuddy(), ...scanRaccoon(), ...scanCline(), ...scanAutoClaw()];
+  return [...scanTrae(), ...scanWorkBuddy(), ...scanRaccoon(), ...scanCline(), ...scanAutoClaw(), ...scanZcode()];
+}
+
+// ===== ZCode 本机登录态扫描 =====
+// 两个来源：① ~/.zcode/v2/credentials.json（当前 live 登录态，enc:v1 全键解密）
+//           ② ~/.zcode/v2/account-profiles/profiles.json（官方多账号档案：
+//              每档案 cred_file 解密拿 oauth 键，provider_api_keys 明文直接给对话凭据）
+// uid 口径：coding-plan 键名里的 account uuid > zcodejwt payload user_id > 档案 user_id。
+
+/** 凭据集 → 扫描候选（token 不回显，proxy_scan 出口已脱敏，导入时按候选标识回读） */
+function zcodeCandidateFrom(parsed, extra) {
+  const record = zcodeLocal.accountRecord(parsed, extra);
+  return {
+    channel: "zcode",
+    ...record,
+    expiresAt: 0, // zcodejwt 无 exp；coding-plan key 长期有效
+    source: "scan",
+    file: (extra && extra.file) || "credentials.json",
+  };
+}
+
+function scanZcode() {
+  const out = [];
+  const seen = new Set();
+  // ① 当前 live 登录态
+  const live = zcodeLocal.readLive();
+  if (live) {
+    if (live.jwt || live.codingPlanKeys.length) {
+      const c = zcodeCandidateFrom(live, { file: "credentials.json（当前登录）" });
+      if (c.uid || c.token || c.refreshToken) {
+        out.push(c);
+        if (c.uid) seen.add(c.uid);
+      }
+    } else if (Object.keys(live.raw || {}).length) {
+      // 文件存在但主凭据一个都解不开：官方可能换了密钥派生式，诚实降级引导 OAuth
+      out.push({ channel: "zcode", uid: "", name: "", token: "", refreshToken: "", source: "scan", encrypted: true, file: "credentials.json" });
+    }
+  }
+  // ② 官方多账号档案（每档案一份凭据快照 + 明文 provider_api_keys）
+  for (const prof of zcodeLocal.readProfiles()) {
+    const cred = prof.cred;
+    if (!cred) continue;
+    const jwtFallback = prof.providerApiKeys["builtin:zai-start-plan"] || prof.providerApiKeys["builtin:bigmodel-start-plan"] || "";
+    const c = zcodeCandidateFrom(cred, {
+      profileApiKeys: prof.providerApiKeys,
+      jwtFallback,
+      uid: prof.uid,
+      name: prof.name,
+      email: prof.email,
+      avatar: prof.avatar,
+      provider: prof.family,
+      file: `account-profiles/${prof.file || prof.profileId}`,
+    });
+    if (!c.uid && !c.token && !c.refreshToken) continue;
+    if (c.uid && seen.has(c.uid)) continue; // live 已占位的 uid 不重复出候选
+    if (c.uid) seen.add(c.uid);
+    out.push(c);
+  }
+  return out;
+}
+
+/**
+ * 本机 agent 客户端「当前登录态」速查：渠道 → { uid, name }。
+ * 与 scanAll 的差异：只要「正在登录的那一份」，历史快照（WorkBuddy 带时间戳文件）与
+ * 多账号档案（ZCode account-profiles）都不算——号池列表用它给账号打「本机登录」徽标。
+ *   trae        mtime 最新的 storage.json（iCubeAuthInfo 里的 uid）
+ *   workbuddy   workbuddy-desktop.info（非历史快照）
+ *   workbuddy_ai workbuddy-desktop-ai.info
+ *   raccoon     ~/.box-agent/config/auth.json（JWT iss）
+ *   zcode       ~/.zcode/v2/credentials.json（live 登录态）
+ */
+function currentLocalLogins() {
+  const out = {};
+  try {
+    // traeStoragePaths 已按 mtime 倒序，第一份即本机最近一次使用的登录态
+    const hit = traeStoragePaths(TRAE_APP_DIRS.trae)
+      .map((p) => readTraeStorage(p, "trae"))
+      .find((c) => c && !c.encrypted && c.uid);
+    if (hit) out.trae = { uid: hit.uid, name: hit.name || "" };
+  } catch { /* 单渠道探测失败不影响其他 */ }
+  try {
+    for (const c of scanWorkBuddy()) {
+      if (c.encrypted || !c.uid) continue;
+      if (out[c.channel]) continue;
+      if (/（历史快照）/.test(c.file || "")) continue;
+      out[c.channel] = { uid: c.uid, name: c.name || "" };
+    }
+  } catch { /* 同上 */ }
+  try {
+    const r = scanRaccoon()[0];
+    if (r && r.uid) out.raccoon = { uid: r.uid, name: r.name || "" };
+  } catch { /* 同上 */ }
+  try {
+    const live = zcodeLocal.readLive();
+    if (live) {
+      const rec = zcodeLocal.accountRecord(live, {});
+      const uid = String(rec.uid || zcodeLocal.uidFromJwt(live.jwt) || "");
+      if (uid) out.zcode = { uid, name: String(rec.name || "") };
+    }
+  } catch { /* 同上 */ }
+  return out;
+
 }
 
 /** 导入扫描结果入池：同渠道同 uid 已存在则更新凭据（刷新 token），否则新建 */
 function importCandidate(candidate, channelOverride) {
   const channel = channelOverride || candidate.channel;
-  if (!candidate.token) {
+  if (!candidate.token && !candidate.refreshToken) {
     throw new Error(
       candidate.encrypted
         ? "该本地登录态是加密信封，离线解不开，请改用「OAuth 登录」"
@@ -644,7 +825,16 @@ function validateTraeCallback(q, session) {
   if (state != null && state !== "") {
     return state === session.state ? { ok: true } : { ok: false, message: "state 校验不通过（非本次发起的授权回调）" };
   }
-  return { ok: true };
+  const traceId = q.get("login_trace_id") || q.get("loginTraceID");
+  if (traceId != null && traceId !== "") {
+    return traceId === session.traceId ? { ok: true } : { ok: false, message: "login_trace_id 校验不通过（非本次发起的授权会话）" };
+  }
+  // 既无 state 也无 traceId 时：仅放行须经 PKCE code_verifier 校验的 authCode 模式，杜绝未经授权直接注入裸 Token
+  const hasAuthCode = !!(q.get("authCode") || q.get("code") || q.get("authCodeInfo") || q.get("auth_code_info"));
+  if (hasAuthCode) {
+    return { ok: true };
+  }
+  return { ok: false, message: "安全拦截：回调缺少会话校验标识（state/login_trace_id），拒绝直接注入裸凭据" };
 }
 
 /** 解回调里 URL 编码的 JSON 参数（userInfo / userJwt / authCodeInfo），参考项目 parse_json_param */
@@ -770,11 +960,15 @@ async function saveTraeAccount(accessToken, refreshToken, channel, extra) {
   return { id, uid };
 }
 
-// ===== 商汤小浣熊：授权码 + 手动粘贴回调 URL =====
-// 官方登录走客户端深链回调（office-raccoon://auth/callback?code=xxx），AgentHub 无法代收深链；
-// 但授权页（/code/authorize）可以在浏览器打开，用户登录后复制地址栏的深链 URL 粘回来，
-// 从 URL 里提取一次性授权码，调 /auth/v1/login_with_authorization_code 换 token。
-// 与 Trae 的「手动粘贴回调地址」兜底路径完全同构，复用 oauthSession.submit。
+// ===== 商汤小浣熊：内嵌授权窗截获深链回调（授权码不经过官方客户端） =====
+// 官方登录的收尾是深链回调 office-raccoon://auth/callback?code=xxx（一次性授权码）。
+// 在系统浏览器里打开授权页时，这个深链会被操作系统交给本机的官方客户端（或让用户手动选择），
+// 授权码被官方客户端消费掉 → AgentHub 既拿不到回调、粘贴同一段 URL 换码还会回 200035
+// （授权码不存在/已消费），这就是「oauth 登录收不到回调」的根因。
+// 因此这里改为：授权页在 AgentHub 自己的内嵌授权窗里打开，窗口层拦截一切 office-raccoon://
+// 跳转、就地提取授权码（不进系统浏览器、不惊动官方客户端）→ 换 token 入池。
+// 其余渠道本就不经过深链：trae 回环 HTTP / workbuddy·zcode 服务端轮询，回调天然只到 AgentHub。
+// 手动粘贴深链 URL 保留为兜底（窗口被关、页面形态变化时用），复用 oauthSession.submit。
 
 function raccoonCfg() {
   return rules.get("headers.json").raccoon || {};
@@ -809,56 +1003,211 @@ async function exchangeRaccoonAuthCode(code) {
   };
 }
 
-/** 小浣熊 OAuth：打开官方授权页，用户登录后复制地址栏深链 URL 粘回完成兑换 */
-async function beginRaccoonOAuth(channel, onDone) {
+/** 小浣熊 OAuth：内嵌授权窗 + 深链截获（主操作）；手动粘贴深链 URL（兜底） */
+async function beginRaccoonOAuth(channel, onDone, helpers) {
   const state = crypto.randomBytes(16).toString("hex");
   const c = raccoonCfg();
   const authUrl = `${String(c.authPageBase || "https://xiaohuanxiong.com").replace(/\/+$/, "")}/code/authorize?login_source=desktop&appname=${encodeURIComponent(c.authAppName || "办公小浣熊客户端")}`;
+  const openWindow = helpers && helpers.openAuthWindow;
 
-  oauthSession = {
-    mode: "manual",
+  /** 授权码 → 兑换凭据 → 落库（深链截获与手动粘贴共用；opts.keepSession 时提取失败不杀会话，允许重粘） */
+  const redeem = async (rawCode, opts) => {
+    const code = String(rawCode || "").trim();
+    if (!code) {
+      const message = "未能从回调里提取授权码，请回到授权页重新登录获取新码";
+      if (!(opts && opts.keepSession)) finishOAuth({ ok: false, message });
+      return { ok: false, message };
+    }
+    try {
+      const cred = await exchangeRaccoonAuthCode(code);
+      if (!cred.ok) {
+        finishOAuth({ ok: false, message: cred.message });
+        return { ok: false, message: cred.message };
+      }
+      // uid 从 access_token 的 iss 解（与 scanRaccoon 同口径），office_identity 入 meta
+      const uid = raccoonAuth.tokenUid(cred.token) || "";
+      const existing = uid ? store.listAccounts(channel).find((a) => a.uid === uid) : null;
+      if (existing) {
+        store.updateAccount(existing.id, {
+          token: cred.token,
+          refreshToken: cred.refreshToken,
+          status: "online",
+          coolUntil: 0,
+          coolReason: "",
+          meta: { ...readAccountMeta(existing.id), officeIdentity: cred.officeIdentity || "" },
+        });
+        finishOAuth({ ok: true, id: existing.id, uid });
+        return { ok: true, id: existing.id, uid, updated: true };
+      }
+      const id = store.addAccount({
+        channel,
+        uid,
+        name: uid ? `账号 ${uid.slice(0, 6)}` : "小浣熊账号",
+        token: cred.token,
+        refreshToken: cred.refreshToken,
+        source: "oauth",
+        meta: { officeIdentity: cred.officeIdentity || "" },
+      });
+      finishOAuth({ ok: true, id, uid });
+      return { ok: true, id, uid, updated: false };
+    } catch (e) {
+      const msg = String((e && e.message) || e);
+      finishOAuth({ ok: false, message: msg });
+      return { ok: false, message: msg };
+    }
+  };
+
+  const session = {
+    mode: "window",
     channel,
     state,
     onDone,
     timer: setTimeout(() => finishOAuth({ ok: false, message: "登录超时（3 分钟）" }), OAUTH_TIMEOUT_MS),
-    // 用户粘贴地址栏深链 URL（office-raccoon://auth/callback?code=xxx）完成登录
+    closeWindow: null,
+    // 手动兜底：整段粘贴 office-raccoon://auth/callback?code=xxx 深链
     submit: async (rawInput) => {
       if (!oauthSession || oauthSession.channel !== channel) return { ok: false, message: "当前没有进行中的登录" };
       const q = parseCallbackInput(rawInput);
       const code = q && (q.get("code") || q.get("authCode") || q.get("authorization_code"));
       if (!code) return { ok: false, message: "无法从粘贴的内容里提取授权码：请整段复制浏览器地址栏内容（形如 office-raccoon://auth/callback?code=…）" };
+      return redeem(code);
+    },
+  };
+  oauthSession = session;
+
+  // 深链 → 授权码（两处截获点共用）：office-raccoon://auth/callback?code=…
+  const redeemDeeplink = (deepUrl) => {
+    const q = parseCallbackInput(deepUrl);
+    const code = q && (q.get("code") || q.get("authCode") || q.get("authorization_code"));
+    void redeem(code);
+  };
+
+  if (typeof openWindow === "function") {
+    const opened = openWindow({
+      title: "商汤小浣熊 · 官方授权登录",
+      url: authUrl,
+      onCaptured: redeemDeeplink,
+      // 用户关窗 = 放弃本次登录（已完成兑换的会话在最后一步收尾，不会走到这里）
+      onClosed: () => {
+        if (oauthSession === session) finishOAuth({ ok: false, message: "已关闭授权窗口，登录未完成" });
+      },
+    });
+    if (opened && opened.ok !== false) {
+      session.closeWindow = opened.close || null;
+      session.attachCancel = () => {
+        try { if (session.closeWindow) session.closeWindow(); } catch { /* 已关 */ }
+      };
+      return { ok: true, mode: "window" };
+    }
+    // 窗口创建失败（fork：网关子进程是 ELECTRON_RUN_AS_NODE，无 BrowserWindow）——
+    // 不失败，落回手动粘贴模式：url 返给 UI 展示，深链由用户粘回（submit 兜底两者通吃）
+  }
+  return { ok: true, url: authUrl, mode: "manual" };
+}
+
+// ===== ZCode：服务端中介 CLI 轮询登录（无回环端口） =====
+// 流程（复刻官方 3.12.3 startOAuthWithPolling，zcode-api src/auth/oauth.ts 实证）：
+//   ① 本机生成 32B hex poll_token，POST /oauth/cli/init {provider} 换 {flow_id, authorize_url}
+//   ② 授权地址拼「桌面中转页」参数（zai 用 redirect_uri / bigmodel 用 redirect），浏览器完成授权
+//   ③ GET /oauth/cli/poll/{flow_id} 按服务端下发的间隔轮询，ready 得
+//      {token(zcodejwt), user, {provider}:{access_token,refresh_token}}
+//   ④ 落库后后台跑激活链：business login 触发服务端初始化 billing plan →
+//      轮询 plans 就绪 → 解析 coding-plan API key（getCustomerInfo → api_keys find-or-create → copy 取 secret）
+// 手动兜底：粘贴 zcode://zai-auth/callback?code=… 深链，走 /oauth/token 授权码兑换。
+
+function zcodeCfg() {
+  return rules.get("headers.json").zcode || {};
+}
+
+/** ZCode 控制面公共头（控制面带 X-Device-Mid；与 adapters.zcodeCtlHeaders 同构，独立一份防循环依赖） */
+function zcodeCtlHeaders(c, bearerToken) {
+  const ver = c.appVersion || "4.1.10";
+  const h = {
+    "content-type": "application/json",
+    accept: "application/json",
+    "User-Agent": `ZCode/${ver}`,
+    "HTTP-Referer": c.refererOrigin || "https://zcode.z.ai",
+    "X-Title": `Z Code@${c.sourceTitle || "cli"}`,
+    "X-ZCode-App-Version": ver,
+    "X-Platform": c.platform || "win32-x64",
+    "X-Release-Channel": "stable",
+    "X-Client-Language": "zh-CN",
+    "X-Client-Timezone": "Asia/Shanghai",
+    "X-Os-Category": "windows",
+  };
+  const mid = (() => {
+    const t = zcodeLocal.readJson(zcodeLocal.paths().telemetry);
+    return String((t && t.deviceMid) || "");
+  })();
+  if (mid) h["X-Device-Mid"] = mid;
+  if (bearerToken) h["authorization"] = `Bearer ${bearerToken}`;
+  return h;
+}
+
+/** 桌面中转页参数：官方客户端在 authorize_url 上拼的 zcode:// 弹跳地址（授权完成服务端落标记，poll 才翻 ready） */
+function zcodeInterstitial(c) {
+  const u = new URL("/app/oauth/login", c.refererOrigin || "https://zcode.z.ai");
+  u.searchParams.set("redirect", "zcode://oauth/callback");
+  u.searchParams.set("app_version", c.appVersion || "4.1.10");
+  return u.toString();
+}
+
+async function beginZcodeOAuth(channel, onDone) {
+  const c = zcodeCfg();
+  const provider = String(c.oauthProvider || "zai");
+  const pollToken = crypto.randomBytes(32).toString("hex");
+  const initR = await adapters
+    .httpJson(c.oauthInitUrl, {
+      method: "POST",
+      headers: { ...zcodeCtlHeaders(c, pollToken) },
+      body: JSON.stringify({ provider }),
+    })
+    .catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
+  const d = initR.data && (initR.data.data || initR.data);
+  const flowId = d && String(d.flow_id || "");
+  const authorizeUrlRaw = d && String(d.authorize_url || "");
+  if (!initR.ok || !flowId || !authorizeUrlRaw) {
+    const msg = (initR.data && (initR.data.message || initR.data.msg)) || initR.message || `HTTP ${initR.status || 0}`;
+    return { ok: false, message: `ZCode 登录初始化失败：${msg}` };
+  }
+  const intervalMs = Math.max(1000, Number(d.poll_interval_sec) * 1000 || 1500);
+  const expiresAt = Number(d.expires_at) * 1000 || 0;
+  const authUrl = (() => {
+    try {
+      const u = new URL(authorizeUrlRaw);
+      u.searchParams.set(provider === "zai" ? "redirect_uri" : "redirect", zcodeInterstitial(c));
+      return u.toString();
+    } catch {
+      return authorizeUrlRaw;
+    }
+  })();
+
+  oauthSession = {
+    mode: "poll",
+    channel,
+    state: flowId,
+    pollToken,
+    provider,
+    intervalMs,
+    server: null,
+    onDone,
+    timer: null,
+    deadline: Math.min(Date.now() + OAUTH_TIMEOUT_MS, expiresAt || Date.now() + OAUTH_TIMEOUT_MS),
+    // 手动兜底：粘贴 zcode:// 深链回调（授权码换 token）
+    submit: async (rawInput) => {
+      const text = String(rawInput || "").trim();
+      const m = /[?&]code=([^&#]+)/.exec(text);
+      if (!m) return { ok: false, message: "无法从粘贴内容提取授权码：请复制形如 zcode://zai-auth/callback?code=… 的整段链接" };
+      const state = (/[?&]state=([^&#]+)/.exec(text) || [])[1] || "";
       try {
-        const cred = await exchangeRaccoonAuthCode(code);
+        const cred = await exchangeZcodeAuthCode(decodeURIComponent(m[1]), decodeURIComponent(state));
         if (!cred.ok) {
           finishOAuth({ ok: false, message: cred.message });
           return { ok: false, message: cred.message };
         }
-        // uid 从 access_token 的 iss 解（与 scanRaccoon 同口径），office_identity 入 meta
-        const uid = raccoonAuth.tokenUid(cred.token) || "";
-        const existing = uid ? store.listAccounts(channel).find((a) => a.uid === uid) : null;
-        if (existing) {
-          store.updateAccount(existing.id, {
-            token: cred.token,
-            refreshToken: cred.refreshToken,
-            status: "online",
-            coolUntil: 0,
-            coolReason: "",
-            meta: { officeIdentity: cred.officeIdentity || "" },
-          });
-          finishOAuth({ ok: true, id: existing.id, uid });
-          return { ok: true, id: existing.id, uid, updated: true };
-        }
-        const id = store.addAccount({
-          channel,
-          uid,
-          name: uid ? `账号 ${uid.slice(0, 6)}` : "小浣熊账号",
-          token: cred.token,
-          refreshToken: cred.refreshToken,
-          source: "oauth",
-          meta: { officeIdentity: cred.officeIdentity || "" },
-        });
-        finishOAuth({ ok: true, id, uid });
-        return { ok: true, id, uid, updated: false };
+        const saved = await saveZcodeAccount(channel, cred);
+        finishOAuth({ ok: true, id: saved.id, uid: saved.uid });
+        return { ok: true, id: saved.id, uid: saved.uid, updated: saved.updated };
       } catch (e) {
         const msg = String((e && e.message) || e);
         finishOAuth({ ok: false, message: msg });
@@ -866,7 +1215,266 @@ async function beginRaccoonOAuth(channel, onDone) {
       }
     },
   };
-  return { ok: true, url: authUrl, mode: "manual" };
+  pollZcodeToken();
+  return { ok: true, url: authUrl, mode: "poll" };
+}
+
+function pollZcodeToken() {
+  const session = oauthSession;
+  if (!session) return;
+  const c = zcodeCfg();
+  const tick = async () => {
+    if (!oauthSession || oauthSession.state !== session.state) return;
+    if (Date.now() > session.deadline) {
+      finishOAuth({ ok: false, message: "登录超时（3 分钟）" });
+      return;
+    }
+    const r = await adapters
+      .httpJson(`${c.oauthPollBase}/${encodeURIComponent(session.state)}`, {
+        method: "GET",
+        headers: zcodeCtlHeaders(c, session.pollToken),
+      })
+      .catch(() => null);
+    // 网络错误/5xx/408/429 按 pending 继续等；4xx 其余与信封 code 非 0 是终局错误
+    if (r && r.status >= 400 && r.status < 500 && r.status !== 408 && r.status !== 429) {
+      finishOAuth({ ok: false, message: `登录轮询失败（HTTP ${r.status}）` });
+      return;
+    }
+    if (r && r.ok && r.data) {
+      const code = Number(r.data.code ?? 0);
+      if (code !== 0) {
+        finishOAuth({ ok: false, message: `登录轮询失败（code ${code}）${r.data.message || r.data.msg || ""}` });
+        return;
+      }
+      const d = r.data.data || {};
+      const status = String(d.status || "pending");
+      if (status === "ready") {
+        const p = session.provider === "bigmodel" ? "bigmodel" : "zai";
+        const prov = (d[p] && typeof d[p] === "object" ? d[p] : {}) || {};
+        const cred = {
+          jwt: String(d.token || "").trim(),
+          accessToken: String(prov.access_token || "").trim(),
+          refreshToken: String(prov.refresh_token || "").trim(),
+          provider: p,
+          user: d.user && typeof d.user === "object" ? d.user : {},
+        };
+        if (!cred.jwt || !cred.accessToken) {
+          finishOAuth({ ok: false, message: "登录返回缺少凭据字段（token/access_token）" });
+          return;
+        }
+        try {
+          const saved = await saveZcodeAccount(session.channel, cred);
+          finishOAuth({ ok: true, id: saved.id, uid: saved.uid });
+        } catch (e) {
+          finishOAuth({ ok: false, message: String((e && e.message) || e) });
+        }
+        return;
+      }
+      if (status === "failed") {
+        finishOAuth({ ok: false, message: "授权失败，请重新发起登录" });
+        return;
+      }
+    }
+    if (oauthSession && oauthSession.state === session.state) oauthSession.timer = setTimeout(tick, session.intervalMs);
+  };
+  session.timer = setTimeout(tick, session.intervalMs);
+}
+
+/** 授权码兑换（手动粘贴 zcode:// 深链的兜底路径） */
+async function exchangeZcodeAuthCode(code, state) {
+  const c = zcodeCfg();
+  const provider = String(c.oauthProvider || "zai");
+  const r = await adapters
+    .httpJson(c.oauthTokenUrl, {
+      method: "POST",
+      headers: zcodeCtlHeaders(c, ""),
+      body: JSON.stringify({ provider, code, redirect_uri: "zcode://zai-auth/callback", state }),
+    })
+    .catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
+  const d = r.data && (r.data.data || r.data);
+  const jwt = d && String(d.token || d.zcode_token || "").trim();
+  const prov = (d && typeof d[provider] === "object" ? d[provider] : null) || d || {};
+  const accessToken = String(prov.access_token || prov.accessToken || "").trim();
+  if (r.ok && jwt && accessToken) {
+    return {
+      ok: true,
+      jwt,
+      accessToken,
+      refreshToken: String(prov.refresh_token || prov.refreshToken || "").trim(),
+      provider,
+      user: (d && d.user) || {},
+    };
+  }
+  return { ok: false, message: (r.data && (r.data.message || r.data.msg)) || r.message || `授权码兑换失败 HTTP ${r.status || 0}` };
+}
+
+/** OAuth 凭据落库（同 uid 更新既有行），并后台激活 coding-plan */
+async function saveZcodeAccount(channel, cred) {
+  const uid = String(cred.user.user_id || cred.user.uid || "") || zcodeLocal.uidFromJwt(cred.jwt);
+  const email = String(cred.user.email || "");
+  const name = String(cred.user.name || cred.user.nickname || email || (uid ? `ZCode ${uid.slice(0, 6)}` : "ZCode 账号"));
+  const deviceMid = (cred.meta && cred.meta.deviceMid) || util.uuid();
+  const meta = {
+    provider: cred.provider,
+    email,
+    avatar: String(cred.user.avatar || cred.user.avatar_url || ""),
+    deviceMid,
+    codingPlanResolved: false,
+    sw: {
+      accessToken: zcodeLocal.seal(cred.accessToken),
+      refreshToken: zcodeLocal.seal(cred.refreshToken),
+      userInfo: zcodeLocal.seal(JSON.stringify(cred.user || {})),
+      codingPlanKeys: zcodeLocal.seal("[]"),
+      relayPassHash: "",
+    },
+  };
+  const existing = uid ? store.listAccounts(channel).find((a) => a.uid === uid) : null;
+  let id;
+  let updated = false;
+  if (existing) {
+    // 合并 meta：保留旧 meta 里可能存在的 relayPassHash、历史画像与专属 deviceMid
+    const oldMeta = readAccountMeta(existing.id);
+    const existingCodingPlanKeys = (oldMeta.sw && oldMeta.sw.codingPlanKeys) ? oldMeta.sw.codingPlanKeys : "";
+    const merged = {
+      ...oldMeta,
+      ...meta,
+      deviceMid: oldMeta.deviceMid || meta.deviceMid,
+      sw: {
+        ...(oldMeta.sw || {}),
+        ...meta.sw,
+        codingPlanKeys: existingCodingPlanKeys || meta.sw.codingPlanKeys,
+        relayPassHash: (oldMeta.sw && oldMeta.sw.relayPassHash) || "",
+      },
+    };
+    store.updateAccount(existing.id, { token: cred.jwt, meta: merged, status: "online", coolUntil: 0, coolReason: "" });
+    id = existing.id;
+    updated = true;
+  } else {
+    id = store.addAccount({
+      channel,
+      uid,
+      name,
+      token: cred.jwt,
+      refreshToken: "",
+      source: "oauth",
+      meta,
+    });
+  }
+  // 后台激活链：business login 初始化 billing plan → 解析 coding-plan API key（失败不阻塞账号可用性）
+  activateZcodeAccount(id, { accessToken: cred.accessToken, jwt: cred.jwt, provider: cred.provider }).catch(() => {});
+  return { id, uid, updated };
+}
+
+function readAccountMeta(id) {
+  try {
+    const row = store.getAccount(id);
+    const m = JSON.parse((row && row.meta) || "{}");
+    return m && typeof m === "object" && !Array.isArray(m) ? m : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * 登录后激活链（zcode-account-switcher oauth.js + zcode-api resolver.ts 实证）：
+ * 新账号必须补 POST z/login 触发服务端初始化 billing plan，否则额度查询/claim 全为空；
+ * 然后经 getCustomerInfo → 默认机构/默认项目 → find-or-create「zcode-api-key」→ copy 取 secret
+ * 解析出 coding-plan 凭据（{apiKey}.{secret}），写入 refresh_enc 与 meta.sw.codingPlanKeys。
+ * 全程后台执行，任何一步失败只标 meta.codingPlanResolved=false（start-plan 通道仍可用）。
+ */
+async function activateZcodeAccount(accountId, cred) {
+  const c = zcodeCfg();
+  const mark = (patch) => {
+    const meta = readAccountMeta(accountId);
+    store.updateAccount(accountId, { meta: { ...meta, ...patch } });
+  };
+  // ① business login（0/3/10s 三次重试；服务端初始化是异步的）
+  for (const delay of [0, 3000, 10000]) {
+    if (delay) await new Promise((r) => setTimeout(r, delay));
+    const r = await adapters
+      .httpJson(c.businessLoginUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({ token: cred.accessToken }),
+      })
+      .catch(() => null);
+    const bizToken = r && r.data && (r.data.access_token || r.data.accessToken || (r.data.data && r.data.data.access_token));
+    if (r && r.ok && bizToken) {
+      cred.bizToken = String(bizToken);
+      break;
+    }
+    if (r && r.data && (r.data.code === 0 || r.data.code === 200 || r.data.success === true)) break; // 成功但无 token：plan 初始化已触发
+  }
+  // ② 等 billing plans 就绪（1/3/6/15/30/60s 渐进轮询）
+  const qs = `app_version=${encodeURIComponent(c.appVersion)}&platform=${encodeURIComponent(c.platform)}`;
+  let plansReady = false;
+  for (const delay of [1000, 3000, 6000, 15000, 30000, 60000]) {
+    await new Promise((r) => setTimeout(r, delay));
+    const r = await adapters
+      .httpJson(`${c.billingBase}/billing/current?${qs}`, { method: "GET", headers: zcodeCtlHeaders(c, cred.jwt) })
+      .catch(() => null);
+    const plans = r && r.data && r.data.data && Array.isArray(r.data.data.plans) ? r.data.data.plans : [];
+    if (plans.length) {
+      plansReady = true;
+      break;
+    }
+  }
+  // ③ coding-plan API key 解析链（bizToken 必需；bigmodel 路直接用 accessToken 作 authorization）
+  if (!cred.bizToken && cred.provider === "zai") {
+    mark({ codingPlanResolved: false, codingPlanError: "business login 未取到 bizToken" });
+    return;
+  }
+  try {
+    const bizBase = cred.provider === "bigmodel" ? c.bigmodelBizBase : c.zaiBizBase;
+    const authorization = cred.provider === "bigmodel" ? cred.accessToken : `Bearer ${cred.bizToken}`;
+    const bizHeaders = { "content-type": "application/json", authorization };
+    const unwrap = (r) => {
+      const body = r && r.data;
+      const code = body && (body.code ?? body.status);
+      if (!r || !r.ok || (code != null && code !== 0 && code !== 200 && code !== "0" && code !== "200")) {
+        throw new Error((body && (body.msg || body.message)) || `biz API HTTP ${(r && r.status) || 0}`);
+      }
+      return body.data ?? body;
+    };
+    const info = unwrap(await adapters.httpJson(`${bizBase}/api/biz/customer/getCustomerInfo`, { method: "GET", headers: bizHeaders }));
+    const orgs = Array.isArray(info.organizations) ? info.organizations : Array.isArray(info.orgs) ? info.orgs : [];
+    if (!orgs.length) throw new Error("getCustomerInfo 返回无机构");
+    const org = orgs.find((o) => String(o.organizationName || o.name || "").includes("默认机构")) || orgs[0];
+    const orgId = String(org.organizationId || org.id || org.orgId || "");
+    const projects = Array.isArray(org.projects) ? org.projects : [];
+    const proj = projects.find((p) => String(p.projectName || p.name || "").includes("默认项目")) || projects[0];
+    const projectId = proj && String(proj.projectId || proj.id || "");
+    if (!orgId || !projectId) throw new Error("默认机构/默认项目缺失");
+    const keysUrl = `${bizBase}/api/biz/v1/organization/${orgId}/projects/${projectId}/api_keys`;
+    let apiKey = "";
+    try {
+      const list = unwrap(await adapters.httpJson(keysUrl, { method: "GET", headers: bizHeaders }));
+      const found = (Array.isArray(list) ? list : []).find((k) => k && k.name === "zcode-api-key" && typeof k.apiKey === "string" && k.apiKey);
+      if (found) apiKey = found.apiKey;
+    } catch { /* 列表失败走创建 */ }
+    if (!apiKey) {
+      const created = unwrap(await adapters.httpJson(keysUrl, { method: "POST", headers: bizHeaders, body: JSON.stringify({ name: "zcode-api-key" }) }));
+      if (typeof created.apiKey !== "string" || !created.apiKey) throw new Error("API key 创建返回缺 apiKey 字段");
+      apiKey = created.apiKey;
+    }
+    const copy = unwrap(await adapters.httpJson(`${keysUrl}/copy/${encodeURIComponent(apiKey)}`, { method: "GET", headers: bizHeaders }));
+    const secret = String(copy.secretKey || copy.secret_key || "");
+    if (!secret) throw new Error("API key copy 返回缺 secretKey");
+    const fullKey = `${apiKey}.${secret}`;
+    const uid = String((store.getAccount(accountId) || {}).uid || "");
+    const keyName = `account-provider:coding-plan:account:zai-individual-coding-plan:account:${uid}:api-key`;
+    const meta = readAccountMeta(accountId);
+    store.updateAccount(accountId, {
+      refreshToken: fullKey,
+      meta: {
+        ...meta,
+        codingPlanResolved: true,
+        sw: { ...(meta.sw || {}), codingPlanKeys: zcodeLocal.seal(JSON.stringify([{ keyName, plain: fullKey }])) },
+      },
+    });
+  } catch (e) {
+    mark({ codingPlanResolved: false, codingPlanError: String((e && e.message) || e).slice(0, 200) });
+  }
 }
 
 /** Trae SOLO CN：PKCE + 本地回环回调 */
@@ -1477,301 +2085,6 @@ async function exchangeAutoClawIntl(userapi, vendor, code, upstreamState, naviga
   };
 }
 
-// ===== ZCode OAuth（智谱/Z.AI 编码套餐订阅登录；服务端中介 CLI 轮询，无本地回调；协议参考 agent2api zcode/oauth.rs + coding_key.rs） =====
-// 四步：① init 拿 flow_id + authorize_url ② 补中转页参数（redirect/redirect_uri 两地不同）③ 用户浏览器授权
-// ④ 轮询 poll。拿到 OAuth 令牌后**必须**再换一把编码套餐 API Key（coding key）——直接拿 OAuth 令牌打
-// /chat/completions 必 401。换取失败即登录失败，不落半条「能登录但发不出请求」的账号。
-
-/** RFC 3986 unreserved 透传编码（与 agent2api claim::urlencode 同规则；查询值/路径段通用） */
-function zcodeUrlencode(value) {
-  return String(value == null ? "" : value).replace(/[^A-Za-z0-9\-_.~]/g, (c) =>
-    Array.from(Buffer.from(c, "utf8")).map((b) => "%" + b.toString(16).toUpperCase().padStart(2, "0")).join(""));
-}
-
-/** 中转页替换（set 语义）：国际版换 redirect_uri、国内版换 redirect；中转页地址整体再编一次
- *  （内层已是 zcode%3A%2F%2F…，外层编成 %253A%252F%252F…，中转页解一次仍得 zcode://oauth/callback）。
- *  写错参数名对应那一地会静默停在 pending 直到超时——这是最不直观的一处坑（见 oauth.rs 模块头）。 */
-function applyZcodeInterstitial(cfg, authorizeUrl) {
-  const param = cfg.region === "intl" ? "redirect_uri" : "redirect";
-  const ver = adapters._zcodeAppVersion();
-  const target = zcodeUrlencode(`${adapters._zcodeOrigin}/app/oauth/login?redirect=zcode%3A%2F%2Foauth%2Fcallback&app_version=${ver}`);
-  const replacement = `${param}=${target}`;
-  const [head, fragment] = String(authorizeUrl || "").split("#");
-  const qi = head.indexOf("?");
-  const path = qi >= 0 ? head.slice(0, qi) : head;
-  const query = qi >= 0 ? head.slice(qi + 1) : "";
-  const segs = [];
-  let replaced = false;
-  for (const seg of query.split("&").filter(Boolean)) {
-    if (seg.startsWith(`${param}=`)) { if (!replaced) { segs.push(replacement); replaced = true; } continue; }
-    segs.push(seg);
-  }
-  if (!replaced) segs.push(replacement);
-  let out = `${path}?${segs.join("&")}`;
-  if (fragment != null) out += `#${fragment}`;
-  return out;
-}
-
-/** 候选键里取第一个非空字符串（上游 id 字段名换过几轮） */
-function pickZcodeId(item, keys) {
-  for (const k of keys) {
-    const v = item && item[k];
-    if (typeof v === "string" && v.trim()) return v.trim();
-  }
-  return "";
-}
-
-/** JWT exp → 毫秒（coding key 多是不透明串，解不出回 0，调用方再退回套餐 jwt） */
-function zcodeExpiresAt(token) {
-  const exp = Number(util.jwtDecode(String(token || "")).exp) || 0;
-  return exp > 0 ? (exp > 1e12 ? exp : exp * 1000) : 0;
-}
-// 注：httpJson 硬编码 60s 超时且不读额外键（见 adapters.cjs），故这里不传 timeoutMs（那是死键）。
-
-/** 一次 biz 接口调用 + 信封解包：code/status 缺失=成功，0/200/"" 成功；返回 data ?? 整包。
- *  authorization 为空 = 不发该头（z/login 是匿名接口，发空 Authorization 会被判 401）。 */
-async function zcodeBizRequest(url, method, authorization, body) {
-  const headers = {};
-  if (body !== undefined) headers["content-type"] = "application/json";
-  if (authorization && authorization.trim()) headers.authorization = authorization;
-  const r = await adapters.httpJson(url, {
-    method, headers,
-    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
-  }).catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
-  const payload = r.data;
-  if (payload == null || typeof payload !== "object") throw new Error("ZCode 登录换取失败：上游响应不是 JSON");
-  const code = payload.code != null ? payload.code : payload.status;
-  if (code != null && !(Number(code) === 0 || Number(code) === 200 || String(code).trim() === "")) {
-    throw new Error(`ZCode 登录换取被拒：${(payload.msg && String(payload.msg).trim()) || "上游未说明原因"}`);
-  }
-  return payload.data != null ? payload.data : payload;
-}
-
-/** OAuth 令牌 → 编码套餐 API Key（coding key）。国际版恒为 {apiKey}.{secret}；国内版有 secret 两段、否则单段。 */
-async function resolveZcodeCodingKey(cfg, oauthToken) {
-  const token = String(oauthToken || "").trim();
-  if (!token) throw new Error("ZCode 登录响应里没有可换取推理凭证的登录态");
-  const host = cfg.bizHost;
-  // 国际版：OAuth 令牌 → biz 令牌（Bearer）；国内版：OAuth 令牌直接当 biz 令牌（裸令牌，逐字照 agent2api）
-  let bizToken = token;
-  if (cfg.region === "intl") {
-    const d = await zcodeBizRequest(`${host}/api/auth/z/login`, "POST", "", { token });
-    bizToken = String((d && (d.access_token || d.accessToken)) || (d && d.data && d.data.access_token) || "").trim();
-    if (!bizToken) throw new Error("ZCode 登录换取失败：上游未返回访问令牌");
-  }
-  const authorization = cfg.region === "intl" ? `Bearer ${bizToken}` : bizToken;
-  const ci = await zcodeBizRequest(`${host}/api/biz/customer/getCustomerInfo`, "GET", authorization);
-  const orgs = ci && (Array.isArray(ci.organizations) ? ci.organizations : Array.isArray(ci.orgs) ? ci.orgs : null);
-  if (!orgs || !orgs.length) throw new Error("ZCode 登录换取失败：该账号下没有可用机构");
-  const org = orgs.find((o) => String((o && (o.organizationName || o.name)) || "").includes("默认机构")) || orgs[0];
-  const orgId = pickZcodeId(org, ["organizationId", "id", "orgId"]);
-  if (!orgId) throw new Error("ZCode 登录换取失败：机构缺少标识");
-  const projects = org && Array.isArray(org.projects) ? org.projects : null;
-  if (!projects || !projects.length) throw new Error("ZCode 登录换取失败：默认机构下没有可用项目");
-  const project = projects.find((p) => String((p && (p.projectName || p.name)) || "").includes("默认项目")) || projects[0];
-  const projectId = pickZcodeId(project, ["projectId", "id"]);
-  if (!projectId) throw new Error("ZCode 登录换取失败：项目缺少标识");
-  const keysUrl = `${host}/api/biz/v1/organization/${orgId}/projects/${projectId}/api_keys`;
-  let apiKey = "";
-  try {
-    const list = await zcodeBizRequest(keysUrl, "GET", authorization);
-    if (Array.isArray(list)) {
-      const hit = list.find((k) => k && k.name === "zcode-api-key" && String(k.apiKey || "").trim());
-      if (hit) apiKey = String(hit.apiKey).trim();
-    }
-  } catch { /* 列表失败不致命：交给「建也失败」那步 */ }
-  if (!apiKey) {
-    const created = await zcodeBizRequest(keysUrl, "POST", authorization, { name: "zcode-api-key" });
-    apiKey = String((created && created.apiKey) || "").trim();
-    if (!apiKey) throw new Error("ZCode 登录换取失败：上游未返回新建密钥");
-  }
-  let secret = "";
-  try {
-    const copied = await zcodeBizRequest(`${keysUrl}/copy/${zcodeUrlencode(apiKey)}`, "GET", authorization);
-    secret = String((copied && (copied.secretKey || copied.secret_key)) || "").trim();
-  } catch { /* 没 secret 按地区决定 */ }
-  if (cfg.region === "intl") {
-    if (!secret) throw new Error("ZCode 国际版未返回密钥 secret（无法用于推理），请在 z.ai 控制台确认编码套餐已开通后重试");
-    return `${apiKey}.${secret}`;
-  }
-  return secret ? `${apiKey}.${secret}` : apiKey;
-}
-async function beginZcodeOAuth(channel, onDone) {
-  const cfg = adapters._zcodeRegionByChannel(channel);
-  const pollToken = crypto.randomBytes(32).toString("hex");
-  const deviceMid = crypto.randomUUID(); // X-Device-Mid：领取路径要用；跨请求稳定，随凭证落盘
-  const r = await adapters.httpJson(`${adapters._zcodeOrigin}/api/v1/oauth/cli/init`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${pollToken}`, "content-type": "application/json" },
-    body: JSON.stringify({ provider: cfg.upstreamProvider }),
-  }).catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
-  const payload = r.data;
-  if (payload && payload.code != null && Number(payload.code) !== 0) {
-    return { ok: false, message: `ZCode 登录发起失败（${payload.code}）：${payload.msg || payload.message || "上游拒绝"}` };
-  }
-  const data = payload && payload.data;
-  const flowId = data && String(data.flow_id || "");
-  const authorizeUrl = data && String(data.authorize_url || "");
-  if (!r.ok || !flowId || !authorizeUrl) {
-    return { ok: false, message: `ZCode 登录发起失败（HTTP ${r.status}）：${(payload && (payload.msg || payload.message)) || r.message || "上游未返回 flow_id/authorize_url"}` };
-  }
-  const pollIntervalMs = Math.max(1, Number(data.poll_interval_sec) || 3) * 1000;
-  const expiresAtMs = Number(data.expires_at) > 0 ? Number(data.expires_at) * 1000 : 0;
-  const url = applyZcodeInterstitial(cfg, authorizeUrl);
-  // 上游 expires_at 更权威（到点作废 flow），但可能没给（0）；与本地 3 分钟兜底取更早者
-  const deadline = expiresAtMs > 0 ? Math.min(expiresAtMs, Date.now() + OAUTH_TIMEOUT_MS) : Date.now() + OAUTH_TIMEOUT_MS;
-  const label = cfg.region === "intl" ? "国际版" : "国内版";
-  oauthSession = {
-    mode: "poll", channel, state: flowId, server: null, onDone, timer: null, deadline,
-    submit: async () => ({ ok: false, message: "ZCode 登录无需粘贴回调地址，请在浏览器完成授权后回到本窗口等待" }),
-  };
-  const tick = async () => {
-    if (!oauthSession || oauthSession.state !== flowId) return; // 已取消或换渠道
-    if (Date.now() > oauthSession.deadline) { finishOAuth({ ok: false, message: "ZCode 网页登录超时，请重新发起" }); return; }
-    const pr = await adapters.httpJson(`${adapters._zcodeOrigin}/api/v1/oauth/cli/poll/${encodeURIComponent(flowId)}`, {
-      method: "GET", headers: { authorization: `Bearer ${pollToken}` },
-    }).catch(() => null);
-    // 信封 code != 0 → 致命；网络错误 / 5xx / 408 / 429 / 畸形体 → 当 pending 继续轮（协议参考 oauth.rs 模块头）
-    if (pr && pr.data && pr.data.code != null && Number(pr.data.code) !== 0) {
-      finishOAuth({ ok: false, message: `ZCode 登录失败（${pr.data.code}）：${pr.data.msg || pr.data.message || "上游拒绝"}` });
-      return;
-    }
-    const pdata = pr && pr.ok && pr.data && pr.data.data;
-    const status = pdata && String(pdata.status || "");
-    if (status === "ready") {
-      try {
-        const branch = pdata[cfg.upstreamProvider] || {};
-        const accessToken = String(branch.access_token || "").trim();
-        if (!accessToken) throw new Error(`ZCode 登录响应缺少 ${cfg.upstreamProvider}.access_token`);
-        const jwt = String(pdata.token || "").trim();
-        const userId = String((pdata.user && pdata.user.user_id) || "").trim();
-        const refreshToken = String(branch.refresh_token || "").trim(); // bigmodel 才有；写回本机客户端登录态要用
-        const userInfoObj = (pdata.user && typeof pdata.user === "object") ? pdata.user : {};
-        // OAuth 令牌换编码套餐 API Key——网络动作放在拿会话锁之前（持锁等网络会把取消一起挡住）
-        const codingKey = await resolveZcodeCodingKey(cfg, accessToken);
-        if (!oauthSession || oauthSession.state !== flowId) return; // 换取期间已取消
-        const uid = userId ? `${cfg.uidPrefix}${userId}` : "";
-        const id = await saveDiscoveredAccount(channel, {
-          uid,
-          name: userId ? `ZCode ${label} · ${userId}` : `ZCode ${label}`,
-          token: codingKey,
-          refreshToken: "",
-          expiresAt: zcodeExpiresAt(codingKey) || zcodeExpiresAt(jwt) || 0,
-          // meta 存两套凭据：jwt/device_mid 供额度与领取；oauth* / userInfo 供「写回本机 ZCode 客户端登录态」重建 credentials.json
-          meta: { jwt, device_mid: deviceMid, user_id: userId, region: cfg.region, upstreamProvider: cfg.upstreamProvider, oauthAccessToken: accessToken, oauthRefreshToken: refreshToken, userInfo: JSON.stringify(userInfoObj) },
-          source: "oauth",
-        });
-        finishOAuth({ ok: true, id, uid });
-      } catch (e) { finishOAuth({ ok: false, message: String((e && e.message) || e) }); }
-      return;
-    }
-    if (status === "failed") { finishOAuth({ ok: false, message: "ZCode 授权被拒绝或已失效，请重新发起登录" }); return; }
-    if (oauthSession && oauthSession.state === flowId) oauthSession.timer = setTimeout(tick, pollIntervalMs);
-  };
-  oauthSession.timer = setTimeout(tick, pollIntervalMs);
-  return { ok: true, url, mode: "poll" };
-}
-
-// ===== ZCode 活动领取（额度套餐领取；协议参考 zcode-switch claim.rs） =====
-// preview 列可领套餐、claim 领取。claim 需阿里云滑块验证参数（X-Aliyun-Captcha-Verify-Param）——
-// 由渲染层弹滑块拿到后回传（复用 autoclaw_intl 那套 Aliyun SDK）。三者都用账号的套餐 JWT（meta.jwt）+ X-Device-Mid。
-
-/** 从账号取领取所需的 jwt / device_mid；缺 jwt（粘贴 coding key 的账号）返回 error */
-function zcodeAccountAuth(accountId) {
-  const acc = store.getAccount(String(accountId || ""));
-  if (!acc) return { error: "账号不存在" };
-  if (acc.channel !== "zcode" && acc.channel !== "zcode_intl") return { error: "该账号不是 ZCode 渠道" };
-  let meta = {};
-  try { meta = acc.meta ? JSON.parse(acc.meta) : {}; } catch { meta = {}; }
-  const jwt = String(meta.jwt || "").trim();
-  if (!jwt) return { error: "该账号无套餐令牌（粘贴 coding key 导入的账号无法领取），请用 OAuth 登录的账号" };
-  return { acc, jwt, deviceMid: String(meta.device_mid || "") };
-}
-
-const ZCODE_PLAN_ORIGIN = "https://zcode.z.ai";
-
-/** 领取失败码 → 文案（claim.rs failure_message 表） */
-function zcodeClaimFailMessage(code, body) {
-  const server = String((body && (body.msg || body.message)) || "").trim();
-  const base = {
-    1001: "活动不存在或未开始",
-    1002: "活动暂不可用",
-    1003: "该套餐已领取过",
-    1004: "不符合领取条件（账号或客户端版本不满足）",
-    1005: "已领取，需等本期结束后再领",
-    3001: "请求参数错误（通常是缺少设备标识）",
-    3007: "需要完成滑块验证",
-    401: "登录态失效，请重新登录该账号",
-  }[Number(code)] || "领取失败";
-  return server ? `${base}（${server}）` : base;
-}
-
-/** 列可领套餐（GET billing/preview）。返回 {ok, plans:[{planId,name,description,priority,grants:[]}]} */
-async function zcodeClaimPreview(accountId) {
-  const auth = zcodeAccountAuth(accountId);
-  if (auth.error) return { ok: false, message: auth.error };
-  const ad = adapters.get(auth.acc.channel);
-  const ver = adapters._zcodeAppVersion();
-  const url = `${ZCODE_PLAN_ORIGIN}/api/v1/zcode-plan/billing/preview?app_version=${encodeURIComponent(ver)}&platform=win32-x64`;
-  const r = await adapters.httpJson(url, { method: "GET", headers: ad._billingHeaders(auth.jwt, auth.deviceMid) })
-    .catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
-  const code = r.data && r.data.code != null ? Number(r.data.code) : (r.ok ? 0 : -1);
-  if (code !== 0) {
-    // preview 404 = 活动未部署（正常，无可领）；其余按失败码给文案
-    if (r.status === 404) return { ok: true, plans: [] };
-    return { ok: false, message: zcodeClaimFailMessage(code, r.data) };
-  }
-  const raw = (r.data && r.data.data && Array.isArray(r.data.data.plans)) ? r.data.data.plans : [];
-  const plans = raw.map((p) => {
-    const planId = String((p && (p.plan_id || p.planId)) || "").trim();
-    const ents = Array.isArray(p && p.entitlements) ? p.entitlements : [];
-    const grants = ents
-      .filter((e) => (e.meter === "model_usage") && (e.unit_type === "token" || e.unitType === "token") && String(e.show_name || e.showName || "").trim())
-      .map((e) => {
-        const name = String(e.show_name || e.showName || "");
-        const units = Number(e.grant_units || e.grantUnits || 0);
-        const period = { daily: "每日", weekly: "每周", monthly: "每月" }[String(e.period || "")] || "一次性";
-        return `${name} · ${units} Token（${period}）`;
-      });
-    return { planId, name: String((p && p.name) || "").trim(), description: String((p && p.description) || "").trim(), priority: Number((p && p.priority) || 0), grants };
-  }).filter((p) => p.planId).sort((a, b) => b.priority - a.priority || a.planId.localeCompare(b.planId));
-  return { ok: true, plans };
-}
-
-/** 滑块配置（GET client/configs，无鉴权）。返回 {ok, enabled, region, prefix, sceneId} */
-async function zcodeClaimCaptchaConfig() {
-  const ad = adapters.get("zcode");
-  const r = await adapters.httpJson(`${ZCODE_PLAN_ORIGIN}/api/v1/client/configs`, { method: "GET", headers: ad._billingHeaders("", "") })
-    .catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
-  if (!r.ok || !r.data || Number(r.data.code) !== 0) return { ok: false, message: "滑块配置获取失败" };
-  const c = (r.data.data && r.data.data.configs && r.data.data.configs.captcha) || {};
-  return { ok: true, enabled: !!c.enabled, region: String(c.region || ""), prefix: String(c.prefix || ""), sceneId: String(c.sceneId || "") };
-}
-
-/** 领取（POST billing/claim）。captchaParam 由渲染层滑块回调传入。 */
-async function zcodeClaim(accountId, planId, captchaParam, captchaRegion) {
-  const auth = zcodeAccountAuth(accountId);
-  if (auth.error) return { ok: false, message: auth.error };
-  const pid = String(planId || "").trim();
-  if (!pid) return { ok: false, message: "请先选择要领取的套餐" };
-  if (!String(captchaParam || "").trim()) return { ok: false, message: "请先完成滑块验证" };
-  const ad = adapters.get(auth.acc.channel);
-  const headers = { ...ad._billingHeaders(auth.jwt, auth.deviceMid), "content-type": "application/json", "x-aliyun-captcha-verify-param": String(captchaParam).trim() };
-  if (String(captchaRegion || "").trim()) headers["x-aliyun-captcha-verify-region"] = String(captchaRegion).trim();
-  const r = await adapters.httpJson(`${ZCODE_PLAN_ORIGIN}/api/v1/zcode-plan/billing/claim`, { method: "POST", headers, body: JSON.stringify({ plan_id: pid }) })
-    .catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
-  const code = r.data && r.data.code != null ? Number(r.data.code) : (r.ok ? 0 : -1);
-  if (code !== 0) {
-    const nextAt = code === 1005 && r.data && r.data.data && r.data.data.plan && r.data.data.plan.ends_at ? Number(r.data.data.plan.ends_at) * 1000 : 0;
-    return { ok: false, code, nextAt, message: zcodeClaimFailMessage(code, r.data) };
-  }
-  // 领取成功后顺手刷一次额度，让号池立刻看到新套餐
-  // 惰性 require 避免任何加载期环（credits→pool→store，均不反向依赖 discovery）
-  try { require("./credits.cjs").refreshAccount(auth.acc.id).catch(() => {}); } catch { /* 刷新失败不影响领取结果 */ }
-  const plan = (r.data.data && r.data.data.plan) || {};
-  return { ok: true, planName: String(plan.name || pid), startsAt: Number(plan.starts_at || 0) * 1000 || 0, endsAt: Number(plan.ends_at || 0) * 1000 || 0 };
-}
-
 // ===== 会话收尾 =====
 
 function finishOAuth(result) {
@@ -1783,6 +2096,10 @@ function finishOAuth(result) {
     try {
       session.server.close();
     } catch { /* 已关 */ }
+  }
+  // 收尾副作用（如小浣熊授权窗：登录结束一律关窗，无论成功/失败/超时）
+  if (typeof session.attachCancel === "function") {
+    try { session.attachCancel(result); } catch { /* 收尾异常不吞掉登录结果 */ }
   }
   try {
     session.onDone(result);
@@ -1799,7 +2116,7 @@ function finishOAuth(result) {
  * @param {(result:object)=>void} [onDone] 登录结束回调（成功/失败都回一次）
  * @returns {Promise<{ok:boolean,url?:string,message?:string,mode?:string,userCode?:string,needCaptcha?:boolean,captcha?:object}>} url 由主进程 shell.openExternal 打开
  */
-async function beginOAuth(channel, opts, onDone) {
+async function beginOAuth(channel, opts, onDone, helpers) {
   const o = opts && typeof opts === "object" ? opts : {};
   const cb = typeof opts === "function" ? opts : onDone; // 兼容旧两参签名
   const ch = String(channel || "trae");
@@ -1807,7 +2124,7 @@ async function beginOAuth(channel, opts, onDone) {
   if (!adapters.get(ch)) throw new Error(`未知渠道 ${ch}`);
   // 小浣熊：上游 v1.18.0 已支持应用内登录（打开官方授权页 → 用户粘回 office-raccoon:// 深链换码），
   // 本分支基点（b476f52）时还只有「不支持」的抛错，合并时按上游实现放行（不再抛错）。
-  if (ch === "raccoon") return beginRaccoonOAuth(ch, cb);
+  if (ch === "raccoon") return beginRaccoonOAuth(ch, cb, helpers); // helpers.openAuthWindow 可选（上游内嵌窗；子进程场景缺省走系统浏览器）
   if (ch === "autoclaw") {
     // 国内版官方只有客户端登录（手机号+验证码）+ auth.json 落盘，没有可代收的网页授权
     throw new Error("AutoClaw（国内）官方没有网页登录：请用「从本机软件导入」（自动读取 %APPDATA%/AutoClaw/auth.json）或粘贴 token");
@@ -1819,6 +2136,7 @@ async function beginOAuth(channel, opts, onDone) {
   if (ch === "autoclaw_intl") return beginAutoClawIntlOAuth(ch, o, cb);
   if (ch === "trae") return beginTraeOAuth(ch, cb);
   return beginWorkBuddyOAuth(ch, cb);
+
 }
 
 /** 手动提交回调地址（浏览器没跳回回环地址时的兜底路径） */
@@ -1840,6 +2158,9 @@ function cancelOAuth() {
       session.server.close();
     } catch { /* 已关 */ }
   }
+  if (typeof session.attachCancel === "function") {
+    try { session.attachCancel({ ok: false, cancelled: true }); } catch { /* 已关 */ }
+  }
   return true;
 }
 
@@ -1848,18 +2169,18 @@ module.exports = {
   scanWorkBuddy,
   scanTrae,
   scanCline,
-  scanAutoClaw,
+  scanAutoClaw,  scanZcode,
+  currentLocalLogins,
+
   importCandidate,
   beginOAuth,
   submitCallbackUrl,
   cancelOAuth,
-  // ZCode 活动领取
-  zcodeClaimPreview,
-  zcodeClaimCaptchaConfig,
-  zcodeClaim,
   byteCryptoDecrypt,
+  validateTraeCallback,
   OAUTH_PORT,
   wbAuthDir,
+  wbAuthCandidateDirs,
   traeStoragePaths,
   // 测试窥视口（下划线前缀 = 非公共契约）：设备流的轮询判定与地区归一纯函数，dev-cline/dev-qoder-test 直测
   _workosPollVerdict: workosPollVerdict,

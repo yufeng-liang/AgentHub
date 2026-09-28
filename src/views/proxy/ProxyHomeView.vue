@@ -4,7 +4,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import * as api from "../../api/ipc";
 import type { ProxyGatewayStatus, ProxyUsageDetail, ProxyUsageRow } from "../../types";
 import { useAppStore } from "../../stores/app";
-import { fmtInt, fmtK, fmtMs } from "./format";
+import { fmtInt, fmtK, fmtMs, fmtTime, statusCls, fmtBalance, balanceUnit } from "./format";
 import RequestLogTable from "./RequestLogTable.vue";
 import RequestDetailDialog from "./RequestDetailDialog.vue";
 
@@ -23,10 +23,13 @@ async function openDetail(row: ProxyUsageRow) {
 // 后台网关起不来的显式错误态（Task 5 §七.1）：转发体回 {ok:false, message:"后台网关未能启动：…"}，
 // 此时绝不能把状态对象当 gatewayStatus 塞进 st 让页面停在假死的空态——单独亮错误卡 + 重试按钮
 const gwErr = ref("");
+const loading = ref(false);
+
 let offEvent: (() => void) | undefined;
 let pollTimer: ReturnType<typeof setInterval> | undefined;
 
 async function refresh() {
+  if (!st.value) loading.value = true;
   try {
     const s = await api.proxyStatus();
     if (s && (s as { ok?: boolean }).ok === false) {
@@ -40,6 +43,8 @@ async function refresh() {
     gwErr.value = "";
   } catch (e) {
     err.value = String((e as Error).message || e);
+  } finally {
+    loading.value = false;
   }
 }
 
@@ -255,7 +260,7 @@ onUnmounted(() => {
         <div class="kpi"><span>成功率</span><b>{{ (st?.today.successRate ?? 100).toFixed(1) }}%</b></div>
         <div class="kpi"><span>TTFT 均值</span><b>{{ fmtMs(st?.today.ttftAvg || 0) }}</b></div>
       </div>
-      <div class="grid-3" style="margin-top: 12px">
+      <div class="agent-cards-grid">
         <div v-for="c in st?.channels || []" :key="c.id" class="card">
           <div class="card-title">
             {{ c.display }}
@@ -264,8 +269,8 @@ onUnmounted(() => {
             </span>
           </div>
           <div style="display: flex; align-items: baseline; gap: 8px">
-            <b class="big-num">{{ fmtInt(c.totalCredits) }}</b>
-            <span style="font-size: 11px; color: var(--text-3)">积分</span>
+            <b class="big-num" :title="c.id === 'zcode' ? `${fmtInt(c.totalCredits)} Tokens` : ''">{{ fmtBalance(c.totalCredits, c.id) }}</b>
+            <span style="font-size: 11px; color: var(--text-3)">{{ balanceUnit(c.id) }}</span>
           </div>
           <div class="rows" style="margin-top: 6px">
             <div class="row"><div class="grow"><div class="name">今日请求 / Token</div></div><span class="num">{{ c.todayReq }} · {{ fmtK(c.todayTokens) }}</span></div>
@@ -275,6 +280,7 @@ onUnmounted(() => {
       <div class="card" style="margin-top: 12px">
         <div class="card-title">
           实时请求流 <span class="right">最近 {{ recent.length }} 条</span>
+
         </div>
         <RequestLogTable :rows="recent" scope="home" @detail="openDetail" />
       </div>
@@ -577,5 +583,18 @@ onUnmounted(() => {
 .app-steps b {
   color: var(--text);
   font-weight: 600;
+}
+
+/* Agent 渠道卡片自适应网格，避免多渠道落单孤立 */
+.agent-cards-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+@media (min-width: 1080px) {
+  .agent-cards-grid {
+    grid-template-columns: repeat(4, 1fr);
+  }
 }
 </style>

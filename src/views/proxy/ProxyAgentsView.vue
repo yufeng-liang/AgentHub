@@ -3,11 +3,11 @@
      签到结果按渠道各自记忆；账号经四途径添加（OAuth / 本机导入 / 文件 / 粘贴）。
      号池多设备 WebDAV 同步已移至独立「号池同步」页 -->
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch, nextTick } from "vue";
 import * as api from "../../api/ipc";
 import type { ProxyChannelView, ProxyAccount, ProxyChannelId, ProxyBuiltinChannelId, ProxyChannelKind, ProxyPoolStrategy, ProxyScanCandidate, ProxyCheckinRow } from "../../types";
 import { useAppStore } from "../../stores/app";
-import { fmtInt, fmtK, fmtDate, fmtAgo, ACCOUNT_STATUS, SOURCE_NAMES, channelName } from "./format";
+import { fmtInt, fmtK, fmtDate, fmtAgo, ACCOUNT_STATUS, SOURCE_NAMES, channelName, fmtBalance, balanceUnit } from "./format";
 
 const app = useAppStore();
 const pool = ref<ProxyChannelView[]>([]);
@@ -78,8 +78,9 @@ const CHANNEL_META: Record<ProxyBuiltinChannelId, { icon: string; hint: string }
   autoclaw: { icon: "ph-robot", hint: "粘贴 · 本机导入（官方无网页登录）" },
   autoclaw_intl: { icon: "ph-globe", hint: "OAuth 登录（滑块验证）· 粘贴" },
   qoder: { icon: "ph-cursor", hint: "设备授权登录 · 粘贴" },
-  zcode: { icon: "ph-sparkle", hint: "OAuth 登录（订阅额度）· 粘贴" },
-  zcode_intl: { icon: "ph-sparkle", hint: "OAuth 登录（订阅额度）· 粘贴" },
+  zcode: { icon: "ph-lightning", hint: "GLM 编码套餐 · 领奖励 · 切号保远程" },
+  zcode_intl: { icon: "ph-lightning", hint: "GLM 编码套餐 · 国际区（薄别名渠道）" },
+
 };
 // 自定义提供商只有 API Key：没有登录态、没有签到、没有余额概念，措辞要与生态渠道明确区分
 const PROVIDER_META = { icon: "ph-plugs-connected", hint: "API Key 轮转 · 无余额概念" };
@@ -218,16 +219,20 @@ const OAUTH_HELP: Record<string, { title: string; desc: string }> = {
     desc: "跳转官方授权页（登录域由官方下发），授权后回调本机回环地址完成登录。<br />每账号独立执行一次，可反复添加多账号；3 分钟无响应即超时。<br />若浏览器停在回调页没自动跳回，可把地址栏内容整段粘到下方。",
   },
   workbuddy: {
-    title: "用 WorkBuddy（中国区）官方登录页登录",
+    title: "用 WorkBuddy CN 官方登录页登录",
     desc: "跳转官方登录页，登录完成后本机每 1.5 秒轮询一次授权结果，无需手动回调。<br />每账号独立执行一次，可反复添加多账号；3 分钟无响应即超时。",
   },
   workbuddy_ai: {
-    title: "用 WorkBuddy AI（国际版）官方登录页登录",
+    title: "用 WorkBuddy AI 官方登录页登录",
     desc: "跳转国际版官方登录页，登录完成后本机自动轮询授权结果。<br />每账号独立执行一次，可反复添加多账号；3 分钟无响应即超时。",
   },
   raccoon: {
     title: "用「商汤小浣熊」官方授权页登录",
-    desc: "跳转官方授权页完成登录后，浏览器地址栏会显示 office-raccoon://auth/callback?code=…<br />把地址栏整段内容复制粘贴到下方输入框，即可完成登录入池。<br />3 分钟无操作即超时。",
+    desc: "在应用内弹出的授权窗里完成登录，授权码由本应用直接截获入池——不经过系统浏览器，也不会拉起或顶掉本机小浣熊客户端的登录（深链永不出本应用）。<br />每账号独立执行一次，可反复添加多账号；3 分钟无响应即超时。<br />授权窗被意外拦截时，可把 office-raccoon://auth/callback?code=… 整段粘到下方兜底。",
+  },
+  zcode: {
+    title: "用 Z.ai 官方授权页登录 ZCode（智谱）",
+    desc: "跳转 Z.ai 授权页完成登录后，本机按服务端轮询自动完成入池（无需粘贴回调）。<br />登录后后台自动初始化套餐并解析编码套餐 API Key（约几十秒），期间账号已可用于 Start 套餐对话。<br />若浏览器停在 zcode:// 回调页，可把地址栏整段粘到下方兜底。",
   },
   // ===== 新增五渠道（autoclaw 国内版无网页登录，不出 OAuth 档，故本表无它的条目） =====
   cline_free: {
@@ -245,10 +250,6 @@ const OAUTH_HELP: Record<string, { title: string; desc: string }> = {
   qoder: {
     title: "用 Qoder 账号设备授权登录",
     desc: "跳转 Qoder 授权页登录并选择账号，本机每 2 秒轮询自动完成。<br />国际版 / 中国版在下方切换；也可「粘贴 JSON」导入。",
-  },
-  zcode: {
-    title: "用 ZCode 智谱（国内）订阅登录态登录",
-    desc: "跳转 ZCode 授权页（智谱账号）登录，本机按上游节奏轮询自动完成。<br />登录后自动换取编码套餐 API Key 入池，用的是订阅额度、不消耗开放平台 API Key。<br />也可「粘贴 JSON」导入 coding key。",
   },
   zcode_intl: {
     title: "用 ZCode 智谱（国际 / Z.AI）订阅登录态登录",
@@ -291,6 +292,9 @@ const pasteHint = computed(() => PASTE_HINT[addChannel.value] || "");
 
 // 粘贴 JSON 的字段示例（placeholder 用，随渠道切换 token 字段名提示）
 const pastePlaceholder = computed(() => {
+  if (addChannel.value === "zcode") {
+    return `zcode 支持三种形态：\n① 轻量：{ "zcodeJwtToken": "…", "codingPlanKey": "apiKey.secret（选填）", "provider": "zai" }\n② 快照：{ "credentials": {…}, "config": {…} }（整份凭据，含切号快照）\n③ zcode-account-switcher 导出文件的 accounts 数组条目`;
+  }
   const tokenKey = addChannel.value === "trae" ? "jwt" : "accessToken";
   const extra = addChannel.value === "raccoon" ? `\n  "officeIdentity": "选填，团队版组织标识",` : "";
   return `单个对象或数组均可，字段容忍别名：\n{\n  "name": "主账号（选填）",\n  "${tokenKey}": "渠道原生 token（必填）",\n  "refreshToken": "选填",${extra}\n  "uid": "选填，缺省从 token 解析"\n}`;
@@ -306,23 +310,48 @@ const STRATEGIES: { value: ProxyPoolStrategy; label: string }[] = [
   { value: "round_robin", label: "轮询" },
 ];
 
+const loading = ref(false);
+const zcodeHasReward = ref(false);
+
+async function checkZcodeReward() {
+  try {
+    const res = await api.proxyCheckinStatus("zcode");
+    if (res && res.ok && Array.isArray(res.rows)) {
+      zcodeHasReward.value = res.rows.some((r) => {
+        if (!r.ok || r.already || r.unavailable) return false;
+        if (Array.isArray(r.plans) && r.plans.length > 0) return true;
+        return !r.already && !r.unavailable && r.ok;
+      });
+    } else {
+      zcodeHasReward.value = false;
+    }
+  } catch {
+    zcodeHasReward.value = false;
+  }
+}
+
 async function refresh() {
+  if (!pool.value.length) loading.value = true;
   try {
     pool.value = await api.proxyPool();
     ideStatus.value = await api.proxyIdeStatus().catch(() => null);
+    void checkZcodeReward();
   } catch (e) {
     toast(String((e as Error).message || e), "err");
+  } finally {
+    loading.value = false;
   }
 }
 
 /** 右上角刷新按钮：只刷当前渠道（不是全量），结果走 Toast 提示 */
 async function refreshCurrentChannel() {
   if (refreshingChannel.value) return;
-  refreshingChannel.value = true; // 期间可能切渠道，消息与结果都归属发起时的渠道
+  const channel = activeChannel.value; // 期间可能切渠道，消息与结果都归属发起时的渠道
+  refreshingChannel.value = true;
   try {
-    const r = await api.proxyCreditsRefreshChannel(activeChannel.value);
+    const r = await api.proxyCreditsRefreshChannel(channel);
     const unavail = (r.results || []).filter((x) => x.unavailable);
-    let text = `${channelName(activeChannel.value)} 已刷新 ${r.total ?? 0} 个账号，失败 ${r.failed ?? 0}`;
+    let text = `${channelName(channel)} 已刷新 ${r.total ?? 0} 个账号，失败 ${r.failed ?? 0}`;
     if (unavail.length) text += ` · ${unavail.length} 个账号积分服务未开放（${unavail[0].message || ""}）`;
     toast(text, r.failed ? "err" : "info");
   } catch (e) {
@@ -336,14 +365,14 @@ async function refreshCurrentChannel() {
 // ===== 每日签到（三渠道不同形态：Trae ug 签到 / WB 中国区 daily-checkin / 国际版无签到只有加油包） =====
 
 function checkinTagCls(r: ProxyCheckinRow) {
-  if (!r.ok) return "tag-err";
+  if (!r.ok) return r.needCaptcha ? "tag-warn" : "tag-err";
   if (r.already) return "tag-dim";
   if (r.unavailable) return "tag-warn";
   return "tag-ok";
 }
 function checkinTagText(r: ProxyCheckinRow) {
-  if (!r.ok) return "失败";
-  if (r.already) return "已签到";
+  if (!r.ok) return r.needCaptcha ? "需过码" : "失败";
+  if (r.already) return checkinShownChannel.value === "zcode" ? "已领取" : "已签到";
   if (r.unavailable) return "不开放";
   return "成功";
 }
@@ -354,7 +383,16 @@ async function runCheckinChannel() {
   const channel = activeChannel.value; // 签到期间可能切渠道：发起渠道先存快照，结果才不会记错名下
   checkinBusy.value = true;
   try {
-    const r = await api.proxyCheckinRun({ channel, action: "checkin" });
+    let r = await api.proxyCheckinRun({ channel, action: "checkin" });
+    if ((r as unknown as { needCaptcha?: boolean; captcha?: { region?: string; prefix?: string; sceneId?: string } }).needCaptcha) {
+      // zcode 领取的人机校验二段流：渲染层过码后带参数重试一次
+      const solved = await solveZcodeCaptcha((r as unknown as { captcha: { region?: string; prefix?: string; sceneId?: string } }).captcha);
+      if (!solved) {
+        toast("人机校验未完成，已取消领取", "err");
+        return;
+      }
+      r = await api.proxyCheckinRun({ channel, action: "checkin", captcha: solved });
+    }
     if (r.ok === false) {
       toast(r.message || "签到失败", "err");
       return;
@@ -412,12 +450,58 @@ async function runTrial() {
   }
 }
 
-/** 一键把账号应用为本地 IDE 当前登录态（WB 双区写回 auth 文件；Trae 加密信封诚实降级） */
+// ===== ZCode 独立人机校验（过码）=====
+const solvingCaptchaId = ref<string>("");
+
+/** 判断该账号当前是否因 3007/人机校验而报错或需过码 */
+function isNeedCaptcha(acc?: ProxyAccount | null): boolean {
+  if (!acc) return false;
+  const msg = String(acc.lastError?.message || acc.coolReason || "");
+  return acc.channel === "zcode" && (/人机校验|验证码|3007|captcha|verify/i.test(msg));
+}
+
+/** 触发独立人机校验过码流程（两段式：子进程回滑块配置 → 渲染层过码 → 带参完成） */
+async function runSolveCaptcha(acc: ProxyAccount) {
+  if (!acc || solvingCaptchaId.value) return;
+  solvingCaptchaId.value = acc.id;
+  try {
+    let r = await api.proxyZcodeSolveCaptcha(acc.id);
+    const first = r as unknown as { needCaptcha?: boolean; captcha?: { region?: string; prefix?: string; sceneId?: string } };
+    if (first.needCaptcha) {
+      const solved = await solveZcodeCaptcha(first.captcha);
+      if (!solved) {
+        toast("人机校验未完成，已取消", "err");
+        return;
+      }
+      r = await api.proxyZcodeSolveCaptcha(acc.id, solved.verifyParam, solved.region);
+    }
+    if (r.ok) {
+      toast(r.message || "人机校验通过，账号已恢复可用", "info");
+      if (errRow.value?.id === acc.id) errRow.value = null;
+    } else {
+      toast(r.message || "人机校验未完成", "err");
+    }
+  } catch (e) {
+    toast(String((e as Error).message || e), "err");
+  } finally {
+    solvingCaptchaId.value = "";
+    await refresh();
+  }
+}
+
+/** 一键把账号应用为本地 IDE 当前登录态（WB 双区写回 auth 文件；Trae 加密信封诚实降级；
+ *  zcode 合并式写回 credentials.json——远程连接地址保持不变；raccoon 写回 auth.json 并重启客户端；
+ *  两者客户端在跑都会先弹确认关闭，防内存态回写覆盖） */
 async function ideSwitch(acc: ProxyAccount) {
   if (ideSwitching.value) return;
   ideSwitching.value = acc.id;
   try {
     const r = await api.proxyIdeSwitch(acc.id);
+    if (r.needConfirm) {
+      // 客户端正在运行：弹确认框，用户确认「关闭客户端并切换」后带 confirmAck 重调
+      pendingConfirm.value = { accountId: acc.id, channel: acc.channel, name: acc.name || acc.uid || "", message: r.message || "" };
+      return;
+    }
     toast(r.message || (r.ok ? "已切换" : "暂不支持"), r.ok ? "info" : "err");
   } catch (e) {
     toast(String((e as Error).message || e), "err");
@@ -427,7 +511,33 @@ async function ideSwitch(acc: ProxyAccount) {
   }
 }
 
-/** 该账号能否写回本地客户端（白名单：只有 workbuddy 双区与小浣熊有可写的登录文件；Trae 是加密信封） */
+/** zcode / raccoon 切号确认（需先关闭客户端再执行切换） */
+const pendingConfirm = ref<{ accountId: string; channel: string; name: string; message: string } | null>(null);
+const confirmBusy = ref(false);
+async function confirmIdeSwitch() {
+  const p = pendingConfirm.value;
+  if (!p || confirmBusy.value) return;
+  confirmBusy.value = true;
+  try {
+    const r = await api.proxyIdeSwitch(p.accountId, true);
+    toast(r.message || (r.ok ? "已切换" : "切换失败"), r.ok ? "info" : "err");
+    if (r.ok) pendingConfirm.value = null;
+  } catch (e) {
+    toast(String((e as Error).message || e), "err");
+  } finally {
+    confirmBusy.value = false;
+    ideStatus.value = await api.proxyIdeStatus().catch(() => ideStatus.value);
+  }
+}
+
+/** zcode 切号回滚（切出问题/远程连接异常时一键还原最近一次切前状态） */
+async function zcodeRollback() {
+  const r = await api.proxyZcodeSwitchRollback().catch((e) => ({ ok: false, message: String((e as Error).message || e) }));
+  toast(r.message || (r.ok ? "已回滚" : "回滚失败"), r.ok ? "info" : "err");
+}
+
+/** 该账号能否写回本地客户端（Trae 的登录态是加密信封，写不了） */
+
 function ideSupported(acc: ProxyAccount) {
   // 自定义提供商的账号是一把第三方 API Key，本机没有对应的客户端登录态可写。
   // 必须挡在最前面：下面的分支对未知渠道会回落到 WorkBuddy 的判定，
@@ -437,6 +547,7 @@ function ideSupported(acc: ProxyAccount) {
   if (!ideStatus.value) return true;
   if (acc.channel === "raccoon") return ideStatus.value.raccoonInstalled !== false;
   if (acc.channel === "zcode" || acc.channel === "zcode_intl") return ideStatus.value.zcodeInstalled !== false;
+
   return acc.channel === "workbuddy_ai" ? ideStatus.value.workbuddyAiInstalled !== false : ideStatus.value.workbuddyInstalled !== false;
 }
 
@@ -444,127 +555,67 @@ function ideTitle(acc: ProxyAccount) {
   if (channelKind(acc.channel) !== "builtin") return "自定义提供商只有一把 API Key，本机没有对应的客户端登录态可写回";
   if (acc.channel === "trae") return "Trae 本地登录态为 ByteCrypto 加密信封（绑定设备密钥），无法构造合法信封，暂不支持写回";
   // 新渠道（Cline / AutoClaw / Qoder）本机就没有这套登录文件，别说成"未安装"
-  if (acc.channel === "raccoon") return "把该账号写为本机 ~/.box-agent/config/auth.json（小浣熊登录态，明文 JSON，需重启客户端生效）";
-  if (acc.channel === "zcode" || acc.channel === "zcode_intl") return "把该账号写为本机 ~/.zcode/v2/credentials.json（ZCode 客户端登录态，明文 JSON，需重启客户端生效；仅本应用 OAuth 登录的账号可写回）";
-  if (acc.channel === "raccoon") return "把该账号写为本机 ~/.box-agent/config/auth.json（小浣熊登录态，明文 JSON，需重启客户端生效）";
+if (acc.channel === "raccoon") return "把该账号写为小浣熊本机登录态（~/.box-agent/config/auth.json）；客户端在运行会先确认关闭、切完自动重启，登录文件缺失时按号池凭据重建";
+  if (acc.channel === "zcode" || acc.channel === "zcode_intl") return "把该账号写为本机 ZCode 当前登录态（合并式写回，移动端远程连接地址保持不变；切换需关闭并重启客户端）";
   if (!ideSupported(acc)) return "本机未找到对应客户端的登录文件（未安装或从未登录过）";
   return `把该账号写为本地 ${channelName(acc.channel)} 当前登录态（需重启客户端）`;
 }
 
-// ===== ZCode 活动领取（额度套餐领取）=====
-const claimOpen = ref(false);
-const claimAcc = ref<ProxyAccount | null>(null);
-const claimPlans = ref<api.ZcodeClaimPlan[]>([]);
-const claimLoading = ref(false);
-const claimBusy = ref(false);
-const claimingPlanId = ref("");
-const claimMsg = ref("");
-const claimErr = ref(false);
+// ===== ZCode 活动领取（上游 v1.31 起走 checkin 二段流：一键领取 → needCaptcha → 渲染层过码 → 带参重试）=====
+// 旧「领取面板」（proxy_zcode_claim_* 三命令）随上游渠道重构退役：领取动作并入渠道「一键领取」，
+// planId 由适配器自动选当前可领套餐，本组件只负责过码这一段。
+const zcapOpen = ref(false);
+let zcapTimer: number | undefined = undefined;
 
-function openClaim(acc: ProxyAccount) {
-  claimAcc.value = acc;
-  claimOpen.value = true;
-  claimPlans.value = [];
-  claimMsg.value = "";
-  claimErr.value = false;
-  loadClaimPreview();
-}
-function closeClaim() {
-  claimOpen.value = false;
-  claimAcc.value = null;
-  if (aclawCaptchaTimer) { clearTimeout(aclawCaptchaTimer); aclawCaptchaTimer = undefined; }
-  aclawInstance?.hide?.();
-  aclawInstance = null;
-}
-async function loadClaimPreview() {
-  if (!claimAcc.value) return;
-  claimLoading.value = true;
-  claimMsg.value = "";
-  claimErr.value = false;
-  try {
-    const r = await api.proxyZcodeClaimPreview(claimAcc.value.id);
-    if (!r.ok) { claimMsg.value = r.message || "获取可领套餐失败"; claimErr.value = true; claimPlans.value = []; }
-    else claimPlans.value = r.plans || [];
-  } catch (e) {
-    claimMsg.value = String((e as Error).message || e); claimErr.value = true;
-  } finally {
-    claimLoading.value = false;
-  }
-}
-
-/** 领取一个套餐：先拿滑块配置，需要验证就弹阿里云滑块拿 param，再调 claim */
-async function claimPlan(plan: api.ZcodeClaimPlan) {
-  if (!claimAcc.value || claimBusy.value) return;
-  claimBusy.value = true;
-  claimingPlanId.value = plan.planId;
-  claimMsg.value = "";
-  claimErr.value = false;
-  try {
-    const cfg = await api.proxyZcodeClaimCaptchaConfig();
-    let captchaParam = "";
-    let captchaRegion = "";
-    if (cfg.ok && cfg.enabled && cfg.sceneId) {
-      captchaRegion = cfg.region || "";
-      captchaParam = await runZcodeCaptcha(cfg.region || "", cfg.prefix || "", cfg.sceneId);
-      if (!captchaParam) { claimMsg.value = "滑块验证未完成，已取消领取"; claimErr.value = true; return; }
-    } else {
-      // 上游把滑块关了：极少见，仍需一个非空参数，用占位符尝试（后端会据上游结果回报）
-      claimMsg.value = "上游未启用滑块验证，无法构造领取所需的验证参数，请稍后再试"; claimErr.value = true; return;
-    }
-    const r = await api.proxyZcodeClaim({ accountId: claimAcc.value.id, planId: plan.planId, captchaParam, captchaRegion });
-    if (r.ok) {
-      const win = r.endsAt ? `，有效期至 ${fmtDate(r.endsAt)}` : "";
-      toast(`已领取「${r.planName || plan.name}」${win}`, "info");
-      claimMsg.value = `领取成功：${r.planName || plan.name}${win}`;
-      claimErr.value = false;
-      await refresh();
-      await loadClaimPreview();
-    } else {
-      claimMsg.value = r.message || "领取失败";
-      claimErr.value = true;
-      toast(r.message || "领取失败", "err");
-    }
-  } catch (e) {
-    claimMsg.value = String((e as Error).message || e); claimErr.value = true;
-  } finally {
-    claimBusy.value = false;
-    claimingPlanId.value = "";
-  }
-}
-
-/** 领取专用阿里云滑块：复用 loadAliyunCaptcha，挂到 zclaim-captcha-* 节点，回调返回 verify param */
+/** 领取专用阿里云滑块：复用 loadAliyunCaptcha，挂到 zcap-captcha-* 节点，回调返回 verify param */
 function runZcodeCaptcha(region: string, prefix: string, sceneId: string): Promise<string> {
   return new Promise<string>(async (resolve) => {
     try {
       await loadAliyunCaptcha(region, prefix);
-    } catch (e) {
-      claimMsg.value = String((e as Error).message || e); claimErr.value = true;
-      resolve(""); return;
+    } catch {
+      zcapOpen.value = false;
+      resolve("");
+      return;
     }
     const w = window as unknown as AliyunCaptchaWindow;
-    if (typeof w.initAliyunCaptcha !== "function") { resolve(""); return; }
+    if (typeof w.initAliyunCaptcha !== "function") { zcapOpen.value = false; resolve(""); return; }
     let done = false;
-    const finish = (v: string) => { if (done) return; done = true; if (aclawCaptchaTimer) { clearTimeout(aclawCaptchaTimer); aclawCaptchaTimer = undefined; } resolve(v); };
-    const mount = document.getElementById("zclaim-captcha-element");
+    const finish = (v: string) => {
+      if (done) return;
+      done = true;
+      if (zcapTimer) { clearTimeout(zcapTimer); zcapTimer = undefined; }
+      zcapOpen.value = false;
+      resolve(v);
+    };
+    zcapOpen.value = true;
+    await nextTick(); // 挂载节点随弹窗渲染，先等 DOM 就绪
+    const mount = document.getElementById("zcap-captcha-element");
     if (mount) mount.innerHTML = "";
     w.initAliyunCaptcha!({
       SceneId: sceneId,
       mode: "popup",
-      element: "#zclaim-captcha-element",
-      button: "#zclaim-captcha-trigger",
+      element: "#zcap-captcha-element",
+      button: "#zcap-captcha-trigger",
       slideStyle: { width: 360, height: 40 },
       language: "cn",
       captchaVerifyCallback: async (param: string) => {
         finish(param);
-        return { captchaResult: true, bizResult: true }; // 领取结果由 claim 请求判定，这里只负责取到 param
+        return { captchaResult: true, bizResult: true }; // 领取结果由 checkin 重试判定，这里只负责取到 param
       },
       onBizResultCallback: () => {},
       getInstance: (inst) => { aclawInstance = inst || null; },
       onError: () => finish(""),
     });
-    setTimeout(() => (document.getElementById("zclaim-captcha-trigger") as HTMLButtonElement | null)?.click(), 2100);
-    aclawCaptchaTimer = window.setTimeout(() => finish(""), ACLAW_CAPTCHA_TIMEOUT_MS);
+    setTimeout(() => (document.getElementById("zcap-captcha-trigger") as HTMLButtonElement | null)?.click(), 2100);
+    zcapTimer = window.setTimeout(() => finish(""), ACLAW_CAPTCHA_TIMEOUT_MS);
   });
+}
+
+/** checkin 结果里的 needCaptcha → 弹过码 → 组装重试参数；取消/超时返回 null */
+async function solveZcodeCaptcha(cfg: { region?: string; prefix?: string; sceneId?: string } | undefined) {
+  if (!cfg || !cfg.sceneId) return null;
+  const verifyParam = await runZcodeCaptcha(cfg.region || "", cfg.prefix || "", cfg.sceneId);
+  return verifyParam ? { verifyParam, region: cfg.region || "", sceneId: cfg.sceneId } : null;
 }
 
 async function refreshOne(acc: ProxyAccount) {
@@ -724,6 +775,7 @@ async function beginOauth() {
   oauthErr.value = false;
   oauthMsg.value = "";
   oauthUserCode.value = "";
+
   callbackMsg.value = "";
   try {
     const r = ch === "autoclaw_intl" ? await beginAutoClawIntlLogin() : await api.proxyOauthBegin(ch, oauthOpts(ch));
@@ -1111,7 +1163,7 @@ onUnmounted(() => {
 <template>
   <section class="page">
     <div class="page-body">
-      <!-- 渠道主按钮：三个大按钮，各自独立成区；选中即点亮，下方整块区域随之切换 -->
+      <!-- 渠道主按钮：五个渠道卡片；只留名称，第二行显示 1/1 可用 -->
       <div class="channel-switch">
         <button
           v-for="ch in pool"
@@ -1126,6 +1178,7 @@ onUnmounted(() => {
           </span>
           <span class="ch-badge" :class="{ ok: ch.summary.onlineCount > 0 }">
             {{ ch.summary.accountCount ? `${ch.summary.onlineCount}/${ch.summary.accountCount} 可用` : "空号池" }}
+
           </span>
         </button>
       </div>
@@ -1160,21 +1213,36 @@ onUnmounted(() => {
                 :title="'国际版无每日签到，这是一次性 trial 加油包'"
                 @click="runTrial"
               >{{ checkinBusy ? "领取中…" : "领加油包" }}</button>
+              <button v-else-if="ch.id === 'zcode' && zcodeHasReward" class="btn btn-sm" :disabled="checkinBusy" @click="runCheckinChannel">
+                {{ checkinBusy ? "领取中…" : "一键领取" }}
+              </button>
               <button v-else-if="checkinCapable(ch.id)" class="btn btn-sm" :disabled="checkinBusy" @click="runCheckinChannel">
                 {{ checkinBusy ? "签到中…" : "一键签到" }}
               </button>
+              <button
+                v-if="ch.id === 'zcode' || ch.id === 'zcode_intl'"
+                class="btn btn-sm"
+                title="切号出问题或移动端远程连接异常时，一键还原到最近一次切换前的状态"
+                @click="zcodeRollback"
+              >切号回滚</button>
               <button class="btn btn-sm btn-primary" :disabled="refreshingChannel" @click="refreshCurrentChannel">
                 {{ refreshingChannel ? "刷新中…" : "刷新" }}
               </button>
             </template>
+
           </span>
         </div>
         <!-- 聚合顶部（单一数据源实时推导） -->
         <div class="agg">
           <!-- 提供商没有余额与到期概念（API Key 不设额度、不过期）：硬显示 0 会被读成「余额不足」，
                而这三项对生态渠道是真信息，所以按 kind 隐藏而不是换成假数据 -->
-          <div v-if="isBuiltin(ch)" class="agg-item"><span>总余额</span><b>{{ fmtInt(ch.summary.totalCredits) }}</b></div>
+          <div v-if="isBuiltin(ch)" class="agg-item">
+            <span>总余额</span>
+            <b :title="ch.id === 'zcode' || ch.id === 'zcode_intl' ? `${fmtInt(ch.summary.totalCredits)} Tokens` : ''">{{ fmtBalance(ch.summary.totalCredits, ch.id) }}</b>
+            <span v-if="ch.id === 'zcode' || ch.id === 'zcode_intl'" style="font-size: 11px; font-weight: normal; color: var(--text-3); margin-left: 2px">Tokens</span>
+          </div>
           <div class="agg-item"><span>{{ isBuiltin(ch) ? "账号数" : "Key 数" }}</span><b>{{ ch.summary.accountCount }}</b></div>
+
           <div class="agg-item"><span>可用</span><b>{{ ch.summary.onlineCount }}</b></div>
           <div v-if="isBuiltin(ch)" class="agg-item"><span>最早到期</span><b>{{ ch.summary.earliestExpire ? fmtDate(ch.summary.earliestExpire) : "-" }}</b></div>
           <div class="agg-item"><span>今日消耗</span><b>{{ ch.summary.todayReq }} 次 · {{ fmtK(ch.summary.todayTokens) }}</b></div>
@@ -1253,15 +1321,6 @@ onUnmounted(() => {
                     签到
                   </button>
                   <button
-                    v-if="acc.hasToken && (ch.id === 'zcode' || ch.id === 'zcode_intl')"
-                    class="btn-link btn-sm"
-                    :disabled="claimBusy"
-                    title="领取 ZCode 活动额度套餐（需完成滑块验证）"
-                    @click="openClaim(acc)"
-                  >
-                    领取
-                  </button>
-                  <button
                     v-if="isBuiltin(ch)"
                     class="btn-link btn-sm"
                     :disabled="ideSwitching === acc.id || !ideSupported(acc)"
@@ -1318,9 +1377,100 @@ onUnmounted(() => {
               </template>
               <tr v-if="!ch.accounts.length">
                 <td colspan="6" style="text-align: center; color: var(--text-3); padding: 14px">
+
                   号池为空 —— 点「添加账号」：OAuth 登录 / 从本机软件导入 / 文件导入 / 手动粘贴
                 </td>
               </tr>
+              <template v-else>
+                <tr v-for="(acc, i) in ch.accounts" :key="acc.id" :style="{ '--i': i }">
+                  <td class="acc-cell">
+                    <span v-if="renamingId !== acc.id" class="acc-name" :title="acc.name + '（点击重命名）'" @click="startRename(acc)">{{ acc.name || "（未命名账号）" }}</span>
+                    <input
+                      v-else
+                      v-model="renameText"
+                      class="input input-xs"
+                      style="width: 120px"
+                      @blur="commitRename(acc)"
+                      @keydown.enter="commitRename(acc)"
+                      @keydown.esc="renamingId = ''"
+                    />
+                    <span class="acc-sub">
+                      <span class="acc-src">{{ SOURCE_NAMES[acc.source] || acc.source }}</span>
+                      <i>·</i>
+                      <button class="acc-uid mono" :disabled="!acc.uid" title="点击查看完整 UID" @click="uidRow = acc">
+                        {{ acc.uid ? uidBrief(acc.uid) : "无 UID" }}
+                      </button>
+                      <template v-if="acc.liveHere">
+                        <i>·</i>
+                        <span class="tag tag-info acc-live" :title="`${ch.display} 客户端在本机当前登录的就是这个账号`"><i class="ph ph-desktop-tower"></i>本机登录</span>
+                      </template>
+                    </span>
+                  </td>
+                  <td>
+                    <!-- 状态标签：使用 pill 样式 -->
+                    <span
+                      class="pill status-tag"
+                      :class="[isNeedCaptcha(acc) ? 'warn' : acc.status === 'online' ? 'ok' : acc.status === 'cooling' ? 'warn' : acc.status === 'disabled' ? 'blue' : 'err', { 'has-err': !!acc.lastError }]"
+                      :title="acc.lastError ? '点击查看最近一次上游错误' : ''"
+                      @click="acc.lastError && (errRow = acc)"
+                    >
+                      {{ isNeedCaptcha(acc) ? "需过码" : (ACCOUNT_STATUS[acc.status]?.text || acc.status) }}
+                    </span>
+                    <!-- 冷却剩余时间：秒级跳动，到点自动归零消失（状态派生在主进程惰性完成） -->
+                    <span v-if="coolLeft(acc)" class="cool-left mono">剩 {{ coolLeft(acc) }}</span>
+                    <!-- 模型级冷却（6004/11102 不落账号状态）：悬浮看逐模型明细 -->
+                    <span v-if="modelCoolLeft(acc)" class="cool-left mono" :title="modelCoolTitle(acc)">模型冷却剩 {{ modelCoolLeft(acc) }}</span>
+                  </td>
+                  <td class="mono num" :title="acc.channel === 'zcode' && acc.credits > 0 ? `${fmtInt(acc.credits)} Tokens` : ''">{{ acc.hasToken ? (acc.credits === -1 ? "不限" : fmtBalance(acc.credits, acc.channel)) : "-" }}</td>
+                  <td class="mono">{{ acc.expiresAt ? fmtDate(acc.expiresAt) : "-" }}</td>
+                  <td class="mono num">{{ acc.todayReq }} 次 · {{ fmtK(acc.todayTokens) }}</td>
+                  <td style="text-align: right">
+                    <button class="btn-link btn-sm" :disabled="refreshingId === acc.id" @click="refreshOne(acc)">
+                      {{ refreshingId === acc.id ? "刷新中…" : "刷新" }}
+                    </button>
+                    <button
+                      v-if="acc.hasToken"
+                      class="btn-link btn-sm"
+                      :disabled="checkinBusy"
+                      :title="acc.channel === 'workbuddy_ai' ? '国际版无每日签到，用上方工具栏「领加油包」' : acc.channel === 'raccoon' ? '登录送积分（幂等，锁定当日积分 7 天）' : acc.channel === 'zcode' ? '领取当前可领的奖励套餐（如需人机校验会弹官方验证窗）' : '对该账号执行每日签到'"
+                      @click="runCheckinAccount(acc)"
+                    >
+                      {{ acc.channel === "zcode" ? "领取" : "签到" }}
+                    </button>
+                    <button
+                      v-if="acc.channel === 'zcode'"
+                      class="btn-link btn-sm"
+                      :class="{ 'btn-captcha-warn': isNeedCaptcha(acc) }"
+                      :disabled="solvingCaptchaId === acc.id"
+                      :title="isNeedCaptcha(acc) ? '触发了上游阿里云人机校验，点击弹出验证码窗口进行过码' : '手动完成一次阿里云人机校验以刷新上游风控信誉'"
+                      @click="runSolveCaptcha(acc)"
+                    >
+                      {{ solvingCaptchaId === acc.id ? "过码中…" : (isNeedCaptcha(acc) ? "需过码" : "过码") }}
+                    </button>
+                    <button
+                      class="btn-link btn-sm"
+                      :disabled="ideSwitching === acc.id || !ideSupported(acc)"
+                      :title="ideTitle(acc)"
+                      @click="ideSwitch(acc)"
+                    >
+                      {{ ideSwitching === acc.id ? "切换中…" : "切到 IDE" }}
+                    </button>
+                    <button
+                      v-if="acc.status === 'cooling' || (acc.modelCool && acc.modelCool.length)"
+                      class="btn-link btn-sm"
+                      :disabled="coolOffId === acc.id"
+                      :title="acc.status === 'cooling'
+                        ? '立即结束冷却，账号马上回到可用调度（同时豁免其模型级冷却）'
+                        : '该账号部分模型在冷却中（6004 限流/11102 不支持），解除后这些模型立即恢复可用'"
+                      @click="releaseCool(acc)"
+                    >
+                      {{ coolOffId === acc.id ? "解除中…" : "解冷却" }}
+                    </button>
+                    <button class="btn-link btn-sm" @click="toggleAccount(acc)">{{ acc.status === "disabled" ? "启用" : "停用" }}</button>
+                    <button class="btn-link btn-sm danger" @click="delRow = acc; delOpen = true">移出</button>
+                  </td>
+                </tr>
+              </template>
             </tbody>
           </table>
         </div>
@@ -1393,12 +1543,13 @@ onUnmounted(() => {
                 <code class="oauth-user-code">{{ oauthUserCode }}</code>
               </div>
               <!-- 回环模式兜底 + 手动粘贴模式主操作：整段粘贴回调地址 -->
-              <div v-if="(oauthMode === 'loopback' || oauthMode === 'manual') && oauthWaiting" class="cb-row">
+              <div v-if="(oauthMode === 'loopback' || oauthMode === 'manual' || oauthMode === 'window' || addChannel === 'zcode' || addChannel === 'zcode_intl') && oauthWaiting" class="cb-row">
+
                 <input
                   v-model="callbackInput"
                   class="input"
                   style="flex: 1"
-                  :placeholder="oauthMode === 'manual' ? '登录完成后，把浏览器地址栏整段粘到这里（office-raccoon://auth/callback?code=…）' : '浏览器没跳回？把地址栏整段粘到这里'"
+                  :placeholder="addChannel === 'raccoon' ? '授权窗没自动完成？把 office-raccoon://auth/callback?code=… 整段粘到这里' : addChannel === 'zcode' ? '授权完成后一般无需操作；若停在回调页，把地址栏整段粘到这里（zcode://…）' : '浏览器没跳回？把地址栏整段粘到这里'"
                 />
                 <button class="btn btn-sm" :disabled="!callbackInput.trim() || callbackBusy" @click="submitCallback">
                   {{ callbackBusy ? "提交中…" : "提交" }}
@@ -1473,6 +1624,7 @@ onUnmounted(() => {
           <footer class="add-foot">
             <span class="add-foot-hint">
               <template v-if="addMethod === 'oauth' && (oauthBusy || oauthWaiting)"><i class="ph ph-circle-notch"></i>{{ oauthFootHint }}</template>
+
               <template v-else-if="addMethod === 'local'">导入后仍可刷新余额、切到 IDE 或停用</template>
               <template v-else>入池后可在下方列表里刷新余额、切到 IDE 或停用</template>
             </span>
@@ -1520,6 +1672,24 @@ onUnmounted(() => {
         </div>
       </div>
 
+      <!-- 切号确认：目标客户端正在运行，需先关闭再切换（zcode 额外承诺远程连接地址不变） -->
+      <div v-if="pendingConfirm" class="p-mask" @click.self="pendingConfirm = null">
+        <div class="p-dlg glass">
+          <div class="p-title">切换 {{ channelName(pendingConfirm.channel) }} 登录账号</div>
+          <div class="set-desc">
+            {{ pendingConfirm?.message }}<br />
+            <template v-if="pendingConfirm?.channel === 'zcode'">切换后<b>移动端远程连接地址保持不变</b>，流量与奖励归属「{{ pendingConfirm?.name }}」。</template>
+            <template v-else>切换后流量与奖励归属「{{ pendingConfirm?.name }}」，原登录文件自动备份、可回滚。</template>
+          </div>
+          <div class="p-actions">
+            <button class="btn" @click="pendingConfirm = null">取消</button>
+            <button class="btn btn-primary" :disabled="confirmBusy" @click="confirmIdeSwitch">
+              {{ confirmBusy ? "切换中…" : "关闭客户端并切换" }}
+            </button>
+          </div>
+        </div>
+      </div>
+
       <!-- 签到结果弹窗：一键签到 / 单账号签到 / 领加油包跑完即弹，逐账号一行（结果仍按渠道记忆，切渠道互不串扰） -->
       <div v-if="checkinOpen" class="p-mask" @click.self="checkinOpen = false">
         <div class="p-dlg glass checkin-dlg">
@@ -1553,33 +1723,13 @@ onUnmounted(() => {
         </div>
       </div>
 
-      <!-- ZCode 活动领取：列可领套餐 + 阿里云滑块验证 + 领取（复用 autoclaw_intl 那套 Aliyun SDK） -->
-      <div v-if="claimOpen" class="p-mask" @click.self="closeClaim">
+      <!-- ZCode 领取过码弹窗（极简：只承载阿里云滑块挂载点） -->
+      <div v-if="zcapOpen" class="p-mask" @click.self="zcapOpen = false">
         <div class="p-dlg glass">
-          <div class="p-title"><i class="ph ph-gift"></i> 领取 ZCode 活动额度 · {{ claimAcc?.name || claimAcc?.uid || "" }}</div>
-          <div class="set-desc">领取后额度自动入号池。领取需完成阿里云滑块验证；每期套餐领过后需等本期结束再领。</div>
-          <div v-if="claimLoading" class="checkin-empty">加载可领套餐中…</div>
-          <div v-else-if="!claimPlans.length" class="checkin-empty">当前没有可领取的活动套餐（活动未开始或已领完）</div>
-          <div v-else class="checkin-rows">
-            <div v-for="p in claimPlans" :key="p.planId" class="checkin-row">
-              <div class="checkin-name">
-                {{ p.name || p.planId }}
-                <span v-for="(g, i) in p.grants" :key="i" class="tag tag-ok">{{ g }}</span>
-              </div>
-              <span class="checkin-msg">{{ p.description }}</span>
-              <button class="btn-link btn-sm" :disabled="claimBusy" @click="claimPlan(p)">
-                {{ claimBusy && claimingPlanId === p.planId ? "领取中…" : "领取" }}
-              </button>
-            </div>
-          </div>
-          <div v-if="claimMsg" class="set-desc" :class="{ 'err-text': claimErr }" style="margin-top:8px">{{ claimMsg }}</div>
-          <!-- 领取专用滑块挂载点（与添加账号弹窗的 aliyun-captcha-element 分开，避免同页重复 id） -->
-          <div id="zclaim-captcha-element" class="captcha-mount"></div>
-          <button id="zclaim-captcha-trigger" class="captcha-trigger" type="button" aria-hidden="true" tabindex="-1"></button>
-          <div class="p-actions">
-            <button class="btn" @click="closeClaim">关闭</button>
-            <button class="btn" :disabled="claimLoading || claimBusy" @click="loadClaimPreview">刷新可领列表</button>
-          </div>
+          <div class="p-title"><i class="ph ph-shield-check"></i> 完成人机验证</div>
+          <div class="set-desc">验证通过后自动继续领取；关闭弹窗即取消本次领取。</div>
+          <div id="zcap-captcha-element" class="captcha-mount"></div>
+          <button id="zcap-captcha-trigger" class="captcha-trigger" type="button" aria-hidden="true" tabindex="-1"></button>
         </div>
       </div>
 
@@ -1607,6 +1757,14 @@ onUnmounted(() => {
           <div class="err-text mono">{{ errRow.lastError?.message || "（无错误详情）" }}</div>
           <div class="p-actions">
             <button class="btn" @click="errRow = null">关闭</button>
+            <button
+              v-if="errRow.channel === 'zcode' && isNeedCaptcha(errRow)"
+              class="btn btn-warning"
+              :disabled="solvingCaptchaId === errRow.id"
+              @click="runSolveCaptcha(errRow)"
+            >
+              {{ solvingCaptchaId === errRow.id ? "正在打开验证窗…" : "立即过码" }}
+            </button>
             <button class="btn btn-primary" :disabled="!errRow.lastError" @click="copyErr">{{ errCopied ? "已复制" : "复制错误" }}</button>
           </div>
         </div>
@@ -1759,12 +1917,16 @@ onUnmounted(() => {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.ch-hint {
-  font-size: 10.5px;
+.ch-sub {
+  font-size: 11px;
   color: var(--text-3);
+  font-family: var(--font-mono);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.channel-btn.active .ch-sub {
+  color: var(--accent-strong);
 }
 .ch-badge {
   flex-shrink: 0;
@@ -2371,6 +2533,16 @@ onUnmounted(() => {
   font-style: normal;
   opacity: 0.6;
 }
+/* 「本机登录」徽标：本机 agent 客户端当前登录的就是这个账号（与全局 tag 同构，自带小图标） */
+.acc-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  white-space: nowrap;
+}
+.acc-live .ph {
+  font-size: 11px;
+}
 .acc-uid {
   border: none;
   background: none;
@@ -2442,5 +2614,22 @@ onUnmounted(() => {
   background: var(--danger-dim);
   color: var(--danger);
   border: 1px solid transparent;
+}
+.btn-captcha-warn {
+  color: #f59e0b !important;
+  font-weight: 600;
+  background: rgba(245, 158, 11, 0.12) !important;
+  border-radius: 4px;
+  padding: 2px 7px !important;
+  animation: pulse 1.8s infinite;
+}
+.btn-warning {
+  background: #f59e0b !important;
+  color: #ffffff !important;
+  border: none;
+  font-weight: 500;
+}
+.btn-warning:hover {
+  background: #d97706 !important;
 }
 </style>
