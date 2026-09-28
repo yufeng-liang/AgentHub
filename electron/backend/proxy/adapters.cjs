@@ -1189,6 +1189,9 @@ function makeWorkBuddy(channelId) {
         util.injectThinking(out, (mergedMeta.reasoning && mergedMeta.reasoning.defaultEffort) || "");
         util.backfillReasoningContent(out);
       }
+      // Anthropic 客户端 thinking 预算非法/负 → 协议层不派生：按方案 §3.1「当 enabled 无档」补默认档
+      // （deepseek 已由 injectThinking 补过，这里被 reasoning_effort 非 null 挡掉；off 标记同样被挡）
+      util.fillThinkingDefaultEffort(out, (mergedMeta.reasoning && mergedMeta.reasoning.defaultEffort) || "");
       util.normalizeReasoningEffort(out, mergedMeta.reasoning);
       if (out.reasoning_effort != null && !out.reasoning_effort) delete out.reasoning_effort;
       // prompt_cache_key（参考项目 cache_key.go：账号段硬隔离，跨账号绝不碰撞——防命中错账号前缀缓存）
@@ -1276,13 +1279,7 @@ function makeWorkBuddy(channelId) {
           if (data.usage) {
             emit({
               type: "usage",
-              usage: {
-                prompt_tokens: Number(data.usage.prompt_tokens) || 0,
-                completion_tokens: Number(data.usage.completion_tokens) || 0,
-                total_tokens: Number(data.usage.total_tokens) || 0,
-                ...util.openaiCacheTokens(data.usage),
-                ...util.upstreamCredit(data.usage),
-              },
+              usage: util.normalizeOpenAiUsage(data.usage),
             });
           }
         });
@@ -1732,13 +1729,7 @@ const raccoon = {
         if (data.usage) {
           emit({
             type: "usage",
-            usage: {
-              prompt_tokens: Number(data.usage.prompt_tokens ?? data.usage.input_tokens) || 0,
-              completion_tokens: Number(data.usage.completion_tokens ?? data.usage.output_tokens) || 0,
-              total_tokens: Number(data.usage.total_tokens) || 0,
-              ...util.openaiCacheTokens(data.usage),
-              ...util.upstreamCredit(data.usage),
-            },
+            usage: util.normalizeOpenAiUsage(data.usage, true),
           });
         }
       });
@@ -1768,17 +1759,20 @@ const raccoon = {
   /** 今日消耗积分：小浣熊对话响应不带 per-request 消耗，只能靠积分明细 /bills 反查。
    *  取 type=expense 明细（按时间倒序），累加「今日（本地日）」的消耗（points 负数取绝对值），
    *  翻到出现非今日记录即停。成功返回今日消耗（>=0）；失败/无端点返回 null（调用方据此保持
-   *  未上报 -1，不造假）。注意明细有几分钟同步延迟，故为「近实时」而非精确到最后一条。 */
+   *  未上报 -1，不造假）。注意明细有几分钟同步延迟，故为「近实时」而非精确到最后一条。
+   *  日期判定用 util.toMs 统一吃 ISO/秒/毫秒三种时间戳（纯 ISO 假设会把 epoch 秒判成 1970
+   *  提前断页少算）；无法解析日期的明细不计数也不触发断页——若整页全是无日期记录则整体返回
+   *  null（连"今天"都断定不了，宁缺勿假），部分无日期则按有日期部分累计（下界）。 */
   async queryTodayCredits(account, secrets) {
     const c = this.cfg();
     if (!c.billsUrl) return null;
     const headers = raccoonWebHeaders(c, account, secrets);
     const now = new Date();
-    const isToday = (iso) => {
-      const t = new Date(iso);
+    const isTodayMs = (ms) => {
+      const t = new Date(ms);
       return t.getFullYear() === now.getFullYear() && t.getMonth() === now.getMonth() && t.getDate() === now.getDate();
     };
-    let sum = 0, offset = 0, cursor = "";
+    let sum = 0, offset = 0, cursor = "", sawDated = false;
     for (let pages = 0; pages < 10; pages += 1) {
       const qs = new URLSearchParams({ "paging.limit": "50", type: "expense" });
       if (cursor) qs.set("cursor", cursor); else qs.set("paging.offset", String(offset));
@@ -1791,8 +1785,10 @@ const raccoon = {
       if (!items.length) break;
       let sawOlder = false;
       for (const it of items) {
-        const ts = it.created_at || it.createdAt;
-        if (ts && !isToday(ts)) { sawOlder = true; continue; }
+        const ms = util.toMs(it.created_at ?? it.createdAt);
+        if (!ms) continue; // 无日期/解析失败：不计入也不断页（断页依据只认确凿的非今日记录）
+        sawDated = true;
+        if (!isTodayMs(ms)) { sawOlder = true; continue; }
         const p = Number(it.points);
         if (Number.isFinite(p) && p < 0) sum += -p;
       }
@@ -1803,7 +1799,7 @@ const raccoon = {
       else if (hasMore) offset += items.length;
       else break;
     }
-    return Math.round(sum);
+    return sawDated ? Math.round(sum) : null;
   },
 
   /** 签到状态：小浣熊无独立"签到状态"接口，每日积分随登录自动发放，标 unavailable 说明查询不适用 */
@@ -2005,13 +2001,7 @@ function makeCline(pool) {
             if (choice.finish_reason) emit({ type: "finish", reason: choice.finish_reason });
           }
           if (data.usage) {
-            emit({ type: "usage", usage: {
-              prompt_tokens: Number(data.usage.prompt_tokens) || 0,
-              completion_tokens: Number(data.usage.completion_tokens) || 0,
-              total_tokens: Number(data.usage.total_tokens) || 0,
-              ...util.openaiCacheTokens(data.usage),
-              ...util.upstreamCredit(data.usage),
-            } });
+            emit({ type: "usage", usage: util.normalizeOpenAiUsage(data.usage) });
           }
         });
       } finally { cancelTimer(); }
@@ -2211,13 +2201,7 @@ function makeAutoClaw(region) {
             if (choice.finish_reason) emit({ type: "finish", reason: choice.finish_reason });
           }
           if (data.usage) {
-            emit({ type: "usage", usage: {
-              prompt_tokens: Number(data.usage.prompt_tokens) || 0,
-              completion_tokens: Number(data.usage.completion_tokens) || 0,
-              total_tokens: Number(data.usage.total_tokens) || 0,
-              ...util.openaiCacheTokens(data.usage),
-              ...util.upstreamCredit(data.usage),
-            } });
+            emit({ type: "usage", usage: util.normalizeOpenAiUsage(data.usage) });
           }
         });
       } finally { cancelTimer(); }
@@ -2284,38 +2268,40 @@ const QODER_CHAT_PATH = "algo/api/v2/service/pro/sse/agent_chat_generation?Fetch
 const QODER_MODEL_LIST_PATH = "algo/api/v2/model/list?Encode=1";
 const QODER_REFRESH_PATH = "/algo/api/v3/user/refresh_token"; // center 域
 const QODER_USERINFO_PATH = "/api/v1/userinfo"; // open_api 域
-// 兜底清单（协议参考 §3.8；upstreamKey/reasoning/efforts/vision/倍率快照 2026-09-20 实测；global 17 / cn 10）
+// 兜底清单（协议参考 §3.8；upstreamKey/reasoning/vision/倍率快照 2026-09-20 实测；global 17 / cn 10）。
+// 档位已全部收编进 rules/effort_catalog.json（统一 seed loader，方案 §3.2），此处不再内联 efforts——
+// seed 解析失败时按 §5.1 退空表，chat 侧 allow-list 自有默认档兜底，不需要第二份档位数据。
 const QODER_FALLBACK = {
   global: [
-    ["Qwen3.8-Flash", "qfmodel", true, ["low", "medium", "xhigh"], true, "0.1"],
-    ["Qwen3.8-Max", "qmodel_38max", true, ["low", "medium", "xhigh"], true, "0.5"],
-    ["Auto", "auto", false, [], true, "1"],
-    ["Ultimate", "ultimate", true, [], true, "1.6"],
-    ["Performance", "performance", true, [], true, "1.1"],
-    ["Efficient", "efficient", false, [], true, "0.3"],
-    ["Sonus", "smodel", true, [], true, "3.2"],
-    ["Cantus", "cmodel", true, [], true, "3.2"],
-    ["Qwen3.7-Max", "qmodel_latest", true, [], true, "0.5"],
-    ["Qwen3.7-Plus", "qmodel", false, [], true, "0.1"],
-    ["Kimi-K3", "kmodel_latest", false, [], true, "0.8"],
-    ["Kimi-K2.8-Preview", "kmodel", false, [], true, "0.3"],
-    ["GLM-5.3", "gmodel", true, [], true, "0.6"],
-    ["GLM-5.3-Flash", "gfmodel", true, [], true, "0.1"],
-    ["DeepSeek-V4-Pro", "dmodel", true, [], true, "0.8"],
-    ["DeepSeek-Flash", "dfmodel", true, [], true, "0.2"],
-    ["MiniMax-M3", "mmodel", false, [], true, "0.2"],
+    ["Qwen3.8-Flash", "qfmodel", true, true, "0.1"],
+    ["Qwen3.8-Max", "qmodel_38max", true, true, "0.5"],
+    ["Auto", "auto", false, true, "1"],
+    ["Ultimate", "ultimate", true, true, "1.6"],
+    ["Performance", "performance", true, true, "1.1"],
+    ["Efficient", "efficient", false, true, "0.3"],
+    ["Sonus", "smodel", true, true, "3.2"],
+    ["Cantus", "cmodel", true, true, "3.2"],
+    ["Qwen3.7-Max", "qmodel_latest", true, true, "0.5"],
+    ["Qwen3.7-Plus", "qmodel", false, true, "0.1"],
+    ["Kimi-K3", "kmodel_latest", false, true, "0.8"],
+    ["Kimi-K2.8-Preview", "kmodel", false, true, "0.3"],
+    ["GLM-5.3", "gmodel", true, true, "0.6"],
+    ["GLM-5.3-Flash", "gfmodel", true, true, "0.1"],
+    ["DeepSeek-V4-Pro", "dmodel", true, true, "0.8"],
+    ["DeepSeek-Flash", "dfmodel", true, true, "0.2"],
+    ["MiniMax-M3", "mmodel", false, true, "0.2"],
   ],
   cn: [
-    ["Qwen3.8-Flash", "qfmodel", true, ["low", "medium", "xhigh"], true, "0.1"],
-    ["Qwen3.8-Max", "qmodel_38max", true, ["low", "medium", "xhigh"], true, "0.5"],
-    ["Auto", "auto", false, [], true, "1"],
-    ["Qwen3.7-Max", "qmodel_latest", true, [], true, "0.5"],
-    ["Qwen3.7-Plus", "qmodel", false, [], true, "0.1"],
-    ["DeepSeek-V4-Pro", "dmodel", true, [], true, "0.8"],
-    ["DeepSeek-Flash", "dfmodel", false, [], true, "0.2"],
-    ["GLM-5.3", "gmodel", true, [], true, "0.6"],
-    ["Kimi-K2.8-Preview", "kmodel", true, [], true, "0.3"],
-    ["MiniMax-M3", "mmodel", false, [], true, "0.2"],
+    ["Qwen3.8-Flash", "qfmodel", true, true, "0.1"],
+    ["Qwen3.8-Max", "qmodel_38max", true, true, "0.5"],
+    ["Auto", "auto", false, true, "1"],
+    ["Qwen3.7-Max", "qmodel_latest", true, true, "0.5"],
+    ["Qwen3.7-Plus", "qmodel", false, true, "0.1"],
+    ["DeepSeek-V4-Pro", "dmodel", true, true, "0.8"],
+    ["DeepSeek-Flash", "dfmodel", false, true, "0.2"],
+    ["GLM-5.3", "gmodel", true, true, "0.6"],
+    ["Kimi-K2.8-Preview", "kmodel", true, true, "0.3"],
+    ["MiniMax-M3", "mmodel", false, true, "0.2"],
   ],
 };
 
@@ -2478,11 +2464,12 @@ function makeQoder() {
     modelEntries() {
       const seen = new Map();
       for (const region of ["global", "cn"]) {
-        for (const [id, key, reasoning, efforts, vision, rate] of QODER_FALLBACK[region]) {
+        for (const [id, key, reasoning, vision, rate] of QODER_FALLBACK[region]) {
           if (seen.has(id.toLowerCase())) continue;
-          // 档位数据已收编进 rules/effort_catalog.json（统一 seed loader）；内联 efforts 仅作解析失败时的兜底
+          // 档位唯一来源是 rules/effort_catalog.json（收编完成，方案 §3.2）；seed 缺失 → 空 allow-list，
+          // chat 侧退默认档兜底。contextLength 同源 seed 兜底（此处只保模型身份/倍率快照）。
           const seedEff = seedEntryFor("qoder", id);
-          const eff = (seedEff && Array.isArray(seedEff.efforts)) ? seedEff.efforts : efforts;
+          const eff = (seedEff && Array.isArray(seedEff.efforts)) ? seedEff.efforts : [];
           seen.set(id.toLowerCase(), {
             client: id, upstream: key,
             entry: { id, name: id, rate: Number(rate) || 0, capabilities: { images: vision, reasoning, tools: true }, contextLength: 200000, maxOutputTokens: 0, _key: key, _efforts: eff },
@@ -2589,7 +2576,7 @@ function makeQoder() {
             if (Object.keys(delta).length) emit({ type: "delta", delta });
           }
           if (choice && choice.finish_reason) { flushUsage(); emit({ type: "finish", reason: choice.finish_reason }); }
-          if (chunk.usage) usage = { prompt_tokens: Number(chunk.usage.prompt_tokens) || 0, completion_tokens: Number(chunk.usage.completion_tokens) || 0, total_tokens: Number(chunk.usage.total_tokens) || 0, ...util.openaiCacheTokens(chunk.usage), ...util.upstreamCredit(chunk.usage) };
+          if (chunk.usage) usage = util.normalizeOpenAiUsage(chunk.usage);
         });
         const tail = splitter.flush();
         if (tail) emit({ type: "delta", delta: { content: tail } }); // 不 flush 会丢末尾文字
@@ -2774,13 +2761,7 @@ function makeZcode(region) {
             if (choice.finish_reason) emit({ type: "finish", reason: choice.finish_reason });
           }
           if (data.usage) {
-            emit({ type: "usage", usage: {
-              prompt_tokens: Number(data.usage.prompt_tokens ?? data.usage.input_tokens) || 0,
-              completion_tokens: Number(data.usage.completion_tokens ?? data.usage.output_tokens) || 0,
-              total_tokens: Number(data.usage.total_tokens) || 0,
-              ...util.openaiCacheTokens(data.usage),
-              ...util.upstreamCredit(data.usage),
-            } });
+            emit({ type: "usage", usage: util.normalizeOpenAiUsage(data.usage, true) });
           }
         });
       } finally { cancelTimer(); }
@@ -3010,6 +2991,8 @@ function makeOpenaiCompat(row) {
       const entry = this.entryFor(model);
       const ovr = userModelMeta()[`${row.id}/${(entry && entry.client) || model}`] || null;
       const mergedMeta = mergeModelMeta(null, entry && entry.entry, ovr);
+      // Anthropic 客户端 thinking 预算非法/负 → 协议层不派生：补默认档（方案 §3.1）；off 标记照常删档
+      util.fillThinkingDefaultEffort(out, (mergedMeta.reasoning && mergedMeta.reasoning.defaultEffort) || "");
       util.normalizeReasoningEffort(out, mergedMeta.reasoning);
       // 网关自己注入的内部字段，上游不认（raccoon 同款剔除清单）
       delete out.conversation_id;
@@ -3059,13 +3042,7 @@ function makeOpenaiCompat(row) {
           if (data.usage) {
             emit({
               type: "usage",
-              usage: {
-                prompt_tokens: Number(data.usage.prompt_tokens ?? data.usage.input_tokens) || 0,
-                completion_tokens: Number(data.usage.completion_tokens ?? data.usage.output_tokens) || 0,
-                total_tokens: Number(data.usage.total_tokens) || 0,
-                ...util.openaiCacheTokens(data.usage),
-                ...util.upstreamCredit(data.usage),
-              },
+              usage: util.normalizeOpenAiUsage(data.usage, true),
             });
           }
         });
@@ -3133,13 +3110,7 @@ function makeOpenaiCompat(row) {
       if (data.usage) {
         emit({
           type: "usage",
-          usage: {
-            prompt_tokens: Number(data.usage.prompt_tokens ?? data.usage.input_tokens) || 0,
-            completion_tokens: Number(data.usage.completion_tokens ?? data.usage.output_tokens) || 0,
-            total_tokens: Number(data.usage.total_tokens) || 0,
-            ...util.openaiCacheTokens(data.usage),
-            ...util.upstreamCredit(data.usage),
-          },
+          usage: util.normalizeOpenAiUsage(data.usage, true),
         });
       }
     },

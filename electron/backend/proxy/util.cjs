@@ -140,9 +140,12 @@ function isDeepSeekModel(model) {
 }
 
 /** deepseek thinking 注入：显式 disabled 尊重并删 effort；显式 enabled 缺 effort 补默认档；
- *  无 thinking 注入 enabled + 补默认档。非 deepseek 零改动。 */
+ *  无 thinking 注入 enabled + 补默认档。非 deepseek 零改动。
+ *  reasoning_effort="off" 是 Anthropic 入站「客户端显式关思考」的管线标记（anthropic-in.budgetToEffort）：
+ *  此时绝不能注入 enabled——否则客户端的关思考会被翻转成开思考（方案 §3.1 off=删除档位）。 */
 function injectThinking(obj, defaultEffort) {
   if (!obj || !isDeepSeekModel(obj.model)) return;
+  if (obj.reasoning_effort === "off") return;
   const dft = String(defaultEffort || "high");
   const th = obj.thinking && typeof obj.thinking === "object" ? obj.thinking : null;
   const typ = th ? String(th.type || "").trim() : "";
@@ -177,10 +180,22 @@ function normalizeEffortName(effort) {
 /** reasoning_effort 档位降级（参考项目 normalizeReasoningEffort）：模型目录声明 supportedEfforts
  *  时按其收敛——请求档不在支持集则降到 ≤ 请求档的最高支持档；支持档全高于请求档取最低档。 */
 function normalizeReasoningEffort(obj, reasoningMeta) {
+  if (!obj) return;
+  // "off" 不是最低档：语义是「关思考」（方案 §3.1 type=disabled/0 → off → 删除档位）。
+  // 绝不能落进下面的降级算法（支持档全高于 off 会被抬成最低档=把关思考翻成开思考）：
+  // 模型被用户覆盖明确声明支持 off 时原样保留（此时它是一个真实档位），否则删除档位字段。
+  if (normalizeEffortName(obj.reasoning_effort) === "off") {
+    const supported = (reasoningMeta && Array.isArray(reasoningMeta.supportedEfforts))
+      ? reasoningMeta.supportedEfforts.map(normalizeEffortName).filter((s) => EFFORT_RANK[s] != null)
+      : [];
+    if (supported.includes("off")) obj.reasoning_effort = "off";
+    else delete obj.reasoning_effort;
+    return;
+  }
   const supported = (reasoningMeta && Array.isArray(reasoningMeta.supportedEfforts))
     ? reasoningMeta.supportedEfforts.map(normalizeEffortName).filter((s) => EFFORT_RANK[s] != null)
     : [];
-  if (!supported.length || !obj) return;
+  if (!supported.length) return;
   // "none"→"off" 别名折叠后再判档（Repo1 词表兼容）；折叠后写回 obj，保证发往上游的是本项目词表
   const cur = typeof obj.reasoning_effort === "string" ? normalizeEffortName(obj.reasoning_effort) : "";
   if (!cur || EFFORT_RANK[cur] == null) return;
@@ -189,6 +204,22 @@ function normalizeReasoningEffort(obj, reasoningMeta) {
   const curRank = EFFORT_RANK[cur];
   const lower = sorted.filter((s) => EFFORT_RANK[s] <= curRank);
   obj.reasoning_effort = lower.length ? lower[lower.length - 1] : sorted[0];
+}
+
+/** Anthropic 客户端「thinking 预算非法/负」→ 协议层不派生档位（anthropic-in.budgetToEffort 返回
+ *  undefined），落到管线时 reasoning_effort 未定。按方案 §3.1「当 enabled 无档」补模型默认档。
+ *  识别标记：body.extraBody.thinking 存在（anthropic-in 的 thinking 原件透传位，chat/responses 入站没有）；
+ *  deepseek 渠道由 injectThinking 补默认档，此处补的 reasoning_effort 非 null 会被它的 ensureEffort 跳过，
+ *  故两个调用点都可以无条件调用。补上的档随后照常过 normalizeReasoningEffort 收敛。
+ *  返回是否补了档（测试断言用）。 */
+function fillThinkingDefaultEffort(obj, defaultEffort) {
+  if (!obj || obj.reasoning_effort != null) return false;
+  const th = obj.extraBody && obj.extraBody.thinking;
+  if (!th || typeof th !== "object") return false;
+  const d = normalizeEffortName(defaultEffort);
+  if (!d || EFFORT_RANK[d] == null) return false;
+  obj.reasoning_effort = d;
+  return true;
 }
 
 /** deepseek 多轮回填（参考项目 backfillReasoningContent）：会话含 reasoning 痕迹时，
@@ -442,11 +473,27 @@ function upstreamCredit(u) {
   return { credit: n };
 }
 
+/** 上游 OpenAI 形 usage → 内部规范 usage：计数字段 + 缓存字段 + 实报积分三件套的统一收口。
+ *  全项目 8 处适配器 emit 都必须是同一形状；aliases=true 时回退读 Anthropic 风格
+ *  input_tokens/output_tokens（小浣熊 / zcode / 兼容站混用两套命名的实测）。
+ *  缓存/积分上游没给就不出现在返回对象里——server 记账据此落 -1（未上报）而不是假 0。 */
+function normalizeOpenAiUsage(u, aliases) {
+  if (!u || typeof u !== "object") return { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+  return {
+    prompt_tokens: Number(u.prompt_tokens ?? (aliases ? u.input_tokens : undefined)) || 0,
+    completion_tokens: Number(u.completion_tokens ?? (aliases ? u.output_tokens : undefined)) || 0,
+    total_tokens: Number(u.total_tokens) || 0,
+    ...openaiCacheTokens(u),
+    ...upstreamCredit(u),
+  };
+}
+
 module.exports = {
   uuid, traceId, jwtDecode, dig, toMs, normalizeExpiryMs,
   isCompleteJson, parseRetryAfterHeaders, stableConvId, promptCacheKey,
   isDeepSeekModel, injectThinking, normalizeReasoningEffort, backfillReasoningContent, EFFORT_LEVELS, EFFORT_RANK, normalizeEffortName,
+  fillThinkingDefaultEffort,
   SseScanner, stripEmptyDelta, hasConsumableDelta, chunk, DONE, Aggregator, openaiError, validateChatBody, estimateTokens,
-  openaiCacheTokens, upstreamCredit,
+  openaiCacheTokens, upstreamCredit, normalizeOpenAiUsage,
   appVersion,
 };

@@ -1138,7 +1138,8 @@ onUnmounted(() => {
             {{ ch.summary.accountCount ? `${ch.summary.onlineCount}/${ch.summary.accountCount} 可用` : "空号池" }}
           </span>
           <span v-if="ch.summary.expired" class="tag tag-err">有账号已过期</span>
-          <span v-else-if="ch.summary.expiringSoon" class="tag tag-warn">24h 内有到期</span>
+          <!-- 文案跟随 expiringSoonDays 阈值（默认 7 天，与后端 poolSummary/expiresBadge 同源），别写死 24h -->
+          <span v-else-if="ch.summary.expiringSoon" class="tag tag-warn">{{ app.config.proxy.expiringSoonDays ?? 7 }} 天内有到期</span>
           <!-- 工具栏：只属于当前渠道（策略 / 添加 / 签到或加油包 / 刷新），与其他渠道互不关联 -->
           <span class="panel-tools">
             <select

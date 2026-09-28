@@ -231,10 +231,11 @@ const DEFAULTS = {
       "kimi-k2.6": { efforts: ["medium"], default: "medium" },
       "grok-4.7": { efforts: ["low", "medium", "high", "xhigh"], default: "high" },
     },
-    // Qoder：收编 adapters.cjs QODER_FALLBACK 的档位数据（快照 2026-09-20 实测，两区仅这两个模型带档位）
+    // Qoder：收编 adapters.cjs QODER_FALLBACK 的档位与上下文数据（快照 2026-09-20 实测，两区仅这两个模型带档位）。
+    // contextLength 兜底沿内联表同值（上游拉取覆盖 seed）；WorkBuddy 两家暂无实测 context 数据，刻意留空不编造。
     qoder: {
-      "qwen3.8-flash": { efforts: ["low", "medium", "xhigh"] },
-      "qwen3.8-max": { efforts: ["low", "medium", "xhigh"] },
+      "qwen3.8-flash": { efforts: ["low", "medium", "xhigh"], contextLength: 200000 },
+      "qwen3.8-max": { efforts: ["low", "medium", "xhigh"], contextLength: 200000 },
     },
   },
   // Trae function 字段按模型分发（TraeWorkAssistant models_sync.rs 实证：

@@ -201,10 +201,15 @@ function toInternal(raw) {
   const extraBody = {};
   if (raw.thinking) {
     // 加法语义（方案 §3.1）：原始 thinking 透传给 Anthropic 原生上游；同时派生 reasoning_effort 给 effort 档位型上游。
+    // off 不在协议层删档：置 "off" 标记贯通管线——适配器侧 util.injectThinking 靠它抑制 enabled 注入
+    // （deepseek 渠道的 thinking 原件在 extraBody，协议层删了档位标记，注入会把关思考翻回开思考）、
+    // util.normalizeReasoningEffort 靠它落地「删档位」。Anthropic 原生上游由 extraBody.thinking(type=disabled) 生效。
     extraBody.thinking = raw.thinking;
     const eff = budgetToEffort(raw.thinking);
-    if (eff === "off") { delete body.reasoning_effort; notes.push("thinking disabled/budget=0：思考档位置 off（删除档位）"); }
+    if (eff === "off") { body.reasoning_effort = "off"; notes.push("thinking disabled/budget=0：置 off 标记（管线删档位/抑制注入）"); }
     else if (eff) { body.reasoning_effort = eff; notes.push(`thinking.budget_tokens 派生 reasoning_effort=${eff}`); }
+    // 非法/负 budget（eff=undefined）：当 enabled 无档，不派生；默认档由适配器侧
+    // util.fillThinkingDefaultEffort 按合并后 ModelMeta 补上（此处无元数据，不补）
   }
   if (raw.metadata) extraBody.metadata = raw.metadata;
   if (raw.top_k != null) extraBody.top_k = raw.top_k;

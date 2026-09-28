@@ -1,6 +1,7 @@
 // ModelMeta 统一层 + 思考强度贯通 自测（方案 2026-09-28）：纯函数直测，无外部依赖、不起网关、不碰真实配置。
 // 覆盖：① effort_catalog seed 解析容错 ② 三源「取代不并集」合并 ③ capabilities 逐键合并（含 video）
-//       ④ effort 越界降级 ⑤ budget→effort 阈值 ⑥ none→off 别名
+//       ④ effort 越界降级 ⑤ budget→effort 阈值 ⑥ none→off 别名 ⑦ off 标记管线（关思考不回注）
+//       ⑧ 非法 budget 补默认档（fillThinkingDefaultEffort） ⑨ usage 归一收口（normalizeOpenAiUsage）
 // 用法：node scripts/dev-effort-catalog-test.cjs
 "use strict";
 const assert = require("node:assert");
@@ -154,10 +155,10 @@ check("budget: toInternal 加法语义 —— 保留 thinking 透传 + 派生 re
   assert.strictEqual(r.body.reasoning_effort, "medium", "8000 → medium");
   assert.deepStrictEqual(r.body.extraBody.thinking, { type: "enabled", budget_tokens: 8000 }, "原始 thinking 必须原样透传");
 });
-check("budget: toInternal disabled → 不带 reasoning_effort（删档），thinking 仍透传", () => {
+check("budget: toInternal disabled → 置 off 标记贯通管线，thinking 仍透传", () => {
   const r = anthropicIn.toInternal({ model: "deepseek-v4", max_tokens: 100, messages: [{ role: "user", content: "hi" }], thinking: { type: "disabled" } });
   assert.ok(r.ok);
-  assert.ok(!("reasoning_effort" in r.body), "disabled → 不发档位");
+  assert.strictEqual(r.body.reasoning_effort, "off", "off 标记在协议层保留，由 util 管线落地删档/抑制注入");
   assert.deepStrictEqual(r.body.extraBody.thinking, { type: "disabled" });
 });
 
@@ -180,6 +181,83 @@ check("alias: seedToMeta 把 efforts 里的 none 归一成 off", () => {
 check("alias: merge 里 supportedEfforts 的 none 也归一成 off", () => {
   const m = adapters._mergeModelMeta(null, { reasoning: { supportedEfforts: ["none", "medium"] } }, null);
   assert.deepStrictEqual(m.reasoning.supportedEfforts, ["off", "medium"]);
+});
+
+// ===== ⑦ off 标记管线（方案 §3.1：off=关思考，绝不降级成最低档/回注 enabled） =====
+check("off: normalizeReasoningEffort 支持集不含 off → 删除档位（不抬成最低档）", () => {
+  const obj = { reasoning_effort: "off" };
+  util.normalizeReasoningEffort(obj, { supportedEfforts: ["low", "high"] });
+  assert.ok(!("reasoning_effort" in obj), "off 应删档而不是降级到 low");
+});
+check("off: 支持集显式声明 off（用户覆盖）→ 原样保留", () => {
+  assert.strictEqual(downgrade("off", ["off", "low"]), "off");
+});
+check("off: 别名 none 无 off 支持档 → 同样删档（旧实现会错误翻成最低档）", () => {
+  const obj = { reasoning_effort: "none" };
+  util.normalizeReasoningEffort(obj, { supportedEfforts: ["medium"] });
+  assert.ok(!("reasoning_effort" in obj));
+});
+check("off: injectThinking 遇 off 标记不注入 enabled（防把客户端关思考翻回开思考）", () => {
+  const obj = { model: "deepseek-v4", reasoning_effort: "off" };
+  util.injectThinking(obj, "high");
+  assert.ok(!("thinking" in obj), "off 标记下不得注入 thinking:enabled");
+  assert.strictEqual(obj.reasoning_effort, "off");
+});
+check("off: 支持集为空时 off 也删档（不再走『无原料不收敛』早退）", () => {
+  const obj = { reasoning_effort: "off" };
+  util.normalizeReasoningEffort(obj, null);
+  assert.ok(!("reasoning_effort" in obj));
+});
+
+// ===== ⑧ 非法 budget 补默认档（fillThinkingDefaultEffort，方案 §3.1「当 enabled 无档」） =====
+check("fill: extraBody.thinking 存在且未定档 → 补默认档", () => {
+  const obj = { model: "glm-5.3", extraBody: { thinking: { type: "enabled", budget_tokens: -5 } } };
+  assert.strictEqual(util.fillThinkingDefaultEffort(obj, "high"), true);
+  assert.strictEqual(obj.reasoning_effort, "high");
+});
+check("fill: 已有档位（含 off 标记）→ 不覆盖", () => {
+  const a = { reasoning_effort: "medium", extraBody: { thinking: { budget_tokens: -1 } } };
+  assert.strictEqual(util.fillThinkingDefaultEffort(a, "high"), false);
+  assert.strictEqual(a.reasoning_effort, "medium");
+  const b = { reasoning_effort: "off", extraBody: { thinking: { type: "disabled" } } };
+  assert.strictEqual(util.fillThinkingDefaultEffort(b, "high"), false);
+});
+check("fill: 无 extraBody.thinking（chat/responses 入站）→ 不补", () => {
+  assert.strictEqual(util.fillThinkingDefaultEffort({ model: "glm-5.3" }, "high"), false);
+  assert.strictEqual(util.fillThinkingDefaultEffort({ model: "glm-5.3", extraBody: {} }, "high"), false);
+});
+check("fill: 默认档非法/空 → 不补", () => {
+  const obj = { extraBody: { thinking: { budget_tokens: NaN } } };
+  assert.strictEqual(util.fillThinkingDefaultEffort(obj, ""), false);
+  assert.strictEqual(util.fillThinkingDefaultEffort(obj, "bogus"), false);
+  assert.ok(!("reasoning_effort" in obj));
+});
+check("fill+收敛: 补默认档后过 normalizeReasoningEffort 降级到支持档", () => {
+  const obj = { model: "glm-5.2", extraBody: { thinking: { budget_tokens: -3 } } };
+  util.fillThinkingDefaultEffort(obj, "max"); // seed: glm-5.2 支持集 ["high","xhigh"]
+  util.normalizeReasoningEffort(obj, { supportedEfforts: ["high", "xhigh"] });
+  assert.strictEqual(obj.reasoning_effort, "xhigh");
+});
+
+// ===== ⑨ usage 归一收口（normalizeOpenAiUsage：计数字段 + 缓存 + 实报积分统一形状） =====
+check("usage: OpenAI 形 → 规范三件套 + 缓存/积分展开", () => {
+  const u = util.normalizeOpenAiUsage(
+    { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, prompt_tokens_details: { cached_tokens: 4 }, credit: 0.02 }
+  );
+  assert.deepStrictEqual(u, { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, cached_tokens: 4, credit: 0.02 });
+});
+check("usage: aliases=true 回退 input_tokens/output_tokens（小浣熊/zcode/兼容站）", () => {
+  const u = util.normalizeOpenAiUsage({ input_tokens: 7, output_tokens: 3 }, true);
+  assert.deepStrictEqual(u, { prompt_tokens: 7, completion_tokens: 3, total_tokens: 0 });
+  const noAlias = util.normalizeOpenAiUsage({ input_tokens: 7, output_tokens: 3 });
+  assert.strictEqual(noAlias.prompt_tokens, 0, "aliases 缺省不回退（内置渠道原口径）");
+});
+check("usage: 上游没给缓存/积分 → 字段缺席（-1 未上报哨兵约定）", () => {
+  const u = util.normalizeOpenAiUsage({ prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 });
+  assert.ok(!("cached_tokens" in u) && !("credit" in u));
+});
+check("usage: 空入参 → 全 0 兜底（不崩）", () => {
+  assert.deepStrictEqual(util.normalizeOpenAiUsage(null), { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 });
 });
 
 // ===== metaOverridden 标记 =====

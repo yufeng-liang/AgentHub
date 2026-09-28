@@ -705,11 +705,25 @@ function updateAccount(id, patch) {
 function noteError(id, message) {
   const msg = String(message || "").trim();
   if (!id || !msg) return;
+  mergeAccountMeta(id, { lastError: { at: Date.now(), message: msg.slice(0, 400) } });
+}
+
+/** 读取并解析账号 meta（解析失败/账号不存在 → 空对象）。与 mergeAccountMeta 配对使用。 */
+function accountMeta(id) {
   open();
   const cur = getAccount(id);
-  if (!cur) return;
-  const meta = { ...parseMeta(cur.meta), lastError: { at: Date.now(), message: msg.slice(0, 400) } };
-  updateAccount(id, { meta });
+  return cur ? parseMeta(cur.meta) : {};
+}
+
+/** 原子合并账号 meta（读-改-写收在 store 一层）。要往 meta 补键一律走这里，
+ *  不要自己 getAccount 后 spread 回写——读快照与写回之间隔着 await 时，
+ *  并发方的写入（lastError / renamedAt / 池同步）会被旧合并整体覆盖。 */
+function mergeAccountMeta(id, patch) {
+  if (!id || !patch || typeof patch !== "object") return false;
+  open();
+  const cur = getAccount(id);
+  if (!cur) return false;
+  return updateAccount(id, { meta: { ...parseMeta(cur.meta), ...patch } });
 }
 
 /** 记录账号一次消耗的滚动计数（跨天自动清零）；credits 为上游实报积分（缺省/-1 = 未上报，
@@ -734,10 +748,14 @@ function bumpAccountUsage(id, tokens, credits) {
   );
 }
 
-/** 权威设置账号今日消耗积分（用于对话不带 per-request 消耗、靠积分明细反查的渠道，如小浣熊）：
- *  直接置为传入值（非累加），并与 bumpAccountUsage 一致地做跨天滚动（新的一天先清零 req/tokens）。
- *  credits<0 视为未上报，不落库（保持旧值/哨兵，宁缺勿假）。 */
-function setCreditsToday(id, credits) {
+/** 设置账号今日消耗积分（对话不带 per-request 消耗的渠道：小浣熊靠积分明细反查、
+ *  WorkBuddy/CodeBuddy 靠套餐累计读数差）。与 bumpAccountUsage 一致地做跨天滚动
+ *  （新的一天先清零 req/tokens）。credits<0 视为未上报，不落库（保持旧值/哨兵，宁缺勿假）。
+ *  mode="max"（明细反查口径用）：与已有值取大者——账单/明细有几分钟同步延迟，盲 set 会用
+ *  滞后快照覆盖 bumpAccountUsage 刚累加的实报值（临时少算）；账单单调递增，取大者即最新事实。
+ *  默认 "replace"（套餐读数差口径用）：上游 used 是无滞后的累计计数器，读数差即权威值，
+ *  且「读数回退=套餐续期」时要能把今日归 0——取大者会卡在旧值，当天都不再收敛。 */
+function setCreditsToday(id, credits, mode) {
   open();
   const cur = getAccount(id);
   if (!cur) return;
@@ -745,11 +763,13 @@ function setCreditsToday(id, credits) {
   if (c < 0) return;
   const today = dayStr();
   const sameDay = cur.today_day === today;
+  const prev = sameDay ? (cur.credits_today ?? -1) : -1;
+  const next = mode === "max" ? Math.max(prev, c) : c;
   db.prepare("UPDATE accounts SET today_day=?, today_req=?, today_tokens=?, credits_today=? WHERE id=?").run(
     today,
     sameDay ? cur.today_req : 0,
     sameDay ? cur.today_tokens : 0,
-    c,
+    next,
     id
   );
 }
@@ -1128,7 +1148,7 @@ module.exports = {
   createKey, listKeys, findKeyBySecret, updateKey, deleteKey, keyTodayReq,
   listAgents, setPoolStrategy,
   listProviders, getProvider, saveProvider, deleteProvider,
-  listAccounts, accountRows, getAccount, accountSecrets, addAccount, updateAccount, bumpAccountUsage, setCreditsToday, removeAccount, noteError,
+  listAccounts, accountRows, getAccount, accountMeta, mergeAccountMeta, accountSecrets, addAccount, updateAccount, bumpAccountUsage, setCreditsToday, removeAccount, noteError,
   listModelCooldowns, upsertModelCooldown, deleteModelCooldowns,
   snapshotCredits,
   setCreditPackages, listCreditPackages,

@@ -100,6 +100,8 @@ async function refreshAccount(id) {
     }
   }
   const cur = store.getAccount(acc.id) || acc;
+  // credits === -1 是「余额未知」哨兵（企业版无限额度 / 本次未拿到数值，见 updateAccount 对 credits 的口径）：
+  // 拿不到余额就无法证伪「余额不足」，按可用复活——复活只看状态机，不强行编一个余额值
   const revive =
     cur.status === "relogin" || (cur.status === "exhausted" && (credits > 0 || credits === -1 || (expiresAt || 0) > Date.now()));
   store.updateAccount(acc.id, {
@@ -110,24 +112,27 @@ async function refreshAccount(id) {
   });
   store.snapshotCredits(acc.channel, acc.id, credits, expiresAt || 0);
   // 今日消耗积分：对话响应不带 per-request 消耗、但有积分明细的渠道（如小浣熊），
-  // 刷余额时顺带反查明细汇总今日消耗，写入 credits_today（权威 set，非累加）；查不到不动
+  // 刷余额时顺带反查明细汇总今日消耗，写入 credits_today（明细有同步延迟，取大者合并防滞后
+  // 快照覆盖 bumpAccountUsage 刚累加的实报值）；查不到不动
   if (typeof adapter.queryTodayCredits === "function") {
     const spent = await adapter.queryTodayCredits(acc, secrets).catch(() => null);
-    if (typeof spent === "number" && spent >= 0) store.setCreditsToday(acc.id, spent);
+    if (typeof spent === "number" && spent >= 0) store.setCreditsToday(acc.id, spent, "max");
   }
   // 今日消耗积分（累计口径渠道，如 WorkBuddy/CodeBuddy）：上游只给「套餐累计已消耗 used」，
   // 无 per-request、也无消耗明细。用「本次读数 − 今日首次读数」折出今日消耗（两次权威读数相减，
-  // 非估算）；基线存 meta.wbUsedDay/wbUsedBase，跨天/首次/读数回退（套餐续期）时重置基线、今日归 0。
+  // 非估算）；基线存 meta.creditsUsedDay/creditsUsedBase——口径同时覆盖 WorkBuddy 与 CodeBuddy，
+  // 旧键 wbUsedDay/wbUsedBase 名不副实已改名，兼容读取一次（写只落新键）。跨天/首次/读数回退
+  // （套餐续期，此时上游日计数已重置、今日消耗无从找回）时重置基线、今日归 0。
   // 与 queryTodayCredits（明细口径，如小浣熊）互斥：那类渠道不返回 r.used，二者不叠加。
+  // meta 走 store.mergeAccountMeta 原子合并，不整读整写（防覆盖并发期的 lastError/renamedAt）。
   if (typeof r.used === "number" && Number.isFinite(r.used) && r.used >= 0 && typeof adapter.queryTodayCredits !== "function") {
     const usedNow = Math.round(r.used);
-    const fresh = store.getAccount(acc.id) || cur;
-    let meta = {};
-    try { meta = fresh.meta ? JSON.parse(fresh.meta) : {}; } catch { meta = {}; }
     const today = store.dayStr();
-    const sameDay = meta.wbUsedDay === today;
-    const base = sameDay && Number.isFinite(meta.wbUsedBase) && meta.wbUsedBase <= usedNow ? meta.wbUsedBase : usedNow;
-    store.updateAccount(acc.id, { meta: { ...meta, wbUsedDay: today, wbUsedBase: base } });
+    const meta = store.accountMeta(acc.id);
+    const sameDay = meta.creditsUsedDay === today || meta.wbUsedDay === today;
+    const prevBase = Number.isFinite(meta.creditsUsedBase) ? meta.creditsUsedBase : Number(meta.wbUsedBase);
+    const base = sameDay && Number.isFinite(prevBase) && prevBase <= usedNow ? prevBase : usedNow;
+    store.mergeAccountMeta(acc.id, { creditsUsedDay: today, creditsUsedBase: base });
     store.setCreditsToday(acc.id, Math.max(0, usedNow - base));
   }
   return { id: acc.id, credits, expiresAt: expiresAt || 0 };
