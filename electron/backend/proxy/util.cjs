@@ -400,11 +400,26 @@ function openaiCacheTokens(u) {
   return out;
 }
 
+/** 从上游 usage 对象里归一「本次请求消耗的积分」。
+ *  只认「消耗」语义的字段名（credit/cost 族），刻意不认 points/balance/remain 这类「余额」字段，
+ *  避免把余额误当消耗。返回 { credit } 或 {}（未上报——与落库 -1 哨兵一致，宁缺勿假）。
+ *  0 是有效值（命中缓存时上游可能报接近 0 的消耗），故用 Number.isFinite 判定而非真值。 */
+function upstreamCredit(u) {
+  if (!u || typeof u !== "object") return {};
+  const v =
+    u.credit ?? u.credits ?? u.total_credit ?? u.total_credits ??
+    u.credits_used ?? u.credit_used ?? u.used_credits ??
+    u.cost ?? u.total_cost;
+  const n = Number(v);
+  if (v == null || !Number.isFinite(n) || n < 0) return {};
+  return { credit: n };
+}
+
 module.exports = {
   uuid, traceId, jwtDecode, dig, toMs,
   isCompleteJson, parseRetryAfterHeaders, stableConvId, promptCacheKey,
   isDeepSeekModel, injectThinking, normalizeReasoningEffort, backfillReasoningContent, EFFORT_LEVELS,
   SseScanner, stripEmptyDelta, hasConsumableDelta, chunk, DONE, Aggregator, openaiError, validateChatBody, estimateTokens,
-  openaiCacheTokens,
+  openaiCacheTokens, upstreamCredit,
   appVersion,
 };

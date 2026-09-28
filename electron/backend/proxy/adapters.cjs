@@ -1134,6 +1134,7 @@ function makeWorkBuddy(channelId) {
                 completion_tokens: Number(data.usage.completion_tokens) || 0,
                 total_tokens: Number(data.usage.total_tokens) || 0,
                 ...util.openaiCacheTokens(data.usage),
+                ...util.upstreamCredit(data.usage),
               },
             });
           }
@@ -1589,6 +1590,7 @@ const raccoon = {
               completion_tokens: Number(data.usage.completion_tokens ?? data.usage.output_tokens) || 0,
               total_tokens: Number(data.usage.total_tokens) || 0,
               ...util.openaiCacheTokens(data.usage),
+              ...util.upstreamCredit(data.usage),
             },
           });
         }
@@ -1820,6 +1822,7 @@ function makeCline(pool) {
               completion_tokens: Number(data.usage.completion_tokens) || 0,
               total_tokens: Number(data.usage.total_tokens) || 0,
               ...util.openaiCacheTokens(data.usage),
+              ...util.upstreamCredit(data.usage),
             } });
           }
         });
@@ -2025,6 +2028,7 @@ function makeAutoClaw(region) {
               completion_tokens: Number(data.usage.completion_tokens) || 0,
               total_tokens: Number(data.usage.total_tokens) || 0,
               ...util.openaiCacheTokens(data.usage),
+              ...util.upstreamCredit(data.usage),
             } });
           }
         });
@@ -2393,7 +2397,7 @@ function makeQoder() {
             if (Object.keys(delta).length) emit({ type: "delta", delta });
           }
           if (choice && choice.finish_reason) { flushUsage(); emit({ type: "finish", reason: choice.finish_reason }); }
-          if (chunk.usage) usage = { prompt_tokens: Number(chunk.usage.prompt_tokens) || 0, completion_tokens: Number(chunk.usage.completion_tokens) || 0, total_tokens: Number(chunk.usage.total_tokens) || 0, ...util.openaiCacheTokens(chunk.usage) };
+          if (chunk.usage) usage = { prompt_tokens: Number(chunk.usage.prompt_tokens) || 0, completion_tokens: Number(chunk.usage.completion_tokens) || 0, total_tokens: Number(chunk.usage.total_tokens) || 0, ...util.openaiCacheTokens(chunk.usage), ...util.upstreamCredit(chunk.usage) };
         });
         const tail = splitter.flush();
         if (tail) emit({ type: "delta", delta: { content: tail } }); // 不 flush 会丢末尾文字
@@ -2674,6 +2678,7 @@ function makeOpenaiCompat(row) {
                 completion_tokens: Number(data.usage.completion_tokens ?? data.usage.output_tokens) || 0,
                 total_tokens: Number(data.usage.total_tokens) || 0,
                 ...util.openaiCacheTokens(data.usage),
+                ...util.upstreamCredit(data.usage),
               },
             });
           }
@@ -2747,6 +2752,7 @@ function makeOpenaiCompat(row) {
             completion_tokens: Number(data.usage.completion_tokens ?? data.usage.output_tokens) || 0,
             total_tokens: Number(data.usage.total_tokens) || 0,
             ...util.openaiCacheTokens(data.usage),
+            ...util.upstreamCredit(data.usage),
           },
         });
       }
