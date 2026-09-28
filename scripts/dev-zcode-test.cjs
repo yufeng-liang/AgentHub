@@ -9,6 +9,11 @@ const path = require("node:path");
 process.env.APPDATA = fs.mkdtempSync(path.join(os.tmpdir(), "agenthub-zcode-test-"));
 const ZHOME = fs.mkdtempSync(path.join(os.tmpdir(), "agenthub-zcode-home-"));
 process.env.ZCODE_SWITCH_HOME = ZHOME;
+// 隔离必须到 dataRoot 这一层：ideswitch.zcodeDataRoot 的兜底链里 ZCODE_SWITCH_DATA_ROOT /
+// ZCODE_DATA_BASE_DIR 优先于 home——本机若设了它们（如 ZCode 客户端注入的真实数据目录），
+// 写回会打到真实 ~/.zcode（2026-09-28 实测踩中）。清掉让 dataRoot 回落到隔离的 ZHOME。
+delete process.env.ZCODE_SWITCH_DATA_ROOT;
+delete process.env.ZCODE_DATA_BASE_DIR;
 
 let pass = 0, fail = 0;
 function ok(name, cond, extra) {
@@ -98,6 +103,9 @@ const store = require("../electron/backend/proxy/store.cjs");
     : (id === "w0" ? { id: "w0", channel: "zcode", name: "无oauth", uid: "u", meta: JSON.stringify({ jwt: "jj" }) } : null);
   const sw = ide.switchIdeAccount("w1");
   ok("写回成功、路径在 .zcode/v2/credentials.json", sw.ok && sw.file.includes(path.join(".zcode", "v2", "credentials.json")), sw);
+  // 隔离守卫：写回必须落在 ZHOME 内。dataRoot 解析被外部 env 劫持时（见文件头注释），在这里硬失败
+  // 而不是默默写进真实客户端目录——该断言 2026-09-28 实测拦下过一次真实目录污染。
+  ok("隔离守卫：写回文件在 ZHOME 内", sw.ok && path.isAbsolute(sw.file) && sw.file.startsWith(ZHOME + path.sep), { file: sw.file, ZHOME });
   const cred = JSON.parse(fs.readFileSync(sw.file, "utf8"));
   ok("credentials.json 五键齐（含 refresh + user_info）",
     cred.zcodejwttoken === "jj" && cred["oauth:active_provider"] === "bigmodel" && cred["oauth:bigmodel:access_token"] === "oauth-abc" && cred["oauth:bigmodel:refresh_token"] === "rt" && cred["oauth:bigmodel:user_info"] === JSON.stringify({ id: "42" }), Object.keys(cred));
