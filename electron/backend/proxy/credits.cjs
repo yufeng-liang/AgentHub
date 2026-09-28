@@ -87,16 +87,28 @@ async function refreshAccount(id) {
   // 复活逻辑：拿到新余额后，relogin / exhausted（余额不足或到期被自动切走的）账号回 online。
   // 注意 acc 是本次刷新开始前的旧快照，中间隔了上游网络请求（数秒）——期间请求链路可能刚把
   // 该号冷却（429 → cooling），必须用最新状态判定复活，不然会把新冷却无条件覆盖回 online
+  // 逐包明细（Q2 持久化 / Q7 派生）：adapter 返回 packages 时落库，并以包集为单一事实源
+  // 派生账号级 credits/expiresAt —— 剩余=Σ未过期包剩余；最近到期=min(剩余>0 且未过期 的包到期)。
+  let credits = r.credits;
+  let expiresAt = r.expiresAt || 0;
+  if (Array.isArray(r.packages)) {
+    store.setCreditPackages(acc.id, acc.channel, r.packages);
+    const derived = pool.deriveAccountCredits(r.packages);
+    if (derived) {
+      credits = derived.credits;
+      expiresAt = derived.expiresAt;
+    }
+  }
   const cur = store.getAccount(acc.id) || acc;
   const revive =
-    cur.status === "relogin" || (cur.status === "exhausted" && (r.credits > 0 || (r.expiresAt || 0) > Date.now()));
+    cur.status === "relogin" || (cur.status === "exhausted" && (credits > 0 || credits === -1 || (expiresAt || 0) > Date.now()));
   store.updateAccount(acc.id, {
-    credits: r.credits,
+    credits,
     creditsAt: Date.now(),
-    expiresAt: r.expiresAt || cur.expires_at,
+    expiresAt: expiresAt || cur.expires_at,
     ...(revive ? { status: "online", coolUntil: 0, coolReason: "" } : {}),
   });
-  store.snapshotCredits(acc.channel, acc.id, r.credits, r.expiresAt || 0);
+  store.snapshotCredits(acc.channel, acc.id, credits, expiresAt || 0);
   // 今日消耗积分：对话响应不带 per-request 消耗、但有积分明细的渠道（如小浣熊），
   // 刷余额时顺带反查明细汇总今日消耗，写入 credits_today（权威 set，非累加）；查不到不动
   if (typeof adapter.queryTodayCredits === "function") {
@@ -118,7 +130,7 @@ async function refreshAccount(id) {
     store.updateAccount(acc.id, { meta: { ...meta, wbUsedDay: today, wbUsedBase: base } });
     store.setCreditsToday(acc.id, Math.max(0, usedNow - base));
   }
-  return { id: acc.id, credits: r.credits, expiresAt: r.expiresAt || 0 };
+  return { id: acc.id, credits, expiresAt: expiresAt || 0 };
 }
 
 /** 单渠道逐账号批量刷新（号池页「刷新当前渠道」用），每渠道并发 ≤2；单账号失败不影响其余 */

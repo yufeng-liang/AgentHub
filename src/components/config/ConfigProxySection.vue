@@ -70,6 +70,7 @@ async function save() {
     app.config.proxy.rateLimitPerMin = Math.max(0, Math.round(Number(app.config.proxy.rateLimitPerMin) || 0));
     app.config.proxy.concurrency = Math.max(1, Math.round(Number(app.config.proxy.concurrency) || 1));
     app.config.proxy.usageRetentionDays = Math.min(3650, Math.max(1, Math.round(Number(app.config.proxy.usageRetentionDays) || 90)));
+    app.config.proxy.expiringSoonDays = Math.min(3650, Math.max(0, Math.round(Number(app.config.proxy.expiringSoonDays) || 7)));
     const r = await app.save();
     if (r && r.ok === false) {
       msg.value = r.message || "保存失败";
@@ -193,6 +194,14 @@ function openDataDir() {
             <div class="set-desc">用量统计的请求明细保留天数（1~3650），启动时按它清理旧流水；统计页「清理」按钮也按这个值立即删一轮</div>
           </div>
           <input v-model.number="app.config.proxy.usageRetentionDays" class="input mono" style="width: 90px" type="number" min="1" max="3650" />
+          <span style="font-size: 11px; color: var(--text-3)">天</span>
+        </div>
+        <div class="set-row">
+          <div class="set-info">
+            <div class="set-name">积分包到期预警</div>
+            <div class="set-desc">积分包剩余天数 ≤ 该值时标「即将到期」（0~3650）；号池页到期徽标与「积分到期」总览的分级配色共用此阈值</div>
+          </div>
+          <input v-model.number="app.config.proxy.expiringSoonDays" class="input mono" style="width: 90px" type="number" min="0" max="3650" />
           <span style="font-size: 11px; color: var(--text-3)">天</span>
         </div>
         <div class="set-row">

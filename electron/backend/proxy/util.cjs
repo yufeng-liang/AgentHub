@@ -61,6 +61,26 @@ function toMs(v) {
   return n < 1e12 ? n * 1000 : n;
 }
 
+/**
+ * 积分包到期归一（方案 Q10）：上游到期字段名混乱且有脏值，统一成"可比毫秒时间戳"。
+ * - 纯日期串（YYYY-MM-DD，无时分秒）补 23:59:59（当天有效，不因取到 00:00 被误判成前一天就过期）
+ * - 秒/毫秒自动判别沿用 toMs
+ * - "远未来"脏值（如 DeductionEndTime=2049 与月底 CycleEndTime 并存）超过 now + farYears 年 → 视为长期有效，返回 0
+ * 返回 0 表示"无到期 / 长期有效"（与 expiresAt=0 语义一致）。
+ */
+function normalizeExpiryMs(raw, farYears) {
+  const years = Number(farYears) > 0 ? Number(farYears) : 5;
+  let v = raw;
+  if (typeof v === "string") {
+    const s = v.trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) v = s + "T23:59:59"; // 纯日期补当天末尾
+  }
+  const ms = toMs(v);
+  if (!ms) return 0;
+  if (ms > Date.now() + years * 365 * 86400000) return 0; // 远未来脏值 → 长期有效
+  return ms;
+}
+
 /** 判定字符串是否为完整 JSON（SSE 紧凑流兼容的判据，参考项目 wb_sse 实证） */
 function isCompleteJson(s) {
   if (!s || s === "[DONE]") return false;
@@ -423,7 +443,7 @@ function upstreamCredit(u) {
 }
 
 module.exports = {
-  uuid, traceId, jwtDecode, dig, toMs,
+  uuid, traceId, jwtDecode, dig, toMs, normalizeExpiryMs,
   isCompleteJson, parseRetryAfterHeaders, stableConvId, promptCacheKey,
   isDeepSeekModel, injectThinking, normalizeReasoningEffort, backfillReasoningContent, EFFORT_LEVELS, EFFORT_RANK, normalizeEffortName,
   SseScanner, stripEmptyDelta, hasConsumableDelta, chunk, DONE, Aggregator, openaiError, validateChatBody, estimateTokens,

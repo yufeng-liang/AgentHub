@@ -195,6 +195,7 @@ function exportPool(channel) {
         expiresAt: view.expiresAt || 0,
         credits: view.credits || 0,
         creditsAt: view.creditsAt || 0,
+        packages: store.listCreditPackages(view.id), // 逐包明细（Q9）：与额度同一次 LWW 整体替换
         source: view.source || "paste",
         meta: view.meta && typeof view.meta === "object" ? view.meta : {},
         updatedAt: accountStamp(view),
@@ -277,7 +278,7 @@ function mergeSnapshot(snap, channel) {
         skipped++;
         continue;
       }
-      store.addAccount({
+      const newId = store.addAccount({
         channel: ra.channel,
         uid: ra.uid || "",
         name: ra.name || "",
@@ -287,6 +288,8 @@ function mergeSnapshot(snap, channel) {
         expiresAt: ra.expiresAt || 0,
         meta: ra.meta && typeof ra.meta === "object" ? ra.meta : {},
       });
+      // 逐包明细随整号入池（Q9）：新号一并落远端包集，异机不必等本机首次刷新才看到明细
+      if (Array.isArray(ra.packages)) store.setCreditPackages(newId, ra.channel, ra.packages);
       added++;
       continue;
     }
@@ -296,6 +299,8 @@ function mergeSnapshot(snap, channel) {
       patch.credits = ra.credits;
       patch.creditsAt = ra.creditsAt;
       patch.expiresAt = ra.expiresAt;
+      // 包集与额度同一次 LWW 整体替换（Q9）：远端 creditsAt 更新即以远端包集为准
+      if (Array.isArray(ra.packages)) store.setCreditPackages(local.id, ra.channel || local.channel, ra.packages);
     }
     // 自定义备注名（用户备注）：远端较新时覆盖本机（LWW）。阈值必须与导出侧**同一把尺**（accountStamp），
     // 否则「各用一把尺」会让改名方的新名被对端按更小的阈值判回去（三期 fork 侧修复，2026-09-24）

@@ -152,6 +152,7 @@ function defaultConfig() {
       rateLimitPerMin: 120,     // 单 Key 令牌桶限速（次/分钟，Key 可单独覆盖）
       concurrency: 8,           // 上游并发上限
       creditsRefreshMin: 30,    // 额度自动刷新周期（分钟）
+      expiringSoonDays: 7,      // 积分包「即将到期」预警阈值（天，Q4）：号池到期徽标与到期总览分级共用（0~3650）
       usageRetentionDays: 90,   // 请求流水保留期（天）：启动 GC 与统计页「清理」共用（7~3650）
       debugStatus: false,       // /status 调试端点（默认关，仅回环地址）
       modelOverrides: {},       // 模型 → 渠道 的 per-model 覆盖（多源重叠时优先）

@@ -46,6 +46,7 @@ function defaultConfig(): AppConfig {
       rateLimitPerMin: 120,
       concurrency: 8,
       creditsRefreshMin: 30,
+      expiringSoonDays: 7,
       usageRetentionDays: 90,
       debugStatus: false,
       modelOverrides: {},

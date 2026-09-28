@@ -3,6 +3,31 @@
 "use strict";
 const store = require("./store.cjs");
 
+// 即将到期阈值（天，Q4）：设置页可调，index.cjs register 时按 settings().expiringSoonDays 灌入。
+// 放本模块的模块级变量（仿 store.usageRetentionDays），避免让热路由模块依赖 config。
+let expiringSoonDays = 7;
+function setExpiringSoonDays(n) {
+  const v = Number(n);
+  if (Number.isFinite(v) && v >= 0 && v <= 3650) expiringSoonDays = v;
+}
+function expiringSoonMs() { return expiringSoonDays * 86400000; }
+
+/** 从包集派生账号级 credits/expiresAt（Q7，单一事实源）：
+ *  - 剩余 = Σ(未过期包的剩余)；已过期包不计入余额
+ *  - 最近到期 = min(剩余>0 且未过期 的包到期)；无这类包则 0（无到期/长期）
+ *  - 任一包为不限（total 或 remaining = -1）→ credits = -1（无限额度哨兵）
+ *  - 无包（空/非数组）→ 返回 null，调用方保留上游聚合值 */
+function deriveAccountCredits(packages, now) {
+  if (!Array.isArray(packages) || !packages.length) return null;
+  now = now || Date.now();
+  const unlimited = packages.some((p) => Number(p.remaining) === -1 || Number(p.total) === -1);
+  const valid = packages.filter((p) => !(Number(p.expiresAt) > 0 && Number(p.expiresAt) <= now));
+  const credits = unlimited ? -1 : valid.reduce((s, p) => s + Math.max(0, Number(p.remaining) || 0), 0);
+  const withRemain = valid.filter((p) => (Number(p.remaining) || 0) > 0 && Number(p.expiresAt) > 0);
+  const expiresAt = withRemain.length ? Math.min(...withRemain.map((p) => Number(p.expiresAt))) : 0;
+  return { credits, expiresAt };
+}
+
 /** 派生有效状态：cooling 到期自动回 online；exhausted 到次日 04:00 后给复活机会 */
 function effectiveStatus(acc, now) {
   now = now || Date.now();
@@ -374,7 +399,7 @@ function poolSummary(channel) {
     // 已过期必须单独出标志：expiresAt - now 对过期账号是负数，按旧的「< 86400000」判定会把
     // 过期一周的号也标成「即将到期」（2026-09-27 Trae 渠道侧栏实测）
     expired: accs.some((a) => a.expiresAt > 0 && a.expiresAt <= now),
-    expiringSoon: accs.some((a) => a.expiresAt > now && a.expiresAt - now < 86400000),
+    expiringSoon: accs.some((a) => a.expiresAt > now && a.expiresAt - now < expiringSoonMs()),
     todayReq: accs.reduce((s, a) => s + a.todayReq, 0),
     todayTokens: accs.reduce((s, a) => s + a.todayTokens, 0),
     lastCreditsAt: accs.reduce((m, a) => Math.max(m, a.creditsAt || 0), 0),
@@ -385,5 +410,5 @@ module.exports = {
   effectiveStatus, poolAccounts, pickAccount, coolAccount, coolAccountMs,
   coolAccountModel, isModelCooled, accountModelCool, poolSummary, nextDay4AM,
   acquireAccount, releaseAccount, softBackoffMs, noteSessionDead, noteServerError, noteSuccess,
-  releaseCool,
+  releaseCool, setExpiringSoonDays, deriveAccountCredits,
 };
