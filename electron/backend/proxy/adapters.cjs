@@ -660,6 +660,7 @@ function parseWbResource(data, isEnterprise) {
     const used = Number(util.dig(d, /^used_num$|^usednum$|^credit$/i)) || 0;
     return {
       credits: limit < 0 ? -1 : Math.max(limit - used, 0),
+      used,
       expiresAt: util.toMs(util.dig(d, /cycle_end_time|cycle_reset_time|end_time|expire/i)),
     };
   }
@@ -700,7 +701,7 @@ function parseWbResource(data, isEnterprise) {
   } else if (size > 0 && size - remain > used) {
     used = size - remain;
   }
-  return { credits: Math.max(remain, 0), expiresAt: earliestEnd };
+  return { credits: Math.max(remain, 0), used, expiresAt: earliestEnd };
 }
 
 /** 官方客户端会话头族（参考项目 ChatMeta 实证：后台按 X-Conversation-Request-ID 聚合请求，

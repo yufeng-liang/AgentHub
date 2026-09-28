@@ -103,6 +103,21 @@ async function refreshAccount(id) {
     const spent = await adapter.queryTodayCredits(acc, secrets).catch(() => null);
     if (typeof spent === "number" && spent >= 0) store.setCreditsToday(acc.id, spent);
   }
+  // 今日消耗积分（累计口径渠道，如 WorkBuddy/CodeBuddy）：上游只给「套餐累计已消耗 used」，
+  // 无 per-request、也无消耗明细。用「本次读数 − 今日首次读数」折出今日消耗（两次权威读数相减，
+  // 非估算）；基线存 meta.wbUsedDay/wbUsedBase，跨天/首次/读数回退（套餐续期）时重置基线、今日归 0。
+  // 与 queryTodayCredits（明细口径，如小浣熊）互斥：那类渠道不返回 r.used，二者不叠加。
+  if (typeof r.used === "number" && Number.isFinite(r.used) && r.used >= 0 && typeof adapter.queryTodayCredits !== "function") {
+    const usedNow = Math.round(r.used);
+    const fresh = store.getAccount(acc.id) || cur;
+    let meta = {};
+    try { meta = fresh.meta ? JSON.parse(fresh.meta) : {}; } catch { meta = {}; }
+    const today = store.dayStr();
+    const sameDay = meta.wbUsedDay === today;
+    const base = sameDay && Number.isFinite(meta.wbUsedBase) && meta.wbUsedBase <= usedNow ? meta.wbUsedBase : usedNow;
+    store.updateAccount(acc.id, { meta: { ...meta, wbUsedDay: today, wbUsedBase: base } });
+    store.setCreditsToday(acc.id, Math.max(0, usedNow - base));
+  }
   return { id: acc.id, credits: r.credits, expiresAt: r.expiresAt || 0 };
 }
 
