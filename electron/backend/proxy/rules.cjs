@@ -240,6 +240,7 @@ const DEFAULTS = {
       defaultModel: "raccoon-chat-ml-5-5",
       // 积分/配额/账号域（渲染层 fetchWithAuth，统一 {code,data} 信封）
       balanceUrl: "https://xiaohuanxiong.com/api/web/points/v1/balance",
+      billsUrl: "https://xiaohuanxiong.com/api/web/points/v1/bills",
       settingUrl: "https://xiaohuanxiong.com/api/web/office/v3/setting_info",
       userInfoUrl: "https://xiaohuanxiong.com/api/web/auth/v1/user_info",
       grantUrl: "https://xiaohuanxiong.com/api/web/desktop/v1/login/points/grant",

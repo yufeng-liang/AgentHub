@@ -97,6 +97,12 @@ async function refreshAccount(id) {
     ...(revive ? { status: "online", coolUntil: 0, coolReason: "" } : {}),
   });
   store.snapshotCredits(acc.channel, acc.id, r.credits, r.expiresAt || 0);
+  // 今日消耗积分：对话响应不带 per-request 消耗、但有积分明细的渠道（如小浣熊），
+  // 刷余额时顺带反查明细汇总今日消耗，写入 credits_today（权威 set，非累加）；查不到不动
+  if (typeof adapter.queryTodayCredits === "function") {
+    const spent = await adapter.queryTodayCredits(acc, secrets).catch(() => null);
+    if (typeof spent === "number" && spent >= 0) store.setCreditsToday(acc.id, spent);
+  }
   return { id: acc.id, credits: r.credits, expiresAt: r.expiresAt || 0 };
 }
 

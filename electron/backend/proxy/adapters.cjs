@@ -1618,6 +1618,47 @@ const raccoon = {
     return { credits, raw: d };
   },
 
+  /** 今日消耗积分：小浣熊对话响应不带 per-request 消耗，只能靠积分明细 /bills 反查。
+   *  取 type=expense 明细（按时间倒序），累加「今日（本地日）」的消耗（points 负数取绝对值），
+   *  翻到出现非今日记录即停。成功返回今日消耗（>=0）；失败/无端点返回 null（调用方据此保持
+   *  未上报 -1，不造假）。注意明细有几分钟同步延迟，故为「近实时」而非精确到最后一条。 */
+  async queryTodayCredits(account, secrets) {
+    const c = this.cfg();
+    if (!c.billsUrl) return null;
+    const headers = raccoonWebHeaders(c, account, secrets);
+    const now = new Date();
+    const isToday = (iso) => {
+      const t = new Date(iso);
+      return t.getFullYear() === now.getFullYear() && t.getMonth() === now.getMonth() && t.getDate() === now.getDate();
+    };
+    let sum = 0, offset = 0, cursor = "";
+    for (let pages = 0; pages < 10; pages += 1) {
+      const qs = new URLSearchParams({ "paging.limit": "50", type: "expense" });
+      if (cursor) qs.set("cursor", cursor); else qs.set("paging.offset", String(offset));
+      const r = await httpJson(`${c.billsUrl}?${qs.toString()}`, { method: "GET", headers }).catch(() => ({ ok: false, status: 0, data: null }));
+      if (r.status === 401) return null; // 401 交由 refreshAccount 主链路刷新，这里不误判
+      const code = Number((r.data && r.data.code) ?? (r.ok ? 0 : -1));
+      if (!r.ok || !r.data || (code !== 0 && code !== 200)) return null;
+      const d = r.data.data || r.data;
+      const items = Array.isArray(d.items) ? d.items : [];
+      if (!items.length) break;
+      let sawOlder = false;
+      for (const it of items) {
+        const ts = it.created_at || it.createdAt;
+        if (ts && !isToday(ts)) { sawOlder = true; continue; }
+        const p = Number(it.points);
+        if (Number.isFinite(p) && p < 0) sum += -p;
+      }
+      if (sawOlder) break; // 倒序明细已翻到昨天：今日记录已全覆盖
+      const nextCursor = d.next_cursor || (d.paging && d.paging.next_cursor) || "";
+      const hasMore = d.has_more === true || (d.paging && (Number(d.paging.offset || 0) + items.length) < Number(d.paging.total || 0));
+      if (nextCursor) cursor = String(nextCursor);
+      else if (hasMore) offset += items.length;
+      else break;
+    }
+    return Math.round(sum);
+  },
+
   /** 签到状态：小浣熊无独立"签到状态"接口，每日积分随登录自动发放，标 unavailable 说明查询不适用 */
   async checkinStatus(account, secrets) {
     try {

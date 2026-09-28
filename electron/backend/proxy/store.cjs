@@ -720,6 +720,26 @@ function bumpAccountUsage(id, tokens, credits) {
   );
 }
 
+/** 权威设置账号今日消耗积分（用于对话不带 per-request 消耗、靠积分明细反查的渠道，如小浣熊）：
+ *  直接置为传入值（非累加），并与 bumpAccountUsage 一致地做跨天滚动（新的一天先清零 req/tokens）。
+ *  credits<0 视为未上报，不落库（保持旧值/哨兵，宁缺勿假）。 */
+function setCreditsToday(id, credits) {
+  open();
+  const cur = getAccount(id);
+  if (!cur) return;
+  const c = Number.isFinite(credits) && credits >= 0 ? Math.round(credits) : -1;
+  if (c < 0) return;
+  const today = dayStr();
+  const sameDay = cur.today_day === today;
+  db.prepare("UPDATE accounts SET today_day=?, today_req=?, today_tokens=?, credits_today=? WHERE id=?").run(
+    today,
+    sameDay ? cur.today_req : 0,
+    sameDay ? cur.today_tokens : 0,
+    c,
+    id
+  );
+}
+
 function removeAccount(id) {
   open();
   db.prepare("DELETE FROM credits_history WHERE account_id = ?").run(String(id));
@@ -1033,7 +1053,7 @@ module.exports = {
   createKey, listKeys, findKeyBySecret, updateKey, deleteKey, keyTodayReq,
   listAgents, setPoolStrategy,
   listProviders, getProvider, saveProvider, deleteProvider,
-  listAccounts, accountRows, getAccount, accountSecrets, addAccount, updateAccount, bumpAccountUsage, removeAccount, noteError,
+  listAccounts, accountRows, getAccount, accountSecrets, addAccount, updateAccount, bumpAccountUsage, setCreditsToday, removeAccount, noteError,
   listModelCooldowns, upsertModelCooldown, deleteModelCooldowns,
   snapshotCredits,
   insertUsage, statsToday, statsTrend, statsTop, statsDetail, recentRequests,
