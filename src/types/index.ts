@@ -329,8 +329,9 @@ export type ProxyBuiltinChannelId = "trae" | "workbuddy" | "workbuddy_ai" | "rac
  *  自建 slug 是运行期数据，编译期无从枚举，所以这里放宽成普通字符串（同 ProxyRoute 的既有做法），
  *  保留字面量联合只为了 IDE 补全。**需要"仅内置"约束的地方请用 ProxyBuiltinChannelId。** */
 export type ProxyChannelId = ProxyBuiltinChannelId | (string & {});
-/** builtin = 内置生态渠道；另外两种是自定义提供商的**上游协议形态**（与入站协议无关） */
-export type ProxyProviderKind = "openai_compat" | "anthropic_messages";
+/** builtin = 内置生态渠道；另外三种是自定义提供商的**上游协议形态**（与入站协议无关）。
+ *  值集合与后端 provider.cjs 的 KINDS 同源，漂移由 dev-provider-test 断言守住。 */
+export type ProxyProviderKind = "openai_compat" | "anthropic_messages" | "openai_responses";
 export type ProxyChannelKind = "builtin" | ProxyProviderKind;
 
 /** Key 路由：auto 或任一渠道 id（渠道后续扩充即为普通字符串，保留字面量仅为补全提示） */
@@ -468,7 +469,7 @@ export interface ProxyChannelView {
   accounts: ProxyAccount[];
 }
 
-// ===== 自定义提供商（中转站 / 自建 OpenAI 兼容端点） =====
+// ===== 自定义提供商（中转站 / 自建端点，上游可为 chat、Messages、Responses 三种形态） =====
 
 /** models 条目：字符串 = 裸名且上游同名；对象 = 可带客户端可见名与上游真名的别名映射及目录元数据 */
 export type ProxyProviderModel = string | {
@@ -805,7 +806,7 @@ export const MODULES: ModuleDef[] = [
     pages: [
       { id: "home", name: "总览" },
       { id: "keys", name: "API Keys" },
-      { id: "providers", name: "提供商" },
+      { id: "providers", name: "自定义提供商" },
       { id: "agents", name: "号池" },
       { id: "expiry", name: "积分到期" },
 

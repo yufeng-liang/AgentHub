@@ -20,9 +20,18 @@ const SLUG_RE = /^[a-z0-9][a-z0-9_-]{1,31}$/;
 // 撞上的后果不是报错而是行为诡异——例如 slug="v1" 会让 `/v1/models` 的解析歧义。
 const RESERVED = new Set(["auto", "all", "v1", "models", "healthz", "status", "readyz"]);
 
-// 上游协议形态：绝大多数中转站是 OpenAI 兼容；Claude 中转生态里有相当一部分只开 /v1/messages
-const KINDS = new Set(["openai_compat", "anthropic_messages"]);
+// 上游协议形态：绝大多数中转站是 OpenAI 兼容；Claude 中转生态里有相当一部分只开 /v1/messages；
+// 而 OpenAI 自己往 /v1/responses 收敛之后，一批新站与自建网关只开这一个端点。
+// 这三个值同时是 UI 下拉、KIND_DEFAULT 的候选与 adapters.cjs chat() 的分派键——加一档要三处同改，
+// 前端那份由 dev-provider-test 的「kind 值集合与后端同源」断言守住。
+const KINDS = new Set(["openai_compat", "anthropic_messages", "openai_responses"]);
 const KIND_DEFAULT = "openai_compat";
+/** 探测失败时按形态给一句人话（拿 OpenAI 措辞去报 Responses 站的失败会把人引向错误的排查方向） */
+const KIND_LABEL = {
+  openai_compat: "不是 OpenAI Chat 兼容端点",
+  anthropic_messages: "不是 Anthropic Messages 端点",
+  openai_responses: "不是 OpenAI Responses 端点",
+};
 
 /** base_url 归一化：只在**写入侧**做一次并存规范值，出站一律 `base + "/chat/completions"`。
  *  留两处拼接口径迟早会漂（尾斜杠、/v1 有无是中转站两种常见写法）。
@@ -42,7 +51,10 @@ function normalizeBaseUrl(raw) {
   let p = u.pathname.replace(/\/+$/, "");
   // 长后缀优先、剥到不动为止：先匹配 /chat/completions 会让 /v1/chat/completions 只掉一半，
   // 剩个 /v1 就得靠"再归一一次"才干净——写入侧存的就是脏值，读侧永远拼错端点。
-  const TRAILING = ["/v1/chat/completions", "/chat/completions", "/v1/messages", "/v1"];
+  // /v1/responses 必须与 /v1/messages 同列：漏一条的后果不是报错而是静默拼出
+  // `.../v1/responses/v1/responses`（出站一律在 base 后面补 /v1/<leaf>）。
+  // 刻意不收裸 "/responses"——那是个太通用的挂载路径名，撞上的代价比省下一次手删更贵。
+  const TRAILING = ["/v1/chat/completions", "/chat/completions", "/v1/messages", "/v1/responses", "/v1"];
   for (let changed = true; changed; ) {
     changed = false;
     for (const suffix of TRAILING) {
@@ -336,6 +348,9 @@ async function probe({ id, accountId, baseUrl, key, model, kind, extraHeaders, e
   if (!target) return { ok: false, message: "请先填要试的模型名" };
   const headers = normalizeHeaders(extraHeaders || {});
   if (!headers.ok) return headers;
+  // 认不出的 kind 不报错、按缺省形态探：这是探测不是保存，保存侧的 validate 才是拒人的地方。
+  // 但一旦真按缺省探了，失败文案就得说缺省那种形态，否则会把人引向另一个协议的排查路径。
+  const resolvedKind = KINDS.has(kind) ? kind : KIND_DEFAULT;
 
   // 已保存过的提供商要拿它自己的清单去探：否则 upstream 真名映射、别名、思考档位降级全都不生效，
   // "探测通过但真实请求 400"就是这么来的。新建表单（无 id 或清单里没这个模型）才退化成裸名直传。
@@ -349,7 +364,7 @@ async function probe({ id, accountId, baseUrl, key, model, kind, extraHeaders, e
 
   const adapter = adapters.makeOpenaiCompat({
     id: id || "__probe__",
-    kind: KINDS.has(kind) ? kind : KIND_DEFAULT,
+    kind: resolvedKind,
     baseUrl: base.url,
     models: probeModels,
     extraHeaders: headers.headers,
@@ -378,7 +393,7 @@ async function probe({ id, accountId, baseUrl, key, model, kind, extraHeaders, e
   }
   const ms = Date.now() - started;
   if (streamErr) return { ok: false, status: streamErr.status || 502, ms, message: `流内错误：${streamErr.message}` };
-  if (!sample && !finishReason) return { ok: false, status: 502, ms, message: "上游没有任何内容返回（可能不支持该模型或不是 OpenAI 兼容端点）" };
+  if (!sample && !finishReason) return { ok: false, status: 502, ms, message: `上游没有任何内容返回（可能不支持该模型，或该地址${KIND_LABEL[resolvedKind]}）` };
   return { ok: true, ms, model: target, sample: sample.slice(0, 200), finishReason, usage };
 }
 

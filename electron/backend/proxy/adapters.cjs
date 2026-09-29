@@ -14,6 +14,7 @@ const clineAuth = require("./clineAuth.cjs");
 const acCred = require("./autoclawCredentials.cjs");
 const acPrompt = require("./autoclawPrompt.cjs");
 const aup = require("./protocols/anthropic-up.cjs");
+const rup = require("./protocols/responses-up.cjs");
 const qcosy = require("./qoderCosy.cjs");
 const config = require("../config.cjs");
 
@@ -3296,6 +3297,7 @@ function compatUrl(base, leaf) {
 function makeOpenaiCompat(row) {
   const entries = compatModelEntries(row);
   const chatUrl = compatUrl(row.baseUrl, "chat/completions");
+  const responsesUrl = compatUrl(row.baseUrl, "responses");
   // 客户端名 → 上游真名 / → 条目。别名与模型名同等参与解析（别名不进 /v1/models，
   // 但客户端拿它发请求必须能命中），所以两张表都要把 aliases 铺进去。
   const upstreamByClient = new Map();
@@ -3369,21 +3371,27 @@ function makeOpenaiCompat(row) {
       return { ok: true, models };
     },
 
-    rewriteBody(model, body) {
-      const out = { ...(body || {}) };
-      out.model = this.upstreamFor(model);
-      out.stream = true; // 一律流式打上游，非流式由 server 侧 Aggregator 本地聚合（见 chat() 注释）
-      if (!isPlainObj(out.stream_options)) out.stream_options = {};
-      out.stream_options.include_usage = true;
-      // 思考档位按该模型声明的支持集降级（与内置渠道同一个 util，档位词表也同源）：
-      // 客户端要 low 而上游只有 medium/high 时，透传过去是一个 400，降级才可用。
-      // 喂入合并后 ModelMeta（拉取 + 用户覆盖，方案 §2.3）——提供商无 seed 层，seed 传 null。
+    /** 思考档位按该模型声明的支持集降级（与内置渠道同一个 util，档位词表也同源）：
+     *  客户端要 low 而上游只有 medium/high 时，透传过去是一个 400，降级才可用。
+     *  喂入合并后 ModelMeta（拉取 + 用户覆盖，方案 §2.3）——提供商无 seed 层，seed 传 null。
+     *  chat 与 Responses 两种出站形态共用这一份：档位口径抄两遍必然漂开，而且是静默的。 */
+    applyReasoning(model, out) {
       const entry = this.entryFor(model);
       const ovr = userModelMeta()[`${row.id}/${(entry && entry.client) || model}`] || null;
       const mergedMeta = mergeModelMeta(null, entry && entry.entry, ovr);
       // Anthropic 客户端 thinking 预算非法/负 → 协议层不派生：补默认档（方案 §3.1）；off 标记照常删档
       util.fillThinkingDefaultEffort(out, (mergedMeta.reasoning && mergedMeta.reasoning.defaultEffort) || "");
       util.normalizeReasoningEffort(out, mergedMeta.reasoning);
+      return out;
+    },
+
+    rewriteBody(model, body) {
+      const out = { ...(body || {}) };
+      out.model = this.upstreamFor(model);
+      out.stream = true; // 一律流式打上游，非流式由 server 侧 Aggregator 本地聚合（见 chat() 注释）
+      if (!isPlainObj(out.stream_options)) out.stream_options = {};
+      out.stream_options.include_usage = true;
+      this.applyReasoning(model, out);
       // 网关自己注入的内部字段，上游不认（raccoon 同款剔除清单）
       delete out.conversation_id;
       delete out.conversationId;
@@ -3391,10 +3399,13 @@ function makeOpenaiCompat(row) {
       return deepMerge(out, row.extraBody || {});
     },
 
-    /** 对话：按提供商的上游协议形态分派。两种形态共用同一套 emit 词汇与同一份调度、号池、记账代码。
-     *  Anthropic 形态上游不发 stream_options / 不接 OpenAI body，见 chatAnthropic。 */
+    /** 对话：按提供商的上游协议形态分派。三种形态共用同一套 emit 词汇与同一份调度、号池、记账代码。
+     *  Anthropic 形态上游不发 stream_options / 不接 OpenAI body，见 chatAnthropic；
+     *  Responses 形态同理不接 chat body，见 chatResponses。 */
     async chat(ctx) {
-      return row.kind === "anthropic_messages" ? this.chatAnthropic(ctx) : this.chatOpenai(ctx);
+      if (row.kind === "anthropic_messages") return this.chatAnthropic(ctx);
+      if (row.kind === "openai_responses") return this.chatResponses(ctx);
+      return this.chatOpenai(ctx);
     },
 
     /** OpenAI 协议 1:1 透传 */
@@ -3473,6 +3484,49 @@ function makeOpenaiCompat(row) {
           const data = parseJson(text);
           if (!data) throw Object.assign(new Error(`上游返回非 JSON（${text.slice(0, 200)}）`), { status: 502 });
           aup.emitWhole(data, emit, t.nameMap, statusOf);
+          return result;
+        }
+        await pumpSse(resp, (_event, raw) => {
+          const data = parseJson(raw);
+          if (data) tr.push(data);
+        });
+        tr.close();
+      } finally {
+        cancelTimer();
+      }
+      return result;
+    },
+
+    /**
+     * Responses 形态上游（只开 /v1/responses 的中转站与自建网关）。
+     * 请求与事件流的互转都在 protocols/responses-up.cjs；这里只管 HTTP 与错误映射。
+     */
+    async chatResponses({ secrets, model, body, emit }) {
+      const prepared = this.applyReasoning(model, { ...(body || {}), model: this.upstreamFor(model) });
+      const t = rup.toRequest(prepared.model, prepared);
+      if (!t.ok) throw Object.assign(new Error(t.message), { status: 400, fatal: true });
+      if (t.notes && t.notes.length) {
+        // 与入站侧同一规矩：语义损失不可避免，不可追溯才是问题
+        console.warn(`[gateway] 发往 Responses 形态上游 "${row.id}" 的转换损失: ${t.notes.join(" | ")}`);
+      }
+      // extraBody 深合并：允许只覆盖 reasoning.effort 这类嵌套字段而不丢掉整个对象
+      const payloadObj = deepMerge(t.request, row.extraBody || {});
+      const { resp, cancelTimer } = await fetchStream(responsesUrl, { method: "POST", headers: this.headers(secrets), body: JSON.stringify(payloadObj) });
+      const result = { status: 200, planLimit: false };
+      // "欠费"无论上游把 code 写成什么都必须认出来：只有 402 会走「切号 + planLimit」这条既有链路
+      const statusOf = (errObj) => {
+        const s = rup.upstreamErrorStatus(errObj);
+        if (s === 402) result.planLimit = true;
+        return s;
+      };
+      const tr = rup.makeTranslator(emit, statusOf);
+      try {
+        const ctype = String(resp.headers.get("content-type") || "");
+        if (!ctype.includes("event-stream")) {
+          const text = await resp.text();
+          const data = parseJson(text);
+          if (!data) throw Object.assign(new Error(`上游返回非 JSON（${text.slice(0, 200)}）`), { status: 502 });
+          rup.emitWhole(data, emit, statusOf);
           return result;
         }
         await pumpSse(resp, (_event, raw) => {

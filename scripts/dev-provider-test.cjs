@@ -35,6 +35,10 @@ ok("挂载路径下的完整端点", B("https://a.com/api/v1/chat/completions").
 ok("一次就归一干净（不需二次）", B(B("https://a.com/v1/chat/completions").url).url === B("https://a.com/v1/chat/completions").url);
 ok("保留挂载路径", B("https://a.com/api/openai/v1").url === "https://a.com/api/openai", B("https://a.com/api/openai/v1").url);
 ok("幂等（二次归一不变）", B(B("https://a.com/v1/chat/completions").url).url === "https://a.com", B(B("https://a.com/v1/chat/completions").url).url);
+// 出站一律是 `base + "/v1/<leaf>"`：漏剥一条不会报错，只会静默拼出 /v1/responses/v1/responses
+ok("剥 /v1/responses", B("https://a.com/v1/responses").url === "https://a.com", B("https://a.com/v1/responses").url);
+ok("挂载路径下的 /v1/responses", B("https://a.com/api/v1/responses").url === "https://a.com/api", B("https://a.com/api/v1/responses").url);
+ok("裸 /responses 不剥（那是挂载路径名，不是端点）", B("https://a.com/responses").url === "https://a.com/responses", B("https://a.com/responses").url);
 ok("domain 取 hostname", B("https://relay.example.com:8443/v1").domain === "relay.example.com", B("https://relay.example.com:8443/v1"));
 ok("拒空", !B("").ok);
 ok("拒无协议", !B("a.com").ok, B("a.com"));
@@ -182,6 +186,23 @@ ok("前端档位词表与 util.EFFORT_LEVELS 同源", (() => {
   const fe = m[1].split(",").map((x) => String(x).trim().replace(/^["']|["']$/g, "")).filter(Boolean);
   return JSON.stringify(fe) === JSON.stringify(util.EFFORT_LEVELS);
 })(), util.EFFORT_LEVELS);
+// 上游协议形态同理三处共用一份真相：后端 KINDS、下拉选项、列表页 tag。
+// 加一档而前端漏改 → 该档在下拉里选不到；列表页写成三元 → 第三档会被显示成第一档的名字
+// （openai_responses 刚加进来时就是这样，所以这里既比集合、也禁掉那种写法）。
+ok("前端上游协议下拉的 kind 值集合与 provider.KINDS 同源", (() => {
+  const fs = require("node:fs");
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "src/views/proxy/ProxyProvidersView.vue"), "utf8");
+  // 声明带 TS 类型标注（`const KIND_OPTIONS: {...}[] = [`），所以锚点只能锁到 `= [` 之前
+  const m = /const KIND_OPTIONS[^=]*= \[([\s\S]*?)\n\];/.exec(src);
+  if (!m) return false;
+  const fe = [...m[1].matchAll(/value: "([^"]+)"/g)].map((x) => x[1]);
+  return JSON.stringify(fe) === JSON.stringify(provider.KINDS);
+})(), provider.KINDS);
+ok("协议形态展示名走查表而非三元比较", (() => {
+  const fs = require("node:fs");
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "src/views/proxy/ProxyProvidersView.vue"), "utf8");
+  return !/"(anthropic_messages|openai_responses)"\s*\?/.test(src);
+})(), "模板里出现 `kind === \"...\" ?` 形式的三元：加一档就会有一档显示错名字");
 provider.update("relay", { models: [{ model: "gpt-4o", upstream: "gpt-4o-2024-11-20" }, "glm-4.6"] });
 
 console.log("\n适配器缺省项（号池语义不被污染的前提）:");
