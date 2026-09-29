@@ -113,9 +113,30 @@ ok("上游 model 已是真名", rw.model === "gpt-4o-2024-11-20", rw.model);
 ok("注入 include_usage", rw.stream_options && rw.stream_options.include_usage === true);
 ok("剔除 conversation_id", !("conversation_id" in rw) && !("prompt_cache_key" in rw), Object.keys(rw));
 ok("标准字段透传", rw.temperature === 0.3 && Array.isArray(rw.messages));
-provider.update("relay", { extraBody: { reasoning: { effort: "high" }, thinking: { budget_tokens: 100 } } });
+
+// 入站协议原件（body.extraBody）回填上游：只并「该上游形态确有其物」的键。
+// 判据取自 OpenAI/Anthropic 各自的请求表，不是"上游大概会忽略未知字段"——严格端点对未知参数回 400。
+const rwNative = ad.rewriteBody("relay/gpt-4o", {
+  model: "relay/gpt-4o", messages: [{ role: "user", content: "hi" }],
+  extraBody: {
+    parallel_tool_calls: true,                                   // chat 形态确有此字段
+    thinking: { type: "enabled", budget_tokens: 3000 },          // Anthropic 私有
+    top_k: 40,                                                   // Anthropic 私有
+    text: { format: { type: "json_schema" } },                   // Responses 私有
+    service_tier: "priority",                                    // Responses 私有
+  },
+});
+ok("chat 上游绝不收到字面 extraBody 键（曾经原样泄漏出去）", !("extraBody" in rwNative), Object.keys(rwNative));
+ok("chat 形态回填它确有其物的 parallel_tool_calls", rwNative.parallel_tool_calls === true, rwNative.parallel_tool_calls);
+ok("Anthropic/Responses 的私有字段不得发给 chat 上游",
+  !("thinking" in rwNative) && !("top_k" in rwNative) && !("text" in rwNative) && !("service_tier" in rwNative),
+  Object.keys(rwNative));
+
+provider.update("relay", { extraBody: { reasoning: { effort: "high" }, thinking: { budget_tokens: 100 }, parallel_tool_calls: false } });
 const rw2 = adapters.get("relay").rewriteBody("relay/gpt-4o", { model: "relay/gpt-4o", messages: [] });
 ok("extraBody 深合并进上游体", rw2.reasoning.effort === "high" && rw2.thinking.budget_tokens === 100, rw2);
+ok("提供商配置的 extraBody 覆盖权仍高于客户端原件",
+  adapters.get("relay").rewriteBody("relay/gpt-4o", { model: "relay/gpt-4o", messages: [], extraBody: { parallel_tool_calls: true } }).parallel_tool_calls === false);
 ok("extraBody 不许覆盖 model", !provider.create({ id: "bad1", baseUrl: "https://x.test", extraBody: { model: "evil" } }).ok);
 ok("extraHeaders 不许覆盖 authorization", !provider.create({ id: "bad2", baseUrl: "https://x.test", extraHeaders: { Authorization: "Bearer zzz" } }).ok);
 store.deleteProvider("bad1");

@@ -22,7 +22,9 @@ const RESERVED = new Set(["auto", "all", "v1", "models", "healthz", "status", "r
 
 // 上游协议形态：绝大多数中转站是 OpenAI 兼容；Claude 中转生态里有相当一部分只开 /v1/messages；
 // 而 OpenAI 自己往 /v1/responses 收敛之后，一批新站与自建网关只开这一个端点。
-// 这三个值同时是 UI 下拉、KIND_DEFAULT 的候选与 adapters.cjs chat() 的分派键——加一档要三处同改，
+// 这三个值同时是 UI 下拉、KIND_DEFAULT 的候选与 adapters.cjs chat() 的分派键。
+// 加一档要改的不止这里（出站分派与 compatUrl leaf、前端 KIND_OPTIONS、normalizeBaseUrl 的 TRAILING，
+// 以及 adapters.cjs 的 NATIVE_KEYS_BY_KIND 回填白名单）——不写死处数，漏一处都是静默错。
 // 前端那份由 dev-provider-test 的「kind 值集合与后端同源」断言守住。
 const KINDS = new Set(["openai_compat", "anthropic_messages", "openai_responses"]);
 const KIND_DEFAULT = "openai_compat";
@@ -189,7 +191,7 @@ function validate(input, existing) {
   const body = normalizeBody(input.extraBody ?? (existing && existing.extraBody));
   if (!body.ok) return body;
   const kind = input.kind != null ? String(input.kind) : (existing && existing.kind) || KIND_DEFAULT;
-  if (!KINDS.has(kind)) return { ok: false, message: '上游协议形态只支持 openai_compat 与 anthropic_messages' };
+  if (!KINDS.has(kind)) return { ok: false, message: `上游协议形态只支持 ${[...KINDS].join("、")}` };
   const enabled = input.enabled != null ? !!input.enabled : !existing || existing.enabled !== false;
   return {
     ok: true,

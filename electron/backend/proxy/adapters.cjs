@@ -3256,6 +3256,39 @@ function isPlainObj(v) {
   return !!v && typeof v === "object" && !Array.isArray(v);
 }
 
+/** 入站协议原件（内部载体 body.extraBody，由各 *-in 收）回填上游时的白名单：
+ *  只列「该上游形态的请求表里确有其物」的键。判据取自 OpenAI 的 CreateResponse 参数表与
+ *  Anthropic 的 Messages 请求体，不是「上游大概会忽略未知字段」——严格端点对未知参数回 400，
+ *  那会把整条渠道打成不可用，而且客户端只会看到"打不通"。
+ *  Responses 侧刻意收得很窄，被排除的各有实据：include 要来的 encrypted_content 在回程被
+ *  responses-out 恒置 null（发出去也接不住）；service_tier 是中转站最不可能实现的一档；
+ *  safety_identifier/metadata 有长度与条数硬约束，过去"忽略"无害、现在会变成上游的 400，
+ *  等于把无害输入改成致命输入。 */
+const NATIVE_KEYS_BY_KIND = {
+  openai_compat: ["parallel_tool_calls"],
+  anthropic_messages: ["thinking", "metadata", "top_k"],
+  openai_responses: ["text", "reasoning", "parallel_tool_calls", "store"],
+};
+
+/** 覆盖权从低到高：上游请求形 < 客户端协议原件 < 用户在提供商里手填的 extraBody。
+ *  最后一级必须最高，否则用户没法用配置把某个透传字段按住（例如强行关掉 thinking）。
+ *  被白名单挡下的键如实写日志——静默丢才是问题，语义损失本身是设计里认下的。 */
+function withNative(request, body, kind, row) {
+  const src = body && body.extraBody;
+  const native = {};
+  const dropped = [];
+  if (isPlainObj(src)) {
+    const allow = NATIVE_KEYS_BY_KIND[kind] || [];
+    for (const [k, v] of Object.entries(src)) {
+      if (allow.includes(k)) native[k] = v;
+      else dropped.push(k);
+    }
+  }
+  if (dropped.length) console.warn(`[gateway] ${kind} 形态上游没有这些协议原生字段，已丢弃: ${dropped.join("、")}`);
+  const merged = Object.keys(native).length ? deepMerge(request, native) : request;
+  return deepMerge(merged, row.extraBody || {});
+}
+
 /** models_json 条目归一：字符串 = 裸模型名（上游同名）；对象 = 带元数据与别名。
  *  {model(客户端裸名), upstream(上游真名，缺省=model), name/rate/capabilities/contextLength/maxOutputTokens} */
 function compatModelEntries(row) {
@@ -3396,7 +3429,9 @@ function makeOpenaiCompat(row) {
       delete out.conversation_id;
       delete out.conversationId;
       delete out.prompt_cache_key;
-      return deepMerge(out, row.extraBody || {});
+      // 内部载体不能外泄：它曾经跟着 {...body} 原样发给上游，上游收到一个字面叫 extraBody 的未知字段
+      delete out.extraBody;
+      return withNative(out, body, "openai_compat", row);
     },
 
     /** 对话：按提供商的上游协议形态分派。三种形态共用同一套 emit 词汇与同一份调度、号池、记账代码。
@@ -3460,8 +3495,8 @@ function makeOpenaiCompat(row) {
     async chatAnthropic({ secrets, model, body, emit }) {
       const t = aup.toRequest(this.upstreamFor(model), body);
       if (!t.ok) throw Object.assign(new Error(t.message), { status: 400, fatal: true });
-      // extraBody 深合并：允许只覆盖 thinking.max_tokens 这类嵌套字段而不丢掉整个对象
-      const payloadObj = deepMerge(t.request, row.extraBody || {});
+      // 入站协议原件按白名单回填，再让提供商配置的 extraBody 压在其上（覆盖权最高）
+      const payloadObj = withNative(t.request, body, "anthropic_messages", row);
       const headers = { "content-type": "application/json", accept: "application/json", "anthropic-version": "2023-06-01" };
       for (const [k, v] of Object.entries(row.extraHeaders || {})) headers[k] = String(v);
       headers["x-api-key"] = secrets.token || "";
@@ -3509,8 +3544,8 @@ function makeOpenaiCompat(row) {
         // 与入站侧同一规矩：语义损失不可避免，不可追溯才是问题
         console.warn(`[gateway] 发往 Responses 形态上游 "${row.id}" 的转换损失: ${t.notes.join(" | ")}`);
       }
-      // extraBody 深合并：允许只覆盖 reasoning.effort 这类嵌套字段而不丢掉整个对象
-      const payloadObj = deepMerge(t.request, row.extraBody || {});
+      // 入站协议原件按白名单回填，再让提供商配置的 extraBody 压在其上（覆盖权最高）
+      const payloadObj = withNative(t.request, body, "openai_responses", row);
       const { resp, cancelTimer } = await fetchStream(responsesUrl, { method: "POST", headers: this.headers(secrets), body: JSON.stringify(payloadObj) });
       const result = { status: 200, planLimit: false };
       // "欠费"无论上游把 code 写成什么都必须认出来：只有 402 会走「切号 + planLimit」这条既有链路

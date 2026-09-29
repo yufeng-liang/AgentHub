@@ -346,6 +346,24 @@ const chatPost = (body) => post("/v1/chat/completions", body, "", { authorizatio
   const cl = await post("/v1/messages", client("clauderelay/claude-x"), GWKEY.secret);
   const clf = parseSse(cl.text);
   ok("Claude Code 入口 → Anthropic 上游 → Messages 事件全链路", clf[0].data.type === "message_start" && clf[clf.length - 1].data.type === "message_stop" && types(clf).filter((t) => t === "message_start").length === 1, types(clf));
+
+  // 两端同格式（Messages 客户端 → Messages 上游）：入站收进 extraBody 的协议原件必须真的落到上游。
+  // anthropic-in.cjs 的注释早就承诺了"原始 thinking 仍保留给 Anthropic 原生上游"，这里把承诺钉成判据。
+  // max_tokens 必须大于 budget_tokens，否则夹具本身就是一条 Anthropic 会拒的非法请求。
+  const clN = await post("/v1/messages", client("clauderelay/claude-x", {
+    max_tokens: 8192,
+    thinking: { type: "enabled", budget_tokens: 3000 },
+    top_k: 40,
+    metadata: { user_id: "u-9" },
+  }), GWKEY.secret);
+  const upN = seenA[seenA.length - 1].body;
+  ok("同协议链路拿到 200", clN.status === 200, [clN.status, clN.text.slice(0, 200)]);
+  ok("thinking 原件（含 budget_tokens）到达 Anthropic 上游",
+    upN.thinking && upN.thinking.type === "enabled" && upN.thinking.budget_tokens === 3000, upN.thinking);
+  ok("top_k / metadata 原件到达 Anthropic 上游",
+    upN.top_k === 40 && upN.metadata && upN.metadata.user_id === "u-9", [upN.top_k, upN.metadata]);
+  ok("上游请求里没有字面 extraBody 键（内部载体不外泄）", !("extraBody" in upN), Object.keys(upN));
+
   const fm = await provider.fetchModels("clauderelay");
   ok("Anthropic 形态上游也拉得到模型清单（真机实测这类站开了 /v1/models）", fm.ok === true && JSON.stringify(fm.models) === '["claude-x","claude-y"]', fm);
 
