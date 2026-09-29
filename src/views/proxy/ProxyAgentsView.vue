@@ -1321,7 +1321,11 @@ onUnmounted(() => {
           @click="activeChannel = ch.id"
         >
           <span class="ch-text">
-            <span class="ch-name">{{ ch.display }}</span>
+            <!-- 名称折两行仍可能放不下（920 下名区 ~106px），全名交给 tooltip：
+                 proxy 域禁原生 title（scripts/dev-proxy-tooltip-uniform-test.cjs ①） -->
+            <el-tooltip :content="ch.display" placement="top" :show-after="200">
+              <span class="ch-name">{{ ch.display }}</span>
+            </el-tooltip>
             <span class="ch-hint">{{ metaOf(ch).hint }}</span>
           </span>
           <span class="ch-badge" :class="{ ok: ch.summary.onlineCount > 0 }">
@@ -2050,7 +2054,10 @@ onUnmounted(() => {
 /* ===== 渠道主按钮：三列大按钮，各自独立成区，选中才点亮 ===== */
 .channel-switch {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  /* 下限 170 而不是 150：150 在最小窗宽 920（内容 664px）下排 4 列，名区只剩 55px，
+     "WorkBuddy AI（国际版）"折两行也放不下；170 让 920 退到 3 列（名区 ~123px），
+     而 1280（内容 900px）仍是 5 列，行数不变。 */
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
   gap: 10px;
 }
 .channel-btn {
@@ -2119,9 +2126,12 @@ onUnmounted(() => {
 .ch-name {
   font-size: 12.5px;
   font-weight: 650;
-  white-space: nowrap;
+  /* 名称让位给徽标时曾被截成同一个字串（WorkBuddy（中国区）/（国际版）在 1280 下都成
+     "WorkBuddy…"），故允许折两行；两行仍放不下时由外层 el-tooltip 给全名 */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
   overflow: hidden;
-  text-overflow: ellipsis;
 }
 .ch-sub {
   font-size: 11px;

@@ -174,9 +174,13 @@
   font-size: 11px;
   color: var(--text-3);
   margin-top: 2px;
+  /* 单行省略在 920 下会把 "存在于 Codex CLI · 最后修改…" 切成 "存在于 Cod…"（实测丢 137~154px），
+     看不出是哪个工具。改成最多两行；行高由 padding 撑开，不参与任何固定高度数学。 */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  word-break: break-all;
 }
 .sk-tool-row .t-count {
   font-variant-numeric: tabular-nums;

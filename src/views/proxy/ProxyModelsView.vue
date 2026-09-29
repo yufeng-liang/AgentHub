@@ -396,14 +396,16 @@ onMounted(refresh);
             {{ activeTab ? channelName(activeTab) + "模型目录" : "合并模型目录" }}
             <span class="right">{{ rows.length }} 个模型 · 保存即热生效</span>
           </div>
-          <div class="table-scroll" style="overflow-x: hidden" :ref="bindScroller" @scroll.passive="onScrollerScroll">
-            <table class="table table-bare models-table" style="table-layout: fixed; width: 100%">
-              <!-- 列宽用百分比而非像素：应用最小窗宽 920 时表格容器只有 599px，
-                   写死像素（82/105/…）在那之下会重新撑破（改前实测整表被裁 4px、
+          <!-- .table-scroll 本身就是 overflow:auto，原先那句 inline overflow-x:hidden 才是把它锁死的开关 -->
+          <div class="table-scroll" :ref="bindScroller" @scroll.passive="onScrollerScroll">
+            <table class="table table-bare models-table" style="table-layout: fixed; width: 100%; min-width: 900px">
+              <!-- 列宽用百分比而非像素：写死像素（82/105/…）在窄容器下会撑破（改前实测整表被裁 4px、
                    渠道覆盖 +14、状态 +18、元数据 +10）。百分比恒等比缩放，配合
-                   table-layout:fixed + 单元格 overflow:hidden + 控件 width:100%，
-                   结构上就不可能溢出。合计 78%，模型列吃剩余 22%。
-                   每列下限按真身实测内容宽倒推（见下方 .meta-badge / .custom-cell 的注释）。 -->
+                   table-layout:fixed + 单元格 overflow:hidden + 控件 width:100%，合计 78%，
+                   模型列吃剩余 22%。每列下限按真身实测内容宽倒推（见下方 .meta-badge / .custom-cell）。
+                   但「不可能溢出」的前提是容器宽到让每列都拿到自己的下限：最小窗宽 920 下表格容器只有
+                   599px，等比缩放把倍率压到 33px（"131.1K" 实测需 42px）、上下文 input 压到 52px 以下，
+                   数字就被静默切掉了。故给表挂 min-width:900px + 卡内横滚 —— 窄窗下宁可滚一下。 -->
               <colgroup>
                 <col style="width: auto" />
                 <col style="width: 10%" />
@@ -481,12 +483,19 @@ onMounted(refresh);
                     </div>
                   </td>
                   <td class="mono">{{ fmtRate(m.rate) }}</td>
-                  <td style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap">
-                    <span v-for="t in capabilityTags(m)" :key="t" class="tag tag-dim" style="margin-right: 3px; font-size: 10px; padding: 1px 4px">{{ t }}</span>
-                    <span v-if="!capabilityTags(m).length" style="color: var(--text-3)">—</span>
+                  <td class="cell-chips">
+                    <el-tooltip v-if="capabilityTags(m).length > 1" :content="`能力：${capabilityTags(m).join(' / ')}`" placement="top">
+                      <span class="chip-sum"><span class="tag tag-dim">{{ capabilityTags(m)[0] }}</span><span class="tag tag-dim chip-more">+{{ capabilityTags(m).length - 1 }}</span></span>
+                    </el-tooltip>
+                    <span v-else-if="capabilityTags(m).length" class="tag tag-dim">{{ capabilityTags(m)[0] }}</span>
+                    <span v-else style="color: var(--text-3)">—</span>
                   </td>
-                  <td v-if="!activeTab" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap">
-                    <span v-for="s in m.sources" :key="s" class="tag tag-dim" style="margin-right: 3px; font-size: 10px; padding: 1px 4px">{{ channelName(s) }}</span>
+                  <td v-if="!activeTab" class="cell-chips">
+                    <el-tooltip v-if="m.sources.length > 1" :content="`来源渠道：${m.sources.map((s: string) => channelName(s)).join(' / ')}`" placement="top">
+                      <span class="chip-sum"><span class="tag tag-dim">{{ channelName(m.sources[0]) }}</span><span class="tag tag-dim chip-more">+{{ m.sources.length - 1 }}</span></span>
+                    </el-tooltip>
+                    <span v-else-if="m.sources.length" class="tag tag-dim">{{ channelName(m.sources[0]) }}</span>
+                    <span v-else style="color: var(--text-3)">—</span>
                   </td>
                   <td>
                     <el-tooltip :content="m.sources.length === 1 ? '单源模型强制走所属渠道，无需覆盖' : ''" :disabled="m.sources.length !== 1" placement="top">
@@ -1064,9 +1073,32 @@ onMounted(refresh);
   padding-right: 8px;
   overflow: hidden;
 }
+/* 能力 / 来源渠道两列：多枚标签在 920 下曾被省略号切成 "图 …"、"WorkBuddy CN …"，
+   而这两列的宽度是上面按 888 容器倒推的，加宽就要动模型列。改成只显首枚 + 计数角标，
+   全量清单交给 tooltip —— 单行，不碰 ROW_H=60 的虚拟滚动垫高数学。 */
+.cell-chips .tag {
+  font-size: 10px;
+  padding: 1px 4px;
+}
+.chip-sum {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  max-width: 100%;
+  min-width: 0;
+}
+.chip-sum .tag:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chip-more {
+  flex-shrink: 0;
+}
 /* 状态列：开关固有宽 42px（40 + 1px 双边框），是表里唯一的交互控件，
-   被列宽切掉就点不准。左右 padding 收到 2px、列宽给 7.5%，
-   在应用最小窗宽 920（表格容器 599px）下 7.5% = 45px 仍放得下 42px 开关。 */
+   被列宽切掉就点不准。左右 padding 收到 2px、列宽给 7.5%。
+   表挂了 min-width:900px 后，7.5% 的下限就是 67px（此前按 920 窗口的 599px 容器算是 45px），
+   两种口径都放得下 42px 开关。 */
 .models-table th:last-child,
 .models-table td:last-child {
   padding-left: 2px;
