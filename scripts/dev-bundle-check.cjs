@@ -32,7 +32,11 @@ if (KB(entry.length) > 800) fails.push(`entry JS ${KB(entry.length).toFixed(0)} 
 // 带 src/styles/memory.css（40.1 KB 源）等，实测总量 331.8 KB ⇒ 325 这条会红。
 // 与 entry 一样留余量（实测的 ~8%）：这条是「防失控」的粗门槛，不是精确预算；
 // 真正的体积变化由下面的 --check 漂移闸（±5%）盯，两者分工不变。
-if (cssKB > 360) fails.push(`CSS 合计 ${cssKB.toFixed(0)} KB > 360 KB`);
+// 360 → 400 KB（2026-09-29 重推）：上一轮按 331.8 留的余量已被后续迭代吃掉——本次「自定义提供商」
+// 页重做实测 360.5 KB，只超 543 字节就红，等于任何加一行样式的人都得先来动这条门槛。
+// 按同一口径重推（实测 360.5 + ~10%）取整到 400。分工不变：±5% 漂移闸（基线 358.6 KB ≈ 18 KB）
+// 才是逐次看体积变化的一条，这条只拦失控级。
+if (cssKB > 400) fails.push(`CSS 合计 ${cssKB.toFixed(0)} KB > 400 KB`);
 if (js.length < 15) fails.push(`JS chunk 只有 ${js.length} 个，视图没切开`);
 // echarts 的折线渲染实现只应出现在异步 chunk；这两个标识是全量与 core 共有的内部字段名
 if (/seriesType:\s*"line"/.test(entryText)) fails.push("echarts 疑似仍在 entry chunk");

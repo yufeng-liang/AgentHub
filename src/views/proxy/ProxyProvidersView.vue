@@ -1,4 +1,4 @@
-<!-- 反代网关 · 提供商：把第三方中转站 / 自建 OpenAI 兼容端点接进网关。
+<!-- 反代网关 · 自定义提供商：把第三方中转站 / 自建端点接进网关。
      一个提供商 = 一个上游端点 + 若干把 API Key（Key 走号池轮转与冷却）；模型以 `标识/模型名` 形态被客户端调用。
      与「号池」页的分工：这里管端点本身（地址、Key 集合、模型清单、连通性），号池页管各渠道账号的运行状态 -->
 <script setup lang="ts">
@@ -30,8 +30,8 @@ async function refresh() {
 }
 
 // ===== 新建 / 编辑表单 =====
-// 模型清单的**唯一真相是 modelRows**（结构化表格）。高级 JSON 文本框只能单向"应用到表格"，
-// 不再是可编辑源——它一旦成为源，「从上游拉取」就会把已写的元数据整段抹平成裸名（曾经的真实行为）。
+// 模型清单的唯一真相是 modelRows（结构化表格）：它一旦有第二个可编辑源，
+// 「从上游拉取」就会把已写的元数据整段抹平成裸名（曾经的真实行为）。
 const formOpen = ref(false);
 const editingId = ref("");
 const form = ref({
@@ -49,6 +49,21 @@ const testResult = ref<ProxyProviderTestResult | null>(null);
 const testing = ref(false);
 
 const isEdit = computed(() => !!editingId.value);
+
+/** 上游协议形态。值集合与后端 provider.cjs 的 KINDS 同源，漂移由 dev-provider-test 断言守住；
+ *  下拉、列表页 tag、编辑态回填三处都查这张表——写成三元的话，加一档就有一档显示错名字。
+ *  lossy 只在"该形态有几处转换是单向的"时给：完整损失清单在网关日志（emit 的 notes），
+ *  这里只留一句够用户判断选哪个的话。 */
+const KIND_OPTIONS: { value: ProxyProviderKind; label: string; hint: string; lossy?: string }[] = [
+  { value: "openai_compat", label: "OpenAI Chat", hint: "地址是 …/v1/chat/completions" },
+  { value: "anthropic_messages", label: "Anthropic Messages", hint: "只开 …/v1/messages 的 Claude 中转站", lossy: "该形态有损：多段 system 拼成一段、历史里的思考链与签名不回投" },
+  { value: "openai_responses", label: "OpenAI Responses", hint: "只开 …/v1/responses 的站与自建网关", lossy: "该形态有损：思考链不回投、stop 与结构化输出无对应物" },
+];
+const kindLabel = (k: string) => KIND_OPTIONS.find((o) => o.value === k)?.label || k;
+/** 认不出的 kind（历史数据 / 后端先加了档）一律按缺省形态处理，不让下拉显示一个空值 */
+const normalizeKind = (k: unknown): ProxyProviderKind =>
+  KIND_OPTIONS.some((o) => o.value === k) ? (k as ProxyProviderKind) : "openai_compat";
+const kindMeta = computed(() => KIND_OPTIONS.find((o) => o.value === form.value.kind));
 
 /** 档位词表必须与后端 util.EFFORT_LEVELS 同源，漂移由 dev-provider-test 断言守住 */
 const EFFORT_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -159,7 +174,7 @@ function openEdit(row: ProxyProvider) {
     id: row.id,
     display: row.display,
     baseUrl: row.baseUrl,
-    kind: row.kind === "anthropic_messages" ? "anthropic_messages" : "openai_compat",
+    kind: normalizeKind(row.kind),
     keysText: "",
     extraHeadersText: row.extraHeaders && Object.keys(row.extraHeaders).length ? JSON.stringify(row.extraHeaders, null, 2) : "",
     extraBodyText: row.extraBody && Object.keys(row.extraBody).length ? JSON.stringify(row.extraBody, null, 2) : "",
@@ -489,31 +504,6 @@ function applyImport() {
 
 const importStale = computed(() => importState.value === "ready" && importSig.value !== sigNow());
 
-// 高级：直接编辑 JSON（单向应用到表格）
-const advancedOpen = ref(false);
-const advancedText = ref("");
-function openAdvanced() {
-  advancedText.value = JSON.stringify(modelRows.value.filter((r) => (r.model || "").trim()).map(rowToModel), null, 2);
-  advancedOpen.value = !advancedOpen.value;
-}
-function applyAdvanced() {
-  const t = advancedText.value.trim();
-  if (!t) {
-    modelRows.value = [];
-    advancedOpen.value = false;
-    return;
-  }
-  try {
-    const v = JSON.parse(t);
-    const list = Array.isArray(v) ? v : [v];
-    modelRows.value = list.map((x: unknown) => toRow(x as ProxyProviderModel));
-    advancedOpen.value = false;
-    formErr.value = "";
-  } catch (e) {
-    formErr.value = `模型清单不是合法 JSON：${String((e as Error).message || e)}`;
-  }
-}
-
 // ===== Key 管理 =====
 const keysOpen = ref(false);
 const keysRow = ref<ProxyProvider | null>(null);
@@ -595,7 +585,7 @@ onMounted(refresh);
     <div class="page-body">
       <div v-if="err" class="card err-card"><div class="set-desc err-text">{{ err }}</div></div>
       <div class="toolbar">
-        <button class="btn btn-primary" @click="openCreate()">添加提供商</button>
+        <button class="btn btn-primary" @click="openCreate()">添加自定义提供商</button>
       </div>
       <div class="tbl-wrap" style="margin-top: 12px">
         <table class="tbl">
@@ -604,7 +594,7 @@ onMounted(refresh);
             <tr v-for="p in rows" :key="p.id">
               <td class="mono">{{ p.id }}</td>
               <td>{{ p.display }}</td>
-              <td><span class="tag tag-dim">{{ p.kind === "anthropic_messages" ? "Anthropic Messages" : "OpenAI Chat" }}</span></td>
+              <td><span class="tag tag-dim">{{ kindLabel(p.kind) }}</span></td>
               <td class="mono url-cell" :title="p.baseUrl">{{ p.baseUrl }}</td>
               <td class="mono num">{{ p.onlineCount ?? 0 }}/{{ p.keyCount ?? 0 }}</td>
               <td class="mono num">{{ p.models.length }}</td>
@@ -622,7 +612,7 @@ onMounted(refresh);
             </tr>
             <tr v-if="!rows.length">
               <td colspan="9" style="text-align: center; color: var(--text-3); padding: 18px">
-                还没有自定义提供商 —— 点上方「添加提供商」接入中转站或自建端点；
+                还没有自定义提供商 —— 点上方「添加自定义提供商」接入中转站或自建端点；
                 接好后客户端用 <span class="mono">标识/模型名</span> 调用即可，与其他渠道共用同一个网关地址
               </td>
             </tr>
@@ -632,9 +622,9 @@ onMounted(refresh);
       <div class="card" style="margin-top: 12px">
         <div class="card-title">接入约定</div>
         <div class="code">
-          客户端只需把 base_url 指向本网关并填一个网关 Key，模型名写 <b>标识/模型名</b>（如 myrelay/gpt-4o）即可直达该提供商。<br />
-          标识是路由前缀，创建后不可改；不带前缀的裸模型名一律先归内置渠道，只有在内置目录里查不到、
-          且恰好只有一家提供商拥有时才会落到提供商——这样自建条目永远不会悄悄顶掉生态渠道。
+          客户端把 base_url 指向本网关、填一把网关 Key，模型名写 <b>标识/模型名</b>（如 myrelay/gpt-4o）即可直达该提供商。<br />
+          不带前缀的裸模型名一律先归内置渠道，只有内置目录里没有、且只有一家提供商拥有时才会落到提供商——自建条目不会悄悄顶掉生态渠道。<br />
+          模型清单里的别名同样能请求（<span class="mono">标识/别名</span>），但不出现在 /v1/models。
         </div>
       </div>
     </div>
@@ -643,63 +633,69 @@ onMounted(refresh);
       <!-- 新建 / 编辑 -->
       <div v-if="formOpen" class="p-mask" @click.self="formOpen = false">
         <div class="p-dlg glass form-dlg">
-          <div class="p-title">{{ isEdit ? "编辑提供商" : "添加提供商" }}</div>
-          <div v-if="formErr" class="set-row">
-            <div class="set-info"><div class="set-desc err-text">{{ formErr }}</div></div>
+          <div class="form-head">
+            <div class="p-title">{{ isEdit ? "编辑自定义提供商" : "添加自定义提供商" }}</div>
+            <div v-if="formErr" class="set-desc err-text">{{ formErr }}</div>
           </div>
-          <div class="set-row">
-            <div class="set-info">
-              <div class="set-name">标识</div>
-              <div class="set-desc">模型名前缀（{{ form.id || "myslug" }}/gpt-4o）；2~32 位小写字母、数字、- 或 _</div>
-            </div>
-            <input v-model="form.id" class="input mono" style="width: 200px" :disabled="isEdit" placeholder="myslug" />
-          </div>
-          <div v-if="isEdit" class="set-row">
-            <div class="set-info"><div class="set-desc">标识创建后不可改（Key 与历史流水都挂在它上面）。要换名请新建一个再删掉旧的。</div></div>
-          </div>
-          <div class="set-row">
-            <div class="set-info"><div class="set-name">显示名</div><div class="set-desc">只影响界面展示</div></div>
-            <input v-model="form.display" class="input" style="width: 200px" placeholder="我的中转站" />
-          </div>
-          <div class="set-row">
-            <div class="set-info">
-              <div class="set-name">上游地址</div>
-              <div class="set-desc">填到版本前缀为止，如 https://relay.example.com/v1；保存时去掉尾部的 /v1 与端点名，请求时由网关按上游协议补回 /v1/chat/completions 或 /v1/messages</div>
-            </div>
-            <input v-model="form.baseUrl" class="input mono" style="width: 300px" placeholder="https://relay.example.com/v1" />
-          </div>
-          <div class="set-row">
-            <div class="set-info">
-              <div class="set-name">上游协议</div>
-              <div class="set-desc">中转站给的是 OpenAI 兼容地址就选 OpenAI Chat；只认 /v1/messages 的 Claude 中转站选 Anthropic Messages。<br />两种网关都能接，内部会互转，客户端侧看不出区别。<br />
-                选 Anthropic Messages 时有几处转换是单向的：多段 system 会拼成一段、历史里的思考链与签名不带回上游、cache_control 与服务端工具（web_search 等）丢弃。</div>
-            </div>
-            <el-select v-model="form.kind" popper-class="glass-popper" style="width: 220px">
-              <el-option value="openai_compat" label="OpenAI Chat 兼容" />
-              <el-option value="anthropic_messages" label="Anthropic Messages" />
-            </el-select>
-          </div>
-          <div class="set-row models-row">
-            <div class="set-info">
-              <div class="set-name">模型清单</div>
-              <div class="set-desc">
-                表格逐模型配置；<b>从上游拉取</b>可比对出新增 / 已存在 / 上游已下架三组再勾选合并。<br />
-                客户端用 <span class="mono">标识/模型名</span> 或 <span class="mono">标识/别名</span> 都能请求；别名只是多一个入口，不出现在 /v1/models。<br />
-                留空也能用：带前缀的模型名会原样透传给上游。
+          <div class="form-body">
+            <div class="f-grid">
+              <div class="f-row">
+                <div class="set-name">标识</div>
+                <input v-model="form.id" class="input mono f-input" :disabled="isEdit" placeholder="myslug" />
+                <div class="set-desc">模型名前缀（{{ form.id || "myslug" }}/gpt-4o），创建后不可改</div>
               </div>
-              <div v-if="dupModels.length" class="set-desc err-text">模型名重复：{{ dupModels.join("、") }}</div>
+              <div class="f-row">
+                <div class="set-name">显示名</div>
+                <input v-model="form.display" class="input f-input" placeholder="我的中转站" />
+                <div class="set-desc">只影响界面展示，留空则用标识</div>
+              </div>
             </div>
-            <div class="models-col">
+            <div class="f-row">
+              <div class="set-name">上游地址</div>
+              <input v-model="form.baseUrl" class="input mono f-input" placeholder="https://relay.example.com/v1" />
+              <div class="set-desc">填到 <span class="mono">/v1</span> 为止，端点名由网关按下面的协议补</div>
+            </div>
+            <div class="f-row">
+              <div class="set-name">上游协议</div>
+              <el-select v-model="form.kind" popper-class="glass-popper" class="f-input">
+                <el-option v-for="o in KIND_OPTIONS" :key="o.value" :value="o.value" :label="o.label" />
+              </el-select>
+              <div class="set-desc">{{ kindMeta?.hint }}；内部会互转，客户端看不出区别</div>
+              <div v-if="kindMeta?.lossy" class="set-desc f-warn">{{ kindMeta.lossy }}</div>
+            </div>
+            <div class="f-row f-models">
+              <div class="set-name">模型清单<span class="f-count">{{ modelRows.filter((r) => r.model).length }} 个</span></div>
               <div class="models-bar">
                 <button class="btn btn-sm" @click="openImport">从上游拉取</button>
                 <button class="btn btn-sm" @click="addModelRow">添加模型</button>
-                <span class="set-desc">{{ modelRows.filter((r) => r.model).length }} 个模型</span>
                 <label v-if="modelRows.length" class="m-selall">
                   <input type="checkbox" :checked="allSelected" @change="toggleAll" /> 全选
                 </label>
+                <span v-if="dupModels.length" class="set-desc err-text">模型名重复：{{ dupModels.join("、") }}</span>
               </div>
 
-              <div v-if="!modelRows.length" class="models-empty set-desc">还没有模型 —— 点「添加模型」手填，或「从上游拉取」后勾选导入</div>
+              <!-- 批量条紧贴工具条而不是压在列表末尾：它是「勾选之后的下一步」，
+                   隔着一屏模型行放下面，勾完就看不见回来了 -->
+              <div v-if="rowSel.size" class="m-batch">
+                <span class="set-desc">已选 {{ rowSel.size }} 个 →</span>
+                <label class="m-num">上下文<input v-model="batch.contextLength" class="input mono" type="number" placeholder="不改" /></label>
+                <label class="m-num">最大输出<input v-model="batch.maxOutputTokens" class="input mono" type="number" placeholder="不改" /></label>
+                <label class="m-num">倍率<input v-model="batch.rate" class="input mono" type="number" step="0.1" placeholder="不改" /></label>
+                <label v-for="c in CAPS" :key="c.key" class="m-num">
+                  {{ c.label }}
+                  <select v-model="batch[c.key]" class="input">
+                    <option value="">不改</option><option value="1">设为支持</option><option value="0">设为不支持</option>
+                  </select>
+                </label>
+                <el-select v-model="batch.efforts" multiple collapse-tags size="small" popper-class="glass-popper" class="m-efforts" placeholder="档位（不改）">
+                  <el-option v-for="e in EFFORT_LEVELS" :key="e" :value="e" :label="e" />
+                </el-select>
+                <button class="btn btn-sm" @click="applyBatch">应用到所选</button>
+              </div>
+
+              <div v-if="!modelRows.length" class="models-empty set-desc">
+                还没有模型 —— 点「添加模型」手填，或「从上游拉取」后勾选导入；留空也能用，带前缀的模型名原样透传给上游
+              </div>
 
               <div v-for="(m, i) in modelRows" :key="i" class="m-row" :class="{ on: rowSel.has(rowId(m)) }">
                 <div class="m-line">
@@ -720,7 +716,6 @@ onMounted(refresh);
                              popper-class="glass-popper" class="m-efforts" placeholder="思考档位">
                     <el-option v-for="e in EFFORT_LEVELS" :key="e" :value="e" :label="e" />
                   </el-select>
-                  <button class="btn-link btn-sm m-del" @click="removeModelRow(i)">移除</button>
                   <button class="btn btn-sm m-test" :disabled="!m.model || rowTest[rowId(m)]?.state === 'testing'" @click="testOne(m)">
                     {{ rowTest[rowId(m)]?.state === "testing" ? "测试中…" : "测试" }}
                   </button>
@@ -730,82 +725,54 @@ onMounted(refresh);
                   <span v-else-if="rowTest[rowId(m)]?.state === 'fail'" class="tag tag-warn m-fail" :title="rowTest[rowId(m)]?.message">
                     {{ (rowTest[rowId(m)]?.message || "").slice(0, 40) }}
                   </span>
+                  <button class="btn-link btn-sm m-del danger" @click="removeModelRow(i)">移除</button>
                 </div>
               </div>
-
-              <div v-if="rowSel.size" class="m-batch">
-                <span class="set-desc">已选 {{ rowSel.size }} 个 →</span>
-                <label class="m-num">上下文<input v-model="batch.contextLength" class="input mono" type="number" placeholder="不改" /></label>
-                <label class="m-num">最大输出<input v-model="batch.maxOutputTokens" class="input mono" type="number" placeholder="不改" /></label>
-                <label class="m-num">倍率<input v-model="batch.rate" class="input mono" type="number" step="0.1" placeholder="不改" /></label>
-                <label v-for="c in CAPS" :key="c.key" class="m-num">
-                  {{ c.label }}
-                  <select v-model="batch[c.key]" class="input">
-                    <option value="">不改</option><option value="1">设为支持</option><option value="0">设为不支持</option>
-                  </select>
-                </label>
-                <el-select v-model="batch.efforts" multiple collapse-tags size="small" popper-class="glass-popper" class="m-efforts" placeholder="档位（不改）">
-                  <el-option v-for="e in EFFORT_LEVELS" :key="e" :value="e" :label="e" />
-                </el-select>
-                <button class="btn btn-sm" @click="applyBatch">应用到所选</button>
-              </div>
-
-              <div class="models-adv">
-                <button class="btn-link btn-sm" @click="openAdvanced">{{ advancedOpen ? "收起 JSON" : "高级：直接编辑 JSON" }}</button>
-                <template v-if="advancedOpen">
-                  <textarea v-model="advancedText" class="input mono" rows="6" spellcheck="false"></textarea>
-                  <div class="models-tools">
-                    <button class="btn btn-sm" @click="applyAdvanced">应用到模型表</button>
-                    <span class="set-desc">这里是单向的：应用会按这段 JSON 重建上面的表格</span>
-                  </div>
-                </template>
-              </div>
             </div>
-          </div>
-          <div v-if="!isEdit" class="set-row">
-            <div class="set-info">
+            <div v-if="!isEdit" class="f-row">
               <div class="set-name">API Key</div>
-              <div class="set-desc">一行一把，可留空稍后在「Key 管理」里加。多把 Key 自动轮转，被限流的那把单独冷却</div>
+              <textarea v-model="form.keysText" class="input mono f-input" rows="3" placeholder="sk-..."></textarea>
+              <div class="set-desc">一行一把；多把自动轮转，被限流的那把单独冷却。可留空，之后在「Key 管理」里加</div>
             </div>
-            <textarea v-model="form.keysText" class="input mono" rows="3" placeholder="sk-..."></textarea>
-          </div>
-          <div class="set-row">
-            <div class="set-info">
-              <div class="set-name">自定义请求头</div>
-              <div class="set-desc">JSON 对象，选填。鉴权头由网关按 Key 生成，不允许在此覆盖</div>
-            </div>
-            <textarea v-model="form.extraHeadersText" class="input mono" rows="2" placeholder='{ "X-Channel": "agenthub" }'></textarea>
-          </div>
-          <div class="set-row">
-            <div class="set-info">
-              <div class="set-name">附加请求体字段</div>
-              <div class="set-desc">JSON 对象，选填，深合并进上游请求体。不允许覆盖 model / messages / stream</div>
-            </div>
-            <textarea v-model="form.extraBodyText" class="input mono" rows="2" placeholder='{ "reasoning": { "effort": "high" } }'></textarea>
-          </div>
-          <div class="set-row">
-            <div class="set-info"><div class="set-name">启用</div><div class="set-desc">停用即从路由视图消失，带该前缀的请求会报「模型不在目录中」</div></div>
-            <el-switch v-model="form.enabled" />
-          </div>
-          <div v-if="testResult" class="set-row">
-            <div class="set-info">
-              <div class="set-name">连通性</div>
-              <div class="set-desc" :class="testResult.ok ? '' : 'err-text'">
-                <template v-if="testResult.ok">
-                  通过 · {{ testResult.ms }}ms · 收尾 {{ testResult.finishReason || "-" }}
-                  · token {{ testResult.usage?.prompt_tokens ?? "?" }}/{{ testResult.usage?.completion_tokens ?? "?" }}
-                  <template v-if="testResult.sample">· 首段「{{ testResult.sample }}」</template>
-                </template>
-                <template v-else>失败：{{ testResult.message }}<template v-if="testResult.status">（HTTP {{ testResult.status }}）</template></template>
+            <div class="f-grid">
+              <div class="f-row">
+                <div class="set-name">自定义请求头</div>
+                <textarea v-model="form.extraHeadersText" class="input mono f-input" rows="2" placeholder='{ "X-Channel": "agenthub" }'></textarea>
+                <div class="set-desc">JSON 对象，选填；鉴权头由网关按 Key 生成，不能在这里覆盖</div>
+              </div>
+              <div class="f-row">
+                <div class="set-name">附加请求体字段</div>
+                <textarea v-model="form.extraBodyText" class="input mono f-input" rows="2" placeholder='{ "reasoning": { "effort": "high" } }'></textarea>
+                <div class="set-desc">JSON 对象，选填，深合并进上游请求体；不能覆盖 model / messages / stream</div>
               </div>
             </div>
+            <div class="f-inline">
+              <div class="f-inline-info">
+                <div class="set-name">启用</div>
+                <div class="set-desc">停用即从路由视图消失，带该前缀的请求会报「模型不在目录中」</div>
+              </div>
+              <el-switch v-model="form.enabled" />
+            </div>
           </div>
-          <div class="p-actions">
-            <button class="btn" :disabled="testing" @click="doTest">{{ testing ? "测试中…" : "测试连接" }}</button>
-            <button class="btn" @click="formOpen = false">取消</button>
+          <!-- 操作条固定在弹窗底部：表单比视口高，按钮跟着滚走的话每次保存都要先滚到底 -->
+          <div class="form-foot">
+            <button class="btn" :disabled="testing" title="向上游发一次 max_tokens=16 的真实最小请求：会计费，但不改动号池 Key 的冷却状态" @click="doTest">
+              {{ testing ? "测试中…" : "测试连接" }}
+            </button>
+            <span
+              v-if="testResult"
+              class="set-desc f-foot-msg"
+              :class="{ 'err-text': !testResult.ok }"
+              :title="testResult.ok ? testResult.sample : testResult.message"
+            >
+              <template v-if="testResult.ok">
+                通过 {{ testResult.ms }}ms · {{ testResult.finishReason || "-" }} · token {{ testResult.usage?.prompt_tokens ?? "?" }}/{{ testResult.usage?.completion_tokens ?? "?" }}
+              </template>
+              <template v-else>失败：{{ testResult.message }}<template v-if="testResult.status">（HTTP {{ testResult.status }}）</template></template>
+            </span>
+            <button class="btn f-foot-push" @click="formOpen = false">取消</button>
             <button class="btn btn-primary" :disabled="busy" @click="doSave">{{ busy ? "保存中…" : "保存" }}</button>
           </div>
-          <div class="set-desc" style="margin-top: 8px">测试会向上游发一次真实最小请求（max_tokens=16），产生计费；不会改动号池 Key 的冷却状态。</div>
         </div>
       </div>
 
@@ -926,7 +893,7 @@ onMounted(refresh);
       <!-- 删除确认 -->
       <div v-if="delOpen" class="p-mask" @click.self="delOpen = false">
         <div class="p-dlg glass">
-          <div class="p-title">删除提供商</div>
+          <div class="p-title">删除自定义提供商</div>
           <div class="set-desc">
             确定删除「{{ delRow?.display }}」（{{ delRow?.id }}）？它的 {{ delRow?.keyCount ?? 0 }} 把 Key 会一并移出。
             正在用 <span class="mono">{{ delRow?.id }}/模型名</span> 的客户端会立即收到「模型不在任何渠道目录中」。
@@ -964,26 +931,84 @@ onMounted(refresh);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.models-col {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  flex: 1;
-  min-width: 0;
-}
-/* 模型清单表格：一行两排（名字/别名/上游真名 一行，数值与能力一行），
-   比一张八列表格在窄抽屉里可读得多，也不用横向滚动 */
-.models-row {
-  /* 标签列 + 表格并排会把表格压到 400px 以内（三个输入框只能竖排），
-     所以这一行改成上下堆叠，让模型表吃满抽屉宽度 */
-  flex-direction: column;
-  align-items: stretch;
-  gap: 8px;
-}
+/* ===== 表单弹窗：标题与操作条固定，只有中间字段区滚动 =====
+   整窗一起滚的话「保存」会在填到一半时滚出视口，每次提交都得先滚到底。
+   .p-dlg 自带 padding 与 overflow:hidden，这里改成三段式布局，内边距下放到各段。 */
 .form-dlg {
   width: 780px;
   max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+}
+.form-head {
+  flex: none;
+  padding: 16px 18px 0;
+}
+.form-body {
+  flex: 1;
+  min-height: 0;
   overflow: auto;
+  padding: 2px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.form-foot {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 18px 14px;
+  border-top: 1px solid var(--line);
+}
+/* 测试结果挤在按钮排里：长了就截断，完整内容在 title 上 */
+.f-foot-msg {
+  max-width: 330px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.f-foot-push {
+  margin-left: auto;
+}
+/* 字段一律「标签在上、控件吃满宽度」。老的左标签 + 右窄控件写法把 URL 和 JSON 挤断，
+   而省下来的说明只能塞进左列那条缝——说明越长，布局越歪。 */
+.f-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.f-models {
+  gap: 6px;
+}
+.f-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.f-warn {
+  color: var(--warn, #d9a13b);
+}
+.f-count {
+  margin-left: 6px;
+  font-size: 11.5px;
+  font-weight: 400;
+  color: var(--text-3);
+}
+.f-input {
+  width: 100%;
+}
+.f-inline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+.f-inline-info {
+  min-width: 0;
 }
 .models-bar {
   display: flex;
@@ -1079,11 +1104,6 @@ onMounted(refresh);
   border: 1px solid var(--accent);
   border-radius: 8px;
 }
-.models-adv {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
 /* 导入弹窗 */
 .imp-dlg {
   max-height: 78vh;
@@ -1112,11 +1132,6 @@ onMounted(refresh);
   gap: 6px;
   padding: 2px 0 2px 6px;
   font-size: 13px;
-}
-.models-tools {
-  display: flex;
-  align-items: center;
-  gap: 10px;
 }
 textarea.input {
   width: 100%;

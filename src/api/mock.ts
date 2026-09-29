@@ -315,7 +315,7 @@ const PROXY_POOL = [
 ];
 
 /** 提供商列表的预览态：与 PROXY_POOL 里那条 myrelay 是同一个对象，
- *  这样「提供商」页与「号池」页在 npm run dev:web 里对得上 */
+ *  这样「自定义提供商」页与「号池」页在 npm run dev:web 里对得上 */
 const MOCK_PROVIDERS: {
   id: string; display: string; domain: string; kind: string; enabled: boolean; baseUrl: string;
   models: unknown[]; extraHeaders: Record<string, string>; extraBody: Record<string, unknown>;

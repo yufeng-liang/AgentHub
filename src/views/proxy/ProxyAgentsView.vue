@@ -151,7 +151,7 @@ function putCheckin(channel: ProxyChannelId, rows: ProxyCheckinRow[]) {
 }
 
 // 添加账号弹窗（四方式：oauth 官方登录 / local 从本机软件导入 / file 从 JSON-ZIP 文件 / paste 粘贴 JSON）
-// 渠道类型收在内置：提供商的 Key 在「提供商」页管（openAdd 已提前分流），这里的弹窗只服务生态渠道
+// 渠道类型收在内置：提供商的 Key 在「自定义提供商」页管（openAdd 已提前分流），这里的弹窗只服务生态渠道
 type AddMethod = "oauth" | "local" | "file" | "paste";
 const addOpen = ref(false);
 const addChannel = ref<ProxyBuiltinChannelId>("trae");
@@ -832,7 +832,7 @@ async function doDelete() {
 // ===== 添加账号 =====
 
 function openAdd(ch: ProxyChannelView) {
-  // 提供商的 Key 归「提供商」页管（一把一填，带去重与连通性探测）。这里不复用四方式弹窗：
+  // 提供商的 Key 归「自定义提供商」页管（一把一填，带去重与连通性探测）。这里不复用四方式弹窗：
   // OAuth / 本机软件导入 / 凭据包 JSON 对中转站都不成立，硬塞进去只会摆三个必然失败的按钮
   if (!isBuiltin(ch)) {
     app.setPage("providers");
