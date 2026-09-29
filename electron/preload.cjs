@@ -145,7 +145,10 @@ const ALLOWED_COMMANDS = new Set([
   "proxy_ide_status",
   "proxy_zcode_switch_rollback",
   "proxy_zcode_solve_captcha",
-
+  "proxy_zcode_device_status",
+  "proxy_zcode_device_repair",
+  "proxy_zcode_claim_mode",
+  "proxy_zcode_restore_mid",
   "proxy_stats_overview",
   "proxy_stats_top",
   "proxy_stats_detail",
@@ -285,6 +288,7 @@ const ALLOWED_COMMANDS = new Set([
   "memory_conflicts_list",
   "memory_conflicts_diff",
   "memory_conflicts_resolve",
+  "memory_conflicts_resolve_recommended",
   "memory_sync_devices",
   "memory_sync_packs",
   // ===== 记忆中枢：去重 =====

@@ -133,6 +133,12 @@ const extraUserCmds = [
   // ZCode 活动领取（额度套餐领取）：读账号 meta.jwt 打 zcode 平面 billing/claim，实现体归子进程
   { name: "proxy_zcode_switch_rollback", why: "ZCode 切号回滚：切出问题一键还原最近一次切前状态（上游 v1.31）" },
   { name: "proxy_zcode_solve_captcha", why: "ZCode 领取人机校验：粘贴 verifyParam 解锁账号（上游 v1.31）" },
+  // 上游 v1.34/v1.36 的设备指纹四联：读 accounts.meta.deviceMid、写本机 ZCode 登录文件与
+  // sync-state.json，全部必须归子进程（主进程只转发）
+  { name: "proxy_zcode_device_status", why: "ZCode 设备指纹诊断：逐账号列 deviceMid 与撞车状态（上游 v1.34，读号池）" },
+  { name: "proxy_zcode_device_repair", why: "ZCode 设备指纹修复：给撞车/被烧账号重派随机指纹（上游 v1.34，写号池）" },
+  { name: "proxy_zcode_claim_mode", why: "ZCode 领取模式：live 指纹临时借出给单账号 + 重启客户端（上游 v1.36，写本机登录态）" },
+  { name: "proxy_zcode_restore_mid", why: "ZCode 恢复锚定指纹：anchor.remoteMid 写回 live 恢复手机远程（上游 v1.36，写本机登录态）" },
 ];
 const upstreamUserNames = extraUserCmds.map((c) => c.name);
 check("④ 子进程表含 proxy_account_import_blob（import_file 拆两段的子进程半段）",

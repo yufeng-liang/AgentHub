@@ -169,10 +169,17 @@ async function main() {
   assert(raccoonAuth.ownedTokens("someone", "") === null || raccoonAuth.ownedTokens("someone", "") === undefined, "无本地文件时 ownedTokens 不认领");
   const rcUid = raccoonAuth.tokenUid("x." + Buffer.from(JSON.stringify({ iss: "6f66ba", sid: "9a" })).toString("base64url") + ".y");
   assert(rcUid === "6f66ba", "raccoonAuth.tokenUid 认 iss（与 scanRaccoon 同口径）");
-  // ④ OAuth 登录支持（授权码 + 手动粘贴回调 URL 换 token）
+  // ④ OAuth 登录支持：真机主进程里主路径是「内嵌授权窗 + 深链截获」（上游 v1.32.0），手动粘贴
+  //    深链是兜底。但本探针以 ELECTRON_RUN_AS_NODE 跑，拿不到 BrowserWindow ⇒ beginOAuth 必然
+  //    落 manual 兜底（discovery.cjs 里那句 fork 注释就是这条），所以这里按探针形态断言：
+  //    manual 与 url 必须同时出现（只回 manual 不回 url = 用户没有可点的授权页）。
+  //    上游本轮把这里断成 mode==="window" 且不回 url，在我们的跑法下恒假，属架构差异不是回归。
   const raccoonBegin = await discovery.beginOAuth("raccoon", () => {});
-  assert(raccoonBegin.ok === true && raccoonBegin.mode === "manual", "raccoon OAuth 支持（manual 模式）");
+  assert(raccoonBegin.ok === true && raccoonBegin.mode === "manual", "raccoon OAuth 探针环境下降级为 manual 模式");
   assert(typeof raccoonBegin.url === "string" && raccoonBegin.url.includes("/code/authorize"), "raccoon OAuth 授权页地址正确");
+  // 手动兜底仍在：粘贴不是深链的内容应被本地拦下（纯解析，不发任何网络请求）
+  const raccoonPaste = await discovery.submitCallbackUrl("not-a-deeplink");
+  assert(raccoonPaste.ok === false && /授权码/.test(raccoonPaste.message || ""), "raccoon 手动粘贴深链兜底可用（无授权码时如实拦截）");
   discovery.cancelOAuth();
   // ⑤ 401 旋转竞态重试（针头：值变了才重试，没变不原地打转）
   // 这个行为留在集成测试里跑（需要打点 fetch 与文件），smoke 只验证接口存在
@@ -552,21 +559,39 @@ async function main() {
   assert(rr.status === 400 && disBody.error.code === "model_disabled", "禁用模型 400: " + rr.status);
   e2eDisabledFlag.length = 0;
 
-  // 10.10 本地 IDE 快捷切换（WB auth 文件合并写回 + 备份 + Trae 诚实降级）
+  // 10.10 本地 IDE 快捷切换（确认协议 + WB auth 文件合并写回 + 备份 + Trae 诚实降级）
   process.env.LOCALAPPDATA = fs.mkdtempSync(path.join(os.tmpdir(), "ah-lappdata-"));
   const authDir = path.join(process.env.LOCALAPPDATA, "CodeBuddyExtension", "Data", "Public", "auth");
   fs.mkdirSync(authDir, { recursive: true });
   const authFile = path.join(authDir, "workbuddy-desktop.info");
   fs.writeFileSync(authFile, JSON.stringify({ accessToken: "old-token", refreshToken: "old-refresh", uid: "old-uid", nickname: "旧号", editionType: "pro", otherField: 42 }, null, 2));
   const ideswitch = require("../electron/backend/proxy/ideswitch.cjs");
-  const sw = ideswitch.switchIdeAccount(goodWb);
-  assert(sw.ok && sw.backup && fs.existsSync(sw.backup), "WB 切换成功且备份存在");
-  const after = JSON.parse(fs.readFileSync(authFile, "utf8"));
-  assert(after.accessToken === "wb-good" && after.uid === "wbgood", "凭据写回");
-  assert(after.otherField === 42 && after.editionType === "pro", "原文件其它字段保留");
-  assert(JSON.parse(fs.readFileSync(sw.backup, "utf8")).accessToken === "old-token", "备份是旧凭据（可回滚）");
-  const swTrae = ideswitch.switchIdeAccount(goodTrae);
-  assert(!swTrae.ok && /加密信封/.test(swTrae.message), "Trae 诚实降级提示");
+  // 进程探测隔离：真机上本渠道客户端可能正开着，这里必须假装「未运行」——
+  // 切号流程在确认后是真的会去 kill 客户端的，不隔离就会关掉用户正在用的软件
+  const wbClient = require("../electron/backend/proxy/wbClient.cjs");
+  const realIsRunning = wbClient.isWorkbuddyRunning;
+  wbClient.isWorkbuddyRunning = () => ({ running: false, main: false });
+  try {
+    // ① 新入口协议：首调只做只读预检，一律回 needConfirm + probe（ok 必须为 true，
+    //    否则前端 call() 会把它当执行失败抛错，确认框永远弹不出来）；此调不得改动任何文件
+    const pre = ideswitch.switchIdeAccount(goodWb);
+    assert(pre.ok === true && pre.needConfirm === true, "首调返回 needConfirm 且 ok 为 true");
+    assert(pre.probe && pre.probe.channel === "workbuddy" && pre.probe.running === false, "probe 带渠道与运行态");
+    assert(typeof pre.message === "string" && pre.message.length > 0, "确认框正文非空");
+    assert(JSON.parse(fs.readFileSync(authFile, "utf8")).accessToken === "old-token", "预检是只读的，不得提前写文件");
+    // ② 确认后（confirmAck）才真正执行写回
+    const sw = ideswitch.switchIdeAccount(goodWb, { confirmAck: true });
+    assert(sw.ok && sw.backup && fs.existsSync(sw.backup), "WB 切换成功且备份存在");
+    const after = JSON.parse(fs.readFileSync(authFile, "utf8"));
+    assert(after.accessToken === "wb-good" && after.uid === "wbgood", "凭据写回");
+    assert(after.otherField === 42 && after.editionType === "pro", "原文件其它字段保留");
+    assert(JSON.parse(fs.readFileSync(sw.backup, "utf8")).accessToken === "old-token", "备份是旧凭据（可回滚）");
+    // ③ Trae 诚实降级：入口预检就如实回报，不弹确认框
+    const swTrae = ideswitch.switchIdeAccount(goodTrae);
+    assert(!swTrae.ok && /加密信封/.test(swTrae.message), "Trae 诚实降级提示");
+  } finally {
+    wbClient.isWorkbuddyRunning = realIsRunning; // 还原探测，不把替身留给后续用例
+  }
 
   // ===== 11. 新渠道假上游全链路（cline 双池 / autoclaw 双地区 / qoder）=====
   // 三家适配器的上游域是 URL 常量（不像 trae/wb 可经 headers.json 注入），与既有场景同一手段的等价替代：

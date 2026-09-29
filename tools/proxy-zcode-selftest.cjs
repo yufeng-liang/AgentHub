@@ -11,9 +11,15 @@ const assert = require("node:assert");
 // 自测沙箱：所有文件写操作都落在临时目录，绝不碰真实 ~/.zcode/v2 与真实 dataDir
 const SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-selftest-"));
 process.env.ZCODE_V2_DIR = SANDBOX;
-// config.dataDir() 兜底 = APPDATA/AgentHub（ELECTRON_RUN_AS_NODE 下 electronApp 为空）：
-// 锚点 zcode-remote-anchor.json / 切号备份都落在这里，必须一并重定向——
-// 2026-09-28 实测：不重定向会把测试假 relay 值写进真机锚点，污染下一次真实切号。
+// APPDATA 也必须沙箱：zcodeLocal 的「远程连接锚点」（zcode-remote-anchor.json）落在
+// config.dataDir() 下，而 dataDir() 走 %APPDATA%\AgentHub（ELECTRON_RUN_AS_NODE 下 electronApp
+// 为空）。只沙箱 ZCODE_V2_DIR 的话，mergeWriteCredentials 会优先锁定**真机锚点里的
+// passHashEnc**（这是「切号绝不改远程连接地址」的红线设计），于是 T3/T4 拿真机值去比测试假值
+// 必然失败；更糟的是 getOrCreateAnchor 末尾会 saveAnchor()，等于自测去改写用户那个守护红线的
+// 锚点文件。沙箱后锚点从空开始、回退到 live 值，断言与环境无关，真机锚点也不再被触碰
+// （config.dataDir() 每次调用读 env，所以这里在 require 之前赋值即可生效）。
+// 2026-09-28 本机实测过这条污染的后果：不重定向会把测试假 relay 值写进真机锚点，
+// 污染下一次真实切号。
 process.env.APPDATA = SANDBOX;
 
 const zcodeLocal = require("../electron/backend/proxy/zcodeLocal.cjs");
@@ -148,7 +154,11 @@ async function main() {
     tampered["web-remote-control:external-relay:pass_hash"] = "enc:v1:HACKED";
     zl.atomicWriteJson(p.credentials, tampered);
     v = zl.verifyCredentialsWritten(p.credentials, target, before);
-    assert.ok(!v.ok && /远程连接凭据/.test(v.message), `relay 被改应拦截：${v.message}`);
+    // 断言精确锚定 relay 专属分支的现行文案（本 fork 侧把这句改成了
+    // 「远程连接凭据（pass_hash）被改变，已拒绝生效」，上游仍是「远程连接 pass_hash 被改变」；
+    // 合并时正则来自上游、生产文案来自 fork 就会交叉错配。写宽会误从后面的「原有键丢失」
+    // 分支通过，所以按本 fork 的现行消息逐字匹配）
+    assert.ok(!v.ok && /远程连接凭据（pass_hash）被改变/.test(v.message), `relay 被改应拦截：${v.message}`);
     // 丢未知键 → 拦下
     zl.atomicWriteJson(p.credentials, zl.mergeWriteCredentials(target, before));
     const dropped = zl.readJson(p.credentials);

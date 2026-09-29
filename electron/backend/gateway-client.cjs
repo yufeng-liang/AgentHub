@@ -369,6 +369,10 @@ const ALL_PROXY_CMDS = [
   "proxy_provider_add_key", "proxy_provider_remove_key", "proxy_provider_test", "proxy_provider_fetch_models",
   // ZCode 活动领取（额度套餐领取）：实现体在 index.cjs register() 内、随 dispatchTable() 进子进程；主进程只转发
   "proxy_zcode_switch_rollback", "proxy_zcode_solve_captcha",
+  // 上游 v1.34/v1.36 的设备指纹诊断/修复与领取模式：读号池 accounts.meta 的 deviceMid、写本机
+  // ZCode 登录文件，实现体全在子进程（主进程只转发）；漏登记会让号池页按钮报「未授权的 IPC 命令」
+  "proxy_zcode_device_status", "proxy_zcode_device_repair",
+  "proxy_zcode_claim_mode", "proxy_zcode_restore_mid",
 ];
 
 // 4 条真 UI 依赖（规格 §5.7 归属定案）：实现体在本文件，不经管道（dialog/shell 子进程拿不到）。

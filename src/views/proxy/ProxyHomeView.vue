@@ -7,6 +7,7 @@ import { useAppStore } from "../../stores/app";
 import { fmtInt, fmtK, fmtMs, fmtTime, statusCls, fmtBalance, balanceUnit } from "./format";
 import RequestLogTable from "./RequestLogTable.vue";
 import RequestDetailDialog from "./RequestDetailDialog.vue";
+import { coalesceAsync } from "../../utils/timing";
 
 const app = useAppStore();
 const st = ref<ProxyGatewayStatus | null>(null);
@@ -183,19 +184,33 @@ const cliCmd = computed(() => {
 /** 本页是否处于前台：页面经 v-show 保活，切走后轮询与事件刷新必须停下来，
     否则总览在后台持续拉数据重渲染，挤占前台页（号池等）的每一帧 */
 const active = computed(() => app.activeModule === "proxy" && app.activePage === "home");
+
+// 事件合流 + 轮询防重入：refresh 在跑（或主进程正慢）时再触发只补一次，不叠加并发；
+// poolsync/credits 等高频事件经 1s 窗口合并，不再逐条全量刷新
+const scheduleRefresh = coalesceAsync(refresh, 1000);
+
+function startPoll() {
+  stopPoll(); // 先清旧轮询再建，快速来回切页不会叠出多个 interval
+  pollTimer = setInterval(scheduleRefresh, 5000);
+}
+function stopPoll() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = undefined;
+}
+
 watch(active, (on) => {
   if (on) {
     refresh();
-    pollTimer = setInterval(refresh, 5000);
-  } else if (pollTimer) {
-    clearInterval(pollTimer);
-    pollTimer = undefined;
+    startPoll();
+  } else {
+    stopPoll();
+    scheduleRefresh.cancel();
   }
 });
 
 onMounted(() => {
   refresh();
-  pollTimer = setInterval(refresh, 5000);
+  startPoll();
   document.addEventListener("click", closeHint);
   offEvent = api.onUpdateEvent((e) => {
     const p = e as { event?: string; type?: string };
@@ -208,11 +223,13 @@ onMounted(() => {
       return;
     }
     if (!active.value) return;
-    refresh();
+    scheduleRefresh();
   });
 });
 onUnmounted(() => {
-  if (pollTimer) clearInterval(pollTimer);
+  stopPoll();
+  scheduleRefresh.cancel();
+  clearTimeout(copiedTimer);
   document.removeEventListener("click", closeHint);
   if (offEvent) offEvent();
 });

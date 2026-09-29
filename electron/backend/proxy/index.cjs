@@ -225,7 +225,9 @@ async function checkinBatch({ channel, accountId, action, interactive, captcha, 
       }
     }
     const okCount = rows.filter((r) => r.ok).length;
-    events.emit({ type: "credits" });
+    // 只有真正改了状态的 checkin/trial 才广播：status 是纯读取。广播它会让「收到 credits 就刷新」
+    // 的号池页被自己触发的刷新再次唤醒，形成约 1.2 秒一轮的自激刷新循环（每轮还白打一次上游接口）
+    if (act !== "status") events.emit({ type: "credits" });
     return { ok: true, action: act, total: rows.length, okCount, rows };
   } finally {
     if (act !== "status") checkinBusy = false;
@@ -435,10 +437,35 @@ function vaultOk() { return secretbox.backend() !== "none"; }
  *  这两个计时器过去在主进程跑；43 条命令下沉子进程后随实现体一起下沉 ——
  *  留在主进程就会双跑（同一批号被签到两次、同一批号被刷两次额度），这是 gateway.cjs
  *  文件头「子进程不跑计时器」那条注释的解除时刻。签到/刷新的实现体本就在本模块
- *  （checkinBatch / credits），gateway.cjs 装配时调用这里这一个入口，不开第二份实现。 */
+ *  （checkinBatch / credits），gateway.cjs 装配时调用这里这一个入口，不开第二份实现。
+ *  上游 v1.34/v1.36 往它自己的 boot() 里追加了两件启动装配（deviceMid 撞车自愈、remoteMid
+ *  云端兜底）。两者都要读号池库、后者还写子进程独占的 sync-state.json ⇒ 按 §5.4 单一写者
+ *  落在本函数，而不是还原上游 boot()：本 fork 已无主进程 proxy.boot()。 */
 function startBackgroundJobs() {
+  // 存量迁移（deviceMid 撞车自愈启动闸，上游 v1.34.0）：历史版本会给「导入时是本机登录态」的账号继承
+  // 同一枚 live 指纹（adopt 陷阱），多号共用一枚指纹 = 一号领取全组 1004。
+  // 启动时静默跑一次修复，只动撞车/被烧的账号，正常账号零影响（幂等）
+  try {
+    const zs = require("./zcodeSwitch.cjs");
+    const ds = zs.deviceStatus();
+    if (ds.rows.some((r) => r.conflictWith.length || r.burnedLikely || !r.deviceMid)) {
+      zs.repairDeviceMid({});
+    }
+  } catch { /* 迁移失败不阻断启动，号池页仍可手动修复 */ }
   credits.startScheduler(() => settings().creditsRefreshMin);
   startCheckinAuto();
+  // 远程锚定指纹（remoteMid）的云端兜底（上游 v1.36.0）：本机 anchor 缺锚（重装/换机）先从 WebDAV 拉回；
+  // 有锚则顺手上传一份（内容 hash 记账，未变不重传）。fire-and-forget，WebDAV 未配置/网络
+  // 失败一律静默——锚定的主事实在本机 anchor 文件里，云端只是防丢副本
+  try {
+    const ps = require("./poolsync.cjs");
+    const zl = require("./zcodeLocal.cjs");
+    void (async () => {
+      const st = zl.remoteMidState();
+      if (!st.anchorMid) await ps.restoreAnchorMidFromRemote();
+      await ps.backupAnchorMid();
+    })().catch(() => {});
+  } catch { /* WebDAV 不可用不影响启动 */ }
 }
 
 function register(ipcMain) {
@@ -761,6 +788,17 @@ function register(ipcMain) {
   ipcMain.handle("proxy_ide_status", handle(() => ideswitch.ideSwitchStatus()));
   // zcode 切号回滚（逃生通道：切出问题 / 远程连接异常时一键还原最近一次切前状态）
   ipcMain.handle("proxy_zcode_switch_rollback", handle(() => require("./zcodeSwitch.cjs").rollbackLatest()));
+  // zcode 设备指纹诊断（只读）：多号共用一枚指纹 = 一号领取全组 1004 的病灶定位
+  ipcMain.handle("proxy_zcode_device_status", handle(() => require("./zcodeSwitch.cjs").deviceStatus()));
+  // zcode 设备指纹修复（幂等）：撞车/疑似被烧的账号重派全新随机指纹，claim 1004 的唯一出路
+  ipcMain.handle("proxy_zcode_device_repair", handle(({ all } = {}) => require("./zcodeSwitch.cjs").repairDeviceMid({ all: !!all })));
+  // zcode 领取模式（人工链路）：live 指纹临时借出为目标账号专属指纹，官方客户端里人工领周末
+  // 套餐用；客户端在跑时首调返回 needConfirm（前端弹确认），确认后带 confirmAck 重调
+  ipcMain.handle("proxy_zcode_claim_mode", handle(({ accountId, confirmAck } = {}) =>
+    require("./zcodeSwitch.cjs").enterClaimMode(String(accountId || ""), { confirmAck: !!confirmAck })));
+  // zcode 恢复本机锚定指纹（领取模式收尾）：anchor.remoteMid 写回 live，手机远程随之恢复
+  ipcMain.handle("proxy_zcode_restore_mid", handle(({ confirmAck } = {}) =>
+    require("./zcodeSwitch.cjs").restoreRemoteMid({ confirmAck: !!confirmAck })));
   // zcode 独立人机校验（过码）：弹独立沙箱窗过码，拿 verifyParam 核销并解除风控限制
   ipcMain.handle("proxy_zcode_solve_captcha", handle(async ({ accountId, verifyParam, region } = {}) => {
     if (!accountId) return fail("缺少账号 ID");

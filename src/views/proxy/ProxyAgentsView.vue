@@ -5,9 +5,10 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch, nextTick } from "vue";
 import * as api from "../../api/ipc";
-import type { ProxyChannelView, ProxyAccount, ProxyChannelId, ProxyBuiltinChannelId, ProxyChannelKind, ProxyPoolStrategy, ProxyScanCandidate, ProxyCheckinRow } from "../../types";
+import type { ProxyChannelView, ProxyAccount, ProxyChannelId, ProxyBuiltinChannelId, ProxyChannelKind, ProxyPoolStrategy, ProxyScanCandidate, ProxyCheckinRow, ZcodeDeviceRow } from "../../types";
 import { useAppStore } from "../../stores/app";
 import { fmtInt, fmtK, fmtDate, fmtAgo, ACCOUNT_STATUS, SOURCE_NAMES, channelName, fmtBalance, balanceUnit } from "./format";
+import { coalesceAsync } from "../../utils/timing";
 
 const app = useAppStore();
 const pool = ref<ProxyChannelView[]>([]);
@@ -328,6 +329,14 @@ async function checkZcodeReward() {
   } catch {
     zcodeHasReward.value = false;
   }
+  // 顺带刷新指纹告警灯与领取模式状态（无声失败不影响主流程，弹窗打开时会再拉一次实时的）
+  try {
+    const ds = await api.proxyZcodeDeviceStatus();
+    devRows.value = ds.rows || [];
+    devLiveMid.value = ds.liveMid || "";
+    devAnchorMid.value = ds.anchorMid || "";
+    devClaimMode.value = !!ds.claimMode;
+  } catch { /* 忽略 */ }
 }
 
 async function refresh() {
@@ -365,13 +374,13 @@ async function refreshCurrentChannel() {
 // ===== 每日签到（三渠道不同形态：Trae ug 签到 / WB 中国区 daily-checkin / 国际版无签到只有加油包） =====
 
 function checkinTagCls(r: ProxyCheckinRow) {
-  if (!r.ok) return r.needCaptcha ? "tag-warn" : "tag-err";
+  if (!r.ok) return r.needCaptcha || r.deviceBurned ? "tag-warn" : "tag-err";
   if (r.already) return "tag-dim";
   if (r.unavailable) return "tag-warn";
   return "tag-ok";
 }
 function checkinTagText(r: ProxyCheckinRow) {
-  if (!r.ok) return r.needCaptcha ? "需过码" : "失败";
+  if (!r.ok) return r.needCaptcha ? "需过码" : r.deviceBurned ? "指纹被烧" : "失败";
   if (r.already) return checkinShownChannel.value === "zcode" ? "已领取" : "已签到";
   if (r.unavailable) return "不开放";
   return "成功";
@@ -489,9 +498,9 @@ async function runSolveCaptcha(acc: ProxyAccount) {
   }
 }
 
-/** 一键把账号应用为本地 IDE 当前登录态（WB 双区写回 auth 文件；Trae 加密信封诚实降级；
- *  zcode 合并式写回 credentials.json——远程连接地址保持不变；raccoon 写回 auth.json 并重启客户端；
- *  两者客户端在跑都会先弹确认关闭，防内存态回写覆盖） */
+/** 一键把账号应用为本地 IDE 当前登录态：所有渠道首调只做预检（后端返回 needConfirm + probe：
+ *  目标客户端是否在运行 / 安装路径 / 切完是否自动重启），弹确认框让用户过目；确认后带 confirmAck
+ *  重调才真正执行——关客户端 → 等退出 → 写回（Trae 加密信封无法写回，预检即如实回报不弹框） */
 async function ideSwitch(acc: ProxyAccount) {
   if (ideSwitching.value) return;
   ideSwitching.value = acc.id;
@@ -499,7 +508,7 @@ async function ideSwitch(acc: ProxyAccount) {
     const r = await api.proxyIdeSwitch(acc.id);
     if (r.needConfirm) {
       // 客户端正在运行：弹确认框，用户确认「关闭客户端并切换」后带 confirmAck 重调
-      pendingConfirm.value = { accountId: acc.id, channel: acc.channel, name: acc.name || acc.uid || "", message: r.message || "" };
+      pendingConfirm.value = { kind: "switch", accountId: acc.id, channel: acc.channel, name: acc.name || acc.uid || "", message: r.message || "", probe: r.probe || null };
       return;
     }
     toast(r.message || (r.ok ? "已切换" : "暂不支持"), r.ok ? "info" : "err");
@@ -511,22 +520,84 @@ async function ideSwitch(acc: ProxyAccount) {
   }
 }
 
-/** zcode / raccoon 切号确认（需先关闭客户端再执行切换） */
-const pendingConfirm = ref<{ accountId: string; channel: string; name: string; message: string } | null>(null);
+/** 切号/领取模式/恢复指纹统一确认框：kind 区分确认后真正调用的通道 */
+const pendingConfirm = ref<{ kind: "switch" | "claim" | "restore"; accountId: string; channel: string; name: string; message: string; probe: api.IdeSwitchProbe | null } | null>(null);
+/** 确认框标题与按钮文案：切号 / 进入领取模式 / 恢复本机指纹 */
+const confirmTitleText = computed(() => {
+  const k = pendingConfirm.value?.kind;
+  if (k === "claim") return "进入领取模式（临时借出指纹）";
+  if (k === "restore") return "恢复本机锚定指纹";
+  return `切换 ${channelName(pendingConfirm.value?.channel || "zcode")} 登录账号`;
+});
+/** 确认框按钮文案：目标客户端在跑就是「关闭客户端并执行」，没开就直接执行 */
+const confirmActionText = computed(() => {
+  const k = pendingConfirm.value?.kind;
+  const verb = k === "claim" ? "进入领取模式" : k === "restore" ? "恢复本机指纹" : "切换并写入登录态";
+  const p = pendingConfirm.value && pendingConfirm.value.probe;
+  if (p && p.running) return p.relaunch ? `关闭客户端并${k === "switch" ? "切换" : "执行"}` : `关闭客户端（需手动重开）`;
+  return verb;
+});
 const confirmBusy = ref(false);
 async function confirmIdeSwitch() {
   const p = pendingConfirm.value;
   if (!p || confirmBusy.value) return;
   confirmBusy.value = true;
   try {
-    const r = await api.proxyIdeSwitch(p.accountId, true);
-    toast(r.message || (r.ok ? "已切换" : "切换失败"), r.ok ? "info" : "err");
+    const r = p.kind === "claim"
+      ? await api.proxyZcodeClaimMode(p.accountId, true)
+      : p.kind === "restore"
+        ? await api.proxyZcodeRestoreMid(true)
+        : await api.proxyIdeSwitch(p.accountId, true);
+    toast(r.message || (r.ok ? "已完成" : "失败"), r.ok ? "info" : "err");
     if (r.ok) pendingConfirm.value = null;
   } catch (e) {
     toast(String((e as Error).message || e), "err");
   } finally {
     confirmBusy.value = false;
     ideStatus.value = await api.proxyIdeStatus().catch(() => ideStatus.value);
+    await refreshDevState();
+  }
+}
+
+/**
+ * 进入领取模式（人工链路）：把本机指纹临时借出为该账号专属指纹并重启客户端，
+ * 用户在官方客户端里人工领取周末套餐；领完点工具栏「恢复本机指纹」。
+ * 首调只做预检（needConfirm + probe），确认后带 confirmAck 重调。
+ */
+async function enterClaimMode(acc: ProxyAccount) {
+  if (ideSwitching.value) return;
+  ideSwitching.value = acc.id;
+  try {
+    const r = await api.proxyZcodeClaimMode(acc.id);
+    if (r.needConfirm) {
+      pendingConfirm.value = { kind: "claim", accountId: acc.id, channel: acc.channel, name: acc.name || acc.uid || "", message: r.message || "", probe: r.probe || null };
+      return;
+    }
+    toast(r.message || (r.ok ? "已进入领取模式" : "无法进入领取模式"), r.ok ? "info" : "err");
+  } catch (e) {
+    toast(String((e as Error).message || e), "err");
+  } finally {
+    ideSwitching.value = "";
+    await refreshDevState();
+  }
+}
+
+/** 恢复本机锚定指纹（领取模式收尾）：写回 anchor.remoteMid 并重启客户端，手机远程恢复 */
+async function restoreRemoteMid() {
+  if (devBusy.value) return;
+  devBusy.value = true;
+  try {
+    const r = await api.proxyZcodeRestoreMid();
+    if (r.needConfirm) {
+      pendingConfirm.value = { kind: "restore", accountId: "", channel: "zcode", name: "", message: r.message || "", probe: r.probe || null };
+      return;
+    }
+    toast(r.message || (r.ok ? "已恢复" : "恢复失败"), r.ok ? "info" : "err");
+  } catch (e) {
+    toast(String((e as Error).message || e), "err");
+  } finally {
+    devBusy.value = false;
+    await refreshDevState();
   }
 }
 
@@ -535,6 +606,59 @@ async function zcodeRollback() {
   const r = await api.proxyZcodeSwitchRollback().catch((e) => ({ ok: false, message: String((e as Error).message || e) }));
   toast(r.message || (r.ok ? "已回滚" : "回滚失败"), r.ok ? "info" : "err");
 }
+
+// ===== zcode 设备指纹诊断/修复（周末套餐 1004：号间共用一枚指纹时一号领取全组被烧） =====
+const devDlgOpen = ref(false);
+const devRows = ref<ZcodeDeviceRow[]>([]);
+const devLiveMid = ref("");
+const devAnchorMid = ref("");
+const devClaimMode = ref(false);
+const devBusy = ref(false);
+
+async function openDeviceDiag() {
+  devBusy.value = true;
+  try {
+    const r = await api.proxyZcodeDeviceStatus();
+    devRows.value = r.rows || [];
+    devLiveMid.value = r.liveMid || "";
+    devAnchorMid.value = r.anchorMid || "";
+    devClaimMode.value = !!r.claimMode;
+    devDlgOpen.value = true;
+  } catch (e) {
+    toast(String((e as Error).message || e), "err");
+  } finally {
+    devBusy.value = false;
+  }
+}
+
+/** 领取模式状态静默刷新（工具栏警示按钮与诊断弹窗头部都吃这份数据） */
+async function refreshDevState() {
+  try {
+    const r = await api.proxyZcodeDeviceStatus();
+    devRows.value = r.rows || [];
+    devLiveMid.value = r.liveMid || "";
+    devAnchorMid.value = r.anchorMid || "";
+    devClaimMode.value = !!r.claimMode;
+  } catch { /* 忽略：下次轮询再拿 */ }
+}
+
+async function runDeviceRepair(all: boolean) {
+  if (devBusy.value) return;
+  devBusy.value = true;
+  try {
+    const r = await api.proxyZcodeDeviceRepair(all);
+    devRows.value = r.rows || [];
+    devLiveMid.value = r.liveMid || "";
+    toast(r.repaired ? `已给 ${r.repaired} 个账号重派全新设备指纹` : "当前没有需要修复的指纹", "info");
+  } catch (e) {
+    toast(String((e as Error).message || e), "err");
+  } finally {
+    devBusy.value = false;
+  }
+}
+
+/** 有账号处于撞车/疑似被烧状态时工具栏按钮点亮告警 */
+const devHasIssue = computed(() => devRows.value.some((r) => r.conflictWith.length > 0 || r.burnedLikely || !r.deviceMid));
 
 /** 该账号能否写回本地客户端（Trae 的登录态是加密信封，写不了） */
 
@@ -555,10 +679,10 @@ function ideTitle(acc: ProxyAccount) {
   if (channelKind(acc.channel) !== "builtin") return "自定义提供商只有一把 API Key，本机没有对应的客户端登录态可写回";
   if (acc.channel === "trae") return "Trae 本地登录态为 ByteCrypto 加密信封（绑定设备密钥），无法构造合法信封，暂不支持写回";
   // 新渠道（Cline / AutoClaw / Qoder）本机就没有这套登录文件，别说成"未安装"
-if (acc.channel === "raccoon") return "把该账号写为小浣熊本机登录态（~/.box-agent/config/auth.json）；客户端在运行会先确认关闭、切完自动重启，登录文件缺失时按号池凭据重建";
-  if (acc.channel === "zcode" || acc.channel === "zcode_intl") return "把该账号写为本机 ZCode 当前登录态（合并式写回，移动端远程连接地址保持不变；切换需关闭并重启客户端）";
+  if (acc.channel === "raccoon") return "把该账号写为小浣熊本机登录态（~/.box-agent/config/auth.json）；点击后弹确认框，确认即自动关闭客户端、写入、再重新打开，登录文件缺失时按号池凭据重建";
+  if (acc.channel === "zcode" || acc.channel === "zcode_intl") return "把该账号写为本机 ZCode 当前登录态（合并式写回，移动端远程连接地址保持不变）；点击后弹确认框，确认即自动关闭客户端、写入、再重新打开";
   if (!ideSupported(acc)) return "本机未找到对应客户端的登录文件（未安装或从未登录过）";
-  return `把该账号写为本地 ${channelName(acc.channel)} 当前登录态（需重启客户端）`;
+  return `把该账号写为本地 ${channelName(acc.channel)} 当前登录态；点击后弹确认框，确认即自动关闭客户端、写入、再重新打开`;
 }
 
 // ===== ZCode 活动领取（上游 v1.31 起走 checkin 二段流：一键领取 → needCaptcha → 渲染层过码 → 带参重试）=====
@@ -1129,6 +1253,10 @@ async function copyErr() {
 
 // ===== 事件订阅与生命周期 =====
 
+// 事件合流：批量签到/额度刷新时主进程逐账号广播 credits 事件，逐条全量 refresh 会打满 IPC
+// （事件风暴 → 刷新风暴）；合流后同刻只在跑一次、间隔内合并为末尾一次
+const scheduleRefresh = coalesceAsync(refresh, 1200);
+
 onMounted(() => {
   nowTimer = window.setInterval(tickNow, 1000);
   refresh();
@@ -1149,12 +1277,13 @@ onMounted(() => {
         refresh();
       }
     } else if (p.type === "credits" || p.type === "status") {
-      if (active.value) refresh(); // 页面不在前台就不拉不渲染，切回时 watch(active) 会补一次
+      if (active.value) scheduleRefresh(); // 页面不在前台就不拉不渲染，切回时 watch(active) 会补一次
     }
   });
 });
 onUnmounted(() => {
   if (offEvent) offEvent();
+  scheduleRefresh.cancel();
   if (nowTimer) clearInterval(nowTimer);
   if (aclawCaptchaTimer) clearTimeout(aclawCaptchaTimer); // 滑块等待定时器别留到页面销毁之后
 });
@@ -1213,12 +1342,31 @@ onUnmounted(() => {
                 :title="'国际版无每日签到，这是一次性 trial 加油包'"
                 @click="runTrial"
               >{{ checkinBusy ? "领取中…" : "领加油包" }}</button>
-              <button v-else-if="ch.id === 'zcode' && zcodeHasReward" class="btn btn-sm" :disabled="checkinBusy" @click="runCheckinChannel">
-                {{ checkinBusy ? "领取中…" : "一键领取" }}
-              </button>
+              <button
+                v-else-if="ch.id === 'zcode' && zcodeHasReward"
+                class="btn btn-sm"
+                :disabled="checkinBusy"
+                :title="'领取当前可领的奖励套餐（周末包等）；需要人机校验时会弹官方验证窗'"
+                @click="runCheckinChannel"
+              >{{ checkinBusy ? "领取中…" : "一键领取" }}</button>
               <button v-else-if="checkinCapable(ch.id)" class="btn btn-sm" :disabled="checkinBusy" @click="runCheckinChannel">
                 {{ checkinBusy ? "签到中…" : "一键签到" }}
               </button>
+              <button
+                v-if="ch.id === 'zcode'"
+                class="btn btn-sm"
+                :class="{ 'btn-warning': devHasIssue }"
+                :disabled="devBusy"
+                title="设备指纹（deviceMid）诊断与修复：多账号共用同一枚指纹时，一个账号领取周末套餐会把全组账号的当周资格烧掉（服务端提示「不符合领取条件」/1004）。修复即给这些账号重派全新随机指纹"
+                @click="openDeviceDiag"
+              >{{ devBusy ? "检测中…" : devHasIssue ? "指纹异常" : "指纹诊断" }}</button>
+              <button
+                v-if="ch.id === 'zcode' && devClaimMode"
+                class="btn btn-sm btn-warning"
+                :disabled="devBusy"
+                title="本机指纹当前借出给某账号领周末套餐（领取模式），手机远程连接不可用；点击写回本机锚定指纹并重启客户端，远程即恢复"
+                @click="restoreRemoteMid"
+              >{{ devBusy ? "恢复中…" : "恢复本机指纹" }}</button>
               <button
                 v-if="ch.id === 'zcode' || ch.id === 'zcode_intl'"
                 class="btn btn-sm"
@@ -1448,6 +1596,15 @@ onUnmounted(() => {
                       {{ solvingCaptchaId === acc.id ? "过码中…" : (isNeedCaptcha(acc) ? "需过码" : "过码") }}
                     </button>
                     <button
+                      v-if="acc.channel === 'zcode'"
+                      class="btn-link btn-sm"
+                      :disabled="ideSwitching === acc.id"
+                      title="领取模式（人工操作）：把本机指纹临时借出为该账号专属指纹并重启客户端，之后在官方客户端里点「限时可领取」人工领取周末套餐；领完回工具栏点「恢复本机指纹」。期间手机远程不可用"
+                      @click="enterClaimMode(acc)"
+                    >
+                      {{ ideSwitching === acc.id ? "处理中…" : "领取模式" }}
+                    </button>
+                    <button
                       class="btn-link btn-sm"
                       :disabled="ideSwitching === acc.id || !ideSupported(acc)"
                       :title="ideTitle(acc)"
@@ -1672,19 +1829,39 @@ onUnmounted(() => {
         </div>
       </div>
 
-      <!-- 切号确认：目标客户端正在运行，需先关闭再切换（zcode 额外承诺远程连接地址不变） -->
+      <!-- 切号确认：预检事实（客户端是否在跑 / 安装路径 / 切完是否自动重启）先给用户过目再动手 -->
       <div v-if="pendingConfirm" class="p-mask" @click.self="pendingConfirm = null">
         <div class="p-dlg glass">
-          <div class="p-title">切换 {{ channelName(pendingConfirm.channel) }} 登录账号</div>
+          <div class="p-title">{{ confirmTitleText }}</div>
           <div class="set-desc">
             {{ pendingConfirm?.message }}<br />
-            <template v-if="pendingConfirm?.channel === 'zcode'">切换后<b>移动端远程连接地址保持不变</b>，流量与奖励归属「{{ pendingConfirm?.name }}」。</template>
-            <template v-else>切换后流量与奖励归属「{{ pendingConfirm?.name }}」，原登录文件自动备份、可回滚。</template>
+            <template v-if="pendingConfirm?.probe?.note">{{ pendingConfirm.probe.note }}<br /></template>
+            <template v-if="pendingConfirm?.kind === 'switch'">切换后流量与奖励归属「{{ pendingConfirm?.name }}」。</template>
+          </div>
+          <div v-if="pendingConfirm?.probe" class="ide-probe">
+            <div class="ide-probe-row">
+              <span class="ide-probe-k">客户端状态</span>
+              <span class="ide-probe-v">
+                <span class="ide-dot" :class="{ on: pendingConfirm.probe.running }"></span>
+                {{ pendingConfirm.probe.running ? "正在运行（将先关闭）" : "未运行（直接写入登录态）" }}
+              </span>
+            </div>
+            <div v-if="pendingConfirm.probe.exe" class="ide-probe-row">
+              <span class="ide-probe-k">程序路径</span>
+              <span class="ide-probe-v mono" :title="pendingConfirm.probe.exe">{{ pendingConfirm.probe.exe }}</span>
+            </div>
+            <div v-if="pendingConfirm.probe.running" class="ide-probe-row">
+              <span class="ide-probe-k">切换完成后</span>
+              <span class="ide-probe-v">{{ pendingConfirm.probe.relaunch ? "自动重新打开客户端" : "需要手动打开客户端" }}</span>
+            </div>
+            <div v-if="pendingConfirm.probe.warning" class="ide-probe-warn">
+              <i class="ph ph-warning"></i>{{ pendingConfirm.probe.warning }}
+            </div>
           </div>
           <div class="p-actions">
             <button class="btn" @click="pendingConfirm = null">取消</button>
             <button class="btn btn-primary" :disabled="confirmBusy" @click="confirmIdeSwitch">
-              {{ confirmBusy ? "切换中…" : "关闭客户端并切换" }}
+              {{ confirmBusy ? "切换中…" : confirmActionText }}
             </button>
           </div>
         </div>
@@ -1730,6 +1907,43 @@ onUnmounted(() => {
           <div class="set-desc">验证通过后自动继续领取；关闭弹窗即取消本次领取。</div>
           <div id="zcap-captcha-element" class="captcha-mount"></div>
           <button id="zcap-captcha-trigger" class="captcha-trigger" type="button" aria-hidden="true" tabindex="-1"></button>
+        </div>
+      </div>
+
+      <!-- 设备指纹诊断弹窗：逐账号列出专属 deviceMid 与冲突状态，
+           撞车/疑似被烧的行高亮，一键重派全新随机指纹（1004 的唯一出路） -->
+      <div v-if="devDlgOpen" class="p-mask" @click.self="devDlgOpen = false">
+        <div class="p-dlg glass checkin-dlg">
+          <div class="p-title checkin-head">
+            <i class="ph ph-fingerprint"></i>
+            设备指纹诊断
+            <span class="checkin-stats">
+              <span v-if="devClaimMode" class="tag tag-warn">领取模式中 · 远程不可用</span>
+              <span class="tag" :class="devHasIssue ? 'tag-warn' : 'tag-ok'">{{ devHasIssue ? "发现异常" : "全部独立" }}</span>
+              <span class="tag tag-dim" :title="`本机 telemetry-state.json 当前指纹：${devLiveMid || '（无）'}`">本机指纹 {{ devLiveMid ? devLiveMid.slice(0, 8) : "（无）" }}</span>
+              <span class="tag tag-dim" :title="`锚定指纹（远程连接的合法值，终生恒定）：${devAnchorMid || '（未锚定）'}`">锚定 {{ devAnchorMid ? devAnchorMid.slice(0, 8) : "（未锚定）" }}</span>
+            </span>
+          </div>
+          <div class="dev-hint">
+            周末套餐领取资格 = 账号本周未领 + 设备指纹本周未被消耗。多个账号共用同一枚指纹时，一个账号领取成功会把全组账号的当周资格烧掉（服务端报「不符合领取条件」）。切号只写登录态、不动指纹；要在官方客户端里领套餐请用账号行的「领取模式」（临时借出指纹 → 人工领取 → 恢复锚定值），AgentHub 内「一键领取」不受影响。以下异常多为存量遗留，修复即给这些账号重派全新随机指纹。
+          </div>
+          <div class="checkin-rows">
+            <div v-for="r in devRows" :key="r.id" class="checkin-row">
+              <div class="checkin-name">
+                {{ r.name || r.uid || r.id }}
+                <span v-if="r.isLive" class="tag tag-info">本机登录</span>
+                <span v-if="r.conflictWith.length" class="tag tag-err">与 {{ r.conflictWith.map((x) => devRows[x] ? (devRows[x].name || devRows[x].uid || "另一账号") : "另一账号").join("、") }} 共用指纹</span>
+                <span v-else-if="r.burnedLikely" class="tag tag-warn">占用本机指纹</span>
+                <span v-else class="tag tag-ok">独立</span>
+              </div>
+              <span class="checkin-msg mono">指纹 {{ r.short }}<template v-if="r.burnedLikely && r.conflictWith.length"> · 本周资格大概率已被消耗（1004）</template></span>
+            </div>
+            <div v-if="!devRows.length" class="checkin-empty">号池里还没有 zcode 账号</div>
+          </div>
+          <div class="p-actions">
+            <button class="btn" :disabled="devBusy" @click="runDeviceRepair(true)">{{ devBusy ? "处理中…" : "全部换随机指纹" }}</button>
+            <button class="btn btn-primary" :disabled="devBusy || !devHasIssue" @click="runDeviceRepair(false)">{{ devBusy ? "修复中…" : "修复异常指纹" }}</button>
+          </div>
         </div>
       </div>
 
@@ -2216,6 +2430,69 @@ onUnmounted(() => {
   font-family: var(--font-code);
 }
 
+/* ===== 切号确认弹窗：预检事实块（客户端状态 / 程序路径 / 切完是否自动重启 + 未保存丢失告警） ===== */
+.ide-probe {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--bg-soft);
+}
+.ide-probe-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.ide-probe-k {
+  flex-shrink: 0;
+  width: 68px;
+  color: var(--text-3);
+}
+.ide-probe-v {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+/* 程序路径可能很长：单行右截断，完整内容由 title 悬浮显示，别把弹窗撑宽 */
+.ide-probe-v.mono {
+  display: block;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.ide-dot {
+  flex-shrink: 0;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-3);
+}
+.ide-dot.on {
+  background: var(--warn);
+}
+.ide-probe-warn {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--warn);
+}
+.ide-probe-warn .ph {
+  flex-shrink: 0;
+  margin-top: 1px;
+  font-size: 13px;
+}
+
 /* ===== 本机软件导入面板：候选列表（等高面板内滚，避免撑高弹窗） ===== */
 .scan-head {
   display: flex;
@@ -2378,6 +2655,16 @@ onUnmounted(() => {
 }
 .checkin-dlg {
   width: 460px;
+}
+/* 设备指纹诊断弹窗稍宽：行内要放撞车对象标签 + 指纹缩略 */
+.checkin-dlg:has(.dev-hint) {
+  width: 560px;
+}
+.dev-hint {
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-3);
 }
 .checkin-rows {
   margin-top: 10px;
