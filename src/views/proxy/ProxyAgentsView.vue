@@ -1406,8 +1406,8 @@ onUnmounted(() => {
                 <template v-if="isBuiltin(ch)"><th>余额</th><th>到期</th></template>
                 <th>今日</th><th>操作</th>
               </tr>
-              <template v-for="acc in ch.accounts" :key="acc.id">
-              <tr>
+              <template v-for="(acc, i) in ch.accounts" :key="acc.id">
+              <tr :style="{ '--i': i }">
                 <td class="acc-cell">
                   <button
                     v-if="isBuiltin(ch) && acc.packages && acc.packages.length"
@@ -1432,17 +1432,21 @@ onUnmounted(() => {
                     <button class="acc-uid mono" :disabled="!acc.uid" title="点击查看完整 UID" @click="uidRow = acc">
                       {{ acc.uid ? uidBrief(acc.uid) : "无 UID" }}
                     </button>
+                    <template v-if="acc.liveHere">
+                      <i>·</i>
+                      <span class="tag tag-info acc-live" :title="`${ch.display} 客户端在本机当前登录的就是这个账号`"><i class="ph ph-desktop-tower"></i>本机登录</span>
+                    </template>
                   </span>
                 </td>
                 <td>
                   <!-- 状态标签：有最近错误的账号可点击，弹小窗看错误全文 -->
                   <span
                     class="tag status-tag"
-                    :class="[ACCOUNT_STATUS[acc.status]?.cls || 'tag-dim', { 'has-err': !!acc.lastError }]"
+                    :class="[isNeedCaptcha(acc) ? 'tag-warn' : ACCOUNT_STATUS[acc.status]?.cls || 'tag-dim', { 'has-err': !!acc.lastError }]"
                     :title="acc.lastError ? '点击查看最近一次上游错误' : ''"
                     @click="acc.lastError && (errRow = acc)"
                   >
-                    {{ ACCOUNT_STATUS[acc.status]?.text || acc.status }}
+                    {{ isNeedCaptcha(acc) ? "需过码" : (ACCOUNT_STATUS[acc.status]?.text || acc.status) }}
                   </span>
                   <!-- 冷却剩余时间：秒级跳动，到点自动归零消失（状态派生在主进程惰性完成） -->
                   <span v-if="coolLeft(acc)" class="cool-left mono">剩 {{ coolLeft(acc) }}</span>
@@ -1450,7 +1454,7 @@ onUnmounted(() => {
                   <span v-if="modelCoolLeft(acc)" class="cool-left mono" :title="modelCoolTitle(acc)">模型冷却剩 {{ modelCoolLeft(acc) }}</span>
                 </td>
                 <template v-if="isBuiltin(ch)">
-                  <td class="mono num">{{ acc.hasToken ? (acc.credits === -1 ? "不限" : fmtInt(acc.credits)) : "-" }}</td>
+                  <td class="mono num" :title="acc.channel === 'zcode' && acc.credits > 0 ? `${fmtInt(acc.credits)} Tokens` : ''">{{ acc.hasToken ? (acc.credits === -1 ? "不限" : fmtBalance(acc.credits, acc.channel)) : "-" }}</td>
                   <td class="mono">{{ acc.expiresAt ? fmtDate(acc.expiresAt) : "-" }}</td>
                 </template>
                 <td class="mono num">{{ acc.todayReq }} 次 · {{ fmtK(acc.todayTokens) }} · {{ acc.creditsToday < 0 ? "-" : fmtInt(acc.creditsToday) }} 积分</td>
@@ -1460,13 +1464,32 @@ onUnmounted(() => {
                     {{ refreshingId === acc.id ? "刷新中…" : "刷新" }}
                   </button>
                   <button
-                    v-if="acc.hasToken && isBuiltin(ch) && checkinCapable(acc.channel)"
+                    v-if="acc.hasToken && isBuiltin(ch) && (checkinCapable(acc.channel) || acc.channel === 'zcode')"
                     class="btn-link btn-sm"
                     :disabled="checkinBusy"
-                    :title="acc.channel === 'workbuddy_ai' ? '国际版无每日签到，用上方工具栏「领加油包」' : acc.channel === 'raccoon' ? '登录送积分（幂等，锁定当日积分 7 天）' : '对该账号执行每日签到'"
+                    :title="acc.channel === 'workbuddy_ai' ? '国际版无每日签到，用上方工具栏「领加油包」' : acc.channel === 'raccoon' ? '登录送积分（幂等，锁定当日积分 7 天）' : acc.channel === 'zcode' ? '领取当前可领的奖励套餐（如需人机校验会弹官方验证窗）' : '对该账号执行每日签到'"
                     @click="runCheckinAccount(acc)"
                   >
-                    签到
+                    {{ acc.channel === "zcode" ? "领取" : "签到" }}
+                  </button>
+                  <button
+                    v-if="acc.channel === 'zcode'"
+                    class="btn-link btn-sm"
+                    :class="{ 'btn-captcha-warn': isNeedCaptcha(acc) }"
+                    :disabled="solvingCaptchaId === acc.id"
+                    :title="isNeedCaptcha(acc) ? '触发了上游阿里云人机校验，点击弹出验证码窗口进行过码' : '手动完成一次阿里云人机校验以刷新上游风控信誉'"
+                    @click="runSolveCaptcha(acc)"
+                  >
+                    {{ solvingCaptchaId === acc.id ? "过码中…" : (isNeedCaptcha(acc) ? "需过码" : "过码") }}
+                  </button>
+                  <button
+                    v-if="acc.channel === 'zcode'"
+                    class="btn-link btn-sm"
+                    :disabled="ideSwitching === acc.id"
+                    title="领取模式（人工操作）：把本机指纹临时借出为该账号专属指纹并重启客户端，之后在官方客户端里点「限时可领取」人工领取周末套餐；领完回工具栏点「恢复本机指纹」。期间手机远程不可用"
+                    @click="enterClaimMode(acc)"
+                  >
+                    {{ ideSwitching === acc.id ? "处理中…" : "领取模式" }}
                   </button>
                   <button
                     v-if="isBuiltin(ch)"
@@ -1529,105 +1552,6 @@ onUnmounted(() => {
                   号池为空 —— 点「添加账号」：OAuth 登录 / 从本机软件导入 / 文件导入 / 手动粘贴
                 </td>
               </tr>
-              <template v-else>
-                <tr v-for="(acc, i) in ch.accounts" :key="acc.id" :style="{ '--i': i }">
-                  <td class="acc-cell">
-                    <span v-if="renamingId !== acc.id" class="acc-name" :title="acc.name + '（点击重命名）'" @click="startRename(acc)">{{ acc.name || "（未命名账号）" }}</span>
-                    <input
-                      v-else
-                      v-model="renameText"
-                      class="input input-xs"
-                      style="width: 120px"
-                      @blur="commitRename(acc)"
-                      @keydown.enter="commitRename(acc)"
-                      @keydown.esc="renamingId = ''"
-                    />
-                    <span class="acc-sub">
-                      <span class="acc-src">{{ SOURCE_NAMES[acc.source] || acc.source }}</span>
-                      <i>·</i>
-                      <button class="acc-uid mono" :disabled="!acc.uid" title="点击查看完整 UID" @click="uidRow = acc">
-                        {{ acc.uid ? uidBrief(acc.uid) : "无 UID" }}
-                      </button>
-                      <template v-if="acc.liveHere">
-                        <i>·</i>
-                        <span class="tag tag-info acc-live" :title="`${ch.display} 客户端在本机当前登录的就是这个账号`"><i class="ph ph-desktop-tower"></i>本机登录</span>
-                      </template>
-                    </span>
-                  </td>
-                  <td>
-                    <!-- 状态标签：使用 pill 样式 -->
-                    <span
-                      class="pill status-tag"
-                      :class="[isNeedCaptcha(acc) ? 'warn' : acc.status === 'online' ? 'ok' : acc.status === 'cooling' ? 'warn' : acc.status === 'disabled' ? 'blue' : 'err', { 'has-err': !!acc.lastError }]"
-                      :title="acc.lastError ? '点击查看最近一次上游错误' : ''"
-                      @click="acc.lastError && (errRow = acc)"
-                    >
-                      {{ isNeedCaptcha(acc) ? "需过码" : (ACCOUNT_STATUS[acc.status]?.text || acc.status) }}
-                    </span>
-                    <!-- 冷却剩余时间：秒级跳动，到点自动归零消失（状态派生在主进程惰性完成） -->
-                    <span v-if="coolLeft(acc)" class="cool-left mono">剩 {{ coolLeft(acc) }}</span>
-                    <!-- 模型级冷却（6004/11102 不落账号状态）：悬浮看逐模型明细 -->
-                    <span v-if="modelCoolLeft(acc)" class="cool-left mono" :title="modelCoolTitle(acc)">模型冷却剩 {{ modelCoolLeft(acc) }}</span>
-                  </td>
-                  <td class="mono num" :title="acc.channel === 'zcode' && acc.credits > 0 ? `${fmtInt(acc.credits)} Tokens` : ''">{{ acc.hasToken ? (acc.credits === -1 ? "不限" : fmtBalance(acc.credits, acc.channel)) : "-" }}</td>
-                  <td class="mono">{{ acc.expiresAt ? fmtDate(acc.expiresAt) : "-" }}</td>
-                  <td class="mono num">{{ acc.todayReq }} 次 · {{ fmtK(acc.todayTokens) }}</td>
-                  <td style="text-align: right">
-                    <button class="btn-link btn-sm" :disabled="refreshingId === acc.id" @click="refreshOne(acc)">
-                      {{ refreshingId === acc.id ? "刷新中…" : "刷新" }}
-                    </button>
-                    <button
-                      v-if="acc.hasToken"
-                      class="btn-link btn-sm"
-                      :disabled="checkinBusy"
-                      :title="acc.channel === 'workbuddy_ai' ? '国际版无每日签到，用上方工具栏「领加油包」' : acc.channel === 'raccoon' ? '登录送积分（幂等，锁定当日积分 7 天）' : acc.channel === 'zcode' ? '领取当前可领的奖励套餐（如需人机校验会弹官方验证窗）' : '对该账号执行每日签到'"
-                      @click="runCheckinAccount(acc)"
-                    >
-                      {{ acc.channel === "zcode" ? "领取" : "签到" }}
-                    </button>
-                    <button
-                      v-if="acc.channel === 'zcode'"
-                      class="btn-link btn-sm"
-                      :class="{ 'btn-captcha-warn': isNeedCaptcha(acc) }"
-                      :disabled="solvingCaptchaId === acc.id"
-                      :title="isNeedCaptcha(acc) ? '触发了上游阿里云人机校验，点击弹出验证码窗口进行过码' : '手动完成一次阿里云人机校验以刷新上游风控信誉'"
-                      @click="runSolveCaptcha(acc)"
-                    >
-                      {{ solvingCaptchaId === acc.id ? "过码中…" : (isNeedCaptcha(acc) ? "需过码" : "过码") }}
-                    </button>
-                    <button
-                      v-if="acc.channel === 'zcode'"
-                      class="btn-link btn-sm"
-                      :disabled="ideSwitching === acc.id"
-                      title="领取模式（人工操作）：把本机指纹临时借出为该账号专属指纹并重启客户端，之后在官方客户端里点「限时可领取」人工领取周末套餐；领完回工具栏点「恢复本机指纹」。期间手机远程不可用"
-                      @click="enterClaimMode(acc)"
-                    >
-                      {{ ideSwitching === acc.id ? "处理中…" : "领取模式" }}
-                    </button>
-                    <button
-                      class="btn-link btn-sm"
-                      :disabled="ideSwitching === acc.id || !ideSupported(acc)"
-                      :title="ideTitle(acc)"
-                      @click="ideSwitch(acc)"
-                    >
-                      {{ ideSwitching === acc.id ? "切换中…" : "切到 IDE" }}
-                    </button>
-                    <button
-                      v-if="acc.status === 'cooling' || (acc.modelCool && acc.modelCool.length)"
-                      class="btn-link btn-sm"
-                      :disabled="coolOffId === acc.id"
-                      :title="acc.status === 'cooling'
-                        ? '立即结束冷却，账号马上回到可用调度（同时豁免其模型级冷却）'
-                        : '该账号部分模型在冷却中（6004 限流/11102 不支持），解除后这些模型立即恢复可用'"
-                      @click="releaseCool(acc)"
-                    >
-                      {{ coolOffId === acc.id ? "解除中…" : "解冷却" }}
-                    </button>
-                    <button class="btn-link btn-sm" @click="toggleAccount(acc)">{{ acc.status === "disabled" ? "启用" : "停用" }}</button>
-                    <button class="btn-link btn-sm danger" @click="delRow = acc; delOpen = true">移出</button>
-                  </td>
-                </tr>
-              </template>
             </tbody>
           </table>
         </div>
