@@ -283,7 +283,8 @@ onMounted(refresh);
 
 <template>
   <section class="page">
-    <div class="page-body">
+    <!-- 目录页要「一屏显示」：page-body 变弹性列，目录卡片吃掉剩余高度、表格在卡内滚动（见下方 .page-fill） -->
+    <div class="page-body" :class="{ 'page-fill': mainTab === 'catalog' }">
       <div v-if="err" class="card err-card"><div class="set-desc err-text">{{ err }}</div></div>
 
       <!-- 顶部三大 Tab：合并模型目录 / 自定义模型映射 / 全渠道反向模型映射 + 路由说明按钮 -->
@@ -339,7 +340,7 @@ onMounted(refresh);
           </Transition>
         </div>
 
-        <div class="card" style="margin-top: 10px">
+        <div class="card models-card" style="margin-top: 10px">
           <div class="card-title">
             {{ activeTab ? channelName(activeTab) + "模型目录" : "合并模型目录" }}
             <span class="right">{{ rows.length }} 个模型 · 保存即热生效</span>
@@ -603,17 +604,52 @@ onMounted(refresh);
         </div>
       </div>
     </Teleport>
-  </section>
-<ModelMetaEditor
+
+    <!-- 元数据编辑器：自身 Teleport 到 body，留在这里不产生额外布局。
+         必须留在 <section> 之内 —— 挂到 </section> 之后会让本组件变成 fragment 根，
+         App.vue 上的 v-show 会被静默忽略（只 warn 不报错），页面一旦挂载就再也藏不起来，
+         切到同模块别的页时目标页被追加到它后面、落在屏幕外，看起来就是「点了没反应」 -->
+    <ModelMetaEditor
       :model="editing"
       :override="editingOverride"
       @close="closeMetaEditor"
       @save="saveMeta"
       @clear="clearMetaGroup"
     />
+  </section>
   </template>
 
 <style scoped>
+/* ===== 目录页「一屏显示」：整页不出页面级滚动条，表格用满剩余高度、在卡内滚动 =====
+   .page 本身就是 height:100% 的弹性列（global.css），page-body 撑满剩余高度即可；
+   块布局下 .models-main-tabs 的 margin-bottom 与 .page-body > * + * 的 margin-top 会折叠成 12px，
+   弹性列不折叠，故显式清零前者，保持原有节奏不变 */
+.page-fill {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.page-fill > .models-main-tabs {
+  margin-bottom: 0;
+}
+.models-card {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+/* 卡片标题不参与伸缩，剩余高度全给表格容器 */
+.models-card > .card-title {
+  flex: none;
+}
+/* 覆盖全局 .table-scroll 的 max-height: min(480px, 62vh) 硬上限：改由卡片剩余高度决定 */
+.models-card > .table-scroll {
+  flex: 1;
+  min-height: 0;
+  max-height: none;
+}
+
 /* ===== 顶部三大 Tab 切换按钮 ===== */
 .models-main-tabs {
   display: flex;

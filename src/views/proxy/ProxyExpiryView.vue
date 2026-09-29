@@ -1,11 +1,22 @@
 <!-- 积分到期总览（方案 Q3c）：把所有渠道所有账号的积分包拉平，按到期升序统一呈现，
-     一屏看清「哪些包快过期了」。分级配色与号池页展开明细一致（主进程按 expiringSoonDays 派生）。 -->
+     一屏看清「哪些包快过期了」。分级配色与号池页展开明细一致（主进程按 expiringSoonDays 派生）。
+     默认档「有余额」滤掉剩余为 0 的包——已用完的包再谈到期没有信息量（2026-09-29）。 -->
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import * as api from "../../api/ipc";
 import type { ProxyChannelView, ProxyCreditPackage } from "../../types";
 import { useAppStore } from "../../stores/app";
 import { fmtInt, fmtDate } from "./format";
+import {
+  STATUS_OPTIONS,
+  SORT_OPTIONS,
+  applyExpiryFilter,
+  countByState,
+  statusOf,
+  type ExpiryRow,
+  type ExpirySortKey,
+  type ExpiryStatusFilter,
+} from "./expiryRows";
 
 const app = useAppStore();
 const active = computed(() => app.activeModule === "proxy" && app.activePage === "expiry");
@@ -14,6 +25,10 @@ const pool = ref<ProxyChannelView[]>([]);
 const loading = ref(false);
 const err = ref("");
 let offEvent: (() => void) | undefined;
+
+const statusFilter = ref<ExpiryStatusFilter>("usable");
+const channelFilter = ref("all");
+const sortKey = ref<ExpirySortKey>("expiryAsc");
 
 function isBuiltin(ch: ProxyChannelView) {
   return ch.kind !== "openai_compat";
@@ -31,47 +46,35 @@ async function refresh() {
   }
 }
 
-interface ExpiryRow {
-  key: string;
-  channelDisplay: string;
-  accountName: string;
-  pkg: ProxyCreditPackage;
-}
-
-// 拉平：只取生态渠道（有积分包概念）里已刷出包的账号
-const rows = computed<ExpiryRow[]>(() => {
+// 拉平：只取生态渠道（有积分包概念）里已刷出包的账号；排序交给 applyExpiryFilter
+const allRows = computed<ExpiryRow[]>(() => {
   const out: ExpiryRow[] = [];
   for (const ch of pool.value) {
     if (!isBuiltin(ch)) continue;
     for (const acc of ch.accounts) {
       for (const [i, pkg] of (acc.packages || []).entries()) {
-        out.push({ key: `${acc.id}:${pkg.code || i}`, channelDisplay: ch.display, accountName: acc.name || "（未命名）", pkg });
+        out.push({ key: `${acc.id}:${pkg.code || i}`, channelId: ch.id, channelDisplay: ch.display, accountName: acc.name || "（未命名）", pkg });
       }
     }
   }
-  // 到期升序；无到期(0=长期)排最后；同到期按剩余降序
-  out.sort((a, b) => {
-    const ea = a.pkg.expiresAt || Number.POSITIVE_INFINITY;
-    const eb = b.pkg.expiresAt || Number.POSITIVE_INFINITY;
-    if (ea !== eb) return ea - eb;
-    const ra = a.pkg.remaining === -1 ? Number.POSITIVE_INFINITY : a.pkg.remaining;
-    const rb = b.pkg.remaining === -1 ? Number.POSITIVE_INFINITY : b.pkg.remaining;
-    return rb - ra;
-  });
   return out;
 });
 
-const summary = computed(() => {
-  let expired = 0;
-  let soon = 0;
-  let ok = 0;
-  for (const r of rows.value) {
-    if (r.pkg.expired) expired++;
-    else if (r.pkg.expiringSoon) soon++;
-    else ok++;
-  }
-  return { expired, soon, ok, total: rows.value.length };
+const channelOptions = computed(() => {
+  const seen = new Map<string, string>();
+  for (const r of allRows.value) if (!seen.has(r.channelId)) seen.set(r.channelId, r.channelDisplay);
+  return [...seen].map(([value, label]) => ({ value, label }));
 });
+
+// 选中的渠道从号池消失后（渠道被删/改）回落「全部」，免得下拉里显示裸 id
+watch(channelOptions, (opts) => {
+  if (channelFilter.value !== "all" && !opts.some((o) => o.value === channelFilter.value)) channelFilter.value = "all";
+});
+
+const rows = computed(() => applyExpiryFilter(allRows.value, { status: statusFilter.value, channelId: channelFilter.value, sort: sortKey.value }));
+
+// 聚合标签走全量：它们是总览数字，不随筛选变化
+const summary = computed(() => countByState(allRows.value));
 
 function daysText(pkg: ProxyCreditPackage): string {
   if (!pkg.expiresAt) return "长期";
@@ -80,14 +83,40 @@ function daysText(pkg: ProxyCreditPackage): string {
   return `剩 ${d} 天`;
 }
 function statusCls(pkg: ProxyCreditPackage): string {
-  if (pkg.expired) return "tag-err";
-  if (pkg.expiringSoon) return "tag-warn";
-  return "tag-dim";
+  switch (statusOf(pkg)) {
+    case "expired":
+      return "tag-err";
+    case "soon":
+      return "tag-warn";
+    case "used":
+      return "tag-dim";
+    default:
+      return "tag-ok";
+  }
 }
 function statusText(pkg: ProxyCreditPackage): string {
-  if (pkg.expired) return "已过期";
-  if (pkg.expiringSoon) return "即将到期";
-  return "生效中";
+  switch (statusOf(pkg)) {
+    case "expired":
+      return "已过期";
+    case "soon":
+      return "即将到期";
+    case "used":
+      return "已用完";
+    default:
+      return "生效中";
+  }
+}
+function rowCls(pkg: ProxyCreditPackage): string {
+  switch (statusOf(pkg)) {
+    case "expired":
+      return "row-expired";
+    case "soon":
+      return "row-soon";
+    case "used":
+      return "row-used";
+    default:
+      return "";
+  }
 }
 function amount(v: number): string {
   return v === -1 ? "不限" : fmtInt(v);
@@ -117,12 +146,27 @@ onUnmounted(() => {
         <div class="expiry-actions">
           <span class="agg-tag tag-err" v-if="summary.expired">已过期 {{ summary.expired }}</span>
           <span class="agg-tag tag-warn" v-if="summary.soon">即将到期 {{ summary.soon }}</span>
-          <span class="agg-tag tag-dim">生效中 {{ summary.ok }}</span>
+          <span class="agg-tag tag-dim" v-if="summary.used">已用完 {{ summary.used }}</span>
+          <span class="agg-tag tag-ok" v-if="summary.ok">生效中 {{ summary.ok }}</span>
           <button class="btn btn-sm" :disabled="loading" @click="refresh">{{ loading ? "刷新中…" : "刷新" }}</button>
         </div>
       </div>
 
       <div v-if="err" class="expiry-err">{{ err }}</div>
+
+      <div class="expiry-filters">
+        <el-select v-model="statusFilter" class="f-el-select" popper-class="glass-popper" style="width: 118px">
+          <el-option v-for="o in STATUS_OPTIONS" :key="o.value" :value="o.value" :label="o.label" />
+        </el-select>
+        <el-select v-model="channelFilter" class="f-el-select" popper-class="glass-popper" style="width: 170px">
+          <el-option value="all" label="全部渠道" />
+          <el-option v-for="o in channelOptions" :key="o.value" :value="o.value" :label="o.label" />
+        </el-select>
+        <el-select v-model="sortKey" class="f-el-select" popper-class="glass-popper" style="width: 140px">
+          <el-option v-for="o in SORT_OPTIONS" :key="o.value" :value="o.value" :label="o.label" />
+        </el-select>
+        <span class="expiry-count">显示 {{ rows.length }} / {{ summary.total }} 条</span>
+      </div>
 
       <div class="tbl-wrap">
         <table class="tbl expiry-tbl">
@@ -130,7 +174,7 @@ onUnmounted(() => {
             <tr>
               <th>渠道 · 账号</th><th>积分包</th><th>剩余 / 总额</th><th>到期</th><th>剩余天数</th><th>状态</th>
             </tr>
-            <tr v-for="r in rows" :key="r.key" :class="{ 'row-expired': r.pkg.expired, 'row-soon': !r.pkg.expired && r.pkg.expiringSoon }">
+            <tr v-for="r in rows" :key="r.key" :class="rowCls(r.pkg)">
               <td>
                 <div class="src-ch">{{ r.channelDisplay }}</div>
                 <div class="src-acc">{{ r.accountName }}</div>
@@ -145,7 +189,11 @@ onUnmounted(() => {
             </tr>
             <tr v-if="!rows.length">
               <td colspan="6" style="text-align: center; color: var(--text-3); padding: 18px">
-                暂无积分包数据 —— 到「号池」页刷新生态渠道账号后，这里会列出各积分包的到期时间
+                {{
+                  summary.total
+                    ? "当前筛选条件下没有匹配的积分包"
+                    : "暂无积分包数据 —— 到「号池」页刷新生态渠道账号后，这里会列出各积分包的到期时间"
+                }}
               </td>
             </tr>
           </tbody>
@@ -177,6 +225,17 @@ onUnmounted(() => {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+}
+.expiry-filters {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.expiry-count {
+  font-size: 12px;
+  color: var(--text-3);
 }
 .agg-tag {
   font-size: 12px;
@@ -219,5 +278,8 @@ onUnmounted(() => {
 }
 .row-soon {
   background: var(--warn-bg, rgba(245, 176, 65, 0.08));
+}
+.row-used {
+  background: rgba(127, 127, 127, 0.06);
 }
 </style>

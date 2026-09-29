@@ -215,6 +215,10 @@ const channels = ref<ProxyChannelRow[]>([]);
 async function refreshChannels() {
   channels.value = (await api.proxyPool().catch(() => channels.value)) || [];
 }
+// 已过期且余额为 0 的渠道没有任何可用余量，留在卡片里只是噪音（2026-09-29）。
+// 注意渠道级 expired 是 some 语义（任一账号过期即置位），所以只按标签过滤会连带藏掉
+// 仍有可用账号的渠道 —— 必须再要求余额也为 0。
+const visibleChannels = computed(() => channels.value.filter((c) => !(c.summary.expired && c.summary.totalCredits === 0)));
 const fmtDay = (ts: number) => {
   if (!ts) return "-";
   const d = new Date(ts);
@@ -238,7 +242,7 @@ const OVERVIEW = computed<Record<ModuleKey, { title: string; hint: string }>>(()
     hint: skillsStats.value ? `${skillsStats.value.mountOk}/${skillsStats.value.mountTotal} 挂载` : "挂载",
   },
   sync: { title: "设备用量", hint: `${devices.value.length} 台设备` },
-  proxy: { title: "渠道额度", hint: channels.value.length ? `${channels.value.length} 个渠道` : "渠道" },
+  proxy: { title: "渠道额度", hint: visibleChannels.value.length ? `${visibleChannels.value.length} 个渠道` : "渠道" },
   memory: {
     title: "记忆概况",
     hint: memoryOverview.value ? `${memoryOverview.value.total} 条记忆` : "记忆中枢",
@@ -524,7 +528,7 @@ const TOOLS = computed<{ name: string; meta: string; label: string; ok: boolean 
 
         <!-- 反代网关：渠道额度（号池实时数据，渠道增减自动跟进） -->
         <template v-else>
-          <div v-for="c in channels" :key="c.id" class="ov-row">
+          <div v-for="c in visibleChannels" :key="c.id" class="ov-row">
             <div class="grow">
               <div class="ov-name">
                 {{ c.display }}<span v-if="c.summary.expired" class="ov-tag danger">已过期</span><span v-else-if="c.summary.expiringSoon" class="ov-tag warn">即将到期</span>
@@ -535,8 +539,8 @@ const TOOLS = computed<{ name: string; meta: string; label: string; ok: boolean 
             </div>
             <b class="ov-num">{{ c.summary.totalCredits.toLocaleString("en-US") }}</b>
           </div>
-          <div v-if="!channels.length" class="ov-row">
-            <div class="grow"><div class="ov-meta">号池尚未接入或加载中</div></div>
+          <div v-if="!visibleChannels.length" class="ov-row">
+            <div class="grow"><div class="ov-meta">{{ channels.length ? "无可用余额渠道（已过期或额度耗尽）" : "号池尚未接入或加载中" }}</div></div>
           </div>
         </template>
       </div>

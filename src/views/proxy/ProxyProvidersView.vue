@@ -665,7 +665,7 @@ onMounted(refresh);
             </div>
             <div class="f-row">
               <div class="set-name">上游协议</div>
-              <el-select v-model="form.kind" popper-class="glass-popper" class="f-input">
+              <el-select v-model="form.kind" popper-class="glass-popper" class="f-sel">
                 <el-option v-for="o in KIND_OPTIONS" :key="o.value" :value="o.value" :label="o.label" />
               </el-select>
               <div class="set-desc">{{ kindMeta?.hint }}；内部会互转，客户端看不出区别</div>
@@ -1009,6 +1009,18 @@ onMounted(refresh);
 }
 .f-input {
   width: 100%;
+}
+/* 上游协议下拉：.f-input 是给原生 input 的壳（根上再画一层边框 + 10px 内边距），
+   挂到 el-select 根上会同时坏两处：① 内层 .el-select__wrapper 自带走一遍边框底色，
+   于是套出双层框；② Element 的弹层按根的 border-box 定宽（取 selectRef.offsetWidth）、
+   却按内层 wrapper 定位，弹层因此整体右移一个内边距、右缘越过控件。这里只给根定宽，
+   尺寸交给 wrapper，与同列 .f-input 的 30px / 12px 齐平。 */
+.f-sel {
+  width: 100%;
+}
+.f-sel :deep(.el-select__wrapper) {
+  min-height: var(--ctl-h);
+  font-size: 12px;
 }
 .f-inline {
   display: flex;

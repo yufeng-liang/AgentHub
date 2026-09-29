@@ -233,13 +233,18 @@ const PROXY_KEYS = [
   { id: "k4", name: "旧测试 Key", mask: "sk-4419···0b3f", secret: "", route: "auto", dailyQuota: 100, rateLimit: 0, enabled: false, createdAt: NOW - 30 * 86400000, todayReq: 0, todayTokens: 0 },
 ];
 
+// 预览态号池。账号上的 packages 是「积分到期」页的数据源：没有它那一页在 dev:web 里永远是空的
+// （expired / expiringSoon 由主进程按 expiringSoonDays 派生，预览态直接写死结果值）。
 const PROXY_POOL = [
   {
     id: "trae", display: "Trae SOLO CN", domain: "api.trae.cn", poolStrategy: "expire_first",
     summary: { channel: "trae", totalCredits: 72480, accountCount: 2, onlineCount: 2, earliestExpire: NOW + 48 * 86400000, expired: false, expiringSoon: false, todayReq: 412, todayTokens: 96400, lastCreditsAt: NOW - 25 * 60000 },
     accounts: [
-      { id: "a1", channel: "trae", uid: "88213476", name: "主账号 · 沐", status: "online", credits: 51230, creditsAt: NOW - 25 * 60000, expiresAt: NOW + 48 * 86400000, coolUntil: 0, coolReason: "", source: "oauth", lastUsed: NOW - 3 * 60000, todayReq: 301, todayTokens: 70200, creditsToday: 21, createdAt: NOW - 20 * 86400000, hasToken: true },
-      { id: "a2", channel: "trae", uid: "90247811", name: "备用号", status: "online", credits: 21250, creditsAt: NOW - 25 * 60000, expiresAt: NOW + 21 * 86400000, coolUntil: 0, coolReason: "", source: "paste", lastUsed: NOW - 40 * 60000, todayReq: 111, todayTokens: 26200, creditsToday: 21, createdAt: NOW - 6 * 86400000, hasToken: true },
+      { id: "a1", channel: "trae", uid: "88213476", name: "主账号 · 沐", status: "online", credits: 51230, creditsAt: NOW - 25 * 60000, expiresAt: NOW + 48 * 86400000, coolUntil: 0, coolReason: "", source: "oauth", lastUsed: NOW - 3 * 60000, todayReq: 301, todayTokens: 70200, creditsToday: 21, createdAt: NOW - 20 * 86400000, hasToken: true,
+        packages: [{ code: "trae-solo", name: "SOLO 基础包", total: 100, used: 0, remaining: 100, expiresAt: NOW + 48 * 86400000 }] },
+      { id: "a2", channel: "trae", uid: "90247811", name: "备用号", status: "online", credits: 21250, creditsAt: NOW - 25 * 60000, expiresAt: NOW + 21 * 86400000, coolUntil: 0, coolReason: "", source: "paste", lastUsed: NOW - 40 * 60000, todayReq: 111, todayTokens: 26200, creditsToday: 21, createdAt: NOW - 6 * 86400000, hasToken: true,
+        // 已用完：默认档「有余额」应当把它藏起来
+        packages: [{ code: "trae-boost", name: "SOLO 加油包", total: 5, used: 5, remaining: 0, expiresAt: NOW + 21 * 86400000 }] },
     ],
   },
   {
@@ -247,8 +252,10 @@ const PROXY_POOL = [
     summary: { channel: "workbuddy", totalCredits: 34120, accountCount: 2, onlineCount: 1, earliestExpire: NOW + 12 * 86400000, expired: false, expiringSoon: false, todayReq: 203, todayTokens: 41200, lastCreditsAt: NOW - 40 * 60000 },
 
     accounts: [
-      { id: "a3", channel: "workbuddy", uid: "wb_7c21", name: "工作号", status: "online", credits: 34120, creditsAt: NOW - 40 * 60000, expiresAt: NOW + 12 * 86400000, coolUntil: 0, coolReason: "", source: "scan", lastUsed: NOW - 8 * 60000, todayReq: 203, todayTokens: 41200, creditsToday: 21, createdAt: NOW - 15 * 86400000, hasToken: true },
-      { id: "a4", channel: "workbuddy", uid: "wb_9e05", name: "历史快照", status: "cooling", credits: 0, creditsAt: NOW - 300 * 60000, expiresAt: 0, coolUntil: NOW + 42000, coolReason: "上游限流", source: "scan", lastUsed: NOW - 55 * 60000, todayReq: 0, todayTokens: 0, creditsToday: -1, createdAt: NOW - 15 * 86400000, hasToken: true },
+      { id: "a3", channel: "workbuddy", uid: "wb_7c21", name: "工作号", status: "online", credits: 34120, creditsAt: NOW - 40 * 60000, expiresAt: NOW + 12 * 86400000, coolUntil: 0, coolReason: "", source: "scan", lastUsed: NOW - 8 * 60000, todayReq: 203, todayTokens: 41200, creditsToday: 21, createdAt: NOW - 15 * 86400000, hasToken: true,
+        packages: [{ code: "wb-fission", name: "CodeBuddy 个人版国内运营裂变包", total: 500, used: 401, remaining: 99, expiresAt: NOW + 12 * 86400000 }] },
+      { id: "a4", channel: "workbuddy", uid: "wb_9e05", name: "历史快照", status: "cooling", credits: 0, creditsAt: NOW - 300 * 60000, expiresAt: 0, coolUntil: NOW + 42000, coolReason: "上游限流", source: "scan", lastUsed: NOW - 55 * 60000, todayReq: 0, todayTokens: 0, creditsToday: -1, createdAt: NOW - 15 * 86400000, hasToken: true,
+        packages: [{ code: "wb-legacy", name: "CodeBuddy 个人版国内运营裂变包", total: 100, used: 100, remaining: 0, expiresAt: NOW + 9 * 86400000 }] },
     ],
   },
   {
@@ -256,18 +263,26 @@ const PROXY_POOL = [
     summary: { channel: "workbuddy_ai", totalCredits: 8120, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 33 * 86400000, expired: false, expiringSoon: false, todayReq: 66, todayTokens: 14800, lastCreditsAt: NOW - 70 * 60000 },
 
     accounts: [
-      { id: "a5", channel: "workbuddy_ai", uid: "wba_3d88", name: "Trial 加油包", status: "online", credits: 8120, creditsAt: NOW - 70 * 60000, expiresAt: NOW + 33 * 86400000, coolUntil: 0, coolReason: "", source: "paste", lastUsed: NOW - 30 * 60000, todayReq: 66, todayTokens: 14800, creditsToday: 21, createdAt: NOW - 4 * 86400000, hasToken: true },
+      { id: "a5", channel: "workbuddy_ai", uid: "wba_3d88", name: "Trial 加油包", status: "online", credits: 8120, creditsAt: NOW - 70 * 60000, expiresAt: NOW + 33 * 86400000, coolUntil: 0, coolReason: "", source: "paste", lastUsed: NOW - 30 * 60000, todayReq: 66, todayTokens: 14800, creditsToday: 21, createdAt: NOW - 4 * 86400000, hasToken: true,
+        packages: [{ code: "wba-bonus", name: "Bonus Pack", total: 100, used: 0, remaining: 100, expiresAt: NOW + 33 * 86400000 }] },
     ],
   },
   {
     id: "raccoon", display: "商汤小浣熊", domain: "xiaohuanxiong.com", poolStrategy: "expire_first",
     summary: { channel: "raccoon", totalCredits: 9800, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 29 * 86400000, expired: false, expiringSoon: true, todayReq: 18, todayTokens: 5200, lastCreditsAt: NOW - 12 * 60000 },
     accounts: [
-      { id: "a6", channel: "raccoon", uid: "rc_88213", name: "小浣熊 1 号", status: "online", credits: 9800, creditsAt: NOW - 12 * 60000, expiresAt: NOW + 29 * 86400000, coolUntil: 0, coolReason: "", source: "json", lastUsed: NOW - 9 * 60000, todayReq: 18, todayTokens: 5200, creditsToday: 21, createdAt: NOW - 3 * 86400000, hasToken: true },
+      { id: "a6", channel: "raccoon", uid: "rc_88213", name: "小浣熊 1 号", status: "online", credits: 9800, creditsAt: NOW - 12 * 60000, expiresAt: NOW + 29 * 86400000, coolUntil: 0, coolReason: "", source: "json", lastUsed: NOW - 9 * 60000, todayReq: 18, todayTokens: 5200, creditsToday: 21, createdAt: NOW - 3 * 86400000, hasToken: true,
+        packages: [
+          // -1 = 不限额度哨兵，且 expiresAt 0 = 长期有效：两处边界在预览态各留一条
+          { code: "rc-unlimited", name: "小浣熊不限量包", total: -1, used: 0, remaining: -1, expiresAt: 0 },
+          { code: "rc-soon", name: "小浣熊试用包", total: 20, used: 5, remaining: 15, expiresAt: NOW + 3 * 86400000, expiringSoon: true },
+        ] },
     ],
   },
-  // 新增的五个生态渠道：预览态一律空号池，只为让「添加账号」弹窗里的设备码 / 滑块 / edition 切换
-  // 面板在 npm run dev:web 里可达（display / domain 与 store.cjs 的 BUILTIN_CHANNELS 逐字同源）
+  // 新增的五个生态渠道：预览态基本空号池，只为让「添加账号」弹窗里的设备码 / 滑块 / edition 切换
+  // 面板在 npm run dev:web 里可达（display / domain 与 store.cjs 的 BUILTIN_CHANNELS 逐字同源）。
+  // 例外是 cline_pass：它带一个「订阅到期且余额为 0」的号，用来演示侧栏「渠道额度」卡片隐藏死渠道，
+  // 以及积分到期页里「已过期但仍有余额」的行（账号 offline ⇒ 不计入 totalCredits，故汇总为 0）
   {
     id: "cline_free", display: "Cline 免费池", domain: "api.cline.bot", poolStrategy: "expire_first",
     summary: { channel: "cline_free", totalCredits: 0, accountCount: 0, onlineCount: 0, earliestExpire: 0, expired: false, expiringSoon: false, todayReq: 0, todayTokens: 0, lastCreditsAt: 0 },
@@ -275,8 +290,12 @@ const PROXY_POOL = [
   },
   {
     id: "cline_pass", display: "Cline 订阅池", domain: "api.cline.bot", poolStrategy: "expire_first",
-    summary: { channel: "cline_pass", totalCredits: 0, accountCount: 0, onlineCount: 0, earliestExpire: 0, expired: false, expiringSoon: false, todayReq: 0, todayTokens: 0, lastCreditsAt: 0 },
-    accounts: [],
+    summary: { channel: "cline_pass", totalCredits: 0, accountCount: 1, onlineCount: 0, earliestExpire: NOW - 9 * 86400000, expired: true, expiringSoon: false, todayReq: 0, todayTokens: 0, lastCreditsAt: NOW - 30 * 86400000 },
+    accounts: [
+      { id: "a8", channel: "cline_pass", uid: "cl_55201", name: "订阅到期号", status: "relogin", credits: 0, creditsAt: NOW - 30 * 86400000, expiresAt: NOW - 9 * 86400000, coolUntil: 0, coolReason: "", source: "paste", lastUsed: NOW - 30 * 86400000, todayReq: 0, todayTokens: 0, creditsToday: -1, createdAt: NOW - 40 * 86400000, hasToken: true,
+        // 已过期但还剩 3：默认档必须保留它（「隐藏已用完」不等于「隐藏已过期」）
+        packages: [{ code: "clp-sub", name: "Cline 订阅额度", total: 500, used: 497, remaining: 3, expiresAt: NOW - 9 * 86400000, expired: true }] },
+    ],
   },
   {
     id: "autoclaw", display: "智谱 AutoClaw（国内）", domain: "autoglm-acceleration-api.zhipuai.cn", poolStrategy: "expire_first",
