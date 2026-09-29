@@ -1,11 +1,13 @@
 <!-- 反代网关 · 模型目录：渠道 tab（全部/各渠道）+ 官方目录拉取 + 启停开关 / 渠道覆盖 / 倍率与能力 / 自定义模型映射
      管理态存框架整体配置（disabledModels / modelOverrides / modelAliases），保存即热生效（服务端每请求读盘） -->
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import type { ComponentPublicInstance } from "vue";
 import * as api from "../../api/ipc";
 import type { ModelCustomEntry, ProxyChannelId, ProxyModel } from "../../types";
 import { useAppStore } from "../../stores/app";
 import { capabilityTags, channelName, fmtRate } from "./format";
+import { ROW_H, colCountFor, winRange } from "./virtualWindow";
 import ModelMetaEditor from "../../components/proxy/ModelMetaEditor.vue";
 
 const app = useAppStore();
@@ -35,6 +37,55 @@ const rows = computed(() => {
     if (!kw) return true;
     return m.id.toLowerCase().includes(kw) || String(m.name || "").toLowerCase().includes(kw);
   });
+});
+
+// ===== 虚拟滚动：只挂载视口附近那十几行 =====
+// 为什么必须做：133 行全量渲染 = 6212 个 DOM 节点，而滚动容器 clientHeight 实测只有 476px
+// （一屏 7 行）。切进本页要付 RecalcStyle ~315ms + Layout ~65ms（单帧最长 500–620ms）；
+// 且 App.vue 用 v-show 保活、访问过的页永不卸载，这 133 行挂的 266 个 el-select
+// （冷挂载实测 +10131 个事件监听器）会让之后**任意两页之间**的切换都付 ~150ms 长任务。
+const firstVisible = ref(0);
+const viewRows = ref(0);
+const range = computed(() => winRange(rows.value.length, firstVisible.value, viewRows.value));
+const win = computed(() => rows.value.slice(range.value.start, range.value.end));
+const vPadTop = computed(() => range.value.padTop);
+const vPadBottom = computed(() => range.value.padBottom);
+
+let scrollerEl: Element | null = null;
+let scrollerRo: ResizeObserver | null = null;
+function measureView() {
+  viewRows.value = scrollerEl ? Math.ceil(scrollerEl.clientHeight / ROW_H) : 0;
+}
+/** 函数式 ref：滚动容器在 v-if 里，切子 Tab 会重建，元素到手/消失各回调一次。
+ *  形参类型必须与 Vue 的 VNodeRef 一致（含 ComponentPublicInstance），
+ *  写窄了 strictFunctionTypes 下会因参数逆变直接报 TS2322。 */
+function bindScroller(el: Element | ComponentPublicInstance | null) {
+  scrollerRo?.disconnect();
+  scrollerRo = null;
+  scrollerEl = el instanceof Element ? el : null;
+  if (scrollerEl) {
+    scrollerRo = new ResizeObserver(measureView);
+    scrollerRo.observe(scrollerEl);
+    measureView();
+  }
+}
+onBeforeUnmount(() => {
+  scrollerRo?.disconnect();
+  scrollerRo = null;
+  scrollerEl = null;
+});
+
+function onScrollerScroll(e: Event) {
+  // 只存「首个可见行下标」而不是 scrollTop：同一行内的滚动像素变化不会触发任何重渲染
+  firstVisible.value = Math.max(0, Math.floor((e.target as HTMLElement).scrollTop / ROW_H));
+}
+
+// 换搜索词 / 换渠道 / 换子 Tab 后原来的位置已不属于新列表，回到顶部。
+// mainTab 必须在内：滚动容器整个在 v-if 里，切走再切回会拿到一个 scrollTop=0 的**新**元素，
+// 而 firstVisible 还停在离开时的行号上 —— 实测那样会在表头下面垫出 3360px 空白，整屏看着是空的。
+watch([filter, activeTab, mainTab], () => {
+  firstVisible.value = 0;
+  if (scrollerEl) scrollerEl.scrollTop = 0;
 });
 
 // ===== 思考强度选项 =====
@@ -345,7 +396,7 @@ onMounted(refresh);
             {{ activeTab ? channelName(activeTab) + "模型目录" : "合并模型目录" }}
             <span class="right">{{ rows.length }} 个模型 · 保存即热生效</span>
           </div>
-          <div class="table-scroll" style="overflow-x: hidden">
+          <div class="table-scroll" style="overflow-x: hidden" :ref="bindScroller" @scroll.passive="onScrollerScroll">
             <table class="table table-bare models-table" style="table-layout: fixed; width: 100%">
               <!-- 列宽用百分比而非像素：应用最小窗宽 920 时表格容器只有 599px，
                    写死像素（82/105/…）在那之下会重新撑破（改前实测整表被裁 4px、
@@ -378,7 +429,11 @@ onMounted(refresh);
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="(m, i) in rows" :key="m.id" :style="{ '--i': i }">
+                <!-- 上下占位行把没挂载的行数按像素垫回来，滚动条长度与滚动手感保持不变 -->
+                <tr v-if="vPadTop" class="v-spacer" :style="{ height: vPadTop + 'px' }" aria-hidden="true">
+                  <td :colspan="colCountFor(activeTab)"></td>
+                </tr>
+                <tr v-for="m in win" :key="m.id">
                   <td style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap">
                     <el-tooltip :content="m.id" placement="top">
                       <div class="mono" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap">{{ m.id }}</div>
@@ -473,8 +528,11 @@ onMounted(refresh);
                     ></div>
                   </td>
                 </tr>
+                <tr v-if="vPadBottom" class="v-spacer" :style="{ height: vPadBottom + 'px' }" aria-hidden="true">
+                  <td :colspan="colCountFor(activeTab)"></td>
+                </tr>
                 <tr v-if="!rows.length">
-                  <td :colspan="activeTab ? 8 : 9" style="text-align: center; color: var(--text-3); padding: 24px 0">
+                  <td :colspan="colCountFor(activeTab)" style="text-align: center; color: var(--text-3); padding: 24px 0">
                     无匹配模型 —— 点上方「拉取模型」从官方目录云端同步（用号池账号 token，不依赖本地软件）
                   </td>
                 </tr>
@@ -987,6 +1045,20 @@ onMounted(refresh);
    三道锁：① 单元格 padding 从 12 收到 8，把横向余量还给内容；
    ② overflow:hidden 让任何超出都停在列内（不渗到隔壁列、也不撑破表格）；
    ③ 下面把 input / el-select 改成随列伸缩，从源头消除超出。 */
+/* 虚拟滚动的占位行：只负责垫高度，不参与单元格上下 padding 与分隔线，也不该有悬停反馈 */
+.models-table tbody tr.v-spacer > td {
+  padding: 0;
+  border: 0;
+}
+.models-table tbody tr.v-spacer {
+  cursor: default;
+}
+/* 全局 .table tbody tr 带逐行入场动画（rowIn + 按 --i 错峰）。虚拟滚动下行会随滚动
+   不断挂载/卸载，那个动画会在每次滚动时对新进入的行重播，看着像整表在闪 —— 这张表关掉。
+   代价：fx 开启的用户进本页时不再有逐行淡入；页仍保留 .page-anim 的整页入场。 */
+.models-table tbody tr {
+  animation: none;
+}
 .models-table :is(th, td) {
   padding-left: 8px;
   padding-right: 8px;

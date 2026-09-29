@@ -1,0 +1,246 @@
+// 模型目录表格「虚拟滚动」结构闸：钉住只挂载视口附近那几十行，且没为了性能砍功能。
+//
+// 起因（2026-09-29 实测）：模型目录 133 行一次性全渲染 = 6212 个 DOM 节点，
+// 切进该页要付 RecalcStyle ~315ms + Layout ~65ms（单帧最长 500–620ms）；
+// 更糟的是 App.vue 用 v-show 保活、访问过的页永不卸载，于是这 133 行挂载的 266 个
+// el-select（冷挂载实测 +10131 个事件监听器）会让**之后任意两个页面之间**的切换
+// 都付 ~150ms 长任务。视口 clientHeight 只有 476px、一屏只看得见 7 行 —— 19 倍过渲染。
+//
+// 判据落在真实渲染出来的 <tr> 上（照 dev-pool-rows-test.cjs 的路子）：静态检查看不见
+// 「模板仍遍历 rows」这种回归，但数行数一眼就能看见。
+// 窗口数学从 src/views/proxy/virtualWindow.ts 导入**同一份实现**，不在测试里抄一遍。
+// 跑法：node scripts/dev-models-vrows-test.cjs
+"use strict";
+if (require.main !== module) return;
+
+const fs = require("node:fs");
+const path = require("node:path");
+const sfc = require("@vue/compiler-sfc");
+const cd = require("@vue/compiler-dom");
+const esbuild = require("esbuild");
+const Vue = require("vue");
+const { renderToString } = require("@vue/server-renderer");
+
+const ROOT = path.resolve(__dirname, "..");
+const FILE = "src/views/proxy/ProxyModelsView.vue";
+const TOTAL = 133; // 与真机 catalog 同量级（实测 proxy_models 返回 133 条）
+
+// ---- 从 TS 源里取真实的窗口数学（与组件用的是同一份，改错了这里一起红） ----
+function loadWindow() {
+  const src = fs.readFileSync(path.join(ROOT, "src/views/proxy/virtualWindow.ts"), "utf8");
+  const js = esbuild.transformSync(src, { loader: "ts", format: "cjs" }).code;
+  const mod = { exports: {} };
+  new Function("module", "exports", js)(mod, mod.exports);
+  return mod.exports;
+}
+const { ROW_H, OVERSCAN, MIN_ROWS, winRange, colCountFor } = loadWindow();
+
+let pass = 0;
+const failures = [];
+function check(name, ok, detail) {
+  if (ok) { pass++; console.log(`  ok  ${name}`); }
+  else { failures.push(name + (detail ? `：${detail}` : "")); console.log(`FAIL  ${name}${detail ? `：${detail}` : ""}`); }
+}
+
+/** 按标签深度切出顶层 <tr>（占位行里的 td 也算顶层，单独识别） */
+function topLevelRows(html) {
+  const re = /<(\/?)(tr|table|td)\b/g;
+  const out = [];
+  let depth = 0, tdDepth = 0, cur = null, start = 0, openTag = "";
+  for (let m; (m = re.exec(html));) {
+    const [, close, tag] = m;
+    if (tag === "tr") {
+      if (!close) {
+        if (depth === 0) { cur = []; start = re.lastIndex; openTag = html.slice(m.index, html.indexOf(">", m.index) + 1); }
+        depth++;
+      } else {
+        depth--;
+        if (depth === 0 && cur) { out.push({ inner: html.slice(start, m.index), tds: cur.length, open: openTag }); cur = null; }
+      }
+    } else if (tag === "table") {
+      if (!close) tdDepth++; else tdDepth--;
+    } else if (tag === "td" && tdDepth === 0 && cur) {
+      if (!close) cur.push(1);
+    }
+  }
+  return out;
+}
+
+/** 片段里只有 4 处 TS 专用语法（2 个 as 断言 + 2 个 (v: string) => 形参标注）。 *  这个版本的 compiler-core 没把 expressionPlugins:['typescript'] 透传到嵌套表达式，
+ *  编译产物里仍留着 `as`，new Function 直接炸。所以先剥掉这两类标注。
+ *  真出现别的 TS 语法时编译会抛错、闸整体红——是响亮的失败，不会假绿。 */
+function stripTs(s) {
+  return s
+    .replace(/\s+as\s+[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*/g, "")
+    .replace(/\(\s*([A-Za-z_$][\w$]*)\s*:\s*[A-Za-z_$][\w$.<>\[\]| ]*\s*\)\s*=>/g, "($1) =>");
+}
+
+/** 编译模型目录那张 <tbody>（认 updateModelCustom 这个只有它才有的绑定） */
+function catalogTbodyRender() {
+  const { descriptor, errors } = sfc.parse(fs.readFileSync(path.join(ROOT, FILE), "utf8"), { filename: FILE });
+  if (errors.length) throw new Error("SFC 解析失败: " + errors[0].message);
+  const tbs = [];
+  const ths = [];
+  (function walk(n) {
+    if (n.type === 1 && n.tag === "tbody") tbs.push(n);
+    if (n.type === 1 && n.tag === "thead") ths.push(n);
+    (n.children || []).forEach(walk);
+  })(cd.parse(descriptor.template.content));
+  const tb = tbs.find((t) => t.loc.source.includes("updateModelCustom"));
+  if (!tb) throw new Error("找不到模型目录的 <tbody>（认 updateModelCustom 这个绑定）：表格被改名或拆走了");
+  const th = ths.find((t) => /<th[\s>]/.test(t.loc.source) && t.loc.source.includes("思考强度"));
+  if (!th) throw new Error("找不到模型目录的 <thead>（认「思考强度」这一列）");
+  const res = cd.compile(stripTs(tb.loc.source), { mode: "function", hoistStatic: false });
+  if (res.errors && res.errors.length) throw new Error("tbody 片段编译失败: " + res.errors[0].message);
+  // 表头列数要单独数：thead 不在 tbody 片段里，早先拿 tbody 源码数 <th 恒为 0（判据自空）
+  const thSource = th.loc.source;
+  return { render: new Function("Vue", res.code + "\nreturn render")(Vue), source: tb.loc.source, thSource };
+}
+
+/** 表头实际列数：「来源渠道」那一列带 v-if="!activeTab"，单渠道视图下它不渲染。
+ *  必须用 <th[\s>] 匹配：<th 单独匹配会把 </thead> 之前那个 <thead> 开标签也算进来（实测多 1）。 */
+function headColCount(thSource, activeTab) {
+  const all = (thSource.match(/<th[\s>]/g) || []).length;
+  const conditional = (thSource.match(/<th[^>]*v-if="!activeTab"/g) || []).length;
+  return all - (activeTab ? conditional : 0);
+}
+
+function mkModels(n) {
+  return Array.from({ length: n }, (_, i) => ({
+    id: `model-${String(i + 1).padStart(3, "0")}`, object: "model", created: 0, owned_by: "trae",
+    sources: i % 3 === 0 ? ["trae", "workbuddy"] : ["trae"],
+    name: `Model ${i + 1}`, rate: null, capabilities: { tools: true }, contextLength: 131072,
+    reasoning: {}, enabled: true, override: "", fallback: "",
+  }));
+}
+
+async function render({ rows, firstVisible, viewRows, activeTab = "" }) {
+  const { render, source, thSource } = catalogTbodyRender();
+  const r = winRange(rows.length, firstVisible, viewRows);
+  const win = rows.slice(r.start, r.end);
+  const noop = () => {};
+  const app = Vue.createSSRApp({ render });
+  Object.assign(app.config.globalProperties, {
+    rows, win, activeTab,
+    vPadTop: r.padTop, vPadBottom: r.padBottom,
+    // 绑**真的** colCountFor，不注入算好的数字：注入等于门禁替被测代码答题，
+    // 变异测试（组件里写死 9）因此漏检过一轮
+    colCountFor,
+    app: { config: { proxy: { modelCustom: { "model-001": { contextLength: 999 } } } } },
+    REASONING_EFFORT_OPTIONS: [{ value: "", label: "默认" }],
+    CHANNEL_OPTIONS: [{ value: "", label: "自动" }, { value: "trae", label: "Trae" }],
+    capabilityTags: () => ["工具"], channelName: () => "Trae", fmtRate: () => "—",
+    updateModelCustom: noop, setOverride: noop, toggleEnabled: noop, openMetaEditor: noop,
+  });
+  app.config.warnHandler = () => {};
+  const html = await renderToString(app);
+  return { html, rowsOut: topLevelRows(html), range: r, win, source, thSource };
+}
+
+const isSpacer = (t) => /v-spacer/.test(t.open);
+const dataRows = (rs) => rs.filter((t) => !isSpacer(t));
+
+async function main() {
+  console.log(`常量：ROW_H=${ROW_H} OVERSCAN=${OVERSCAN} MIN_ROWS=${MIN_ROWS}`);
+
+  // ===== A. 核心判据：133 个模型不得全量挂载 =====
+  const models = mkModels(TOTAL);
+  const a = await render({ rows: models, firstVisible: 0, viewRows: 7 });
+  const top = dataRows(a.rowsOut);
+  check(`① ${TOTAL} 个模型只渲染出 ${top.length} 个数据行（≤25）`, top.length > 0 && top.length <= 25,
+    top.length === TOTAL ? `仍全量渲染 ${top.length} 行 ⇒ 模板遍历的是 rows 而不是 win` : `实得 ${top.length}`);
+  check(`② 渲染的就是窗口那几行（首 ${top[0] ? top[0].inner.includes(a.win[0].id) : false} / 末 ${top.length ? top[top.length - 1].inner.includes(a.win[a.win.length - 1].id) : false}）`,
+    top.length === a.win.length && top[0].inner.includes(a.win[0].id) && top[top.length - 1].inner.includes(a.win[a.win.length - 1].id));
+
+  // ===== B. 总高守恒：占位行必须补齐未渲染的行，否则滚动条会缩短、滚到中途内容跳 =====
+  const spacers = a.rowsOut.filter(isSpacer);
+  // 贴顶时上占位应为 0 行、贴底时下占位应为 0 行，所以「必须两个」是错的判据（会把正确实现判红）。
+  // 真判据是：占位行的有无与高度，必须和窗口数学算出来的一致。
+  const wantPads = [a.range.padTop, a.range.padBottom].filter((v) => v > 0);
+  check(`③ 占位行数量与窗口一致（应为 ${wantPads.length} 个，实得 ${spacers.length}）`,
+    spacers.length === wantPads.length, "缺占位 ⇒ 滚动总高会塌，用户滚到一半内容跳变");
+  const padSum = a.range.padTop + a.range.padBottom;
+  check(`④ 占位高度 = 未渲染行数 × 行高（${padSum} vs ${(TOTAL - top.length) * ROW_H}）`,
+    padSum === (TOTAL - top.length) * ROW_H);
+  const heights = spacers.map((t) => { const m = /height:\s*(\d+(?:\.\d+)?)px/.exec(t.open); return m ? +m[1] : -1; });
+  check(`⑤ 占位行把高度写在自己身上（实得 ${JSON.stringify(heights)}，应为 ${JSON.stringify(wantPads)}）`,
+    JSON.stringify(heights) === JSON.stringify(wantPads),
+    "只算不写 = 占位行高度 0，等于没垫");
+
+  // ===== C. 滚到中段与滚到底：窗口要跟着走，且底部不越界 =====
+  const mid = await render({ rows: models, firstVisible: 60, viewRows: 7 });
+  check(`⑥ 滚到第 60 行时窗口前移（首行 ${dataRows(mid.rowsOut)[0].inner.includes("model-057") ? "model-057" : "?"}）`,
+    dataRows(mid.rowsOut)[0].inner.includes(models[60 - OVERSCAN].id));
+  const end = await render({ rows: models, firstVisible: TOTAL - 1, viewRows: 7 });
+  const endRows = dataRows(end.rowsOut);
+  check(`⑦ 滚到底不越界（${endRows.length} 行、末行是最后一个模型、下占位 0）`,
+    endRows.length <= 25 && endRows[endRows.length - 1].inner.includes(models[TOTAL - 1].id) && end.range.padBottom === 0,
+    `行数=${endRows.length} padBottom=${end.range.padBottom}`);
+
+  // ===== D. 空态与列数 =====
+  const empty = await render({ rows: [], firstVisible: 0, viewRows: 7 });
+  check(`⑧ 0 个模型仍渲染「无匹配模型」行，且不产生占位行`,
+    /无匹配模型/.test(empty.html) && empty.rowsOut.filter(isSpacer).length === 0);
+  const headCols = headColCount(a.thSource, "");
+  const bodyCols = [...new Set(dataRows(a.rowsOut).map((t) => t.tds))];
+  check(`⑨ 表头 ${headCols} 列 ⇒ 每个数据行也 ${headCols} 列（实得 ${bodyCols.join("/")}）`,
+    headCols > 0 && bodyCols.length === 1 && bodyCols[0] === headCols, "列数不一致整表错位");
+  const ch = await render({ rows: models, firstVisible: 0, viewRows: 7, activeTab: "trae" });
+  const chHead = headColCount(ch.thSource, "trae");
+  const chCols = [...new Set(dataRows(ch.rowsOut).map((t) => t.tds))];
+  check(`⑩ 单渠道视图（少一列「来源渠道」）表头 ${chHead} 列 ⇒ 数据行也 ${chHead} 列（实得 ${chCols.join("/")}）`,
+    chHead === headCols - 1 && chCols.length === 1 && chCols[0] === chHead, "activeTab 下列宽/colspan 没跟着改会错位");
+
+  // ===== E. 防「为了性能砍功能」：每行该有的控件还得在 =====
+  const one = dataRows(a.rowsOut)[0].inner;
+  check("⑪ 数据行仍有 2 个下拉（思考强度 + 渠道覆盖）", (one.match(/el-select/g) || []).length >= 2);
+  check("⑫ 数据行仍有「编辑」元数据按钮与状态开关", /meta-edit/.test(one) && /role="switch"/.test(one));
+  check("⑬ 数据行仍渲染上下文输入框", /custom-input/.test(one));
+
+  // ===== F. 只虚拟化了目录这一张表 =====
+  // 数 class="v-spacer" 而不是 v-spacer：后者在 CSS 选择器里也出现（tr.v-spacer），
+  // 早先按 v-spacer 计数得到 4 就是这个原因（判据自身写错，不是实现错）。
+  const src = fs.readFileSync(path.join(ROOT, FILE), "utf8");
+  const inFile = (src.match(/class="v-spacer"/g) || []).length;
+  const inCatalogTbody = (a.source.match(/class="v-spacer"/g) || []).length;
+  check(`⑭ 占位行共 2 个且都在目录那张 tbody 里（文件内 ${inFile} / 目录表内 ${inCatalogTbody}）`,
+    inFile === 2 && inCatalogTbody === 2, "别名/反向映射两张表被误挂占位行会多出不存在的行");
+
+  // ===== G. 纯函数边界 =====
+  check("⑮ winRange(0,…) 返回全零", JSON.stringify(winRange(0, 0, 0)) === JSON.stringify({ start: 0, end: 0, padTop: 0, padBottom: 0 }));
+  check("⑯ winRange 越界钳位（firstVisible=99999）", (() => { const r = winRange(133, 99999, 7); return r.end === 133 && r.padBottom === 0; })());
+  check(`⑰ viewRows 未量到（0）时按 MIN_ROWS 兜底，不渲染空窗`, (() => { const r = winRange(133, 0, 0); return r.end === Math.min(133, MIN_ROWS + OVERSCAN * 2); })());
+
+  // ===== H. 补：变异测试暴露出来的三个漏检面 =====
+  // ⑱ 渲染出的 colspan 必须等于表头实际列数（组件里写死 9 会在这条红）
+  const colspanOf = (t) => { const m = /colspan="(\d+)"/.exec(t.inner); return m ? +m[1] : -1; };
+  const aSpans = a.rowsOut.filter(isSpacer).map(colspanOf);
+  const chSpans = ch.rowsOut.filter(isSpacer).map(colspanOf);
+  check(`⑱ 占位行 colspan 与表头列数一致（全渠道 ${JSON.stringify(aSpans)} vs ${headCols}；单渠道 ${JSON.stringify(chSpans)} vs ${chHead}）`,
+    aSpans.length > 0 && aSpans.every((v) => v === headCols) && chSpans.every((v) => v === chHead),
+    "colspan 与表头列数脱钩 ⇒ 占位行撑出错误的列网格，整表错位");
+  check(`⑲ 空态行 colspan 也等于表头列数（实得 ${colspanOf(empty.rowsOut[0] || {})} vs ${headCols}）`,
+    colspanOf(empty.rowsOut[0] || {}) === headCols);
+  // ⑳ 下界：overscan 太小会在滚动时先看到空白；MIN_ROWS 低于真实视口行数会首屏留白
+  //    （真实视口实测 clientHeight 476 / ROW_H 60 ≈ 8 行）
+  check(`⑳ OVERSCAN>=2 且 MIN_ROWS>=7（实得 ${OVERSCAN}/${MIN_ROWS}）`, OVERSCAN >= 2 && MIN_ROWS >= 7,
+    "上界判据（≤25 行）抓不到「窗口缩到刚好等于视口」这种退化，必须单独钉下界");
+  // ㉑ 窗口要真的把视口连同上下缓冲都盖住
+  const w60 = winRange(133, 60, 7);
+  check(`㉑ 视口 60..66 行被完整覆盖且两侧各有缓冲（实得 ${w60.start}..${w60.end - 1}）`,
+    w60.start <= 60 - 2 && w60.end >= 60 + 7 + 2, "窗口没盖住视口 ⇒ 滚动时出现空洞");
+
+  // ㉒ 滚动归零的 watch 必须同时覆盖 filter / activeTab / mainTab。
+  //    这是绊线不是证明：SSR 片段渲染看不见「容器被 v-if 重建后 firstVisible 仍是旧行号」，
+  //    那个缺陷是真机跑出来的（往返后表头下垫 3360px 空白）。这里只防以后有人把 mainTab 摘掉。
+  const resetWatch = /watch\(\s*\[([^\]]*)\]\s*,\s*\(\)\s*=>\s*\{[\s\S]{0,200}?firstVisible\.value\s*=\s*0/.exec(src);
+  const resetDeps = resetWatch ? resetWatch[1].split(",").map((s) => s.trim()) : [];
+  check(`㉒ 归零 watch 覆盖 filter/activeTab/mainTab（实得 ${JSON.stringify(resetDeps)}）`,
+    !!resetWatch && ["filter", "activeTab", "mainTab"].every((d) => resetDeps.includes(d)),
+    "少一个依赖就会在对应场景下留旧窗口：mainTab 少了 ⇒ 切子 Tab 回来顶部一片空白");
+
+  console.log(`\n${failures.length ? "FAIL " + failures.length + " 项" : "OK 模型目录虚拟滚动结构闸全过"}（共 ${pass + failures.length} 项）`);
+  if (failures.length) process.exit(1);
+}
+
+main().catch((e) => { console.error("闸自身异常:", e.message); process.exit(1); });
