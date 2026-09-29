@@ -346,17 +346,23 @@ onMounted(refresh);
             <span class="right">{{ rows.length }} 个模型 · 保存即热生效</span>
           </div>
           <div class="table-scroll" style="overflow-x: hidden">
-            <table class="table table-bare" style="table-layout: fixed; width: 100%">
+            <table class="table table-bare models-table" style="table-layout: fixed; width: 100%">
+              <!-- 列宽用百分比而非像素：应用最小窗宽 920 时表格容器只有 599px，
+                   写死像素（82/105/…）在那之下会重新撑破（改前实测整表被裁 4px、
+                   渠道覆盖 +14、状态 +18、元数据 +10）。百分比恒等比缩放，配合
+                   table-layout:fixed + 单元格 overflow:hidden + 控件 width:100%，
+                   结构上就不可能溢出。合计 78%，模型列吃剩余 22%。
+                   每列下限按真身实测内容宽倒推（见下方 .meta-badge / .custom-cell 的注释）。 -->
               <colgroup>
-                <col style="width: auto; min-width: 150px" />
-                <col style="width: 82px" />
-                <col style="width: 105px" />
-                <col style="width: 58px" />
-                <col style="width: 78px" />
-                <col v-if="!activeTab" style="width: 110px" />
-                <col style="width: 110px" />
-                <col style="width: 72px" />
-                <col style="width: 48px" />
+                <col style="width: auto" />
+                <col style="width: 10%" />
+                <col style="width: 12%" />
+                <col style="width: 5.5%" />
+                <col style="width: 7.5%" />
+                <col v-if="!activeTab" style="width: 10.5%" />
+                <col style="width: 12%" />
+                <col style="width: 13%" />
+                <col style="width: 7.5%" />
               </colgroup>
               <thead>
                 <tr>
@@ -387,7 +393,6 @@ onMounted(refresh);
                         <input
                           type="number"
                           class="f-input custom-input"
-                          style="width: 58px"
                           :value="(app.config.proxy.modelCustom || {})[m.id]?.contextLength ?? (m.contextLength || '')"
                           placeholder="自动"
                           @change="updateModelCustom(m, { contextLength: Number(($event.target as HTMLInputElement).value) || undefined })"
@@ -401,13 +406,13 @@ onMounted(refresh);
                   <td>
                     <div class="custom-cell">
                       <el-tooltip content="自定义思考强度，直接注入出站请求参数" placement="top">
-                        <span>
+                        <span class="cell-select">
                           <el-select
                             class="f-el-select custom-el-select"
                             popper-class="glass-popper"
                             :persistent="false"
                             :model-value="(app.config.proxy.modelCustom || {})[m.id]?.reasoningEffort || ''"
-                            style="width: 90px"
+                            style="width: 100%"
                             placeholder="默认"
                             @update:model-value="(v: string) => updateModelCustom(m, { reasoningEffort: v })"
                           >
@@ -430,12 +435,12 @@ onMounted(refresh);
                   </td>
                   <td>
                     <el-tooltip :content="m.sources.length === 1 ? '单源模型强制走所属渠道，无需覆盖' : ''" :disabled="m.sources.length !== 1" placement="top">
-                      <span>
+                      <span class="cell-select">
                         <el-select
-                          class="f-el-select"
+                          class="f-el-select override-el-select"
                           popper-class="glass-popper"
                           :persistent="false"
-                          style="width: 100px"
+                          style="width: 100%"
                           :model-value="m.override"
                           :disabled="!m.enabled || m.sources.length === 1"
                           @update:model-value="(v: string) => setOverride(m, v)"
@@ -789,11 +794,23 @@ onMounted(refresh);
   gap: 8px;
 }
 /* 渠道分段选择器：容器框住选项，选中项点亮（与号池弹窗的方式切换同一语言）；
-   容器 padding 3px + 内项 22px + 边框 = 30px，与右侧 .btn / 搜索框同高成一条线 */
+   容器 padding 3px + 内项 22px + 边框 = 30px，与右侧 .btn / 搜索框同高成一条线
+   单行放满 11 个渠道时固有宽约 1172px，而 .page 内容宽只有 966px —— 不换行会把整块
+   page-body 撑出 .page 的横向滚动（表格「模型」列被推到屏幕外，要左右拖才看得全）。
+   故这里允许换行，并清掉 flex item 的 min-width:auto（它正是阻止收缩到固有宽以下的那道锁）。
+   渠道再怎么增都不会再撑出横向滚动，最多多一行。 */
 .seg {
   display: inline-flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 3px;
+  min-width: 0;
+  /* flex-basis 不能留 auto：auto 取的是不换行的固有宽 1172px，而 models-head 是可换行容器
+     —— 可换行容器「先折行、后收缩」，单是 seg 就超过 922px 容器时它把 head-tools 甩到下一行，
+     而不是压缩 seg（页头因此从 55px 涨到 95px，白丢一行表格高度）。
+     给个能让两者同排进第一行的基准（320 + 10 gap + 工具条 313 ≤ 922），
+     折行判定通过后 seg 再 grow 吃满剩余，实得 ~599px。 */
+  flex: 1 1 320px;
   padding: 3px;
   border: 1px solid var(--line);
   border-radius: var(--r-sm);
@@ -803,7 +820,10 @@ onMounted(refresh);
   display: inline-flex;
   align-items: center;
   height: 22px;
-  padding: 0 11px;
+  /* 横向 7px：12 个渠道标签的固有宽约 1172px，而 seg 与搜索条同排时只分到 ~599px。
+     留 11px 会折成 3 行（末行只剩「ZCode 智谱（国际）」一个），收到 7px 正好 2 行（7+5）。
+     高度方向不动，仍是 3px 容器 padding + 22px 项 + 边框 = 30px 一条线 */
+  padding: 0 7px;
   border: 1px solid transparent;
   border-radius: calc(var(--r-sm) - 3px);
   background: transparent;
@@ -961,13 +981,53 @@ onMounted(refresh);
 .alias-del:hover {
   color: var(--err, #e05555);
 }
-/* 自定义单元格（上下文与思考强度） */
+/* ===== 表格内容不得溢出列宽（与上面百分比 colgroup 配套） =====
+   改前实测：整表比容器宽 4px 被 overflow-x:hidden 静默裁掉，且渠道覆盖 +14、
+   状态 +18、元数据 +10、思考强度 +9 —— 都是控件写死像素宽撑出来的。
+   三道锁：① 单元格 padding 从 12 收到 8，把横向余量还给内容；
+   ② overflow:hidden 让任何超出都停在列内（不渗到隔壁列、也不撑破表格）；
+   ③ 下面把 input / el-select 改成随列伸缩，从源头消除超出。 */
+.models-table :is(th, td) {
+  padding-left: 8px;
+  padding-right: 8px;
+  overflow: hidden;
+}
+/* 状态列：开关固有宽 42px（40 + 1px 双边框），是表里唯一的交互控件，
+   被列宽切掉就点不准。左右 padding 收到 2px、列宽给 7.5%，
+   在应用最小窗宽 920（表格容器 599px）下 7.5% = 45px 仍放得下 42px 开关。 */
+.models-table th:last-child,
+.models-table td:last-child {
+  padding-left: 2px;
+  padding-right: 2px;
+}
+/* .switch 是块级 div，td 上的 text-align:center 对它无效（原本就靠左），
+   padding 归零后会贴到列边线上，显式居中 */
+.models-table td:last-child .switch {
+  margin: 0 auto;
+}
+/* el-tooltip 的触发器是包在 el-select 外面的一层 span（.cell-select 是显式加的，
+   不用 .el-tooltip__trigger 选：那会把「覆盖」角标也拉成整行宽的色块）。
+   不给它宽度的话，里面 width:100% 的 el-select 会按 span 的 shrink-to-fit 算宽，等于没改。 */
+.models-table td > .cell-select,
+.custom-cell > .cell-select {
+  display: block;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+/* 自定义单元格（上下文与思考强度）：占满整列，「自」角标（实测 17px + 4 间距）不参与伸缩，
+   有角标时由 input / select 让位，谁都不越出列宽。
+   上下文列 10% = 89px、内可视 73，扣掉角标占位后 input 还剩 52，
+   而 6 位 Token 数（"131072" + 12px padding）实测需 50 —— 刚好放得下，故不再往下列。 */
 .custom-cell {
   position: relative;
-  display: inline-flex;
+  display: flex;
+  width: 100%;
   align-items: center;
 }
 .custom-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: auto;
   height: 26px;
   padding: 0 6px;
   font-size: 11.5px;
@@ -980,6 +1040,15 @@ onMounted(refresh);
 .custom-input:focus {
   border-color: var(--accent-line);
 }
+/* Chromium 给 input[type=number] 的步进按钮恒常预留约 15px（不悬停也占位），
+   原先写死 58px 的格子放 6 位上下文长度就会被裁成「13107」（实测 scrollWidth 64 vs clientWidth 56）。
+   这个字段是手填 Token 数，±1 步进没有意义，直接摘掉步进；摘后裁切 8px → 0。 */
+.custom-input::-webkit-inner-spin-button,
+.custom-input::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  appearance: none;
+  margin: 0;
+}
 .custom-el-select :deep(.el-select__wrapper) {
   min-height: 26px;
   height: 26px;
@@ -987,6 +1056,7 @@ onMounted(refresh);
   padding: 0 8px;
 }
 .custom-badge {
+  flex: 0 0 auto;
   margin-left: 4px;
   padding: 1px 4px;
   border-radius: 3px;
@@ -1097,6 +1167,10 @@ onMounted(refresh);
   font-size: 13px;
 }
 .meta-badge {
-  margin-left: 6px;
+  /* 元数据列 13%（888 容器下 115px、内可视 99px）要容纳「编辑」按钮 58 + 间距 + 角标 35 = 97。
+     间距 6px 时正好顶到列右界，收 2px 留点余量。
+     （这两个宽度是带 data-v-* 复测出来的：合成节点若不复制 scoped 属性，
+     .meta-badge[data-v-x] 不匹配，量到的 28px 是全局 .tag 的宽，据此调列宽会假绿。） */
+  margin-left: 4px;
 }
 </style>
