@@ -40,11 +40,21 @@ r = rin.toInternal({
   max_output_tokens: 512,
   temperature: 0.3,
   store: true, background: false, include: ["reasoning.matched_message_content"], truncation: "auto",
+  parallel_tool_calls: "auto", text: { format: { type: "json_schema", json_schema: { name: "t" } } },
 });
 ok("instructions → 首条 system", r.body.messages[0].role === "system" && r.body.messages[0].content === "你是一个助手", r.body.messages);
 ok("max_output_tokens → max_tokens", r.body.max_tokens === 512, r.body.max_tokens);
 ok("store/background/include 收下不拒（回 400 会当场打死 Codex）", r.ok === true, r);
-ok("被忽略的字段留痕可查", r.notes.some((n) => /store/.test(n)) && r.notes.some((n) => /include/.test(n)), r.notes);
+// include/truncation 现在收进内部载体等出站按形态回填，不再是损失；只有真没落地的才留痕
+ok("真被忽略的字段留痕可查", r.notes.some((n) => /store/.test(n)) && r.notes.some((n) => /include/.test(n)) && r.notes.some((n) => /truncation/.test(n)), r.notes);
+ok("可补录的原生字段不谎称已忽略", !r.notes.some((n) => /text/.test(n)), r.notes);
+ok("text（结构化输出）进了内部载体", JSON.stringify(r.body.extraBody?.text) === '{"format":{"type":"json_schema","json_schema":{"name":"t"}}}', r.body.extraBody);
+// Responses 的 parallel_tool_calls 是 boolean | "auto"：曾经的 !! 强转只在它从没落到上游时无害
+ok("parallel_tool_calls 的 auto 不被强转成 true", r.body.extraBody?.parallel_tool_calls === "auto", r.body.extraBody);
+
+// store 的例外方向：客户端显式"别存"必须尊重，丢掉等于替用户打开上游持久化
+const rn = rin.toInternal({ model: "gpt-x", input: "hi", store: false });
+ok("store:false 收进载体且不再写忽略 note", rn.body.extraBody?.store === false && !rn.notes.some((n) => /store/.test(n)), rn.notes);
 
 r = rin.toInternal({
   model: "gpt-x",

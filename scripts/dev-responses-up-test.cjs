@@ -269,7 +269,8 @@ function fakeUpstream() {
     req.on("data", (d) => (raw += d));
     req.on("end", () => {
       const b = JSON.parse(raw || "{}");
-      seen.push({ path: req.url, method: req.method, auth: String(req.headers.authorization || ""), model: b.model, stream: b.stream, keys: Object.keys(b).sort(), input: b.input || null, instructions: b.instructions || null });
+      // body 整体留一份：原生字段回填类断言要看具体值，keys 列表不足以区分「并回来了但值是错的」
+      seen.push({ path: req.url, method: req.method, auth: String(req.headers.authorization || ""), model: b.model, stream: b.stream, keys: Object.keys(b).sort(), input: b.input || null, instructions: b.instructions || null, body: b });
       if (String(req.headers.authorization || "").includes("sk-bad")) {
         res.writeHead(429, { "content-type": "application/json" });
         res.end('{"error":{"message":"rate limit"}}');
@@ -311,6 +312,27 @@ function post(body, opts) {
         res.setEncoding("utf8");
         res.on("data", (d) => (t += d));
         res.on("end", () => resolve({ status: res.statusCode, text: t, ctype: String(res.headers["content-type"] || "") }));
+      }
+    );
+    req.setTimeout(15000, () => req.destroy(new Error("网关 15s 无响应")));
+    req.on("error", reject);
+    req.write(JSON.stringify(body));
+    req.end();
+  });
+}
+
+/** 客户端侧也用 Responses 协议打网关（/v1/responses 入站 → Responses 形态上游）：
+ *  这是「两端同格式」的那格，用来验原生字段补录是否真的走通。 */
+function postResponses(body) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      { host: "127.0.0.1", port: GW, path: "/v1/responses", method: "POST", agent: false,
+        headers: { "content-type": "application/json", authorization: "Bearer " + GWKEY.secret } },
+      (res) => {
+        let t = "";
+        res.setEncoding("utf8");
+        res.on("data", (d) => (t += d));
+        res.on("end", () => resolve({ status: res.statusCode, text: t }));
       }
     );
     req.setTimeout(15000, () => req.destroy(new Error("网关 15s 无响应")));
@@ -373,6 +395,39 @@ let GWKEY = { secret: "" };
 
   const f = await post({ model: "rup/gpt-x", messages: [{ role: "system", content: "规则" }, { role: "user", content: "你好" }] });
   ok("非流式请求本地聚合可用", f.status === 200 && JSON.parse(f.text).choices[0].message.content === "你好，世界", f.text.slice(0, 200));
+
+  // ===== 两端同格式（Responses 客户端 → Responses 上游）：协议原生字段必须补录到上游 =====
+  // 这些字段在 chat 形状里没有对应物，入站层过去只是"收下并忽略"，于是两端都支持的字段
+  // 被中间层抹平。判据取自 OpenAI 的 CreateResponse 请求表，不是猜上游会不会忽略未知字段。
+  provider.update("rup", { models: ["gpt-x", "tooly", "trunc", "whole", { model: "efforty", reasoning: { supportedEfforts: ["medium"], defaultEffort: "medium" } }] });
+  const n = await postResponses({
+    model: "rup/gpt-x", input: "你好", stream: true,
+    text: { format: { type: "json_schema", json_schema: { name: "t", schema: { type: "object" } } } },
+    service_tier: "priority", include: ["reasoning.encrypted_content"], truncation: "disabled",
+    safety_identifier: "safety-1", parallel_tool_calls: false, store: false,
+    reasoning: { effort: "high", summary: "auto" },
+  });
+  ok("Responses 客户端 → Responses 上游拿到 200", n.status === 200, [n.status, n.text.slice(0, 200)]);
+  const up = seen[seen.length - 1].body;
+  ok("结构化输出 text 原件到达上游", up.text && up.text.format.type === "json_schema", up.text);
+  ok("被刻意排除的字段确实没发给上游（收窄的白名单要有反向判据）",
+    !("service_tier" in up) && !("include" in up) && !("truncation" in up) && !("safety_identifier" in up),
+    Object.keys(up));
+  ok("parallel_tool_calls 原件到达上游", up.parallel_tool_calls === false, up.parallel_tool_calls);
+  ok("客户端显式 store:false 必须尊重（丢就等于替用户打开上游持久化）", up.store === false, up.store);
+  ok("reasoning.summary 到达上游", up.reasoning && up.reasoning.summary === "auto", up.reasoning);
+  ok("上游请求仍是 Responses 形状（没有 messages/字面 extraBody）",
+    !("messages" in up) && !("extraBody" in up), Object.keys(up));
+
+  // 客户端要的档位上游不支持时，降级由档位表说了算——原件里的 effort 不许绕开它
+  const ne = await postResponses({ model: "rup/efforty", input: "hi", stream: true, reasoning: { effort: "high", summary: "auto" } });
+  const upE = seen[seen.length - 1].body;
+  ok("同协议补录不得绕过思考档位降级（high→声明的 medium）", ne.status === 200 && upE.reasoning.effort === "medium", upE.reasoning);
+  ok("降级后 summary 仍随原件带上", upE.reasoning.summary === "auto", upE.reasoning);
+
+  // 会话存储语义维持不放开：网关每轮全量重放且多号轮转，response id 跨账号互不相通
+  const np = await postResponses({ model: "rup/gpt-x", input: "hi", previous_response_id: "resp_abc" });
+  ok("previous_response_id 仍是硬拒 400", np.status === 400, [np.status, np.text.slice(0, 160)]);
 
   srv.close();
   server.stop();

@@ -6,6 +6,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const OUT = path.join(__dirname, "..", "electron", "backend", "proxy", "protocols", "responses-out.cjs");
+const IN = path.join(__dirname, "..", "electron", "backend", "proxy", "protocols", "responses-in.cjs");
 const raw = fs.readFileSync(OUT, "utf8");
 
 const MUTATIONS = [
@@ -39,16 +40,48 @@ const MUTATIONS = [
     to: 'write(ev(finishReason === "length" ? "response.incomplete" : "response.completed", { type: finishReason === "length" ? "response.incomplete" : "response.completed", response: responsePayload("completed"), sequence_number: seq++ }));',
     expect: /也发 completed/,
   },
+  // ---- 入站侧的「协议原件补录」：这些保护是后加的，没有配对的红就等于没判据 ----
+  {
+    file: IN,
+    name: "NATIVE_FIELDS 里去掉 text",
+    from: 'const NATIVE_FIELDS = ["text"];',
+    to: 'const NATIVE_FIELDS = [];',
+    expect: /进了内部载体/,
+  },
+  {
+    file: IN,
+    name: "把 text 重新列为「已忽略」",
+    from: 'const IGNORED_FIELDS = ["store", "background", "include"',
+    to: 'const IGNORED_FIELDS = ["store", "background", "include", "text"',
+    expect: /可补录的原生字段不谎称已忽略/,
+  },
+  {
+    file: IN,
+    name: "不再尊重客户端的 store:false",
+    from: 'if (raw.store === false) extraBody.store = false;',
+    to: '',
+    expect: /store:false 收进载体且不再写忽略 note/,
+  },
+  {
+    file: IN,
+    name: "parallel_tool_calls 恢复 !! 强转（吃掉 auto）",
+    from: 'extraBody.parallel_tool_calls = raw.parallel_tool_calls;',
+    to: 'extraBody.parallel_tool_calls = !!raw.parallel_tool_calls;',
+    expect: /auto 不被强转成 true/,
+  },
 ];
 
+const files = { [OUT]: raw };
 let bad = 0;
 for (const m of MUTATIONS) {
-  if (!raw.includes(m.from)) {
+  const target = m.file || OUT;
+  const src = files[target] || (files[target] = fs.readFileSync(target, "utf8"));
+  if (!src.includes(m.from)) {
     console.log(`✗ [${m.name}] 变异锚点在源码里找不到（锚点已过期）`);
     bad++;
     continue;
   }
-  fs.writeFileSync(OUT, raw.replace(m.from, m.to));
+  fs.writeFileSync(target, src.replace(m.from, m.to));
   let out = "";
   let threw = false;
   try {
@@ -57,7 +90,7 @@ for (const m of MUTATIONS) {
     out = String((e && (e.stdout || "")) + (e && (e.stderr || "")));
     threw = true;
   } finally {
-    fs.writeFileSync(OUT, raw);
+    fs.writeFileSync(target, src);
   }
   const failed = [...out.matchAll(/✗ (.+?) →/g)].map((x) => x[1]);
   const caught = failed.some((f) => m.expect.test(f));

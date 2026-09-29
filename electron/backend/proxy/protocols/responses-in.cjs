@@ -9,7 +9,15 @@
 
 // Codex 随请求发、但网关没有对应能力的字段：**收下并忽略**，绝不回 400。
 // 回 400 会当场打死客户端（它对 400 没有降级路径），而忽略的代价只是少了一个它本来也用不上的特性。
-const IGNORED_FIELDS = ["store", "background", "include", "truncation", "service_tier", "prompt_cache_key", "metadata", "user", "safety_identifier", "text", "top_logprobs", "reasoning"];
+// store 是半个例外：false 会被收进原件回填（替用户关掉上游持久化），true 才是真忽略。
+const IGNORED_FIELDS = ["store", "background", "include", "truncation", "service_tier",
+  "prompt_cache_key", "metadata", "user", "safety_identifier", "top_logprobs"];
+
+// 两端同格式时能原样补录回上游的 Responses 原生字段（chat 形状里没有它们的位置）。
+// 只列 text 一条是有意的保守：能不能并到上游由 adapters.cjs 的 NATIVE_KEYS_BY_KIND 把关，
+// 而那批被排除字段的理由（回程接不住 / 中转站不实现 / 有长度硬约束）都写在它上面。
+// parallel_tool_calls 与 reasoning 的原件在下面单独特判，不并进这张表。
+const NATIVE_FIELDS = ["text"];
 
 /**
  * Responses 请求体 → 内部 OpenAI chat body。
@@ -61,11 +69,24 @@ function toInternal(raw) {
   if (tools) body.tools = tools;
 
   const extraBody = {};
-  if (raw.parallel_tool_calls != null) extraBody.parallel_tool_calls = !!raw.parallel_tool_calls;
+  // 不再 !! 强转：Responses 的 parallel_tool_calls 允许 boolean | "auto"，
+  // 而这个值过去从没落到上游，现在它真的会被发出去，抄平就等于篡改
+  if (raw.parallel_tool_calls != null) extraBody.parallel_tool_calls = raw.parallel_tool_calls;
+  for (const f of NATIVE_FIELDS) if (raw[f] !== undefined) extraBody[f] = raw[f];
+  if (raw.store === false) extraBody.store = false;
+  if (raw.reasoning && typeof raw.reasoning === "object") {
+    const rest = { ...raw.reasoning };
+    // effort 只走档位降级那一条路（上面已映成 reasoning_effort）：整包回填会把
+    // 「上游不支持就降档」绕成原样透传，换来一个 400
+    delete rest.effort;
+    if (Object.keys(rest).length) extraBody.reasoning = rest;
+  }
   if (Object.keys(extraBody).length) body.extraBody = extraBody;
 
   for (const f of IGNORED_FIELDS) {
-    if (raw[f] !== undefined && f !== "reasoning") notes.push(`Responses 字段 ${f} 已收下并忽略（网关无对应能力）`);
+    if (raw[f] !== undefined && !(f === "store" && raw.store === false)) {
+      notes.push(`Responses 字段 ${f} 已收下并忽略（网关无对应能力）`);
+    }
   }
   return { ok: true, body, notes };
 }
