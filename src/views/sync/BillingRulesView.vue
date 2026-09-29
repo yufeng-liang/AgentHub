@@ -505,7 +505,9 @@ watch(() => app.activePage, (p) => {
                 {{ p.modelId }}
                 <div v-for="a in aliasesByTarget.get(p.modelId)" :key="a.alias" class="alias-line">
                   <span>↳ {{ a.alias }}</span>
-                  <button class="alias-del" title="取消归并" @click="removeAliasRow(a)">×</button>
+                  <el-tooltip content="取消归并" placement="top">
+                    <button class="alias-del" @click="removeAliasRow(a)">×</button>
+                  </el-tooltip>
                 </div>
               </td>
               <td>{{ p.providerId || "不限" }}</td>
@@ -790,8 +792,8 @@ watch(() => app.activePage, (p) => {
   .bs-col + .bs-col { border-left: none; padding-left: 0; }
 }
 
-/* 表格操作列与行内按钮 */
-.op-cell { text-align: right; white-space: nowrap; }
+th.op-cell { text-align: center; white-space: nowrap; }
+td.op-cell { text-align: right; white-space: nowrap; }
 .op-cell .btn-link + .btn-link { margin-left: 2px; }
 /* 保存结果提示：标题行已去除，改为卡片上方的独立反馈行 */
 .save-line { font-size: 12px; color: var(--err); margin-bottom: 14px; }

@@ -75,7 +75,8 @@ CREATE TABLE IF NOT EXISTS accounts (
   today_req INTEGER NOT NULL DEFAULT 0,
   today_tokens INTEGER NOT NULL DEFAULT 0,
   credits_today INTEGER NOT NULL DEFAULT -1,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS credits_history (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -172,6 +173,13 @@ function open() {
   // 在线迁移：accounts.credits_today（账号今日消耗积分，-1=今日尚无上报积分的请求；随 today_day 滚动）
   try {
     db.exec("ALTER TABLE accounts ADD COLUMN credits_today INTEGER NOT NULL DEFAULT -1");
+  } catch { /* 已存在 */ }
+  // 在线迁移：accounts.updated_at（账号最后更新时间戳，用于多机同步冲突仲裁）
+  // 注意：这条**不参与**号池改名的 LWW 比较——它被每一次无关写入（额度刷新等）推进，
+  // 拿它当改名时钟会让改名永远输给「刚刷过额度」的对端。改名走 meta.renamedAt
+  // + poolsync.accountStamp，两侧同一把尺。
+  try {
+    db.exec("ALTER TABLE accounts ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0");
   } catch { /* 已存在 */ }
   // 在线迁移：keys.key_enc（完整 Key 的 DPAPI 加密信封，供列表随时查看 / 复制）
   try {
@@ -594,6 +602,7 @@ function accountView(r) {
     /** 最近一次改名时刻（三期 fork 侧修复）：meta.renamedAt。参与 LWW 时间戳的计算，
      *  否则「改名不推进任何可比时间戳」会让改名永远输给任何因无关原因动过的对端（见 poolsync.accountStamp） */
     renamedAt: Number(meta.renamedAt) || 0,
+    updatedAt: r.updated_at || Math.max(r.credits_at || 0, r.last_used || 0, r.created_at || 0),
     hasToken: tokenUsable(r),
     domain: meta.domain || "",
     enterpriseId: meta.enterpriseId || "",
@@ -644,12 +653,13 @@ function accountSecrets(r) {
   };
 }
 
-function addAccount({ channel, uid, name, token, refreshToken, source, expiresAt, meta }) {
+function addAccount({ channel, uid, name, token, refreshToken, source, expiresAt, meta, updatedAt }) {
   open();
   const id = crypto.randomUUID();
+  const now = Date.now();
   db.prepare(
-    `INSERT INTO accounts (id, channel, uid, name, token_enc, refresh_enc, status, credits, credits_at, expires_at, cool_until, source, last_used, today_day, today_req, today_tokens, created_at, meta)
-     VALUES (?,?,?,?,?,?, 'online', 0, 0, ?, 0, ?, 0, ?, 0, 0, ?, ?)`
+    `INSERT INTO accounts (id, channel, uid, name, token_enc, refresh_enc, status, credits, credits_at, expires_at, cool_until, source, last_used, today_day, today_req, today_tokens, created_at, updated_at, meta)
+     VALUES (?,?,?,?,?,?, 'online', 0, 0, ?, 0, ?, 0, ?, 0, 0, ?, ?, ?)`
   ).run(
     id,
     String(channel),
@@ -660,7 +670,8 @@ function addAccount({ channel, uid, name, token, refreshToken, source, expiresAt
     Math.max(0, Number(expiresAt) || 0),
     String(source || "paste"),
     dayStr(),
-    Date.now(),
+    now,
+    Math.max(0, Number(updatedAt) || now),
     meta && typeof meta === "object" ? JSON.stringify(meta) : ""
   );
   return id;
@@ -698,6 +709,9 @@ function updateAccount(id, patch) {
   if (patch.token != null) put("token_enc", config.encryptSecret(patch.token));
   if (patch.refreshToken != null) put("refresh_enc", config.encryptSecret(patch.refreshToken));
   if (patch.meta != null && typeof patch.meta === "object") put("meta", JSON.stringify(patch.meta));
+  // 维护 updated_at：明确传入或当修改了重要字段时自动刷新
+  const nextUpdatedAt = patch.updatedAt != null ? Number(patch.updatedAt) : Date.now();
+  put("updated_at", nextUpdatedAt);
   if (!sets.length) return true;
   vals.push(cur.id);
   db.prepare(`UPDATE accounts SET ${sets.join(", ")} WHERE id = ?`).run(...vals);

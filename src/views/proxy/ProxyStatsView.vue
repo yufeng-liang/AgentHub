@@ -225,6 +225,8 @@ onMounted(async () => {
             </button>
           </span>
         </div>
+        <!-- 上游 v1.38.0 的 tooltip 改动落在这张内联表上，而 fork 已把它抽成
+             RequestLogTable.vue，故此处只留筛选条；那份浮层改到组件里补 -->
         <!-- 筛选条：时间预设 + 状态 + 渠道 + 模型 + KEY（改任一项回到第 1 页） -->
         <div class="filter-bar">
           <div class="chips">

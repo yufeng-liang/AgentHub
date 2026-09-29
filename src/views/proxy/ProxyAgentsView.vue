@@ -229,7 +229,7 @@ const OAUTH_HELP: Record<string, { title: string; desc: string }> = {
   },
   raccoon: {
     title: "用「商汤小浣熊」官方授权页登录",
-    desc: "在应用内弹出的授权窗里完成登录，授权码由本应用直接截获入池——不经过系统浏览器，也不会拉起或顶掉本机小浣熊客户端的登录（深链永不出本应用）。<br />每账号独立执行一次，可反复添加多账号；3 分钟无响应即超时。<br />授权窗被意外拦截时，可把 office-raccoon://auth/callback?code=… 整段粘到下方兜底。",
+    desc: "在应用内弹出的授权窗里完成登录，授权码由本应用直接截获入池——不经过系统浏览器，也不会拉起或顶掉本机小浣熊客户端的登录（深链永不出本应用）。<br />每账号独立执行一次，可反复添加多账号；3 分钟无响应即超时。<br /><span style=\"color: var(--warn, #e5b454); font-weight: 500;\">⚠️ 注意：多账号入池请统一在此处「OAuth 登录」。切勿在电脑端小浣熊软件点击「退出登录」，否则商汤服务端会吊销旧号凭证导致号池旧号失效。</span><br />授权窗被意外拦截时，可把 office-raccoon://auth/callback?code=… 整段粘到下方兜底。",
   },
   zcode: {
     title: "用 Z.ai 官方授权页登录 ZCode（智谱）",
@@ -1043,6 +1043,16 @@ async function cancelOauth() {
   oauthUserCode.value = "";
 }
 
+function reauthAccount(acc: ProxyAccount) {
+  // addChannel 在 fork 里收窄成「只装生态渠道」（这个弹窗的四种方式对自定义提供商都不成立，
+  // 见上方 openAdd 的分流）。重登按钮只在 status==='relogin' 时出现，而提供商是 API Key 直连、
+  // 永远不会进 relogin（adapters 的 refreshToken 对它恒回 noRefresh），所以这里成立。
+  addChannel.value = acc.channel as ProxyBuiltinChannelId;
+  addMethod.value = "oauth";
+  addOpen.value = true;
+  beginOauth();
+}
+
 /** 兜底：把浏览器地址栏内容整段粘回来完成登录（仅回环模式用得上） */
 async function submitCallback() {
   if (callbackBusy.value || !callbackInput.value.trim()) return;
@@ -1388,6 +1398,9 @@ onUnmounted(() => {
             <span>总余额</span>
             <b :title="ch.id === 'zcode' || ch.id === 'zcode_intl' ? `${fmtInt(ch.summary.totalCredits)} Tokens` : ''">{{ fmtBalance(ch.summary.totalCredits, ch.id) }}</b>
             <span v-if="ch.id === 'zcode' || ch.id === 'zcode_intl'" style="font-size: 11px; font-weight: normal; color: var(--text-3); margin-left: 2px">Tokens</span>
+            <!-- 上游 v1.38.0 把本页的 :title 换成了 el-tooltip（液态玻璃浮层）。整页刻意先不半套：
+                 工具栏、聚合行与账号行三处一起换才看得出统一，只换一处反而多一档不一致。
+                 记在本次合并的「已知未跟上」清单里，要统一就单独一次改完。 -->
           </div>
           <div class="agg-item"><span>{{ isBuiltin(ch) ? "账号数" : "Key 数" }}</span><b>{{ ch.summary.accountCount }}</b></div>
 
@@ -1400,6 +1413,8 @@ onUnmounted(() => {
              状态列点击弹液态玻璃小窗（只显最近一次上游错误全文），冷却剩余时间直接在列表里秒级跳动 -->
         <div class="tbl-wrap" style="margin-top: 8px">
           <table class="tbl pool-tbl">
+        <!-- 上游 v1.38.1 换成 table-scroll + <thead>：刻意不收。fork 的表头在下面的 <tbody>
+             首行里，两边都留就是两行表头；且这张表用的是全站 .tbl 而不是 .table-bare -->
             <tbody>
               <tr>
                 <th>账号</th><th>状态</th>
@@ -1545,6 +1560,10 @@ onUnmounted(() => {
               <tr v-else-if="isBuiltin(ch) && acc.hasToken && (!acc.packages || !acc.packages.length)" class="pkg-hint-row" :key="acc.id + '-hint'">
                 <td :colspan="6" class="pkg-hint">未刷新，点「刷新」获取积分包明细</td>
               </tr>
+        <!-- 上游这 141 行是同一批账号行的**另一套渲染**（el-tooltip + pill 状态徽标，但没有
+             积分包展开、也没有按渠道 kind 分列）。fork 侧那套在上面已经渲染过了，两边都留
+             就是每个账号显示两行——正是 0134a39 修掉的缺陷。这里取 fork 侧；上游带来的
+             「:title 换 el-tooltip」是纯呈现改动，要统一就整页一次做完，别在这里半套 -->
               </template>
               <tr v-if="!ch.accounts.length">
                 <td colspan="6" style="text-align: center; color: var(--text-3); padding: 14px">
@@ -1573,7 +1592,9 @@ onUnmounted(() => {
               </div>
               <div class="add-sub">凭据仅本机 DPAPI 加密保管，不入日志、不外发</div>
             </div>
-            <button class="add-close" title="关闭" @click="closeAdd()"><i class="ph ph-x"></i></button>
+            <el-tooltip content="关闭" placement="top">
+              <button class="add-close" @click="closeAdd()"><i class="ph ph-x"></i></button>
+            </el-tooltip>
           </header>
 
           <!-- 方式切换：分段控件 -->
@@ -1660,14 +1681,15 @@ onUnmounted(() => {
                     </div>
                     <div class="scan-file">{{ c.file }}<template v-if="c.credits"> · 余额 {{ fmtInt(c.credits) }}</template></div>
                   </div>
-                  <button
-                    class="btn btn-sm"
-                    :disabled="c.imported || c.encrypted || !!scanImporting"
-                    :title="c.encrypted ? '本机登录态已加密，请改用 OAuth 登录' : ''"
-                    @click="importScan(c)"
-                  >
-                    {{ scanImporting === scanKey(c) ? "导入中…" : c.imported ? "已导入" : "导入" }}
-                  </button>
+                  <el-tooltip :content="c.encrypted ? '本机登录态已加密，请改用 OAuth 登录' : ''" :disabled="!c.encrypted" placement="top">
+                    <button
+                      class="btn btn-sm"
+                      :disabled="c.imported || c.encrypted || !!scanImporting"
+                      @click="importScan(c)"
+                    >
+                      {{ scanImporting === scanKey(c) ? "导入中…" : c.imported ? "已导入" : "导入" }}
+                    </button>
+                  </el-tooltip>
                 </div>
                 <div v-if="!scanRows.length" class="scan-empty">
                   未在本机发现可导入的登录态 —— 请先在本机登录对应客户端，或改用「OAuth 登录」
@@ -1772,7 +1794,9 @@ onUnmounted(() => {
             </div>
             <div v-if="pendingConfirm.probe.exe" class="ide-probe-row">
               <span class="ide-probe-k">程序路径</span>
-              <span class="ide-probe-v mono" :title="pendingConfirm.probe.exe">{{ pendingConfirm.probe.exe }}</span>
+              <el-tooltip :content="pendingConfirm.probe.exe" placement="top">
+                <span class="ide-probe-v mono">{{ pendingConfirm.probe.exe }}</span>
+              </el-tooltip>
             </div>
             <div v-if="pendingConfirm.probe.running" class="ide-probe-row">
               <span class="ide-probe-k">切换完成后</span>
@@ -1844,8 +1868,12 @@ onUnmounted(() => {
             <span class="checkin-stats">
               <span v-if="devClaimMode" class="tag tag-warn">领取模式中 · 远程不可用</span>
               <span class="tag" :class="devHasIssue ? 'tag-warn' : 'tag-ok'">{{ devHasIssue ? "发现异常" : "全部独立" }}</span>
-              <span class="tag tag-dim" :title="`本机 telemetry-state.json 当前指纹：${devLiveMid || '（无）'}`">本机指纹 {{ devLiveMid ? devLiveMid.slice(0, 8) : "（无）" }}</span>
-              <span class="tag tag-dim" :title="`锚定指纹（远程连接的合法值，终生恒定）：${devAnchorMid || '（未锚定）'}`">锚定 {{ devAnchorMid ? devAnchorMid.slice(0, 8) : "（未锚定）" }}</span>
+              <el-tooltip :content="`本机 telemetry-state.json 当前指纹：${devLiveMid || '（无）'}`" placement="top">
+                <span class="tag tag-dim">本机指纹 {{ devLiveMid ? devLiveMid.slice(0, 8) : "（无）" }}</span>
+              </el-tooltip>
+              <el-tooltip :content="`锚定指纹（远程连接的合法值，终生恒定）：${devAnchorMid || '（未锚定）'}`" placement="top">
+                <span class="tag tag-dim">锚定 {{ devAnchorMid ? devAnchorMid.slice(0, 8) : "（未锚定）" }}</span>
+              </el-tooltip>
             </span>
           </div>
           <div class="dev-hint">
@@ -2651,8 +2679,6 @@ onUnmounted(() => {
   user-select: all;
 }
 /* ===== 列表布局：账号两行式 + 数字列右对齐 ===== */
-.pool-tbl th:nth-child(3),
-.pool-tbl th:nth-child(5),
 .pool-tbl td.num {
   text-align: right;
 }

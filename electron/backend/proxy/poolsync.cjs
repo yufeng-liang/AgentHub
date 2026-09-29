@@ -165,7 +165,11 @@ function renameWouldChangeIdentity(acc) {
  *
  *  另外：重命名本身不推进任何时间戳（只写 name 列），所以这里把 `renamedAt` 一并纳入 —— 改名动作
  *  自己就是一个「最新活动」，否则改名在 LWW 里永远不是最新写（`store.updateAccount` 在写 name 时落
- *  `meta.renamedAt`）。四个来源取 max，两侧共用本函数，不再各写一份。 */
+ *  `meta.renamedAt`）。四个来源取 max，两侧共用本函数，不再各写一份。
+ *
+ *  ⚠ 上游 v1.38.0 另加了一条 `accounts.updated_at` 当同步时钟，**这里刻意不用它**：
+ *  它被每一次无关写入推进（额度刷新每 30 分钟一次），拿它比改名 ⇒ 「刚刷过额度」的对端永远赢过
+ *  真正改了名的一端，正是上面这段注释描述的那个缺陷换了个形态。 */
 function accountStamp(a) {
   return Math.max(
     Number(a.creditsAt || 0),
@@ -175,7 +179,52 @@ function accountStamp(a) {
   );
 }
 
-/** 导出本机号池为快照对象：token/refreshToken 为 DPAPI 解密后的明文（只进加密包，绝不上明文）。
+/** 导出前元数据脱敏/明文化：DPAPI 密文无法跨机解密，将切号快照等敏感字段还原为明文 JSON 结构。
+ *  由于快照整体会打入 AES-256-GCM 加密压缩包，凭据在网络传输与存储中受统一密码严格保护。 */
+function prepareMetaForExport(meta, channel) {
+  if (!meta || typeof meta !== "object") return {};
+  const cloned = JSON.parse(JSON.stringify(meta));
+  if (channel === "zcode" && cloned.sw && typeof cloned.sw === "object") {
+    try {
+      const zl = require("./zcodeLocal.cjs");
+      cloned.sw = {
+        accessToken: zl.unseal(cloned.sw.accessToken),
+        refreshToken: zl.unseal(cloned.sw.refreshToken),
+        userInfo: zl.unseal(cloned.sw.userInfo),
+        codingPlanKeys: zl.unseal(cloned.sw.codingPlanKeys),
+        relayPassHash: zl.unseal(cloned.sw.relayPassHash),
+        _plain: true,
+      };
+    } catch { /* 解密异常保留原样 */ }
+  }
+  return cloned;
+}
+
+/** 导入时元数据本地化：对明文切号快照使用本机 DPAPI 重新封信（seal），确保存入库中的凭据在当前机器上能被 ideswitch 解密切号 */
+function restoreMetaForLocal(meta, channel) {
+  if (!meta || typeof meta !== "object") return {};
+  const cloned = JSON.parse(JSON.stringify(meta));
+  if (channel === "zcode" && cloned.sw && typeof cloned.sw === "object") {
+    try {
+      const zl = require("./zcodeLocal.cjs");
+      const sw = cloned.sw;
+      // 只要带有 _plain 标记，或者字段存在且不以本机 ZSEAL 密文前缀开头，就重新封信
+      const needsSeal = sw._plain || (!String(sw.accessToken || "").startsWith("ZCV1:enc:v1:") && (sw.accessToken || sw.refreshToken || sw.codingPlanKeys));
+      if (needsSeal) {
+        cloned.sw = {
+          accessToken: zl.seal(sw.accessToken),
+          refreshToken: zl.seal(sw.refreshToken),
+          userInfo: zl.seal(sw.userInfo),
+          codingPlanKeys: zl.seal(sw.codingPlanKeys),
+          relayPassHash: zl.seal(sw.relayPassHash),
+        };
+      }
+    } catch { /* 封信异常保留原样 */ }
+  }
+  return cloned;
+}
+
+/** 导出本机号池为快照对象：token/refreshToken 及切号快照为解密后的明文（只进加密包，绝不上明文）。
  *  channel 给定时只导出该渠道（同步页支持「只同步某一个编译器」）。
  *  凭据为空的账号跳过：把空号打进加密包会传播到所有设备（他机拿到的是无凭据坏号） */
 function exportPool(channel) {
@@ -199,7 +248,10 @@ function exportPool(channel) {
         creditsAt: view.creditsAt || 0,
         packages: store.listCreditPackages(view.id), // 逐包明细（Q9）：与额度同一次 LWW 整体替换
         source: view.source || "paste",
-        meta: view.meta && typeof view.meta === "object" ? view.meta : {},
+        meta: prepareMetaForExport(view.meta, view.channel),
+        // 导出侧的时钟必须是 accountStamp：它与导入侧比 name 时用的是同一把尺（见函数注释）。
+        // 上游这里换成了含 updated_at 的 rawUpdatedAt——那个列每刷一次额度就前进，改名会永久输给
+        // 「刚刷过额度」的对端，正是本文件修过的那个缺陷。updated_at 只留给上游的凭据仲裁用。
         updatedAt: accountStamp(view),
       };
     })
@@ -251,30 +303,35 @@ function keyFingerprint(password) {
   return crypto.scryptSync(String(password || ""), KDF_SALT + "|fingerprint", 32).toString("hex").slice(0, 16);
 }
 
-// ===== 合并（自动去重，绝不自动选边删账号：删除只走墓碑） =====
+// ===== 合并（自动处理冲突：有效性仲裁 + 时间戳新者胜 LWW，保证多端凭据同步与切号登录可用） =====
 
 /**
  * 把远端快照合并进本机号池：
- * - 本机已有同身份账号：仅当远端 creditsAt 更新时刷新额度/有效期/到期等动态字段；
- *   远端带了有效 token 而本机为空（如本机凭据损坏）时顺带补凭据
- * - 本机没有：整号入池
- * 返回 { added, updated }
+ * 1. 本机无同身份账号：整号入池，快照敏感字段使用本机 DPAPI 重新封信；
+ * 2. 本机已有同身份账号：自动冲突处理
+ *    - 凭据有效性裁决（Validity First）：本机过期/失效而远端有效 → 自动采用远端凭据；远端过期而本机有效 → 保留本机
+ *    - 时间戳裁决（Last-Write-Wins）：均有效时，以 updatedAt 较新者胜
+ *    - 采纳远端新凭据后，自动重置冷却（cool_until=0）、清除上游错误记录并恢复状态为 online
+ *    - 动态额度按 creditsAt 新者胜刷新；自定义备注名按修改时间覆盖
+ * 返回 { added, updated, skipped }
  */
 function mergeSnapshot(snap, channel) {
   const tombstones = readLocalTombstones();
   let added = 0;
   let updated = 0;
   let skipped = 0;
-  // 本机账号一次取出建索引：原来每条远端账号都全表 listAccounts().find，
-  // O(远端×本机) 且每轮重查 DB，号池大了同步明显变慢
+  const now = Date.now();
   const localByKey = new Map(store.listAccounts().map((a) => [accountKeyOf(a), a]));
+
   for (const ra of snap.accounts) {
     if (!ra || typeof ra.key !== "string" || !ra.key) continue;
     if (channel && ra.channel !== channel) continue; // 只同步指定渠道：其余渠道的远端账号不动
+    const raUpdatedAt = Number(ra.updatedAt || 0);
+
     // 墓碑命中且本机没有该账号：尊重删除，不回捞
     const local = localByKey.get(ra.key);
     if (!local) {
-      if (tombstones[ra.key] && Number(tombstones[ra.key]) >= Number(ra.updatedAt || 0)) continue;
+      if (tombstones[ra.key] && Number(tombstones[ra.key]) >= raUpdatedAt) continue;
       // 远端空凭据不入池：无 token 的账号不可调度，还会继续向下一台设备传播坏号
       if (!ra.token) {
         skipped++;
@@ -288,31 +345,91 @@ function mergeSnapshot(snap, channel) {
         refreshToken: ra.refreshToken || "",
         source: ra.source || "paste",
         expiresAt: ra.expiresAt || 0,
-        meta: ra.meta && typeof ra.meta === "object" ? ra.meta : {},
+        meta: restoreMetaForLocal(ra.meta, ra.channel),
+        updatedAt: raUpdatedAt || now,
       });
       // 逐包明细随整号入池（Q9）：新号一并落远端包集，异机不必等本机首次刷新才看到明细
       if (Array.isArray(ra.packages)) store.setCreditPackages(newId, ra.channel, ra.packages);
       added++;
       continue;
     }
-    // 已有：动态字段 LWW（credits_at 新者胜）；本机状态（启停/冷却）不动
+
+    // 本机已有同身份账号：自动冲突仲裁
+    const localRow = store.getAccount(local.id);
+    const localSecrets = localRow ? store.accountSecrets(localRow) : { token: "", refreshToken: "" };
+    const localUpdatedAt = Number(local.updatedAt || local.creditsAt || local.lastUsed || local.createdAt || 0);
+
+    // 检查凭据是否实质不同
+    const tokenDiffers = (ra.token || "") !== (localSecrets.token || "") || (ra.refreshToken || "") !== (localSecrets.refreshToken || "");
+
+    // 凭据有效性判定：expiresAt 明确过期或 relogin 判定为无效
+    const localHasToken = !!local.hasToken && !!localSecrets.token;
+    const localExpired = local.expiresAt > 0 && local.expiresAt <= now;
+    const localInvalid = !localHasToken || localExpired || local.status === "relogin";
+
+    const remoteHasToken = !!ra.token;
+    const remoteExpired = ra.expiresAt > 0 && ra.expiresAt <= now;
+    const remoteValid = remoteHasToken && !remoteExpired;
+
+    let adoptRemoteCreds = false;
+    if (tokenDiffers && remoteHasToken) {
+      if (localInvalid && remoteValid) {
+        // 规则 1：本机凭据已失效或过期，远端凭据有效 → 远端胜出
+        adoptRemoteCreds = true;
+      } else if (!remoteValid && !localInvalid) {
+        // 规则 2：远端已过期，本机凭据有效 → 坚决保护本机可用凭据
+        adoptRemoteCreds = false;
+      } else {
+        // 规则 3：两端均有效（或均无到期时间），以时间戳新者胜（LWW）
+        if (raUpdatedAt > localUpdatedAt) {
+          adoptRemoteCreds = true;
+        }
+      }
+    }
+
     const patch = {};
+
+    if (adoptRemoteCreds) {
+      patch.token = ra.token;
+      patch.refreshToken = ra.refreshToken || "";
+      patch.expiresAt = ra.expiresAt || 0;
+      patch.meta = restoreMetaForLocal(ra.meta, ra.channel);
+      patch.updatedAt = raUpdatedAt || now;
+      // 只要采纳了远端较新且有效的凭据，重置冷却与解除上游错误，自愈恢复调度
+      patch.coolUntil = 0;
+      patch.coolReason = "";
+      if (local.status === "relogin" || local.status === "cooling") {
+        patch.status = "online";
+      }
+      store.clearError(local.id);
+    } else {
+      // 不换凭据时，若本机切号快照缺失（如纯 token 导入）而远端带有快照，补充切号快照
+      if (ra.channel === "zcode" && ra.meta && ra.meta.sw) {
+        const localMeta = local.meta || {};
+        if (!localMeta.sw || !localMeta.sw.accessToken) {
+          patch.meta = restoreMetaForLocal({ ...localMeta, sw: ra.meta.sw, deviceMid: localMeta.deviceMid || ra.meta.deviceMid }, ra.channel);
+        }
+      }
+    }
+
+    // 动态字段 LWW（credits_at 新者胜）
     if (Number(ra.creditsAt || 0) > Number(local.creditsAt || 0)) {
       patch.credits = ra.credits;
       patch.creditsAt = ra.creditsAt;
-      patch.expiresAt = ra.expiresAt;
+      // 到期时间跟着凭据走（上面 adoptRemoteCreds 分支里已经写过 expiresAt）。这里刻意不再单独搬：
+      // 不采纳远端 token 却搬它的 expiresAt，会让本机凭据挂上别人的有效期——上游的
+      // `if (adoptRemoteCreds)` 门正是为此加的，取上游、弃 fork 那句无条件写。
       // 包集与额度同一次 LWW 整体替换（Q9）：远端 creditsAt 更新即以远端包集为准
       if (Array.isArray(ra.packages)) store.setCreditPackages(local.id, ra.channel || local.channel, ra.packages);
     }
+
     // 自定义备注名（用户备注）：远端较新时覆盖本机（LWW）。阈值必须与导出侧**同一把尺**（accountStamp），
-    // 否则「各用一把尺」会让改名方的新名被对端按更小的阈值判回去（三期 fork 侧修复，2026-09-24）
-    if (typeof ra.name === "string" && ra.name && Number(ra.updatedAt || 0) > accountStamp(local)) {
+    // 否则「各用一把尺」会让改名方的新名被对端按更小的阈值判回去（三期 fork 侧修复，2026-09-24）。
+    // 上游补的 `ra.name !== local.name` 保留：同名不重写，免得两侧时间戳互相追赶。
+    if (typeof ra.name === "string" && ra.name && ra.name !== local.name && Number(ra.updatedAt || 0) > accountStamp(local)) {
       patch.name = ra.name;
     }
-    if (!local.hasToken && ra.token) {
-      patch.token = ra.token;
-      if (ra.refreshToken) patch.refreshToken = ra.refreshToken;
-    }
+
     if (Object.keys(patch).length) {
       store.updateAccount(local.id, patch);
       updated++;

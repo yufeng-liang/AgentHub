@@ -361,6 +361,12 @@ function currentLocalLogins() {
   return map;
 }
 
+// 上游 v1.38.0 在这里加了 openAuthWindow（小浣熊内嵌授权窗 + 深链网络层拦截）。刻意不合：
+// 本文件跑在网关子进程（ELECTRON_RUN_AS_NODE），require("electron") 给的是路径字符串，
+// new BrowserWindow 必抛。fork 的等价链路是 proxy_oauth_begin 只建会话、推 oauth-open 事件交
+// 主进程去开窗，discovery 那边的 helpers.openAuthWindow 因此恒缺省。
+// 代价：上游「深链不进系统浏览器、免得官方客户端消费掉一次性授权码」这条网络层拦截，
+// fork 侧还没有对应实现——要补得补在主进程的授权窗上，别补回这个文件。
 /** 号池页/状态页的渠道列表：内置 4 家 + **全部**自建提供商（含已停用）。
  *  这里刻意不用 store.channelList()——那是路由视图，只给启用中的；停用的提供商总得在界面上
  *  看得见才可能被重新打开，从视图里消失等于让用户没法把它恢复。 */
