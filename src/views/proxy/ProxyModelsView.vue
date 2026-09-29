@@ -453,7 +453,9 @@ onMounted(refresh);
                     <button class="btn btn-sm meta-edit" :aria-label="`编辑 ${m.id} 的能力与档位`" @click="openMetaEditor(m)">
                       <i class="ph ph-sliders-horizontal"></i>编辑
                     </button>
-                    <span v-if="m.metaOverridden && m.metaOverridden.length" class="tag tag-warn meta-badge" title="含用户覆盖">覆盖</span>
+                    <el-tooltip v-if="m.metaOverridden && m.metaOverridden.length" content="含用户覆盖" placement="top">
+                      <span class="tag tag-warn meta-badge">覆盖</span>
+                    </el-tooltip>
                   </td>
                   <td style="text-align: center">
                     <div

@@ -15,6 +15,8 @@ const app = useAppStore();
 const DAYS = 7;
 const ov = ref<ProxyStatsOverview | null>(null);
 const detail = ref<{ total: number; page: number; pageSize: number; rows: ProxyUsageRow[] } | null>(null);
+// 初值 true：首屏还没有行时由 RequestLogTable 摆骨架屏；翻页时已有行，不会闪骨架
+const listLoading = ref(true);
 const page = ref(1);
 const pageSize = 10;
 const dim = ref<"channel" | "model" | "key" | "account">("channel");
@@ -60,6 +62,7 @@ const sinceTs = computed(() => {
 });
 
 async function loadDetail() {
+  listLoading.value = true;
   try {
     detail.value = await api.proxyStatsDetail({
       page: page.value,
@@ -72,6 +75,8 @@ async function loadDetail() {
     });
   } catch (e) {
     err.value = String((e as Error).message || e);
+  } finally {
+    listLoading.value = false;
   }
 }
 watch([range, status, channel, model, keyId], () => {
@@ -173,15 +178,15 @@ onMounted(async () => {
         <div class="kpi"><span>TTFT 均值</span><b>{{ fmtMs(ov?.today.ttftAvg || 0) }}</b></div>
         <div class="kpi">
           <span>缓存命中率</span>
-          <b :title="ov?.today.cacheHitRate != null && ov.today.cacheHitRate < 0 ? '今日暂无回报缓存字段的请求' : '读缓存 tokens ÷ prompt tokens（按上报缓存字段的请求计）'">
-            {{ ov?.today.cacheHitRate != null && ov.today.cacheHitRate >= 0 ? ov.today.cacheHitRate.toFixed(1) + "%" : "-" }}
-          </b>
+          <el-tooltip :content="ov?.today.cacheHitRate != null && ov.today.cacheHitRate < 0 ? '今日暂无回报缓存字段的请求' : '读缓存 tokens ÷ prompt tokens（按上报缓存字段的请求计）'" placement="top">
+            <b>{{ ov?.today.cacheHitRate != null && ov.today.cacheHitRate >= 0 ? ov.today.cacheHitRate.toFixed(1) + "%" : "-" }}</b>
+          </el-tooltip>
         </div>
         <div class="kpi">
           <span>今日消耗积分</span>
-          <b :title="ov?.today.creditsUsed != null && ov.today.creditsUsed < 0 ? '今日暂无回报积分的请求' : '上游实报积分累计'">
-            {{ ov?.today.creditsUsed != null && ov.today.creditsUsed >= 0 ? fmtInt(ov.today.creditsUsed) : "-" }}
-          </b>
+          <el-tooltip :content="ov?.today.creditsUsed != null && ov.today.creditsUsed < 0 ? '今日暂无回报积分的请求' : '上游实报积分累计'" placement="top">
+            <b>{{ ov?.today.creditsUsed != null && ov.today.creditsUsed >= 0 ? fmtInt(ov.today.creditsUsed) : "-" }}</b>
+          </el-tooltip>
         </div>
       </div>
 
@@ -225,8 +230,8 @@ onMounted(async () => {
             </button>
           </span>
         </div>
-        <!-- 上游 v1.38.0 的 tooltip 改动落在这张内联表上，而 fork 已把它抽成
-             RequestLogTable.vue，故此处只留筛选条；那份浮层改到组件里补 -->
+        <!-- 上游 v1.38.0 的 tooltip / 骨架屏改动落在那张内联表上，fork 侧的表已抽成
+             RequestLogTable.vue，浮层与占位都在组件里补好了（含 loading 形参） -->
         <!-- 筛选条：时间预设 + 状态 + 渠道 + 模型 + KEY（改任一项回到第 1 页） -->
         <div class="filter-bar">
           <div class="chips">
@@ -250,7 +255,7 @@ onMounted(async () => {
             <option v-for="k in keyOptions" :key="k.id" :value="k.id">{{ k.name }}</option>
           </select>
         </div>
-        <RequestLogTable :rows="detail?.rows || []" scope="stats" @detail="openDetail" />
+        <RequestLogTable :rows="detail?.rows || []" :loading="listLoading" scope="stats" @detail="openDetail" />
         <div class="pager">
           <button class="btn btn-sm" :disabled="page <= 1" @click="goPage(page - 1)">上一页</button>
           <button class="btn btn-sm" :disabled="page >= totalPages" @click="goPage(page + 1)">下一页</button>

@@ -303,12 +303,12 @@ onUnmounted(() => {
         </div>
       </div>
       <div class="card" style="margin-top: 12px">
-        <!-- 上游 v1.38.0 把这张实时流表扩成了「骨架屏 + 空态文案 + 逐行入场动画 + el-tooltip」，
-             但 fork 早已把它抽成 RequestLogTable.vue（列设置 / 用量 / 重试 / 错误列都在那边），
-             所以这里不收内联表。那四项差异是本次合并**已知未跟上的部分**，不是漏看：
-             骨架屏与 el-tooltip 要补得补进 RequestLogTable，补一次总览与统计页同时受益。 -->
+        <!-- 上游 v1.38.0 把这张实时流表扩成了「骨架屏 + 空态文案 + el-tooltip」，但 fork 早已把它
+             抽成 RequestLogTable.vue（列设置 / 用量 / 重试 / 错误列都在那边），所以这里不收内联表，
+             那三项补进组件里，总览与统计页同时受益。上游同批还加了 :style="{ '--i': i }" 的逐行入场
+             动画，但全仓没有任何 CSS 消费 --i（grep 'var(--i)' 为空），那是段死标记，不跟着抄。 -->
         <div class="card-title">实时请求流 <span class="right">最近 {{ recent.length }} 条</span></div>
-        <RequestLogTable :rows="recent" scope="home" @detail="openDetail" />
+        <RequestLogTable :rows="recent" :loading="loading" scope="home" @detail="openDetail" />
       </div>
       <RequestDetailDialog :req="detailReq" @close="detailReq = null" />
       <div class="card">

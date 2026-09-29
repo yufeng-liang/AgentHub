@@ -79,6 +79,8 @@ function buildCtx({ n, channel, builtin, expanded = [], withPackages = true }) {
     // 与组件里的 CHECKIN_CAPABLE 同口径：这四家有每日签到，qoder / cline / autoclaw 没有
     checkinCapable: (id) => ["workbuddy", "workbuddy_ai", "raccoon", "trae"].includes(id),
     ideSupported: () => true, ideTitle: () => "", channelName: () => "X",
+    // 余额浮层（el-tooltip 用）：真值只在 zcode 家非空，行/列计数与它无关，给个同名桩让绑定不炸
+    creditTip: () => "",
     expandedIds: new Set(expanded), SOURCE_NAMES: { oauth: "OAuth" },
     ACCOUNT_STATUS: { online: { text: "在线", cls: "tag-ok" } },
     fmtInt: String, fmtK: String, fmtBalance: String, fmtDate: () => "2026-09-29", uidBrief: (u) => u,

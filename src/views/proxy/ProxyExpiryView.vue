@@ -135,7 +135,9 @@ onUnmounted(() => {
                 <div class="src-ch">{{ r.channelDisplay }}</div>
                 <div class="src-acc">{{ r.accountName }}</div>
               </td>
-              <td :title="r.pkg.name">{{ r.pkg.name || "积分包" }}</td>
+              <el-tooltip :content="r.pkg.name" :disabled="!r.pkg.name" placement="top">
+                <td>{{ r.pkg.name || "积分包" }}</td>
+              </el-tooltip>
               <td class="mono num">{{ amount(r.pkg.remaining) }} / {{ amount(r.pkg.total) }}</td>
               <td class="mono">{{ r.pkg.expiresAt ? fmtDate(r.pkg.expiresAt) : "长期" }}</td>
               <td class="mono num">{{ daysText(r.pkg) }}</td>

@@ -120,6 +120,15 @@ function ideWritebackCapable(id: ProxyChannelId) {
 function isBuiltin(ch: ProxyChannelView) {
   return ch.kind !== "openai_compat";
 }
+/** zcode 家的余额单位是 Tokens，格子里显示的是换算值，浮层给原值。
+ *  其余渠道余额本就是积分，浮层成了复读 ⇒ 返回空串，模板配 :disabled 用，不飘空泡 */
+function tokensTip(ch: ProxyChannelView) {
+  return ch.id === "zcode" || ch.id === "zcode_intl" ? `${fmtInt(ch.summary.totalCredits)} Tokens` : "";
+}
+/** 账号级余额同上：只有 zcode 家需要把 Tokens 原值补出来，其余渠道返回空串即不出浮层 */
+function creditTip(acc: ProxyAccount) {
+  return acc.channel === "zcode" && acc.credits > 0 ? `${fmtInt(acc.credits)} Tokens` : "";
+}
 function metaOf(ch: ProxyChannelView) {
   return isBuiltin(ch) ? CHANNEL_META[ch.id as ProxyBuiltinChannelId] ?? PROVIDER_META : PROVIDER_META;
 }
@@ -1345,44 +1354,44 @@ onUnmounted(() => {
             <!-- 签到 / 加油包 / 额度刷新都是生态渠道专属动作：自定义提供商只有一把 API Key，
                  既没有每日签到可领，也没有余额可查（主进程一律明确拒答，不该在界面上摆出来） -->
             <template v-if="isBuiltin(ch)">
-              <button
-                v-if="ch.id === 'workbuddy_ai'"
-                class="btn btn-sm"
-                :disabled="checkinBusy"
-                :title="'国际版无每日签到，这是一次性 trial 加油包'"
-                @click="runTrial"
-              >{{ checkinBusy ? "领取中…" : "领加油包" }}</button>
-              <button
+              <el-tooltip v-if="ch.id === 'workbuddy_ai'" content="国际版无每日签到，这是一次性 trial 加油包" placement="top">
+                <button class="btn btn-sm" :disabled="checkinBusy" @click="runTrial">
+                  {{ checkinBusy ? "领取中…" : "领加油包" }}
+                </button>
+              </el-tooltip>
+              <el-tooltip
                 v-else-if="ch.id === 'zcode' && zcodeHasReward"
-                class="btn btn-sm"
-                :disabled="checkinBusy"
-                :title="'领取当前可领的奖励套餐（周末包等）；需要人机校验时会弹官方验证窗'"
-                @click="runCheckinChannel"
-              >{{ checkinBusy ? "领取中…" : "一键领取" }}</button>
+                content="领取当前可领的奖励套餐（周末包等）；需要人机校验时会弹官方验证窗"
+                placement="top"
+              >
+                <button class="btn btn-sm" :disabled="checkinBusy" @click="runCheckinChannel">
+                  {{ checkinBusy ? "领取中…" : "一键领取" }}
+                </button>
+              </el-tooltip>
               <button v-else-if="checkinCapable(ch.id)" class="btn btn-sm" :disabled="checkinBusy" @click="runCheckinChannel">
                 {{ checkinBusy ? "签到中…" : "一键签到" }}
               </button>
-              <button
+              <el-tooltip
                 v-if="ch.id === 'zcode'"
-                class="btn btn-sm"
-                :class="{ 'btn-warning': devHasIssue }"
-                :disabled="devBusy"
-                title="设备指纹（deviceMid）诊断与修复：多账号共用同一枚指纹时，一个账号领取周末套餐会把全组账号的当周资格烧掉（服务端提示「不符合领取条件」/1004）。修复即给这些账号重派全新随机指纹"
-                @click="openDeviceDiag"
-              >{{ devBusy ? "检测中…" : devHasIssue ? "指纹异常" : "指纹诊断" }}</button>
-              <button
+                content="设备指纹（deviceMid）诊断与修复：多账号共用同一枚指纹时，一个账号领取周末套餐会把全组账号的当周资格烧掉（服务端提示「不符合领取条件」/1004）。修复即给这些账号重派全新随机指纹"
+                placement="top"
+              >
+                <button class="btn btn-sm" :class="{ 'btn-warning': devHasIssue }" :disabled="devBusy" @click="openDeviceDiag">
+                  {{ devBusy ? "检测中…" : devHasIssue ? "指纹异常" : "指纹诊断" }}
+                </button>
+              </el-tooltip>
+              <el-tooltip
                 v-if="ch.id === 'zcode' && devClaimMode"
-                class="btn btn-sm btn-warning"
-                :disabled="devBusy"
-                title="本机指纹当前借出给某账号领周末套餐（领取模式），手机远程连接不可用；点击写回本机锚定指纹并重启客户端，远程即恢复"
-                @click="restoreRemoteMid"
-              >{{ devBusy ? "恢复中…" : "恢复本机指纹" }}</button>
-              <button
-                v-if="ch.id === 'zcode' || ch.id === 'zcode_intl'"
-                class="btn btn-sm"
-                title="切号出问题或移动端远程连接异常时，一键还原到最近一次切换前的状态"
-                @click="zcodeRollback"
-              >切号回滚</button>
+                content="本机指纹当前借出给某账号领周末套餐（领取模式），手机远程连接不可用；点击写回本机锚定指纹并重启客户端，远程即恢复"
+                placement="top"
+              >
+                <button class="btn btn-sm btn-warning" :disabled="devBusy" @click="restoreRemoteMid">
+                  {{ devBusy ? "恢复中…" : "恢复本机指纹" }}
+                </button>
+              </el-tooltip>
+              <el-tooltip v-if="ch.id === 'zcode' || ch.id === 'zcode_intl'" content="切号出问题或移动端远程连接异常时，一键还原到最近一次切换前的状态" placement="top">
+                <button class="btn btn-sm" @click="zcodeRollback">切号回滚</button>
+              </el-tooltip>
               <button class="btn btn-sm btn-primary" :disabled="refreshingChannel" @click="refreshCurrentChannel">
                 {{ refreshingChannel ? "刷新中…" : "刷新" }}
               </button>
@@ -1396,11 +1405,12 @@ onUnmounted(() => {
                而这三项对生态渠道是真信息，所以按 kind 隐藏而不是换成假数据 -->
           <div v-if="isBuiltin(ch)" class="agg-item">
             <span>总余额</span>
-            <b :title="ch.id === 'zcode' || ch.id === 'zcode_intl' ? `${fmtInt(ch.summary.totalCredits)} Tokens` : ''">{{ fmtBalance(ch.summary.totalCredits, ch.id) }}</b>
+            <el-tooltip :content="tokensTip(ch)" :disabled="!tokensTip(ch)" placement="top">
+              <b>{{ fmtBalance(ch.summary.totalCredits, ch.id) }}</b>
+            </el-tooltip>
             <span v-if="ch.id === 'zcode' || ch.id === 'zcode_intl'" style="font-size: 11px; font-weight: normal; color: var(--text-3); margin-left: 2px">Tokens</span>
-            <!-- 上游 v1.38.0 把本页的 :title 换成了 el-tooltip（液态玻璃浮层）。整页刻意先不半套：
-                 工具栏、聚合行与账号行三处一起换才看得出统一，只换一处反而多一档不一致。
-                 记在本次合并的「已知未跟上」清单里，要统一就单独一次改完。 -->
+            <!-- 本页浮层已整页统一到 el-tooltip（上游 v1.38.0 口径，工具栏 / 聚合行 / 账号行三处一起换），
+                 原生 title 不许在本页复活：scripts/dev-proxy-tooltip-uniform-test.cjs 会逐文件查。 -->
           </div>
           <div class="agg-item"><span>{{ isBuiltin(ch) ? "账号数" : "Key 数" }}</span><b>{{ ch.summary.accountCount }}</b></div>
 
@@ -1421,17 +1431,21 @@ onUnmounted(() => {
                 <template v-if="isBuiltin(ch)"><th>余额</th><th>到期</th></template>
                 <th>今日</th><th>操作</th>
               </tr>
-              <template v-for="(acc, i) in ch.accounts" :key="acc.id">
-              <tr :style="{ '--i': i }">
+              <template v-for="acc in ch.accounts" :key="acc.id">
+              <tr>
                 <td class="acc-cell">
-                  <button
+                  <el-tooltip
                     v-if="isBuiltin(ch) && acc.packages && acc.packages.length"
-                    class="pkg-caret"
-                    :class="{ open: expandedIds.has(acc.id) }"
-                    :title="expandedIds.has(acc.id) ? '收起积分包明细' : '展开积分包明细'"
-                    @click="togglePkg(acc.id)"
-                  ><i class="ph ph-caret-right" /></button>
-                  <span v-if="renamingId !== acc.id" class="acc-name" :title="acc.name + '（点击重命名）'" @click="startRename(acc)">{{ acc.name || "（未命名账号）" }}</span>
+                    :content="expandedIds.has(acc.id) ? '收起积分包明细' : '展开积分包明细'"
+                    placement="top"
+                  >
+                    <button class="pkg-caret" :class="{ open: expandedIds.has(acc.id) }" @click="togglePkg(acc.id)">
+                      <i class="ph ph-caret-right" />
+                    </button>
+                  </el-tooltip>
+                  <el-tooltip v-if="renamingId !== acc.id" :content="`${acc.name || '（未命名账号）'}（点击重命名）`" placement="top">
+                    <span class="acc-name" @click="startRename(acc)">{{ acc.name || "（未命名账号）" }}</span>
+                  </el-tooltip>
                   <input
                     v-else
                     v-model="renameText"
@@ -1444,32 +1458,45 @@ onUnmounted(() => {
                   <span class="acc-sub">
                     <span class="acc-src">{{ SOURCE_NAMES[acc.source] || acc.source }}</span>
                     <i>·</i>
-                    <button class="acc-uid mono" :disabled="!acc.uid" title="点击查看完整 UID" @click="uidRow = acc">
-                      {{ acc.uid ? uidBrief(acc.uid) : "无 UID" }}
-                    </button>
+                    <el-tooltip content="点击查看完整 UID" placement="top">
+                      <!-- 无 UID 时按钮是 disabled，禁用元素不派发鼠标事件 ⇒ 由这层 span 承接 hover，
+                           否则「为什么点不动」这条提示正好在最需要看的时候哑掉（上游 ConfigUsageSection 同款） -->
+                      <span>
+                        <button class="acc-uid mono" :disabled="!acc.uid" @click="uidRow = acc">
+                          {{ acc.uid ? uidBrief(acc.uid) : "无 UID" }}
+                        </button>
+                      </span>
+                    </el-tooltip>
                     <template v-if="acc.liveHere">
                       <i>·</i>
-                      <span class="tag tag-info acc-live" :title="`${ch.display} 客户端在本机当前登录的就是这个账号`"><i class="ph ph-desktop-tower"></i>本机登录</span>
+                      <el-tooltip :content="`${ch.display} 客户端在本机当前登录的就是这个账号`" placement="top">
+                        <span class="tag tag-info acc-live"><i class="ph ph-desktop-tower"></i>本机登录</span>
+                      </el-tooltip>
                     </template>
                   </span>
                 </td>
                 <td>
                   <!-- 状态标签：有最近错误的账号可点击，弹小窗看错误全文 -->
-                  <span
-                    class="tag status-tag"
-                    :class="[isNeedCaptcha(acc) ? 'tag-warn' : ACCOUNT_STATUS[acc.status]?.cls || 'tag-dim', { 'has-err': !!acc.lastError }]"
-                    :title="acc.lastError ? '点击查看最近一次上游错误' : ''"
-                    @click="acc.lastError && (errRow = acc)"
-                  >
-                    {{ isNeedCaptcha(acc) ? "需过码" : (ACCOUNT_STATUS[acc.status]?.text || acc.status) }}
-                  </span>
+                  <el-tooltip :content="acc.lastError ? '点击查看最近一次上游错误' : ''" :disabled="!acc.lastError" placement="top">
+                    <span
+                      class="tag status-tag"
+                      :class="[isNeedCaptcha(acc) ? 'tag-warn' : ACCOUNT_STATUS[acc.status]?.cls || 'tag-dim', { 'has-err': !!acc.lastError }]"
+                      @click="acc.lastError && (errRow = acc)"
+                    >
+                      {{ isNeedCaptcha(acc) ? "需过码" : (ACCOUNT_STATUS[acc.status]?.text || acc.status) }}
+                    </span>
+                  </el-tooltip>
                   <!-- 冷却剩余时间：秒级跳动，到点自动归零消失（状态派生在主进程惰性完成） -->
                   <span v-if="coolLeft(acc)" class="cool-left mono">剩 {{ coolLeft(acc) }}</span>
                   <!-- 模型级冷却（6004/11102 不落账号状态）：悬浮看逐模型明细 -->
-                  <span v-if="modelCoolLeft(acc)" class="cool-left mono" :title="modelCoolTitle(acc)">模型冷却剩 {{ modelCoolLeft(acc) }}</span>
+                  <el-tooltip v-if="modelCoolLeft(acc)" :content="modelCoolTitle(acc)" :disabled="!modelCoolTitle(acc)" placement="top">
+                    <span class="cool-left mono">模型冷却剩 {{ modelCoolLeft(acc) }}</span>
+                  </el-tooltip>
                 </td>
                 <template v-if="isBuiltin(ch)">
-                  <td class="mono num" :title="acc.channel === 'zcode' && acc.credits > 0 ? `${fmtInt(acc.credits)} Tokens` : ''">{{ acc.hasToken ? (acc.credits === -1 ? "不限" : fmtBalance(acc.credits, acc.channel)) : "-" }}</td>
+                  <el-tooltip :content="creditTip(acc)" :disabled="!creditTip(acc)" placement="top">
+                    <td class="mono num">{{ acc.hasToken ? (acc.credits === -1 ? "不限" : fmtBalance(acc.credits, acc.channel)) : "-" }}</td>
+                  </el-tooltip>
                   <td class="mono">{{ acc.expiresAt ? fmtDate(acc.expiresAt) : "-" }}</td>
                 </template>
                 <td class="mono num">{{ acc.todayReq }} 次 · {{ fmtK(acc.todayTokens) }} · {{ acc.creditsToday < 0 ? "-" : fmtInt(acc.creditsToday) }} 积分</td>
@@ -1478,54 +1505,61 @@ onUnmounted(() => {
                   <button v-if="isBuiltin(ch)" class="btn-link btn-sm" :disabled="refreshingId === acc.id" @click="refreshOne(acc)">
                     {{ refreshingId === acc.id ? "刷新中…" : "刷新" }}
                   </button>
-                  <button
+                  <el-tooltip
                     v-if="acc.hasToken && isBuiltin(ch) && (checkinCapable(acc.channel) || acc.channel === 'zcode')"
-                    class="btn-link btn-sm"
-                    :disabled="checkinBusy"
-                    :title="acc.channel === 'workbuddy_ai' ? '国际版无每日签到，用上方工具栏「领加油包」' : acc.channel === 'raccoon' ? '登录送积分（幂等，锁定当日积分 7 天）' : acc.channel === 'zcode' ? '领取当前可领的奖励套餐（如需人机校验会弹官方验证窗）' : '对该账号执行每日签到'"
-                    @click="runCheckinAccount(acc)"
+                    :content="acc.channel === 'workbuddy_ai' ? '国际版无每日签到，用上方工具栏「领加油包」' : acc.channel === 'raccoon' ? '登录送积分（幂等，锁定当日积分 7 天）' : acc.channel === 'zcode' ? '领取当前可领的奖励套餐（如需人机校验会弹官方验证窗）' : '对该账号执行每日签到'"
+                    placement="top"
                   >
-                    {{ acc.channel === "zcode" ? "领取" : "签到" }}
-                  </button>
-                  <button
+                    <button class="btn-link btn-sm" :disabled="checkinBusy" @click="runCheckinAccount(acc)">
+                      {{ acc.channel === "zcode" ? "领取" : "签到" }}
+                    </button>
+                  </el-tooltip>
+                  <el-tooltip
                     v-if="acc.channel === 'zcode'"
-                    class="btn-link btn-sm"
-                    :class="{ 'btn-captcha-warn': isNeedCaptcha(acc) }"
-                    :disabled="solvingCaptchaId === acc.id"
-                    :title="isNeedCaptcha(acc) ? '触发了上游阿里云人机校验，点击弹出验证码窗口进行过码' : '手动完成一次阿里云人机校验以刷新上游风控信誉'"
-                    @click="runSolveCaptcha(acc)"
+                    :content="isNeedCaptcha(acc) ? '触发了上游阿里云人机校验，点击弹出验证码窗口进行过码' : '手动完成一次阿里云人机校验以刷新上游风控信誉'"
+                    placement="top"
                   >
-                    {{ solvingCaptchaId === acc.id ? "过码中…" : (isNeedCaptcha(acc) ? "需过码" : "过码") }}
-                  </button>
-                  <button
+                    <button
+                      class="btn-link btn-sm"
+                      :class="{ 'btn-captcha-warn': isNeedCaptcha(acc) }"
+                      :disabled="solvingCaptchaId === acc.id"
+                      @click="runSolveCaptcha(acc)"
+                    >
+                      {{ solvingCaptchaId === acc.id ? "过码中…" : (isNeedCaptcha(acc) ? "需过码" : "过码") }}
+                    </button>
+                  </el-tooltip>
+                  <el-tooltip
                     v-if="acc.channel === 'zcode'"
-                    class="btn-link btn-sm"
-                    :disabled="ideSwitching === acc.id"
-                    title="领取模式（人工操作）：把本机指纹临时借出为该账号专属指纹并重启客户端，之后在官方客户端里点「限时可领取」人工领取周末套餐；领完回工具栏点「恢复本机指纹」。期间手机远程不可用"
-                    @click="enterClaimMode(acc)"
+                    content="领取模式（人工操作）：把本机指纹临时借出为该账号专属指纹并重启客户端，之后在官方客户端里点「限时可领取」人工领取周末套餐；领完回工具栏点「恢复本机指纹」。期间手机远程不可用"
+                    placement="top"
                   >
-                    {{ ideSwitching === acc.id ? "处理中…" : "领取模式" }}
-                  </button>
-                  <button
-                    v-if="isBuiltin(ch)"
-                    class="btn-link btn-sm"
-                    :disabled="ideSwitching === acc.id || !ideSupported(acc)"
-                    :title="ideTitle(acc)"
-                    @click="ideSwitch(acc)"
-                  >
-                    {{ ideSwitching === acc.id ? "切换中…" : "切到 IDE" }}
-                  </button>
-                  <button
+                    <button class="btn-link btn-sm" :disabled="ideSwitching === acc.id" @click="enterClaimMode(acc)">
+                      {{ ideSwitching === acc.id ? "处理中…" : "领取模式" }}
+                    </button>
+                  </el-tooltip>
+                  <el-tooltip v-if="isBuiltin(ch)" :content="ideTitle(acc)" :disabled="!ideTitle(acc)" placement="top">
+                    <!-- 「切到 IDE」在客户端没装/不支持时是常置 disabled 的，提示正是解释它为什么点不动 ⇒ 同 UID 那格，用 span 承接 hover -->
+                    <span>
+                      <button
+                        class="btn-link btn-sm"
+                        :disabled="ideSwitching === acc.id || !ideSupported(acc)"
+                        @click="ideSwitch(acc)"
+                      >
+                        {{ ideSwitching === acc.id ? "切换中…" : "切到 IDE" }}
+                      </button>
+                    </span>
+                  </el-tooltip>
+                  <el-tooltip
                     v-if="acc.status === 'cooling' || (acc.modelCool && acc.modelCool.length)"
-                    class="btn-link btn-sm"
-                    :disabled="coolOffId === acc.id"
-                    :title="acc.status === 'cooling'
+                    :content="acc.status === 'cooling'
                       ? '立即结束冷却，账号马上回到可用调度（同时豁免其模型级冷却）'
                       : '该账号部分模型在冷却中（6004 限流/11102 不支持），解除后这些模型立即恢复可用'"
-                    @click="releaseCool(acc)"
+                    placement="top"
                   >
-                    {{ coolOffId === acc.id ? "解除中…" : "解冷却" }}
-                  </button>
+                    <button class="btn-link btn-sm" :disabled="coolOffId === acc.id" @click="releaseCool(acc)">
+                      {{ coolOffId === acc.id ? "解除中…" : "解冷却" }}
+                    </button>
+                  </el-tooltip>
                   <button class="btn-link btn-sm" @click="toggleAccount(acc)">{{ acc.status === "disabled" ? "启用" : "停用" }}</button>
                   <button class="btn-link btn-sm danger" @click="delRow = acc; delOpen = true">移出</button>
                 </td>
@@ -1539,11 +1573,17 @@ onUnmounted(() => {
                         <th>积分包</th><th>已用</th><th>总额</th><th>剩余</th><th>到期</th><th>剩余天数</th><th>状态</th>
                       </tr>
                       <tr v-for="(pkg, pi) in acc.packages" :key="pkg.code || pi">
-                        <td class="pkg-name" :title="pkg.name">
-                          {{ pkg.name || "积分包" }}
-                          <div v-if="pkg.total > 0" class="pkg-bar" :title="`已用 ${fmtInt(pkg.used)} / 总额 ${fmtInt(pkg.total)}`">
-                            <span class="pkg-bar-used" :style="{ width: pkgUsedPct(pkg) + '%' }" />
-                          </div>
+                        <td class="pkg-name">
+                          <!-- 名称与进度条各挂一个浮层，且都**不**挂在 td 上：td 是二者的共同祖先，
+                               包上去会一次 hover 叠出两个浮层（原生 title 是内层覆盖外层，没有这个问题） -->
+                          <el-tooltip :content="pkg.name" :disabled="!pkg.name" placement="top">
+                            <span>{{ pkg.name || "积分包" }}</span>
+                          </el-tooltip>
+                          <el-tooltip v-if="pkg.total > 0" :content="`已用 ${fmtInt(pkg.used)} / 总额 ${fmtInt(pkg.total)}`" placement="top">
+                            <div class="pkg-bar">
+                              <span class="pkg-bar-used" :style="{ width: pkgUsedPct(pkg) + '%' }" />
+                            </div>
+                          </el-tooltip>
                         </td>
                         <td class="mono num">{{ pkg.used === -1 ? "不限" : fmtInt(pkg.used) }}</td>
                         <td class="mono num">{{ pkg.total === -1 ? "不限" : fmtInt(pkg.total) }}</td>

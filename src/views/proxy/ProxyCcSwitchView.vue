@@ -273,20 +273,23 @@ onMounted(() => {
           <div class="kpi"><span>Codex</span><b :class="entry('codex')?.registered ? 'acc' : ''">{{ entry("codex")?.registered ? "已注册" : "未注册" }}</b></div>
           <div class="kpi">
             <span>链路 · Claude Code</span>
-            <b :class="liveCls(st?.live?.claude)" :title="liveTitle(st?.live?.claude)">{{ liveLabel(st?.live?.claude) }}</b>
+            <el-tooltip :content="liveTitle(st?.live?.claude)" :disabled="!liveTitle(st?.live?.claude)" placement="top">
+              <b :class="liveCls(st?.live?.claude)">{{ liveLabel(st?.live?.claude) }}</b>
+            </el-tooltip>
           </div>
           <div class="kpi">
             <span>路由 · Claude Desktop</span>
-            <b
-              :class="takeoverOf('claude-desktop') ? 'acc' : 'err'"
-              :title="takeoverOf('claude-desktop')
-                ? 'CC Switch 当前接管中：Claude Desktop 经其本地网关做角色映射，使用期间需 CC Switch 保持运行'
-                : 'CC Switch 未接管（未开启或未运行）：Claude Desktop 缺角色映射不可用，可在 CC Switch「设置 → 本地路由」开启'"
-            >{{ takeoverOf("claude-desktop") ? "已开启" : "未开启" }}</b>
+            <el-tooltip placement="top" :content="takeoverOf('claude-desktop')
+              ? 'CC Switch 当前接管中：Claude Desktop 经其本地网关做角色映射，使用期间需 CC Switch 保持运行'
+              : 'CC Switch 未接管（未开启或未运行）：Claude Desktop 缺角色映射不可用，可在 CC Switch「设置 → 本地路由」开启'">
+              <b :class="takeoverOf('claude-desktop') ? 'acc' : 'err'">{{ takeoverOf("claude-desktop") ? "已开启" : "未开启" }}</b>
+            </el-tooltip>
           </div>
           <div class="kpi">
             <span>链路 · Codex</span>
-            <b :class="liveCls(st?.live?.codex)" :title="liveTitle(st?.live?.codex)">{{ liveLabel(st?.live?.codex) }}</b>
+            <el-tooltip :content="liveTitle(st?.live?.codex)" :disabled="!liveTitle(st?.live?.codex)" placement="top">
+              <b :class="liveCls(st?.live?.codex)">{{ liveLabel(st?.live?.codex) }}</b>
+            </el-tooltip>
           </div>
           <div class="kpi"><span>数据库</span><b class="mono">{{ st?.dbPath || "-" }}</b></div>
         </div>

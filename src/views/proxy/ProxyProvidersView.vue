@@ -239,6 +239,12 @@ const rowTest = ref<Record<string, { state: "testing" | "ok" | "fail"; ms?: numb
 function rowId(r: ModelRow) {
   return (r.model || "").trim().toLowerCase() || `__blank_${modelRows.value.indexOf(r)}`;
 }
+// 浮层正文走 el-tooltip（上游 v1.38.0 口径）。这三条都可能为空，空串必须 :disabled——
+// 原生 title 给空串是不显示，el-tooltip 给空串会飘出一个空玻璃泡，两档语义得对齐
+const rowOkTip = (r: ModelRow) => rowTest.value[rowId(r)]?.sample || "";
+const rowFailTip = (r: ModelRow) => rowTest.value[rowId(r)]?.message || "";
+const testTip = computed(() =>
+  testResult.value ? ((testResult.value.ok ? testResult.value.sample : testResult.value.message) || "") : "");
 function addModelRow() {
   modelRows.value.push(blankRow());
 }
@@ -595,7 +601,9 @@ onMounted(refresh);
               <td class="mono">{{ p.id }}</td>
               <td>{{ p.display }}</td>
               <td><span class="tag tag-dim">{{ kindLabel(p.kind) }}</span></td>
-              <td class="mono url-cell" :title="p.baseUrl">{{ p.baseUrl }}</td>
+              <el-tooltip :content="p.baseUrl" :disabled="!p.baseUrl" placement="top">
+                <td class="mono url-cell">{{ p.baseUrl }}</td>
+              </el-tooltip>
               <td class="mono num">{{ p.onlineCount ?? 0 }}/{{ p.keyCount ?? 0 }}</td>
               <td class="mono num">{{ p.models.length }}</td>
               <td>
@@ -719,12 +727,12 @@ onMounted(refresh);
                   <button class="btn btn-sm m-test" :disabled="!m.model || rowTest[rowId(m)]?.state === 'testing'" @click="testOne(m)">
                     {{ rowTest[rowId(m)]?.state === "testing" ? "测试中…" : "测试" }}
                   </button>
-                  <span v-if="rowTest[rowId(m)]?.state === 'ok'" class="tag tag-ok" :title="rowTest[rowId(m)]?.sample">
-                    可用 {{ rowTest[rowId(m)]?.ms }}ms
-                  </span>
-                  <span v-else-if="rowTest[rowId(m)]?.state === 'fail'" class="tag tag-warn m-fail" :title="rowTest[rowId(m)]?.message">
-                    {{ (rowTest[rowId(m)]?.message || "").slice(0, 40) }}
-                  </span>
+                  <el-tooltip v-if="rowTest[rowId(m)]?.state === 'ok'" :content="rowOkTip(m)" :disabled="!rowOkTip(m)" placement="top">
+                    <span class="tag tag-ok">可用 {{ rowTest[rowId(m)]?.ms }}ms</span>
+                  </el-tooltip>
+                  <el-tooltip v-else-if="rowTest[rowId(m)]?.state === 'fail'" :content="rowFailTip(m)" :disabled="!rowFailTip(m)" placement="top">
+                    <span class="tag tag-warn m-fail">{{ (rowTest[rowId(m)]?.message || "").slice(0, 40) }}</span>
+                  </el-tooltip>
                   <button class="btn-link btn-sm m-del danger" @click="removeModelRow(i)">移除</button>
                 </div>
               </div>
@@ -756,20 +764,21 @@ onMounted(refresh);
           </div>
           <!-- 操作条固定在弹窗底部：表单比视口高，按钮跟着滚走的话每次保存都要先滚到底 -->
           <div class="form-foot">
-            <button class="btn" :disabled="testing" title="向上游发一次 max_tokens=16 的真实最小请求：会计费，但不改动号池 Key 的冷却状态" @click="doTest">
-              {{ testing ? "测试中…" : "测试连接" }}
-            </button>
-            <span
-              v-if="testResult"
-              class="set-desc f-foot-msg"
-              :class="{ 'err-text': !testResult.ok }"
-              :title="testResult.ok ? testResult.sample : testResult.message"
-            >
-              <template v-if="testResult.ok">
-                通过 {{ testResult.ms }}ms · {{ testResult.finishReason || "-" }} · token {{ testResult.usage?.prompt_tokens ?? "?" }}/{{ testResult.usage?.completion_tokens ?? "?" }}
-              </template>
-              <template v-else>失败：{{ testResult.message }}<template v-if="testResult.status">（HTTP {{ testResult.status }}）</template></template>
-            </span>
+            <!-- 测试期间按钮是 disabled（鼠标事件被浏览器吞掉，浮层此时不出），但那一秒按钮自己写着「测试中…」，
+                 不需要浮层解释，所以不额外套 span 承接 hover —— 只有"常置 disabled 且提示在解释为什么点不动"才套 -->
+            <el-tooltip content="向上游发一次 max_tokens=16 的真实最小请求：会计费，但不改动号池 Key 的冷却状态" placement="top">
+              <button class="btn" :disabled="testing" @click="doTest">
+                {{ testing ? "测试中…" : "测试连接" }}
+              </button>
+            </el-tooltip>
+            <el-tooltip v-if="testResult" :content="testTip" :disabled="!testTip" placement="top">
+              <span class="set-desc f-foot-msg" :class="{ 'err-text': !testResult.ok }">
+                <template v-if="testResult.ok">
+                  通过 {{ testResult.ms }}ms · {{ testResult.finishReason || "-" }} · token {{ testResult.usage?.prompt_tokens ?? "?" }}/{{ testResult.usage?.completion_tokens ?? "?" }}
+                </template>
+                <template v-else>失败：{{ testResult.message }}<template v-if="testResult.status">（HTTP {{ testResult.status }}）</template></template>
+              </span>
+            </el-tooltip>
             <button class="btn f-foot-push" @click="formOpen = false">取消</button>
             <button class="btn btn-primary" :disabled="busy" @click="doSave">{{ busy ? "保存中…" : "保存" }}</button>
           </div>
@@ -962,7 +971,7 @@ onMounted(refresh);
   padding: 10px 18px 14px;
   border-top: 1px solid var(--line);
 }
-/* 测试结果挤在按钮排里：长了就截断，完整内容在 title 上 */
+/* 测试结果挤在按钮排里：长了就截断，完整内容在 el-tooltip 浮层上 */
 .f-foot-msg {
   max-width: 330px;
   min-width: 0;
