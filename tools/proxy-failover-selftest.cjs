@@ -1,6 +1,7 @@
 // 反代网关跨渠道故障转移自测（v1.40.0）：503 耗尽 → 渠道降级 → 请求内跳备选 → 降级避让 →
 // 半开回切 → 指数退避翻倍 → failover 开关 → 全渠道耗尽带轨迹报错
 // 用法：ELECTRON_RUN_AS_NODE=1 electron tools/proxy-failover-selftest.cjs <临时数据目录>
+//       目录参数可省略（省略时自建 mkdtemp）；显式传入的目录必须为空，非空直接报错退出
 //
 // 时序语义说明：本脚本用 base=1500ms 的压缩节奏，让「半开探测再失败」落在 noteChannelFail
 // 的 60s 连败窗内（单次失败即凑满 2 连 → 立刻再降级、streak+1），验证的是 streak 数学与
@@ -13,6 +14,12 @@ const path = require("node:path");
 const fs = require("node:fs");
 
 const tmp = process.argv[2] || fs.mkdtempSync(path.join(os.tmpdir(), "agenthub-failover-test-"));
+// 显式传入的目录必须是空目录：残留状态（例如跟 proxy-smoke 共用了同一个 mktemp）会让
+// 「初始快照为空」这类前置断言以莫须有的方式失败，在这里一句话说清比满屏断言栈有用
+if (fs.existsSync(tmp) && fs.readdirSync(tmp).length > 0) {
+  console.error(`数据目录非空（${tmp}）：本自测要求全新临时目录，请传 mktemp -d 的新结果，或不传参由脚本自建`);
+  process.exit(1);
+}
 process.env.APPDATA = tmp; // config.cjs 纯 Node 模式退回 %APPDATA%\AgentHub
 
 async function main() {
@@ -226,11 +233,11 @@ async function main() {
   rr = await call({ model: "glm-5.3", stream: false, messages: bodyMsg });
   assert(rr.status >= 500, "T6 全渠道失败报错: " + rr.status);
   const t6err = (await rr.json()).error.message;
-  assert(/已尝试 3 个渠道/.test(t6err), "T6 轨迹渠道数: " + t6err);
+  assert(/3 个渠道均不可用/.test(t6err), "T6 轨迹渠道数: " + t6err);
   // 上游原断言把第三家写死成 zcode。本 fork 内置渠道 11 个，`glm-5.3` 的第三家备选按综合分
   // 排到谁取决于目录归属（实测是 autoclaw），所以这里钉「前两家的顺序 + 恰好三家不重复」，
   // 而不是钉第三个名字——顺序与条数才是本场景要证的，名单是渠道清单的函数。
-  const t6seq = (/已尝试 3 个渠道（([^）]+)）/.exec(t6err) || [])[1] || "";
+  const t6seq = (/3 个渠道均不可用（([^）]+)）/.exec(t6err) || [])[1] || "";
   const t6chans = t6seq.split("→");
   assert(t6chans.length === 3 && t6chans[0] === "trae" && t6chans[1] === "workbuddy_ai", "T6 轨迹前两家顺序（主渠道→首个备选）: " + t6seq);
   assert(t6chans[2] && t6chans[2] !== "trae" && t6chans[2] !== "workbuddy_ai", "T6 第三家是另一家具余额的渠道: " + t6seq);

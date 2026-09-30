@@ -854,7 +854,9 @@ async function handleChat(req, res, settings, surface) {
     const st = (lastErr && lastErr.status) || 503;
     const triedUnique = [...new Set(triedChannels)];
     let msg = st === 402 ? poolExhaustedMsg(triedUnique) : (lastErr && lastErr.message) || "渠道暂不可用（号池无可用账号）";
-    if (triedUnique.length > 1) msg = `已尝试 ${triedUnique.length} 个渠道（${triedUnique.join("→")}）均不可用：${msg}`;
+    // 措辞用「N 个渠道均不可用」而不是「已尝试 N 个」：triedChannels 里既有真打过的，也有
+    // 降级中直接跳过 / 号池空没打就过的——它们都确实不可用，但「尝试」只对前者成立
+    if (triedUnique.length > 1) msg = `${triedUnique.length} 个渠道均不可用（${triedUnique.join("→")}）：${msg}`;
     if (!wantStream || !ttftMs) {
       // 还没出过内容：流式下若响应头已发出去就得把错误塞进流，非流式还能正常回错误状态码
       if (wantStream && res.headersSent) sink.endErr(st, msg);
