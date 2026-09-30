@@ -6,7 +6,7 @@ import type { ComponentPublicInstance } from "vue";
 import * as api from "../../api/ipc";
 import type { ModelCustomEntry, ProxyChannelId, ProxyModel } from "../../types";
 import { useAppStore } from "../../stores/app";
-import { capabilityTags, channelName, fmtRate } from "./format";
+import { capabilityTags, channelName, fmtCtx, fmtInt, fmtRate, parseCtxInput } from "./format";
 import { ROW_H, colCountFor, winRange } from "./virtualWindow";
 import ModelMetaEditor from "../../components/proxy/ModelMetaEditor.vue";
 
@@ -99,6 +99,44 @@ const REASONING_EFFORT_OPTIONS = [
   { value: "xhigh", label: "极高 (xhigh)" },
   { value: "max", label: "最大 (max)" },
 ];
+
+// ===== 上下文长度输入：显示 K/M 缩写，编辑时展开为数字 =====
+// ctxDraft 存「正在编辑的原始文本」：有 key 时输入框显示草稿，无 key 时显示 ctxDisplay 的缩写值。
+// 不在草稿态做任何格式化，用户输入的每个字符都原样保留，光标不会跳。
+const ctxDraft = ref<Record<string, string>>({});
+
+/** 该模型当前生效的上下文长度（自定义优先，否则渠道目录值） */
+function ctxValue(m: ProxyModel): number {
+  return Number((app.config.proxy.modelCustom || {})[m.id]?.contextLength) || Number(m.contextLength) || 0;
+}
+
+/** 非编辑态显示值：K/M 缩写 */
+function ctxDisplay(m: ProxyModel): string {
+  return fmtCtx(ctxValue(m));
+}
+
+/** 悬停提示：编辑说明 + 当前精确值（缩写有精度损失，精确数字放这里） */
+function ctxTip(m: ProxyModel): string {
+  const v = ctxValue(m);
+  return v ? `自定义上下文长度（Token）：${fmtInt(v)}，可直接写 128K / 1M，留空恢复默认` : "自定义上下文长度（Token），留空则恢复默认";
+}
+
+/** 提交编辑：解析 "128K"/"1M" 为数字落库；草稿清掉后回到缩写显示 */
+async function commitCtx(m: ProxyModel) {
+  const raw = ctxDraft.value[m.id];
+  if (raw === undefined) return;
+  delete ctxDraft.value[m.id];
+  const parsed = parseCtxInput(raw);
+  // 认不出来的非空文本按「不提交」处理，让显示退回当前值：
+  // parseCtxInput 对无效输入返回 undefined，而 undefined 在下游等于「清空覆盖、恢复默认」——
+  // 把 tooltip 里的 131,072（带千分位）原样粘进来就会静默删掉用户已有的自定义覆盖。
+  // 「留空恢复默认」是用户主动动作，两者不能走同一条路。
+  if (parsed === undefined && raw.trim() !== "") return;
+  // 与「当前生效值」比较而不是与自定义值比较：只聚焦再失焦时草稿就是原始数字，
+  // 若拿自定义值(0)比就会把目录自带值误写成一条自定义覆盖（凭空多出「自」标记）
+  if ((parsed || 0) === ctxValue(m)) return;
+  await updateModelCustom(m, { contextLength: parsed });
+}
 
 // ===== 模型自定义参数更新 =====
 async function updateModelCustom(m: ProxyModel, patch: Partial<ModelCustomEntry>) {
@@ -446,13 +484,21 @@ onMounted(refresh);
                   </td>
                   <td>
                     <div class="custom-cell">
-                      <el-tooltip content="自定义上下文长度（Token），留空则恢复默认" placement="top">
+                      <!-- 非编辑态显示 K/M 缩写（131K / 1M），聚焦才展开成完整数字草稿。
+                           本 fork 的列宽此前已实测到「6 位数字刚好放得下」（见下方 .custom-cell），
+                           收这段的真实收益是：非编辑态不再顶到列边、可直接写 128K / 1.5M 落库，
+                           精确值改由 tooltip 给出（缩写有精度损失）。宽度仍交给 flex，不写死 px。 -->
+                      <el-tooltip :content="ctxTip(m)" placement="top">
                         <input
-                          type="number"
+                          type="text"
                           class="f-input custom-input"
-                          :value="(app.config.proxy.modelCustom || {})[m.id]?.contextLength ?? (m.contextLength || '')"
+                          :value="ctxDraft[m.id] ?? ctxDisplay(m)"
                           placeholder="自动"
-                          @change="updateModelCustom(m, { contextLength: Number(($event.target as HTMLInputElement).value) || undefined })"
+                          @focus="ctxDraft[m.id] = String(ctxValue(m) || '')"
+                          @input="ctxDraft[m.id] = ($event.target as HTMLInputElement).value"
+                          @change="commitCtx(m)"
+                          @blur="commitCtx(m)"
+                          @keydown.enter="($event.target as HTMLInputElement).blur()"
                         />
                       </el-tooltip>
                       <el-tooltip v-if="(app.config.proxy.modelCustom || {})[m.id]?.contextLength" content="已自定义覆盖上下文" placement="top">
@@ -1143,15 +1189,6 @@ onMounted(refresh);
 }
 .custom-input:focus {
   border-color: var(--accent-line);
-}
-/* Chromium 给 input[type=number] 的步进按钮恒常预留约 15px（不悬停也占位），
-   原先写死 58px 的格子放 6 位上下文长度就会被裁成「13107」（实测 scrollWidth 64 vs clientWidth 56）。
-   这个字段是手填 Token 数，±1 步进没有意义，直接摘掉步进；摘后裁切 8px → 0。 */
-.custom-input::-webkit-inner-spin-button,
-.custom-input::-webkit-outer-spin-button {
-  -webkit-appearance: none;
-  appearance: none;
-  margin: 0;
 }
 .custom-el-select :deep(.el-select__wrapper) {
   min-height: 26px;

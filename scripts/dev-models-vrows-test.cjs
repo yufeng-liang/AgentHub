@@ -26,14 +26,15 @@ const FILE = "src/views/proxy/ProxyModelsView.vue";
 const TOTAL = 133; // 与真机 catalog 同量级（实测 proxy_models 返回 133 条）
 
 // ---- 从 TS 源里取真实的窗口数学（与组件用的是同一份，改错了这里一起红） ----
-function loadWindow() {
-  const src = fs.readFileSync(path.join(ROOT, "src/views/proxy/virtualWindow.ts"), "utf8");
-  const js = esbuild.transformSync(src, { loader: "ts", format: "cjs" }).code;
+function loadTsModule(rel) {
+  const js = esbuild.transformSync(fs.readFileSync(path.join(ROOT, rel), "utf8"), { loader: "ts", format: "cjs" }).code;
   const mod = { exports: {} };
   new Function("module", "exports", js)(mod, mod.exports);
   return mod.exports;
 }
-const { ROW_H, OVERSCAN, MIN_ROWS, winRange, colCountFor } = loadWindow();
+const { ROW_H, OVERSCAN, MIN_ROWS, winRange, colCountFor } = loadTsModule("src/views/proxy/virtualWindow.ts");
+// fmtCtx 取真的，不在这里手抄一遍缩写规则（抄了就变成门禁替被测代码答题）
+const { fmtCtx } = loadTsModule("src/views/proxy/format.ts");
 
 let pass = 0;
 const failures = [];
@@ -130,6 +131,12 @@ async function render({ rows, firstVisible, viewRows, activeTab = "" }) {
     REASONING_EFFORT_OPTIONS: [{ value: "", label: "默认" }],
     CHANNEL_OPTIONS: [{ value: "", label: "自动" }, { value: "trae", label: "Trae" }],
     capabilityTags: () => ["工具"], channelName: () => "Trae", fmtRate: () => "—",
+    // 上下文列「非编辑态 K/M 缩写 + 聚焦草稿」引入的绑定点。
+    // 这段只保证模板渲染得出来，本闸的判据是行结构（⑬ 已单独钉输入框还在），
+    // 所以 ctxValue 只取目录值、不复制组件里「自定义优先」那条链路。
+    ctxDraft: {}, ctxValue: (m) => Number(m.contextLength) || 0,
+    ctxDisplay: (m) => fmtCtx(Number(m.contextLength) || 0), ctxTip: () => "自定义上下文长度",
+    commitCtx: noop,
     updateModelCustom: noop, setOverride: noop, toggleEnabled: noop, openMetaEditor: noop,
   });
   app.config.warnHandler = () => {};
