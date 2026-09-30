@@ -408,6 +408,10 @@ watch.setOnEvent(({ kind, summary, count }) => {
 });
 
 // ===== 单实例锁 =====
+// 沙箱钩子（探针/交互验证用，与 config.cjs 的 AGENTHUB_DATA_DIR 同一套路）：显式指定 userData。
+// 必须在 requestSingleInstanceLock 之前生效——锁就落在 userData 里；且 Windows 上 Electron 的
+// appData 取自 Known Folder API 而非 APPDATA 环境变量，光重定向 APPDATA 骗不过锁。不设即无感。
+if (process.env.AGENTHUB_USER_DATA_DIR) app.setPath("userData", process.env.AGENTHUB_USER_DATA_DIR);
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
