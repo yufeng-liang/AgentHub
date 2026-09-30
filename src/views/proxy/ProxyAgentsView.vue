@@ -1202,11 +1202,15 @@ watch(active, (on) => {
 // ===== 冷却剩余时间（秒级跳动：一个定时器驱动全表，冷却多为 1min~6h，秒级粒度直观） =====
 const now = ref(Date.now());
 let nowTimer: number | undefined;
-/** 只有存在未到期的 cooling 账号时才值得每秒跳数：now 不更新，ref 不变，全表不 patch */
+/** 只有存在未到期的 cooling 账号或渠道降级时才值得每秒跳数：now 不更新，ref 不变，全表不 patch。
+ *  必须扫全量渠道——降级角标渲染在所有渠道主按钮上（v-for），只看激活渠道会让
+ *  非激活渠道的降级倒计时冻结在旧读数、过期后角标也不消失 */
 function tickNow() {
   if (!active.value) return;
-  const ch = pool.value.find((c) => c.id === activeChannel.value);
-  if (ch?.accounts.some((a) => a.status === "cooling" && a.coolUntil)) now.value = Date.now();
+  const needs = pool.value.some(
+    (c) => (c.health && c.health.until > now.value) || c.accounts.some((a) => a.status === "cooling" && a.coolUntil)
+  );
+  if (needs) now.value = Date.now();
 }
 function fmtLeft(ms: number): string {
   const s = Math.max(0, Math.ceil(ms / 1000));
@@ -1226,6 +1230,11 @@ function modelCoolLeft(acc: ProxyAccount): string {
   const list = (acc.modelCool || []).filter((m) => m.until > now.value);
   if (!list.length) return "";
   return fmtLeft(Math.min(...list.map((m) => m.until)) - now.value);
+}
+/** 渠道降级剩余时长（跨渠道故障转移：降级中的渠道流量已走备选，到期自动回切）；未降级返回空 */
+function channelCoolLeft(ch: ProxyChannelView): string {
+  if (!ch.health || ch.health.until <= now.value) return "";
+  return fmtLeft(ch.health.until - now.value);
 }
 /** 悬浮明细：逐条列出被冷却的模型与原因 */
 function modelCoolTitle(acc: ProxyAccount): string {
@@ -1295,7 +1304,7 @@ onMounted(() => {
         addOpen.value = false;
         refresh();
       }
-    } else if (p.type === "credits" || p.type === "status") {
+    } else if (p.type === "credits" || p.type === "status" || p.type === "channel-health") {
       if (active.value) scheduleRefresh(); // 页面不在前台就不拉不渲染，切回时 watch(active) 会补一次
     }
   });
@@ -1330,7 +1339,8 @@ onUnmounted(() => {
           </span>
           <span class="ch-badge" :class="{ ok: ch.summary.onlineCount > 0 }">
             {{ ch.summary.accountCount ? `${ch.summary.onlineCount}/${ch.summary.accountCount} 可用` : "空号池" }}
-
+            <!-- 渠道降级：倒计时到秒，1s 一跳由 tickNow 驱动；原因放在下面的渠道卡标题徽标上 -->
+            <em v-if="ch.health && ch.health.until > now" class="ch-degrade">降级 {{ channelCoolLeft(ch) }}</em>
           </span>
         </button>
       </div>
@@ -1342,6 +1352,10 @@ onUnmounted(() => {
           <span class="tag" :class="ch.summary.onlineCount > 0 ? 'tag-ok' : 'tag-dim'">
             {{ ch.summary.accountCount ? `${ch.summary.onlineCount}/${ch.summary.accountCount} 可用` : "空号池" }}
           </span>
+          <!-- 渠道降级徽标：上游那版用原生 title 挂原因，proxy 域统一走 el-tooltip（同门禁 ①） -->
+          <el-tooltip v-if="ch.health && ch.health.until > now" :content="ch.health.reason || '渠道降级，流量已走其他渠道'" placement="top" :show-after="200">
+            <span class="tag tag-err">降级中 · {{ channelCoolLeft(ch) }}后回切</span>
+          </el-tooltip>
           <span v-if="ch.summary.expired" class="tag tag-err">有账号已过期</span>
           <!-- 文案跟随 expiringSoonDays 阈值（默认 7 天，与后端 poolSummary/expiresBadge 同源），别写死 24h -->
           <span v-else-if="ch.summary.expiringSoon" class="tag tag-warn">{{ app.config.proxy.expiringSoonDays ?? 7 }} 天内有到期</span>
@@ -2133,16 +2147,16 @@ onUnmounted(() => {
   -webkit-line-clamp: 2;
   overflow: hidden;
 }
-.ch-sub {
-  font-size: 11px;
-  color: var(--text-3);
-  font-family: var(--font-mono);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.channel-btn.active .ch-sub {
-  color: var(--accent-strong);
+/* 渠道降级角标（跨渠道故障转移）：红色小徽标提示该渠道暂被熔断，倒计时后回切 */
+.ch-degrade {
+  font-style: normal;
+  margin-left: 5px;
+  padding: 0 5px;
+  border-radius: var(--r-pill);
+  background: color-mix(in srgb, var(--danger, var(--err, #e05555)) 18%, transparent);
+  color: var(--danger, var(--err, #e05555));
+  font-size: 10px;
+  line-height: 15px;
 }
 .ch-badge {
   flex-shrink: 0;

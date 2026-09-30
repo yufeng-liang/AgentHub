@@ -58,6 +58,10 @@ function defaultConfig(): AppConfig {
       modelCustom: {},
       autoFallbackEnabled: true,
       fallbackModel: "glm-5.2",
+      channelFailover: true,
+      channelFailoverMax: 3,
+      channelCooldownMs: 120000,
+      channelCooldownCapMs: 900000,
       ccSwitchModel: "",
       checkinAuto: false,
       checkinAutoTime: "09:00",
@@ -238,6 +242,7 @@ const PROXY_KEYS = [
 const PROXY_POOL = [
   {
     id: "trae", display: "Trae SOLO CN", domain: "api.trae.cn", poolStrategy: "expire_first",
+    health: null as { until: number; reason: string; streak: number } | null,
     summary: { channel: "trae", totalCredits: 72480, accountCount: 2, onlineCount: 2, earliestExpire: NOW + 48 * 86400000, expired: false, expiringSoon: false, todayReq: 412, todayTokens: 96400, lastCreditsAt: NOW - 25 * 60000 },
     accounts: [
       { id: "a1", channel: "trae", uid: "88213476", name: "主账号 · 沐", status: "online", credits: 51230, creditsAt: NOW - 25 * 60000, expiresAt: NOW + 48 * 86400000, coolUntil: 0, coolReason: "", source: "oauth", lastUsed: NOW - 3 * 60000, todayReq: 301, todayTokens: 70200, creditsToday: 21, createdAt: NOW - 20 * 86400000, hasToken: true,
@@ -249,6 +254,7 @@ const PROXY_POOL = [
   },
   {
     id: "workbuddy", display: "WorkBuddy（中国区）", domain: "copilot.tencent.com", poolStrategy: "credit_first",
+    health: null as { until: number; reason: string; streak: number } | null,
     summary: { channel: "workbuddy", totalCredits: 34120, accountCount: 2, onlineCount: 1, earliestExpire: NOW + 12 * 86400000, expired: false, expiringSoon: false, todayReq: 203, todayTokens: 41200, lastCreditsAt: NOW - 40 * 60000 },
 
     accounts: [
@@ -260,6 +266,7 @@ const PROXY_POOL = [
   },
   {
     id: "workbuddy_ai", display: "WorkBuddy AI（国际版）", domain: "www.workbuddy.ai", poolStrategy: "expire_first",
+    health: null as { until: number; reason: string; streak: number } | null,
     summary: { channel: "workbuddy_ai", totalCredits: 8120, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 33 * 86400000, expired: false, expiringSoon: false, todayReq: 66, todayTokens: 14800, lastCreditsAt: NOW - 70 * 60000 },
 
     accounts: [
@@ -269,6 +276,7 @@ const PROXY_POOL = [
   },
   {
     id: "raccoon", display: "商汤小浣熊", domain: "xiaohuanxiong.com", poolStrategy: "expire_first",
+    health: null as { until: number; reason: string; streak: number } | null,
     summary: { channel: "raccoon", totalCredits: 9800, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 29 * 86400000, expired: false, expiringSoon: true, todayReq: 18, todayTokens: 5200, lastCreditsAt: NOW - 12 * 60000 },
     accounts: [
       { id: "a6", channel: "raccoon", uid: "rc_88213", name: "小浣熊 1 号", status: "online", credits: 9800, creditsAt: NOW - 12 * 60000, expiresAt: NOW + 29 * 86400000, coolUntil: 0, coolReason: "", source: "json", lastUsed: NOW - 9 * 60000, todayReq: 18, todayTokens: 5200, creditsToday: 21, createdAt: NOW - 3 * 86400000, hasToken: true,
@@ -285,11 +293,13 @@ const PROXY_POOL = [
   // 以及积分到期页里「已过期但仍有余额」的行（账号 offline ⇒ 不计入 totalCredits，故汇总为 0）
   {
     id: "cline_free", display: "Cline 免费池", domain: "api.cline.bot", poolStrategy: "expire_first",
+    health: null as { until: number; reason: string; streak: number } | null,
     summary: { channel: "cline_free", totalCredits: 0, accountCount: 0, onlineCount: 0, earliestExpire: 0, expired: false, expiringSoon: false, todayReq: 0, todayTokens: 0, lastCreditsAt: 0 },
     accounts: [],
   },
   {
     id: "cline_pass", display: "Cline 订阅池", domain: "api.cline.bot", poolStrategy: "expire_first",
+    health: null as { until: number; reason: string; streak: number } | null,
     summary: { channel: "cline_pass", totalCredits: 0, accountCount: 1, onlineCount: 0, earliestExpire: NOW - 9 * 86400000, expired: true, expiringSoon: false, todayReq: 0, todayTokens: 0, lastCreditsAt: NOW - 30 * 86400000 },
     accounts: [
       { id: "a8", channel: "cline_pass", uid: "cl_55201", name: "订阅到期号", status: "relogin", credits: 0, creditsAt: NOW - 30 * 86400000, expiresAt: NOW - 9 * 86400000, coolUntil: 0, coolReason: "", source: "paste", lastUsed: NOW - 30 * 86400000, todayReq: 0, todayTokens: 0, creditsToday: -1, createdAt: NOW - 40 * 86400000, hasToken: true,
@@ -299,22 +309,26 @@ const PROXY_POOL = [
   },
   {
     id: "autoclaw", display: "智谱 AutoClaw（国内）", domain: "autoglm-acceleration-api.zhipuai.cn", poolStrategy: "expire_first",
+    health: null as { until: number; reason: string; streak: number } | null,
     summary: { channel: "autoclaw", totalCredits: 0, accountCount: 0, onlineCount: 0, earliestExpire: 0, expired: false, expiringSoon: false, todayReq: 0, todayTokens: 0, lastCreditsAt: 0 },
     accounts: [],
   },
   {
     id: "autoclaw_intl", display: "智谱 AutoClaw（国际）", domain: "autoglm-api.autoglm.ai", poolStrategy: "expire_first",
+    health: null as { until: number; reason: string; streak: number } | null,
     summary: { channel: "autoclaw_intl", totalCredits: 0, accountCount: 0, onlineCount: 0, earliestExpire: 0, expired: false, expiringSoon: false, todayReq: 0, todayTokens: 0, lastCreditsAt: 0 },
     accounts: [],
   },
   {
     id: "qoder", display: "Qoder", domain: "api3.qoder.sh", poolStrategy: "expire_first",
+    health: null as { until: number; reason: string; streak: number } | null,
     summary: { channel: "qoder", totalCredits: 0, accountCount: 0, onlineCount: 0, earliestExpire: 0, expired: false, expiringSoon: false, todayReq: 0, todayTokens: 0, lastCreditsAt: 0 },
     accounts: [],
   },
   // 自定义提供商在号池页的样子：kind=openai_compat 时余额/到期/签到/切到 IDE 全部不出现
   {
     id: "myrelay", display: "我的中转站", domain: "relay.example.com", poolStrategy: "round_robin", kind: "openai_compat", enabled: true,
+    health: null as { until: number; reason: string; streak: number } | null,
     baseUrl: "https://relay.example.com",
     models: [{ model: "gpt-4o", upstream: "gpt-4o-2024-11-20" }, "deepseek-v3.2"],
     extraHeaders: {}, extraBody: {}, updatedAt: NOW - 30 * 60000,
@@ -326,6 +340,8 @@ const PROXY_POOL = [
   },
   {
     id: "zcode", display: "ZCode（智谱）", domain: "zcode.z.ai", poolStrategy: "expire_first",
+    // 演示降级态：浏览器预览里能看到渠道卡降级徽标与回切倒计时的样式
+    health: { until: NOW + 95_000, reason: "上游 5xx，流量已走其他渠道", streak: 1 } as { until: number; reason: string; streak: number } | null,
     summary: { channel: "zcode", totalCredits: 150000000, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 90 * 86400000, expired: false, expiringSoon: false, todayReq: 12, todayTokens: 250000, lastCreditsAt: NOW - 10 * 60000 },
     accounts: [
       { id: "a7", channel: "zcode", uid: "zc_1001", name: "智谱主号", status: "online", credits: 150000000, creditsAt: NOW - 10 * 60000, expiresAt: NOW + 90 * 86400000, coolUntil: 0, coolReason: "", source: "json", lastUsed: NOW - 5 * 60000, todayReq: 12, todayTokens: 250000, creditsToday: 62000, createdAt: NOW - 5 * 86400000, hasToken: true },
@@ -1007,7 +1023,7 @@ export const mock = {
           running: true, port: 9527, bind: "127.0.0.1", baseUrl: "http://127.0.0.1:9527/v1",
           uptime: 3 * 3600000, active: 1,
           today: { req: 1284, tokens: 312400, successRate: 99.4, ttftAvg: 820 },
-          channels: PROXY_POOL.map((c) => ({ id: c.id, display: c.display, ...c.summary })),
+          channels: PROXY_POOL.map((c) => ({ id: c.id, display: c.display, ...c.summary, health: c.health })),
           keyCount: PROXY_KEYS.length, vaultOk: true, dbDriver: "node:sqlite",
           // 预览态给确定性的假值（不模拟真实 WAL 增长）：walBytes 为 0、从未周期 checkpoint 过。
           // 与真机同形状即可，前端拿它渲染「WAL 观测」一栏不会因字段缺失而崩。

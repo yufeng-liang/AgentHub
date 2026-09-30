@@ -382,6 +382,8 @@ function poolView() {
   pool.setExpiringSoonDays(settings().expiringSoonDays);
   const soonMs = Math.max(0, Number(settings().expiringSoonDays) || 0) * 86400000;
   const now = Date.now();
+  // 渠道降级快照一次取全（上游那版在循环里逐渠道取，每次都是全表快照）
+  const health = server.channelHealthSnapshot();
   // 逐包明细（Q6）：从持久化的 credit_packages 读取并附 expired/expiringSoon 派生量（时间态不落库）
   const withPackages = (a) => ({
     ...a,
@@ -392,6 +394,7 @@ function poolView() {
       expiringSoon: p.expiresAt > now && p.expiresAt - now < soonMs,
     })),
   });
+  // fork 的渠道清单走 poolChannels()（含自定义提供商），store 已不导出旧的 CHANNELS 常量
   return poolChannels().map((c) => {
     const summary = pool.poolSummary(c.id);
     // 当前电脑上的 agent 客户端登录的就是这个账号（按本机登录态 uid 比对，上游 v1.31）
@@ -406,6 +409,7 @@ function poolView() {
       poolStrategy: (agents.find((a) => a.id === c.id) || {}).poolStrategy || "expire_first",
       summary,
       accounts,
+      health: health[c.id] || null, // 降级状态（until/reason/streak），null=正常
     };
   });
 }
@@ -413,13 +417,16 @@ function poolView() {
 function gatewayStatus() {
   const s = server.status();
   const cfg = settings();
+  // 渠道清单同 poolView：用 fork 的 poolChannels()（带 kind、含自定义提供商，store 已不导出旧 CHANNELS）；
+  // 降级快照一次取全，不在 map 里逐渠道重取
+  const health = server.channelHealthSnapshot();
   return {
     ...s,
     port: s.running ? s.port : cfg.port,
     bind: s.running ? s.bind : cfg.bind,
     baseUrl: `http://${s.running ? s.bind : cfg.bind}:${s.running ? s.port : cfg.port}/v1`,
     today: store.statsToday(),
-    channels: poolChannels().map((c) => ({ id: c.id, display: c.display, kind: c.kind, ...pool.poolSummary(c.id) })),
+    channels: poolChannels().map((c) => ({ id: c.id, display: c.display, kind: c.kind, ...pool.poolSummary(c.id), health: health[c.id] || null })),
     keyCount: store.listKeys().length,
     vaultOk: vaultOk(),
     dbDriver: store.driver(),

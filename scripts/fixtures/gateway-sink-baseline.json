@@ -234,11 +234,11 @@
     "id": "waf-channel-block",
     "desc": "WAF Block Page 是渠道级故障：短退避整个渠道，不逐个冷却账号（followup 验退避真的生效）",
     "status": 200,
-    "body": "data: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: {\"error\":{\"message\":\"上游返回 HTML\",\"type\":\"upstream_error\",\"param\":null,\"code\":null}}\n\ndata: [DONE]\n\n",
+    "body": "data: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: {\"error\":{\"message\":\"渠道 trae 被上游边缘拦截（WAF Block Page）：与账号无关，已跳备选渠道\",\"type\":\"upstream_error\",\"param\":null,\"code\":null}}\n\ndata: [DONE]\n\n",
     "followups": [
       {
         "status": 200,
-        "body": "data: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: {\"error\":{\"message\":\"渠道 trae 被上游边缘拦截（WAF Block），Ns 后重试\",\"type\":\"upstream_error\",\"param\":null,\"code\":null}}\n\ndata: [DONE]\n\n",
+        "body": "data: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: {\"error\":{\"message\":\"渠道 trae 降级中（WAF Block），120s 后回切重试\",\"type\":\"upstream_error\",\"param\":null,\"code\":null}}\n\ndata: [DONE]\n\n",
         "picks": []
       }
     ],
@@ -255,15 +255,15 @@
         "channel": "trae",
         "accountName": "一号",
         "model": "glm-4.6",
-        "status": 405,
-        "error": "上游返回 HTML"
+        "status": 503,
+        "error": "渠道 trae 被上游边缘拦截（WAF Block Page）：与账号无关，已跳备选渠道"
       },
       {
-        "channel": "trae",
+        "channel": "",
         "accountName": "",
         "model": "glm-4.6",
         "status": 503,
-        "error": "渠道 trae 被上游边缘拦截（WAF Block），Ns 后重试"
+        "error": "渠道 trae 降级中（WAF Block），120s 后回切重试"
       }
     ]
   },
