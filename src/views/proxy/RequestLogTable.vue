@@ -17,12 +17,13 @@ const COLS: Record<"home" | "stats", ColDef[]> = {
   home: [
     { id: "time", label: "时间" }, { id: "model", label: "模型" }, { id: "channel", label: "渠道" },
     { id: "key", label: "KEY" }, { id: "status", label: "状态" }, { id: "usage", label: "用量" },
-    { id: "credits", label: "积分" }, { id: "ttft", label: "TTFT" }, { id: "latency", label: "耗时" },
+    // 表头用中性「消耗」：行级单位已逐渠道化（积分/Token/额度，见悬浮提示），列头不能钉死单一口径
+    { id: "credits", label: "消耗" }, { id: "ttft", label: "TTFT" }, { id: "latency", label: "耗时" },
   ],
   stats: [
     { id: "time", label: "时间" }, { id: "model", label: "模型" }, { id: "channel", label: "渠道" },
     { id: "key", label: "KEY" }, { id: "account", label: "账号" }, { id: "status", label: "状态" },
-    { id: "usage", label: "用量" }, { id: "credits", label: "积分" }, { id: "ttft", label: "TTFT" },
+    { id: "usage", label: "用量" }, { id: "credits", label: "消耗" }, { id: "ttft", label: "TTFT" },
     { id: "latency", label: "耗时" }, { id: "attempts", label: "重试" }, { id: "error", label: "错误" },
   ],
 };
