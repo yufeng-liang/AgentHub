@@ -1,67 +1,21 @@
-<!-- 请求日志表（总览实时流 / 用量统计明细共用）：列设置按 scope 存 localStorage，
+<!-- 请求日志表（总览实时流 / 用量统计明细共用）：可见列由父页经 visible prop 传入
+     （列设置按钮在父页卡片标题行，见 ColSettingsMenu.vue），
      失败状态徽标与错误摘要可点开详情，用量格第二行展示缓存读取与命中率（agent2api 口径：
      「-」= 上游未上报缓存字段，「0%」= 上报了但命中为 0，两者必须分开）。
      提示浮层一律 el-tooltip（上游 v1.38.0 口径），原生 title 在本页不许复活：
      content 可能为空时必须 :disabled，否则会飘出一个空玻璃泡——原生 title 给空串是不显示，
      这两档语义得对齐。骨架屏同页共用，首屏拉取时先占位再落数据 -->
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed } from "vue";
 import type { ProxyUsageRow } from "../../types";
 import { fmtInt, fmtMs, fmtTime, fmtDate, channelName, statusCls, balanceUnit } from "./format";
+import { LOG_COLS } from "./logCols";
 
-const props = defineProps<{ rows: ProxyUsageRow[]; scope: "home" | "stats"; loading?: boolean }>();
+const props = defineProps<{ rows: ProxyUsageRow[]; scope: "home" | "stats"; loading?: boolean; visible: string[] }>();
 const emit = defineEmits<{ (e: "detail", row: ProxyUsageRow): void }>();
 
-type ColDef = { id: string; label: string };
-const COLS: Record<"home" | "stats", ColDef[]> = {
-  home: [
-    { id: "time", label: "时间" }, { id: "model", label: "模型" }, { id: "channel", label: "渠道" },
-    { id: "key", label: "KEY" }, { id: "status", label: "状态" }, { id: "usage", label: "用量" },
-    // 表头用中性「消耗」：行级单位已逐渠道化（积分/Token/额度，见悬浮提示），列头不能钉死单一口径
-    { id: "credits", label: "消耗" }, { id: "ttft", label: "TTFT" }, { id: "latency", label: "耗时" },
-  ],
-  stats: [
-    { id: "time", label: "时间" }, { id: "model", label: "模型" }, { id: "channel", label: "渠道" },
-    { id: "key", label: "KEY" }, { id: "account", label: "账号" }, { id: "status", label: "状态" },
-    { id: "usage", label: "用量" }, { id: "credits", label: "消耗" }, { id: "ttft", label: "TTFT" },
-    { id: "latency", label: "耗时" }, { id: "attempts", label: "重试" }, { id: "error", label: "错误" },
-  ],
-};
-
-const LS_PREFIX = "agenthub.proxylog.";
-const visible = ref<string[]>(loadCols());
-function loadCols(): string[] {
-  try {
-    const raw = localStorage.getItem(LS_PREFIX + props.scope + ".cols");
-    const saved = raw ? (JSON.parse(raw) as string[]) : null;
-    const ids = COLS[props.scope].map((c) => c.id);
-    const hit = (saved || []).filter((id) => ids.includes(id));
-    return hit.length ? hit : ids; // 存过的列全被删光时回默认（防手改 localStorage 弄出空表）
-  } catch {
-    return COLS[props.scope].map((c) => c.id);
-  }
-}
-watch(visible, (v) => {
-  try { localStorage.setItem(LS_PREFIX + props.scope + ".cols", JSON.stringify(v)); } catch { /* 存不下就算了 */ }
-}, { deep: true });
-
-const cols = computed(() => COLS[props.scope].filter((c) => visible.value.includes(c.id)));
+const cols = computed(() => LOG_COLS[props.scope].filter((c) => props.visible.includes(c.id)));
 const colCount = computed(() => cols.value.length + 1); // + 尾部固定的「详情」按钮列
-
-const settingsOpen = ref(false);
-function toggleCol(id: string) {
-  const has = visible.value.includes(id);
-  if (has && visible.value.length <= 1) return; // 至少留一列，全关的表没有可读性
-  visible.value = has
-    ? visible.value.filter((x) => x !== id)
-    : COLS[props.scope].map((c) => c.id).filter((x) => x === id || visible.value.includes(x));
-}
-function resetCols() {
-  visible.value = COLS[props.scope].map((c) => c.id);
-}
-const onDocClick = () => { settingsOpen.value = false; };
-onMounted(() => document.addEventListener("click", onDocClick));
-onUnmounted(() => document.removeEventListener("click", onDocClick));
 
 function cacheRate(r: ProxyUsageRow): string {
   if (r.cachedTokens < 0 || !r.promptTokens) return "-";
@@ -89,19 +43,6 @@ const emptyText = computed(() =>
 
 <template>
   <div class="rlt-root">
-    <div class="rlt-tools">
-      <div class="rlt-settings-wrap" @click.stop>
-        <button class="btn btn-sm" :class="{ 'btn-primary': settingsOpen }" @click="settingsOpen = !settingsOpen">
-          <i class="ph ph-gear"></i> 列设置
-        </button>
-        <div v-if="settingsOpen" class="rlt-settings glass">
-          <div class="rlt-set-head">显示列 <button class="btn btn-sm" @click="resetCols">恢复默认</button></div>
-          <label v-for="c in COLS[scope]" :key="c.id" class="rlt-set-item">
-            <input type="checkbox" :checked="visible.includes(c.id)" @change="toggleCol(c.id)" />{{ c.label }}
-          </label>
-        </div>
-      </div>
-    </div>
     <div class="tbl-wrap">
       <table class="tbl">
         <tbody>
@@ -172,41 +113,10 @@ const emptyText = computed(() =>
 </template>
 
 <style scoped>
-.rlt-tools {
-  display: flex;
-  justify-content: flex-end;
-  padding: 0 0 6px;
-}
-.rlt-settings-wrap {
-  position: relative;
-}
-.rlt-settings {
-  position: absolute;
-  right: 0;
-  top: calc(100% + 4px);
-  z-index: 60;
-  min-width: 128px;
-  padding: 8px;
-  border-radius: var(--r-md, 8px);
-  border: 1px solid var(--line);
-}
-.rlt-set-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 12px;
-  font-size: 11px;
-  color: var(--text-3);
-  margin-bottom: 4px;
-}
-.rlt-set-item {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  padding: 3px 2px;
-  cursor: pointer;
-  white-space: nowrap;
+/* 表头对齐内容：global 的表头对齐规范默认左对齐，本表无需再覆盖；
+   操作列（表头空 + 详情按钮）保持右对齐 */
+.tbl th.rlt-op {
+  text-align: right !important;
 }
 .usage-cell {
   line-height: 1.5;

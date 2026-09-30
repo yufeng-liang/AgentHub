@@ -9,8 +9,13 @@ import { useAppStore } from "../../stores/app";
 import { fmtInt, fmtK, fmtMs, channelName } from "./format";
 import RequestLogTable from "./RequestLogTable.vue";
 import RequestDetailDialog from "./RequestDetailDialog.vue";
+import ColSettingsMenu from "./ColSettingsMenu.vue";
+import { LOG_COLS } from "./logCols";
 
 const app = useAppStore();
+
+// 明细表可见列：状态交给 ColSettingsMenu（含 localStorage 存档与恢复默认）
+const logCols = ref(LOG_COLS.stats.map((c) => c.id));
 
 const DAYS = 7;
 const ov = ref<ProxyStatsOverview | null>(null);
@@ -223,9 +228,11 @@ onMounted(async () => {
       <div class="card" style="margin-top: 12px">
         <div class="card-title">
           请求明细
-          <span class="right">
+          <!-- 工具条收两行：标题行 = 条数 + 列设置 + 清理；下一行筛选。原先列设置独占第三行错落 -->
+          <span class="right detail-title-tools">
             {{ fmtInt(detail?.total || 0) }} 条<template v-if="sinceTs"> · {{ RANGES.find((r) => r.value === range)?.label }}</template>
-            <button class="btn btn-sm" style="margin-left: 8px" :disabled="cleaning" @click="cleanOpen = true">
+            <ColSettingsMenu v-model="logCols" :cols="LOG_COLS.stats" scope="stats" />
+            <button class="btn btn-sm" :disabled="cleaning" @click="cleanOpen = true">
               <i class="ph ph-broom"></i> 清理
             </button>
           </span>
@@ -255,7 +262,7 @@ onMounted(async () => {
             <option v-for="k in keyOptions" :key="k.id" :value="k.id">{{ k.name }}</option>
           </select>
         </div>
-        <RequestLogTable :rows="detail?.rows || []" :loading="listLoading" scope="stats" @detail="openDetail" />
+        <RequestLogTable :rows="detail?.rows || []" :loading="listLoading" scope="stats" :visible="logCols" @detail="openDetail" />
         <div class="pager">
           <button class="btn btn-sm" :disabled="page <= 1" @click="goPage(page - 1)">上一页</button>
           <button class="btn btn-sm" :disabled="page >= totalPages" @click="goPage(page + 1)">下一页</button>
@@ -336,6 +343,12 @@ onMounted(async () => {
   align-items: center;
   gap: 8px;
   padding: 0 0 8px;
+}
+/* 标题行右侧：条数文本与两枚按钮的间距统一 */
+.detail-title-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
 }
 .pager {
   display: flex;

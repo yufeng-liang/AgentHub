@@ -7,9 +7,13 @@ import { useAppStore } from "../../stores/app";
 import { fmtInt, fmtK, fmtMs, fmtTime, statusCls, fmtBalance, balanceUnit, isTokenChannel } from "./format";
 import RequestLogTable from "./RequestLogTable.vue";
 import RequestDetailDialog from "./RequestDetailDialog.vue";
+import ColSettingsMenu from "./ColSettingsMenu.vue";
+import { LOG_COLS } from "./logCols";
 import { coalesceAsync } from "../../utils/timing";
 
 const app = useAppStore();
+// 实时流可见列：状态交给 ColSettingsMenu（含 localStorage 存档与恢复默认）
+const logCols = ref(LOG_COLS.home.map((c) => c.id));
 const st = ref<ProxyGatewayStatus | null>(null);
 const recent = ref<ProxyUsageRow[]>([]);
 const busy = ref(false);
@@ -286,7 +290,7 @@ onUnmounted(() => {
       <div class="agent-cards-grid">
         <div v-for="c in st?.channels || []" :key="c.id" class="card">
           <div class="card-title">
-            {{ c.display }}
+            <span class="ch-name">{{ c.display }}</span>
             <span class="tag" :class="c.onlineCount > 0 ? 'tag-ok' : 'tag-dim'">
               {{ c.accountCount ? `${c.onlineCount}/${c.accountCount} 可用` : "未配置" }}
             </span>
@@ -307,8 +311,14 @@ onUnmounted(() => {
              抽成 RequestLogTable.vue（列设置 / 用量 / 重试 / 错误列都在那边），所以这里不收内联表，
              那三项补进组件里，总览与统计页同时受益。上游同批还加了 :style="{ '--i': i }" 的逐行入场
              动画，但全仓没有任何 CSS 消费 --i（grep 'var(--i)' 为空），那是段死标记，不跟着抄。 -->
-        <div class="card-title">实时请求流 <span class="right">最近 {{ recent.length }} 条</span></div>
-        <RequestLogTable :rows="recent" :loading="loading" scope="home" @detail="openDetail" />
+        <div class="card-title">
+          实时请求流
+          <span class="right stream-title-tools">
+            最近 {{ recent.length }} 条
+            <ColSettingsMenu v-model="logCols" :cols="LOG_COLS.home" scope="home" />
+          </span>
+        </div>
+        <RequestLogTable :rows="recent" :loading="loading" scope="home" :visible="logCols" @detail="openDetail" />
       </div>
       <RequestDetailDialog :req="detailReq" @close="detailReq = null" />
       <div class="card">
@@ -611,6 +621,24 @@ onUnmounted(() => {
   font-weight: 600;
 }
 
+/* 渠道名 + 状态徽标同行：长名（智谱 AutoClaw（国内）＋未配置）不再各自断行——
+   名字超宽省略号截断，徽标永不折行、不被挤窄 */
+.ch-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.card-title .tag {
+  flex: none;
+  white-space: nowrap;
+}
+/* 标题行右侧：条数文本与列设置按钮的间距统一 */
+.stream-title-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
 /* Agent 渠道卡片自适应网格，避免多渠道落单孤立 */
 .agent-cards-grid {
   display: grid;
