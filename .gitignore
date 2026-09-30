@@ -4,6 +4,8 @@ node_modules/
 # 构建产物
 dist/
 release/
+# 指到别的输出目录打包时留下的同类产物（electron-builder --config.directories.output=release-xxx）
+/release-*/
 
 # 日志
 *.log
