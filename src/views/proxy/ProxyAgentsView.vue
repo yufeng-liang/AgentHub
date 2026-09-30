@@ -1466,8 +1466,8 @@ onUnmounted(() => {
             <tbody>
               <tr>
                 <th>账号</th><th>状态</th>
-                <template v-if="isBuiltin(ch)"><th>余额</th><th>到期</th></template>
-                <th>今日</th><th>操作</th>
+                <template v-if="isBuiltin(ch)"><th class="num">余额</th><th>到期</th></template>
+                <th class="num">今日</th><th>操作</th>
               </tr>
               <template v-for="acc in ch.accounts" :key="acc.id">
               <tr>
@@ -1608,7 +1608,7 @@ onUnmounted(() => {
                   <table class="pkg-tbl">
                     <tbody>
                       <tr>
-                        <th>{{ pkgFallbackName(acc.channel) }}</th><th>已用</th><th>总额</th><th>剩余</th><th>到期</th><th>剩余天数</th><th>状态</th>
+                        <th>{{ pkgFallbackName(acc.channel) }}</th><th class="num">已用</th><th class="num">总额</th><th class="num">剩余</th><th>到期</th><th class="num">剩余天数</th><th>状态</th>
                       </tr>
                       <tr v-for="(pkg, pi) in acc.packages" :key="pkg.code || pi">
                         <td class="pkg-name">

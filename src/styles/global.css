@@ -908,7 +908,7 @@ body {
   font-size: 11.5px;
 }
 .tbl th {
-  text-align: center;
+  text-align: left;
   font-weight: 600;
   color: var(--text-2);
   font-size: 11px;
@@ -2486,7 +2486,7 @@ select option {
 }
 
 .table thead th {
-  text-align: center;
+  text-align: left;
   font-size: 11.5px;
   color: var(--text-3);
   font-weight: 600;
@@ -2530,10 +2530,12 @@ select option {
   color: var(--text);
 }
 .table th.num {
-  text-align: center;
+  text-align: right;
 }
 
-/* 全站所有列表/表格表头文字统一定义：全部居中显示 */
+/* 全站表头对齐规范：表头与列内容同侧。td 默认左对齐，数值列（.num）右对齐，
+   表头跟着走——原先「全站居中」压在左对齐的 td 上，每列表头和内容都错位。
+   不带 !important：Element 内部件（日期面板等）自己的居中样式不该被外层劫持 */
 th,
 table thead th,
 table th,
@@ -2544,7 +2546,11 @@ table th,
 .sk-table th,
 .el-table th,
 .el-table th.el-table__cell {
-  text-align: center !important;
+  text-align: left;
+}
+/* 数值列表头跟 td.num 的右对齐一致（td.num 是右对齐的） */
+th.num {
+  text-align: right;
 }
 
 /* 表格行动画 */

@@ -169,7 +169,7 @@ onUnmounted(() => {
         <table class="tbl expiry-tbl">
           <tbody>
             <tr>
-              <th>渠道 · 账号</th><th>包名</th><th>剩余 / 总额</th><th>到期</th><th>剩余天数</th><th>状态</th>
+              <th>渠道 · 账号</th><th>包名</th><th class="num">剩余 / 总额</th><th>到期</th><th class="num">剩余天数</th><th>状态</th>
             </tr>
             <tr v-for="r in rows" :key="r.key" :class="rowCls(r.pkg)">
               <td>

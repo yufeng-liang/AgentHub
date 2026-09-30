@@ -797,7 +797,7 @@ watch(() => app.activePage, (p) => {
   .bs-col + .bs-col { border-left: none; padding-left: 0; }
 }
 
-th.op-cell { text-align: center; white-space: nowrap; }
+th.op-cell { text-align: right; white-space: nowrap; }
 td.op-cell { text-align: right; white-space: nowrap; }
 .op-cell .btn-link + .btn-link { margin-left: 2px; }
 /* 保存结果提示：标题行已去除，改为卡片上方的独立反馈行 */
