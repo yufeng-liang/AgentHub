@@ -4,7 +4,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { ComponentPublicInstance } from "vue";
 import * as api from "../../api/ipc";
- import type { ModelCustomEntry, ProxyChannelId, ProxyChannelView, ProxyModel } from "../../types";
+import type { ModelCustomEntry, ProxyChannelId, ProxyChannelView, ProxyModel } from "../../types";
 import { useAppStore } from "../../stores/app";
 import { capabilityTags, channelName, fmtCtx, fmtInt, fmtRate, parseCtxInput } from "./format";
 import { ROW_H, colCountFor, winRange } from "./virtualWindow";
@@ -15,13 +15,13 @@ const models = ref<ProxyModel[]>([]);
 const err = ref("");
 const msg = ref("");
 const syncing = ref("");
- const filter = ref("");
- const activeTab = ref(""); // "" = 全部
- /** 号池可用性过滤（默认开）：只看当前激活号池里有可用账号的渠道的模型。
-  *  单渠道 Tab 是显式选择，不受此开关限制。 */
- const onlyAvailable = ref(true);
- const mainTab = ref<"catalog" | "alias" | "reverse">("catalog");
- const ruleDialogOpen = ref(false);
+const filter = ref("");
+const activeTab = ref(""); // "" = 全部
+/** 号池可用性过滤（默认开）：只看当前激活号池里有可用账号的渠道的模型。
+ *  单渠道 Tab 是显式选择，不受此开关限制。 */
+const onlyAvailable = ref(true);
+const mainTab = ref<"catalog" | "alias" | "reverse">("catalog");
+const ruleDialogOpen = ref(false);
 
 // 渠道候选 = 号池当前渠道（渠道后续扩充时自动跟进，不写死）
 const channels = ref<{ id: string; display: string }[]>([]);
@@ -32,32 +32,32 @@ const CHANNEL_OPTIONS = computed<{ value: "" | ProxyChannelId; label: string }[]
 
 // 渠道 tab 只显示有模型的渠道：复用下方 modelsByChannel 预分组（O(渠道) 查直值，不再 O(渠道×模型) 逐对扫描）
 const tabChannels = computed(() => channels.value.filter((c) => (modelsByChannel.value[c.id] || []).length > 0));
- // ===== 号池激活态：渠道健康计算 + 可用性过滤 =====
- // 取数路径与号池页一致（proxy_pool 直查），随 refresh() 一起刷新
- const poolViews = ref<ProxyChannelView[]>([]);
- const channelView = computed<Record<string, { enabled: boolean; online: number; accounts: number; health: string }>>(() => {
+// ===== 号池激活态：渠道健康计算 + 可用性过滤 =====
+// 取数路径与号池页一致（proxy_pool 直查），随 refresh() 一起刷新
+const poolViews = ref<ProxyChannelView[]>([]);
+const channelView = computed<Record<string, { enabled: boolean; online: number; accounts: number; health: string }>>(() => {
    const map: Record<string, { enabled: boolean; online: number; accounts: number; health: string }> = {};
    for (const c of poolViews.value) {
      map[c.id] = { enabled: c.enabled !== false, online: c.summary?.onlineCount ?? 0, accounts: c.summary?.accountCount ?? 0, health: c.health?.reason || "" };
    }
    return map;
- });
- /** 渠道可用 = 启用 + 号池里有账号 + 有在线账号；三者缺一即视为不可用（灰显） */
- function channelAvailable(id: string): boolean {
+});
+/** 渠道可用 = 启用 + 号池里有账号 + 有在线账号；三者缺一即视为不可用（灰显） */
+function channelAvailable(id: string): boolean {
    const v = channelView.value[id];
    return !!v && v.enabled && v.accounts > 0 && v.online > 0;
- }
- /** 渠道 chip 的悬停说明：灰显原因一句话说清 */
- function channelHint(id: string): string {
+}
+/** 渠道 chip 的悬停说明：灰显原因一句话说清 */
+function channelHint(id: string): string {
    const v = channelView.value[id];
    if (!v) return "";
    if (!v.enabled) return "该渠道已在号池中禁用";
    if (!v.accounts) return "该渠道号池中没有账号";
    if (!v.online) return `该渠道账号当前全部不可用${v.health ? `（${v.health}）` : ""}`;
    return "渠道可用";
- }
+}
 
- const rows = computed(() => {
+const rows = computed(() => {
    const kw = filter.value.trim().toLowerCase();
    return models.value.filter((m) => {
      if (activeTab.value && !m.sources.includes(activeTab.value as ProxyChannelId)) return false;
@@ -69,7 +69,7 @@ const tabChannels = computed(() => channels.value.filter((c) => (modelsByChannel
      if (!kw) return true;
      return m.id.toLowerCase().includes(kw) || String(m.name || "").toLowerCase().includes(kw);
    });
- });
+});
 // ===== 虚拟滚动：只挂载视口附近那十几行 =====
 // 为什么必须做：133 行全量渲染 = 6212 个 DOM 节点，而滚动容器 clientHeight 实测只有 476px
 // （一屏 7 行）。切进本页要付 RecalcStyle ~315ms + Layout ~65ms（单帧最长 500–620ms）；
@@ -118,8 +118,8 @@ watch([filter, activeTab, mainTab], () => {
   firstVisible.value = 0;
   if (scrollerEl) scrollerEl.scrollTop = 0;
 });
- // ===== 思考强度选项 =====
- const REASONING_EFFORT_ALL = [
+// ===== 思考强度选项 =====
+const REASONING_EFFORT_ALL = [
    { value: "", label: "默认" },
    { value: "off", label: "关闭 (off)" },
    { value: "minimal", label: "极低 (minimal)" },
@@ -128,21 +128,21 @@ watch([filter, activeTab, mainTab], () => {
    { value: "high", label: "高 (high)" },
    { value: "xhigh", label: "极高 (xhigh)" },
    { value: "max", label: "最大 (max)" },
- ];
- /** 该模型可选的思考强度：元数据里声明了 supportedEfforts 就只给那些档位（+ 默认），
-  *  否则给全量词表 —— 下拉选项与元数据编辑器的「允许档位」不再互相矛盾。 */
- function effortOptions(m: ProxyModel) {
+];
+/** 该模型可选的思考强度：元数据里声明了 supportedEfforts 就只给那些档位（+ 默认），
+ *  否则给全量词表 —— 下拉选项与元数据编辑器的「允许档位」不再互相矛盾。 */
+function effortOptions(m: ProxyModel) {
    const allowed = (m.reasoning?.supportedEfforts || []).filter(Boolean);
    if (!allowed.length) return REASONING_EFFORT_ALL;
    return REASONING_EFFORT_ALL.filter((o) => !o.value || allowed.includes(o.value));
- }
- /** 思考强度下拉的悬停说明：声明了允许档位时点明出处，用户知道选项为何变少 */
- function effortTip(m: ProxyModel): string {
+}
+/** 思考强度下拉的悬停说明：声明了允许档位时点明出处，用户知道选项为何变少 */
+function effortTip(m: ProxyModel): string {
    const allowed = (m.reasoning?.supportedEfforts || []).filter(Boolean);
    return allowed.length
      ? `自定义思考强度（该模型声明支持：${allowed.join(" / ")}），直接注入出站请求参数`
      : "自定义思考强度，直接注入出站请求参数";
- }
+}
 
 // ===== 上下文长度输入：显示 K/M 缩写，编辑时展开为数字 =====
 // ctxDraft 存「正在编辑的原始文本」：有 key 时输入框显示草稿，无 key 时显示 ctxDisplay 的缩写值。
@@ -272,20 +272,24 @@ async function persist(successMsg: string) {
   setTimeout(() => (msg.value = ""), 2000);
 }
 
- async function refresh() {
-   try {
-     models.value = await api.proxyModels();
-     channels.value = await api.proxyPool().catch(() => channels.value);
-     // 号池视图（含 enabled / 在线数 / 降级原因）：渠道 chip 高亮与「仅看可用」过滤的数据源
-     poolViews.value = await api.proxyPool().catch(() => poolViews.value);
-     err.value = "";
-   } catch (e) {
-     err.value = String((e as Error).message || e);
-   }
- }
+async function refresh() {
+  try {
+    models.value = await api.proxyModels();
+    // 号池视图一次取全：channels 只要 id/display 两列，poolViews 还要 enabled/在线数/降级原因
+    // （渠道 chip 高亮与「仅看可用」过滤的数据源），同一份响应喂两边，别打两次 IPC
+    const views = await api.proxyPool().catch(() => null);
+    if (views) {
+      channels.value = views;
+      poolViews.value = views;
+    }
+    err.value = "";
+  } catch (e) {
+    err.value = String((e as Error).message || e);
+  }
+}
 
- /** 启停开关：默认开；关闭即写入 disabledModels 落盘（软件记录，重启保持） */
- async function toggleEnabled(m: ProxyModel, v: string | number | boolean) {
+/** 启停开关：默认开；关闭即写入 disabledModels 落盘（软件记录，重启保持） */
+async function toggleEnabled(m: ProxyModel, v: string | number | boolean) {
    const on = !!v;
    const list = new Set(app.config.proxy.disabledModels || []);
    if (on) list.delete(m.id);
@@ -293,7 +297,7 @@ async function persist(successMsg: string) {
    app.config.proxy.disabledModels = [...list];
    await persist(on ? `已启用 ${m.id}` : `已禁用 ${m.id}`);
    await refresh();
- }
+}
 
 async function setOverride(m: ProxyModel, v: string) {
   const ov = { ...(app.config.proxy.modelOverrides || {}) };
@@ -443,25 +447,25 @@ onMounted(refresh);
       <template v-if="mainTab === 'catalog'">
         <!-- 页头工具条：渠道分段选择器在左、搜索与官方目录拉取在右 -->
         <div class="models-head">
-           <div class="seg">
-             <button class="seg-item" :class="{ active: !activeTab }" @click="activeTab = ''">全部</button>
-             <el-tooltip
-               v-for="c in tabChannels"
-               :key="c.id"
-               :content="channelHint(c.id)"
-               :disabled="channelAvailable(c.id)"
-               placement="top"
-             >
-               <button
-                 class="seg-item"
-                 :class="{ active: activeTab === c.id, unavailable: !channelAvailable(c.id) }"
-                 @click="activeTab = c.id"
-               >
-                 <span v-if="channelAvailable(c.id)" class="seg-dot" aria-hidden="true"></span>
-                 {{ c.display }}
-               </button>
-             </el-tooltip>
-           </div>
+          <div class="seg">
+            <button class="seg-item" :class="{ active: !activeTab }" @click="activeTab = ''">全部</button>
+            <el-tooltip
+              v-for="c in tabChannels"
+              :key="c.id"
+              :content="channelHint(c.id)"
+              :disabled="channelAvailable(c.id)"
+              placement="top"
+            >
+              <button
+                class="seg-item"
+                :class="{ active: activeTab === c.id, unavailable: !channelAvailable(c.id) }"
+                @click="activeTab = c.id"
+              >
+                <span v-if="channelAvailable(c.id)" class="seg-dot" aria-hidden="true"></span>
+                {{ c.display }}
+              </button>
+            </el-tooltip>
+          </div>
           <span class="head-tools">
             <label class="search-box">
               <i class="ph ph-magnifying-glass"></i>
@@ -559,45 +563,45 @@ onMounted(refresh);
                       </el-tooltip>
                     </div>
                   </td>
-                   <td>
-                     <div class="custom-cell">
-                       <el-tooltip :content="effortTip(m)" placement="top">
-                         <span class="cell-select">
-                           <el-select
-                             class="f-el-select custom-el-select"
-                             popper-class="glass-popper"
-                             :persistent="false"
-                             :model-value="(app.config.proxy.modelCustom || {})[m.id]?.reasoningEffort || ''"
-                             style="width: 100%"
-                             placeholder="默认"
-                             @update:model-value="(v: string) => updateModelCustom(m, { reasoningEffort: v })"
-                           >
-                             <el-option v-for="opt in effortOptions(m)" :key="opt.value" :value="opt.value" :label="opt.label" />
-                           </el-select>
-                         </span>
-                       </el-tooltip>
-                       <el-tooltip v-if="(app.config.proxy.modelCustom || {})[m.id]?.reasoningEffort" content="已自定义覆盖思考强度" placement="top">
-                         <span class="custom-badge">自</span>
-                       </el-tooltip>
-                     </div>
-                   </td>
-                  <td class="mono">{{ fmtRate(m.rate) }}</td>
-                    <td class="cell-chips cap-cell" role="button" tabindex="0" :aria-label="`编辑 ${m.id} 的能力与档位`" @click="openMetaEditor(m)" @keydown.enter.prevent="openMetaEditor(m)">
-                      <!-- 2026-09-30 重组：原「元数据」列并进能力格 —— chips 一眼看能力，整格可点开编辑器，
-                           悬停露出铅笔提示可编辑；有用户覆盖时「覆盖」徽标跟过来（信息不丢，列数 -1）。
-                           role=button + 键盘 Enter，可访问性与原按钮打平。 -->
-                      <span class="cap-chips">
-                        <el-tooltip v-if="capabilityTags(m).length > 1" :content="`能力：${capabilityTags(m).join(' / ')}（点击编辑）`" placement="top">
-                          <span class="chip-sum"><span class="tag tag-dim">{{ capabilityTags(m)[0] }}</span><span class="tag tag-dim chip-more">+{{ capabilityTags(m).length - 1 }}</span></span>
-                        </el-tooltip>
-                        <span v-else-if="capabilityTags(m).length" class="tag tag-dim">{{ capabilityTags(m)[0] }}</span>
-                        <span v-else class="cap-none">—</span>
-                      </span>
-                      <i class="ph ph-pencil-simple cap-edit-ic" aria-hidden="true"></i>
-                      <el-tooltip v-if="m.metaOverridden && m.metaOverridden.length" content="含用户覆盖" placement="top">
-                        <span class="tag tag-warn meta-badge">覆盖</span>
+                  <td>
+                    <div class="custom-cell">
+                      <el-tooltip :content="effortTip(m)" placement="top">
+                        <span class="cell-select">
+                          <el-select
+                            class="f-el-select custom-el-select"
+                            popper-class="glass-popper"
+                            :persistent="false"
+                            :model-value="(app.config.proxy.modelCustom || {})[m.id]?.reasoningEffort || ''"
+                            style="width: 100%"
+                            placeholder="默认"
+                            @update:model-value="(v: string) => updateModelCustom(m, { reasoningEffort: v })"
+                          >
+                            <el-option v-for="opt in effortOptions(m)" :key="opt.value" :value="opt.value" :label="opt.label" />
+                          </el-select>
+                        </span>
                       </el-tooltip>
-                    </td>
+                      <el-tooltip v-if="(app.config.proxy.modelCustom || {})[m.id]?.reasoningEffort" content="已自定义覆盖思考强度" placement="top">
+                        <span class="custom-badge">自</span>
+                      </el-tooltip>
+                    </div>
+                  </td>
+                  <td class="mono">{{ fmtRate(m.rate) }}</td>
+                  <td class="cell-chips cap-cell" role="button" tabindex="0" :aria-label="`编辑 ${m.id} 的能力与档位`" @click="openMetaEditor(m)" @keydown.enter.prevent="openMetaEditor(m)">
+                    <!-- 2026-09-30 重组：原「元数据」列并进能力格 —— chips 一眼看能力，整格可点开编辑器，
+                         悬停露出铅笔提示可编辑；有用户覆盖时「覆盖」徽标跟过来（信息不丢，列数 -1）。
+                         role=button + 键盘 Enter，可访问性与原按钮打平。 -->
+                    <span class="cap-chips">
+                      <el-tooltip v-if="capabilityTags(m).length > 1" :content="`能力：${capabilityTags(m).join(' / ')}（点击编辑）`" placement="top">
+                        <span class="chip-sum"><span class="tag tag-dim">{{ capabilityTags(m)[0] }}</span><span class="tag tag-dim chip-more">+{{ capabilityTags(m).length - 1 }}</span></span>
+                      </el-tooltip>
+                      <span v-else-if="capabilityTags(m).length" class="tag tag-dim">{{ capabilityTags(m)[0] }}</span>
+                      <span v-else class="cap-none">—</span>
+                    </span>
+                    <i class="ph ph-pencil-simple cap-edit-ic" aria-hidden="true"></i>
+                    <el-tooltip v-if="m.metaOverridden && m.metaOverridden.length" content="含用户覆盖" placement="top">
+                      <span class="tag tag-warn meta-badge">覆盖</span>
+                    </el-tooltip>
+                  </td>
                   <td v-if="!activeTab" class="cell-chips">
                     <el-tooltip v-if="m.sources.length > 1" :content="`来源渠道：${m.sources.map((s: string) => channelName(s)).join(' / ')}`" placement="top">
                       <span class="chip-sum"><span class="tag tag-dim">{{ channelName(m.sources[0]) }}</span><span class="tag tag-dim chip-more">+{{ m.sources.length - 1 }}</span></span>
@@ -1349,96 +1353,89 @@ onMounted(refresh);
 }
 .rev-route-tag {
   font-size: 11px;
- /* ===== 2026-09-30 重组新增 ===== */
- /* 表头副标注「能力 · 编辑」弱化 */
- .th-sub {
-   font-weight: 400;
-   color: var(--text-3);
-   font-size: 11px;
- }
- /* 渠道 chip：可用渠道带绿点高亮；禁用/无可用账号灰显（禁用感来自降饱和 + 虚线边框） */
- .seg-item.unavailable {
-   color: var(--text-3);
-   opacity: 0.55;
-   border: 1px dashed var(--line);
- }
- .seg-item.unavailable.active {
-   opacity: 1;
- }
- .seg-dot {
-   display: inline-block;
-   width: 5px;
-   height: 5px;
-   border-radius: 50%;
-   background: var(--accent-strong, #4ade80);
-   margin-right: 4px;
-   flex-shrink: 0;
- }
- /* 「仅看可用」开关（合并视图工具条内） */
- .avail-toggle {
-   display: inline-flex;
-   align-items: center;
-   gap: 5px;
-   height: 22px;
-   padding: 0 8px;
-   font-size: 11px;
-   color: var(--text-2);
-   cursor: pointer;
-   user-select: none;
-   white-space: nowrap;
- }
- .avail-check {
-   accent-color: var(--accent-strong, #4ade80);
-   width: 12px;
-   height: 12px;
-   margin: 0;
-   cursor: pointer;
- }
- /* 能力格 = 可点击编辑入口：默认静默，悬停点亮 */
- .cap-cell {
-   cursor: pointer;
- }
- .cap-cell:focus-visible {
-   outline: 2px solid var(--accent-line);
-   outline-offset: -2px;
- }
- .cap-chips {
-   display: inline-flex;
-   align-items: center;
-   gap: 3px;
-   min-width: 0;
-   overflow: hidden;
- }
- .cap-none {
-   color: var(--text-3);
- }
- .cap-edit-ic {
-   flex: 0 0 auto;
-   margin-left: 4px;
-   font-size: 12px;
-   color: var(--text-3);
-   opacity: 0;
-   transition: opacity 0.15s;
- }
- .cap-cell:hover .cap-edit-ic,
- .cap-cell:focus-visible .cap-edit-ic {
-   opacity: 1;
-   color: var(--accent-strong, #4ade80);
- }
- .cap-cell:hover .tag {
-   border-color: var(--line-strong);
- }
- /* 视觉重心：悬停整格淡淡提亮，暗示「整格可点」 */
- .cap-cell:hover {
-   background: var(--bg-soft);
- }
- /* 说明文字来源：编辑器里推理档位段的分工提示 */
- .dlg-hint {
-   font-size: 11px;
-   color: var(--text-3);
-   margin: 4px 0 6px;
-   line-height: 1.5;
- }
+}
+/* ===== 2026-09-30 重组新增 ===== */
+/* 表头副标注「能力 · 编辑」弱化 */
+.th-sub {
+  font-weight: 400;
+  color: var(--text-3);
+  font-size: 11px;
+}
+/* 渠道 chip：可用渠道带绿点高亮；禁用/无可用账号灰显（禁用感来自降饱和 + 虚线边框） */
+.seg-item.unavailable {
+  color: var(--text-3);
+  opacity: 0.55;
+  border: 1px dashed var(--line);
+}
+.seg-item.unavailable.active {
+  opacity: 1;
+}
+.seg-dot {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent-strong, #4ade80);
+  margin-right: 4px;
+  flex-shrink: 0;
+}
+/* 「仅看可用」开关（合并视图工具条内） */
+.avail-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 22px;
+  padding: 0 8px;
+  font-size: 11px;
+  color: var(--text-2);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.avail-check {
+  accent-color: var(--accent-strong, #4ade80);
+  width: 12px;
+  height: 12px;
+  margin: 0;
+  cursor: pointer;
+}
+/* 能力格 = 可点击编辑入口：默认静默，悬停点亮 */
+.cap-cell {
+  cursor: pointer;
+}
+.cap-cell:focus-visible {
+  outline: 2px solid var(--accent-line);
+  outline-offset: -2px;
+}
+.cap-chips {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  min-width: 0;
+  overflow: hidden;
+}
+.cap-none {
+  color: var(--text-3);
+}
+.cap-edit-ic {
+  flex: 0 0 auto;
+  margin-left: 4px;
+  font-size: 12px;
+  color: var(--text-3);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.cap-cell:hover .cap-edit-ic,
+.cap-cell:focus-visible .cap-edit-ic {
+  opacity: 1;
+  color: var(--accent-strong, #4ade80);
+}
+.cap-cell:hover .tag {
+  border-color: var(--line-strong);
+}
+/* 视觉重心：悬停整格淡淡提亮，暗示「整格可点」 */
+.cap-cell:hover {
+  background: var(--bg-soft);
 }
 .rev-route-ch {
   color: var(--text-3);
