@@ -101,7 +101,9 @@ check(`① 反代网关 ${files.length} 个视图零原生 title（残留 ${hits
 // content= 上，要么在配套脚本里返回（statusTip/errTip 这类），总之没被整条删掉。
 // 逐条都对应一处移植前的原生 title。
 const REQUIRED_TIPS = [
-  ["RequestLogTable.vue", ["点击查看详细报错", "点击查看上游响应体", "换号/限流重试后成功", "上游实报消耗积分", "上游未上报消耗积分"]],
+  // 消耗提示的后缀单位已逐渠道化（2026-09-30：积分/Token/额度），钉稳定前缀——
+  // 单位由 balanceUnit(r.channel) 动态拼，字面量只剩前缀
+  ["RequestLogTable.vue", ["点击查看详细报错", "点击查看上游响应体", "换号/限流重试后成功", "上游实报消耗", "上游未上报消耗"]],
   ["ProxyAgentsView.vue", ["点击查看完整 UID", "（点击重命名）", "一键还原到最近一次切换前的状态", "写回本机锚定指纹并重启客户端", "客户端在本机当前登录的就是这个账号"]],
   ["ProxyProvidersView.vue", ["max_tokens=16"]],
   ["ProxyStatsView.vue", ["读缓存 tokens"]],
@@ -188,6 +190,7 @@ async function render({ rows, loading, scope }) {
     emptyText: scope === "home" ? "暂无请求记录 —— 用上方地址发起第一个请求即出现在这里" : "暂无请求记录",
     fmtDate: () => "2026-09-29", fmtTime: () => "10:00:00", fmtInt: (n) => String(n), fmtMs: () => "0.2s",
     channelName: () => "ZCode", statusCls: () => "tag-ok", skelW: () => "70px",
+    balanceUnit: () => "积分",
     modelTip: () => "", statusTip: () => "", errTip: () => "", cacheRate: () => "-", failed: () => false,
     emit: () => {},
   });

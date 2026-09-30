@@ -6,7 +6,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import * as api from "../../api/ipc";
 import type { ProxyChannelView, ProxyCreditPackage } from "../../types";
 import { useAppStore } from "../../stores/app";
-import { fmtInt, fmtDate } from "./format";
+import { fmtDate, fmtBalance, balanceUnit, pkgFallbackName } from "./format";
 import {
   STATUS_OPTIONS,
   SORT_OPTIONS,
@@ -118,9 +118,6 @@ function rowCls(pkg: ProxyCreditPackage): string {
       return "";
   }
 }
-function amount(v: number): string {
-  return v === -1 ? "不限" : fmtInt(v);
-}
 
 onMounted(() => {
   refresh();
@@ -141,7 +138,7 @@ onUnmounted(() => {
       <div class="expiry-head">
         <div class="expiry-title">
           <h2>积分到期总览</h2>
-          <span class="hint">所有渠道积分包按到期时间升序（长期有效排最后）；预警阈值在「设置」里调整</span>
+          <span class="hint">所有渠道的积分包 / Token 套餐按到期时间升序（长期有效排最后）；预警阈值在「设置」里调整</span>
         </div>
         <div class="expiry-actions">
           <span class="agg-tag tag-err" v-if="summary.expired">已过期 {{ summary.expired }}</span>
@@ -172,7 +169,7 @@ onUnmounted(() => {
         <table class="tbl expiry-tbl">
           <tbody>
             <tr>
-              <th>渠道 · 账号</th><th>积分包</th><th>剩余 / 总额</th><th>到期</th><th>剩余天数</th><th>状态</th>
+              <th>渠道 · 账号</th><th>包名</th><th>剩余 / 总额</th><th>到期</th><th>剩余天数</th><th>状态</th>
             </tr>
             <tr v-for="r in rows" :key="r.key" :class="rowCls(r.pkg)">
               <td>
@@ -180,9 +177,11 @@ onUnmounted(() => {
                 <div class="src-acc">{{ r.accountName }}</div>
               </td>
               <el-tooltip :content="r.pkg.name" :disabled="!r.pkg.name" placement="top">
-                <td>{{ r.pkg.name || "积分包" }}</td>
+                <td>{{ r.pkg.name || pkgFallbackName(r.channelId) }}</td>
               </el-tooltip>
-              <td class="mono num">{{ amount(r.pkg.remaining) }} / {{ amount(r.pkg.total) }}</td>
+              <!-- 逐行带单位：Token 渠道（zcode 家）过 fmtToken 换算，积分渠道原值；
+                   两头都是「不限」(-1) 时不缀单位 -->
+              <td class="mono num">{{ fmtBalance(r.pkg.remaining, r.channelId) }} / {{ fmtBalance(r.pkg.total, r.channelId) }}<template v-if="r.pkg.remaining !== -1 || r.pkg.total !== -1"> {{ balanceUnit(r.channelId) }}</template></td>
               <td class="mono">{{ r.pkg.expiresAt ? fmtDate(r.pkg.expiresAt) : "长期" }}</td>
               <td class="mono num">{{ daysText(r.pkg) }}</td>
               <td><span class="tag" :class="statusCls(r.pkg)">{{ statusText(r.pkg) }}</span></td>
@@ -191,8 +190,8 @@ onUnmounted(() => {
               <td colspan="6" style="text-align: center; color: var(--text-3); padding: 18px">
                 {{
                   summary.total
-                    ? "当前筛选条件下没有匹配的积分包"
-                    : "暂无积分包数据 —— 到「号池」页刷新生态渠道账号后，这里会列出各积分包的到期时间"
+                    ? "当前筛选条件下没有匹配的套餐/积分包"
+                    : "暂无套餐数据 —— 到「号池」页刷新生态渠道账号后，这里会列出各积分包 / Token 套餐的到期时间"
                 }}
               </td>
             </tr>

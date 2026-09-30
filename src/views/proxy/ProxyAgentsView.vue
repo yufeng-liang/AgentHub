@@ -7,7 +7,7 @@ import { computed, onMounted, onUnmounted, ref, watch, nextTick } from "vue";
 import * as api from "../../api/ipc";
 import type { ProxyChannelView, ProxyAccount, ProxyChannelId, ProxyBuiltinChannelId, ProxyChannelKind, ProxyPoolStrategy, ProxyScanCandidate, ProxyCheckinRow, ZcodeDeviceRow } from "../../types";
 import { useAppStore } from "../../stores/app";
-import { fmtInt, fmtK, fmtDate, fmtAgo, ACCOUNT_STATUS, SOURCE_NAMES, channelName, fmtBalance, balanceUnit } from "./format";
+import { fmtInt, fmtK, fmtDate, fmtAgo, ACCOUNT_STATUS, SOURCE_NAMES, channelName, fmtBalance, balanceUnit, isTokenChannel, pkgFallbackName } from "./format";
 import { coalesceAsync } from "../../utils/timing";
 
 const app = useAppStore();
@@ -120,14 +120,14 @@ function ideWritebackCapable(id: ProxyChannelId) {
 function isBuiltin(ch: ProxyChannelView) {
   return ch.kind !== "openai_compat";
 }
-/** zcode 家的余额单位是 Tokens，格子里显示的是换算值，浮层给原值。
- *  其余渠道余额本就是积分，浮层成了复读 ⇒ 返回空串，模板配 :disabled 用，不飘空泡 */
+/** zcode 家的余额单位是 Token（智谱套餐按 Token 计，口径表见 format.ts CHANNEL_UNITS），格子里
+ *  显示的是换算值，浮层给原值。其余渠道余额本就是积分，浮层成了复读 ⇒ 返回空串，模板配 :disabled 用，不飘空泡 */
 function tokensTip(ch: ProxyChannelView) {
-  return ch.id === "zcode" || ch.id === "zcode_intl" ? `${fmtInt(ch.summary.totalCredits)} Tokens` : "";
+  return isTokenChannel(ch.id) ? `${fmtInt(ch.summary.totalCredits)} Token` : "";
 }
-/** 账号级余额同上：只有 zcode 家需要把 Tokens 原值补出来，其余渠道返回空串即不出浮层 */
+/** 账号级余额同上：只有 Token 渠道需要把原值补出来，其余渠道返回空串即不出浮层 */
 function creditTip(acc: ProxyAccount) {
-  return acc.channel === "zcode" && acc.credits > 0 ? `${fmtInt(acc.credits)} Tokens` : "";
+  return isTokenChannel(acc.channel) && acc.credits > 0 ? `${fmtInt(acc.credits)} Token` : "";
 }
 function metaOf(ch: ProxyChannelView) {
   return isBuiltin(ch) ? CHANNEL_META[ch.id as ProxyBuiltinChannelId] ?? PROVIDER_META : PROVIDER_META;
@@ -370,7 +370,7 @@ async function refreshCurrentChannel() {
     const r = await api.proxyCreditsRefreshChannel(channel);
     const unavail = (r.results || []).filter((x) => x.unavailable);
     let text = `${channelName(channel)} 已刷新 ${r.total ?? 0} 个账号，失败 ${r.failed ?? 0}`;
-    if (unavail.length) text += ` · ${unavail.length} 个账号积分服务未开放（${unavail[0].message || ""}）`;
+    if (unavail.length) text += ` · ${unavail.length} 个账号余额服务未开放（${unavail[0].message || ""}）`;
     toast(text, r.failed ? "err" : "info");
   } catch (e) {
     toast(String((e as Error).message || e), "err");
@@ -1446,7 +1446,7 @@ onUnmounted(() => {
             <el-tooltip :content="tokensTip(ch)" :disabled="!tokensTip(ch)" placement="top">
               <b>{{ fmtBalance(ch.summary.totalCredits, ch.id) }}</b>
             </el-tooltip>
-            <span v-if="ch.id === 'zcode' || ch.id === 'zcode_intl'" style="font-size: 11px; font-weight: normal; color: var(--text-3); margin-left: 2px">Tokens</span>
+            <span v-if="isTokenChannel(ch.id)" style="font-size: 11px; font-weight: normal; color: var(--text-3); margin-left: 2px">{{ balanceUnit(ch.id) }}</span>
             <!-- 本页浮层已整页统一到 el-tooltip（上游 v1.38.0 口径，工具栏 / 聚合行 / 账号行三处一起换），
                  原生 title 不许在本页复活：scripts/dev-proxy-tooltip-uniform-test.cjs 会逐文件查。 -->
           </div>
@@ -1474,7 +1474,7 @@ onUnmounted(() => {
                 <td class="acc-cell">
                   <el-tooltip
                     v-if="isBuiltin(ch) && acc.packages && acc.packages.length"
-                    :content="expandedIds.has(acc.id) ? '收起积分包明细' : '展开积分包明细'"
+                    :content="(expandedIds.has(acc.id) ? '收起' : '展开') + pkgFallbackName(acc.channel) + '明细'"
                     placement="top"
                   >
                     <button class="pkg-caret" :class="{ open: expandedIds.has(acc.id) }" @click="togglePkg(acc.id)">
@@ -1537,7 +1537,7 @@ onUnmounted(() => {
                   </el-tooltip>
                   <td class="mono">{{ acc.expiresAt ? fmtDate(acc.expiresAt) : "-" }}</td>
                 </template>
-                <td class="mono num">{{ acc.todayReq }} 次 · {{ fmtK(acc.todayTokens) }} · {{ acc.creditsToday < 0 ? "-" : fmtInt(acc.creditsToday) }} 积分</td>
+                <td class="mono num">{{ acc.todayReq }} 次 · {{ fmtK(acc.todayTokens) }} · {{ acc.creditsToday < 0 ? "-" : fmtInt(acc.creditsToday) + " " + balanceUnit(acc.channel) }}</td>
                 <td>
                   <!-- 单行「刷新」= 查一次余额，对只有 API Key 的提供商没有对象（主进程会明确拒答），故隐藏 -->
                   <button v-if="isBuiltin(ch)" class="btn-link btn-sm" :disabled="refreshingId === acc.id" @click="refreshOne(acc)">
@@ -1608,24 +1608,24 @@ onUnmounted(() => {
                   <table class="pkg-tbl">
                     <tbody>
                       <tr>
-                        <th>积分包</th><th>已用</th><th>总额</th><th>剩余</th><th>到期</th><th>剩余天数</th><th>状态</th>
+                        <th>{{ pkgFallbackName(acc.channel) }}</th><th>已用</th><th>总额</th><th>剩余</th><th>到期</th><th>剩余天数</th><th>状态</th>
                       </tr>
                       <tr v-for="(pkg, pi) in acc.packages" :key="pkg.code || pi">
                         <td class="pkg-name">
                           <!-- 名称与进度条各挂一个浮层，且都**不**挂在 td 上：td 是二者的共同祖先，
                                包上去会一次 hover 叠出两个浮层（原生 title 是内层覆盖外层，没有这个问题） -->
                           <el-tooltip :content="pkg.name" :disabled="!pkg.name" placement="top">
-                            <span>{{ pkg.name || "积分包" }}</span>
+                            <span>{{ pkg.name || pkgFallbackName(acc.channel) }}</span>
                           </el-tooltip>
-                          <el-tooltip v-if="pkg.total > 0" :content="`已用 ${fmtInt(pkg.used)} / 总额 ${fmtInt(pkg.total)}`" placement="top">
+                          <el-tooltip v-if="pkg.total > 0" :content="`已用 ${fmtBalance(pkg.used, acc.channel)} / 总额 ${fmtBalance(pkg.total, acc.channel)}`" placement="top">
                             <div class="pkg-bar">
                               <span class="pkg-bar-used" :style="{ width: pkgUsedPct(pkg) + '%' }" />
                             </div>
                           </el-tooltip>
                         </td>
-                        <td class="mono num">{{ pkg.used === -1 ? "不限" : fmtInt(pkg.used) }}</td>
-                        <td class="mono num">{{ pkg.total === -1 ? "不限" : fmtInt(pkg.total) }}</td>
-                        <td class="mono num">{{ pkg.remaining === -1 ? "不限" : fmtInt(pkg.remaining) }}</td>
+                        <td class="mono num">{{ fmtBalance(pkg.used, acc.channel) }}</td>
+                        <td class="mono num">{{ fmtBalance(pkg.total, acc.channel) }}</td>
+                        <td class="mono num">{{ fmtBalance(pkg.remaining, acc.channel) }}</td>
                         <td class="mono">{{ pkg.expiresAt ? fmtDate(pkg.expiresAt) : "长期" }}</td>
                         <td class="mono num">{{ pkgDaysText(pkg) }}</td>
                         <td><span class="tag" :class="pkgStatusCls(pkg)">{{ pkgStatusText(pkg) }}</span></td>
@@ -1636,7 +1636,7 @@ onUnmounted(() => {
               </tr>
               <!-- 已刷新过但无包 / 尚未刷新：给一句可操作提示（builtin 且有 token） -->
               <tr v-else-if="isBuiltin(ch) && acc.hasToken && (!acc.packages || !acc.packages.length)" class="pkg-hint-row" :key="acc.id + '-hint'">
-                <td :colspan="6" class="pkg-hint">未刷新，点「刷新」获取积分包明细</td>
+                <td :colspan="6" class="pkg-hint">未刷新，点「刷新」获取{{ pkgFallbackName(acc.channel) }}明细</td>
               </tr>
         <!-- 上游这 141 行是同一批账号行的**另一套渲染**（el-tooltip + pill 状态徽标，但没有
              积分包展开、也没有按渠道 kind 分列）。fork 侧那套在上面已经渲染过了，两边都留
@@ -1913,7 +1913,7 @@ onUnmounted(() => {
                 <span class="tag" :class="checkinTagCls(r)">{{ checkinTagText(r) }}</span>
               </div>
               <span class="checkin-msg">
-                <template v-if="r.credit">+{{ r.credit }} 积分 · </template>
+                <template v-if="r.credit">+{{ r.credit }} {{ balanceUnit(r.channel) }} · </template>
                 <template v-if="r.streakDays">连续 {{ r.streakDays }} 天 · </template>
                 {{ r.message || "" }}
               </span>

@@ -135,20 +135,25 @@ CREATE INDEX IF NOT EXISTS idx_usage_channel ON usage_requests(channel, ts);
 CREATE INDEX IF NOT EXISTS idx_usage_model ON usage_requests(model, ts);
 `;
 /** 内置渠道：代码常量是它们 display/domain 的唯一真相源（agents 表里的内置行只承载调度策略）。
- *  用户自建提供商不在这张表里，走 agents 表的 kind != 'builtin' 行；两者合并视图见 channelList()。 */
+ *  用户自建提供商不在这张表里，走 agents 表的 kind != 'builtin' 行；两者合并视图见 channelList()。
+ *  unit = 该渠道余额/套餐的计费口径（有的渠道叫积分，有的渠道是 Token 包）：402 耗尽文案
+ *  （server.cjs）据此组词；前端展示的镜像真相源在 src/views/proxy/format.ts CHANNEL_UNITS，
+ *  两边加渠道必须同步。 */
 const BUILTIN_CHANNELS = [
-  { id: "trae", display: "Trae SOLO CN", domain: "api.trae.cn" },
-  { id: "workbuddy", display: "WorkBuddy CN", domain: "copilot.tencent.com" },
-  { id: "workbuddy_ai", display: "WorkBuddy AI", domain: "www.workbuddy.ai" },
-  { id: "raccoon", display: "商汤小浣熊", domain: "xiaohuanxiong.com" },
-  { id: "cline_free", display: "Cline 免费池", domain: "api.cline.bot" },
-  { id: "cline_pass", display: "Cline 订阅池", domain: "api.cline.bot" },
-  { id: "autoclaw", display: "智谱 AutoClaw（国内）", domain: "autoglm-acceleration-api.zhipuai.cn" },
-  { id: "autoclaw_intl", display: "智谱 AutoClaw（国际）", domain: "autoglm-api.autoglm.ai" },
-  { id: "qoder", display: "Qoder", domain: "api3.qoder.sh" },
+  { id: "trae", display: "Trae SOLO CN", domain: "api.trae.cn", unit: "积分" },
+  { id: "workbuddy", display: "WorkBuddy CN", domain: "copilot.tencent.com", unit: "积分" },
+  { id: "workbuddy_ai", display: "WorkBuddy AI", domain: "www.workbuddy.ai", unit: "积分" },
+  { id: "raccoon", display: "商汤小浣熊", domain: "xiaohuanxiong.com", unit: "积分" },
+  // 订阅/加速池：官方无余额接口、消耗也从不实报，unit 只落在 402 耗尽文案上，用中性「额度」
+  { id: "cline_free", display: "Cline 免费池", domain: "api.cline.bot", unit: "额度" },
+  { id: "cline_pass", display: "Cline 订阅池", domain: "api.cline.bot", unit: "额度" },
+  { id: "autoclaw", display: "智谱 AutoClaw（国内）", domain: "autoglm-acceleration-api.zhipuai.cn", unit: "额度" },
+  { id: "autoclaw_intl", display: "智谱 AutoClaw（国际）", domain: "autoglm-api.autoglm.ai", unit: "额度" },
+  { id: "qoder", display: "Qoder", domain: "api3.qoder.sh", unit: "额度" },
   // ZCode（智谱编码套餐；上游 v1.30 起单渠道双 provider：meta.provider=zai|bigmodel，见 adapters.makeZcode）
-  { id: "zcode", display: "ZCode（智谱）", domain: "zcode.z.ai" },
-  { id: "zcode_intl", display: "ZCode 智谱（国际）", domain: "api.z.ai" },
+  // 智谱套餐不是积分，是 Token 包：billing/balance 返回 remaining_units/total_units
+  { id: "zcode", display: "ZCode（智谱）", domain: "zcode.z.ai", unit: "Token" },
+  { id: "zcode_intl", display: "ZCode 智谱（国际）", domain: "api.z.ai", unit: "Token" },
 
 ];
 const BUILTIN_IDS = new Set(BUILTIN_CHANNELS.map((c) => c.id));
@@ -367,6 +372,13 @@ function channelList() {
   }
   channelsMemo = out;
   return out;
+}
+
+/** 渠道计费口径：内置渠道查 BUILTIN_CHANNELS[].unit；自建提供商没有余额概念，一律中性「额度」。
+ *  消费方是 server.cjs 的 402 文案与前端 CHANNEL_UNITS（展示镜像）。 */
+function channelUnit(id) {
+  const hit = BUILTIN_CHANNELS.find((c) => c.id === String(id));
+  return (hit && hit.unit) || "额度";
 }
 
 /** 渠道展示名。已停用的提供商也要能解析出来：统计页 / TOP 榜列的是历史流水里的 channel 值，
@@ -1168,7 +1180,7 @@ module.exports = {
   BUILTIN_CHANNELS,
   isBuiltinChannel,
   channelList, invalidateChannels,
-  channelDisplay,
+  channelDisplay, channelUnit,
   decryptFailureCount,                 // 进程内累计次数（只增不减，诊断/日志用）
   decryptFailureActive,                // 当前仍解不开的条数（/readyz 的 credFail 用它，见函数注释）
   // WAL 收敛与句柄归属（Task 2）；stop 由 startCheckpointTimer 的返回值给出。

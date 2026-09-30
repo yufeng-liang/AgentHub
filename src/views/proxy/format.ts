@@ -69,21 +69,43 @@ export function fmtToken(n: number): string {
   return fmtInt(v);
 }
 
-/** 渠道余额格式化（针对智谱输出换算后的 Token，其他渠道输出积分） */
+/** 各渠道计费单位（逐渠道适配：有的渠道叫积分，有的渠道是 Token 包）。
+ *  真相源在后端 store.cjs BUILTIN_CHANNELS[].unit（402 文案用），此处是展示镜像——两边加渠道必须同步。
+ *  · trae / workbuddy 家 / raccoon：上游按积分计（Trae 积分包、CodeBuddy 加油包、小浣熊 points）；
+ *  · zcode 家：智谱编码套餐不是积分，是 Token 包（billing/balance 的 remaining_units）；
+ *  · cline / autoclaw / qoder：订阅/加速池，官方无余额接口、消耗也从不实报，单位落不到界面上，
+ *    兜底用中性「额度」；自建提供商同此。 */
+export const CHANNEL_UNITS: Record<string, string> = {
+  trae: "积分",
+  workbuddy: "积分",
+  workbuddy_ai: "积分",
+  raccoon: "积分",
+  cline_free: "额度",
+  cline_pass: "额度",
+  autoclaw: "额度",
+  autoclaw_intl: "额度",
+  qoder: "额度",
+  zcode: "Token",
+  zcode_intl: "Token",
+};
+export const balanceUnit = (channel?: string): string => (channel && CHANNEL_UNITS[channel]) || "额度";
+/** Token 计价渠道（智谱家）：余额展示要过 fmtToken 换算（亿/万），浮层给原值 */
+export const isTokenChannel = (channel?: string): boolean => balanceUnit(channel) === "Token";
+
+/** 渠道余额格式化：Token 渠道输出换算后的 Token（智谱 150000000 → 1.5 亿），其余渠道输出积分原值 */
 export function fmtBalance(val: number, channel?: string): string {
   if (val === -1) return "不限";
-  if (channel === "zcode") {
-    return fmtToken(val);
-  }
-  return fmtInt(val);
+  return isTokenChannel(channel) ? fmtToken(val) : fmtInt(val);
 }
 
-/** 渠道余额单位标签 */
-export function balanceUnit(channel?: string): string {
-  return channel === "zcode" ? "Tokens" : "积分";
+/** 积分包明细的包名兜底：各渠道上游叫法不同（Trae 积分包 / WorkBuddy 加油包 / zcode 套餐额度），
+ *  上游没给名字时按渠道口径兜，而不是一律「积分包」 */
+export function pkgFallbackName(channel?: string): string {
+  const u = balanceUnit(channel);
+  return u === "Token" ? "套餐额度" : u === "积分" ? "积分包" : "额度包";
 }
 
-/** 渠道显示名（usage 流水里的 channel id → 中文名） */
+/** 渠道显示名（usage 流水里的 channel id → 中文名；与 store.cjs BUILTIN_CHANNELS.display 对齐） */
 export const CHANNEL_NAMES: Record<string, string> = {
   trae: "Trae SOLO CN",
   workbuddy: "WorkBuddy CN",
@@ -95,7 +117,7 @@ export const CHANNEL_NAMES: Record<string, string> = {
   autoclaw_intl: "智谱 AutoClaw（国际）",
   qoder: "Qoder",
   zcode: "ZCode（智谱）",
-  zcode_intl: "ZCode（智谱·国际）",
+  zcode_intl: "ZCode 智谱（国际）",
 
 };
 export const channelName = (id: string) => CHANNEL_NAMES[id] || id || "-";

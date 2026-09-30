@@ -44,6 +44,20 @@ function sendError(res, status, message, type, code) {
   res.status(status).json(util.openaiError(message, type, code));
 }
 
+/** 402 文案的逐渠道计费口径（unit 真相源在 store.BUILTIN_CHANNELS，见其注释）：
+ *  Trae/WorkBuddy/小浣熊是积分制 → 「积分」；zcode 家是智谱 Token 套餐 → 「Token 余额」；
+ *  cline/autoclaw/qoder 无余额概念 → 「额度」。跨渠道 failover 一轮混过多种口径时退中性「额度」。 */
+function planLimitNoun(chan) {
+  const u = store.channelUnit(chan);
+  return u === "Token" ? "Token 余额" : u;
+}
+function poolExhaustedMsg(channels) {
+  const units = [...new Set((channels || []).map((c) => store.channelUnit(c)))];
+  if (units.length !== 1) return "该渠道号池额度全部耗尽";
+  if (units[0] === "Token") return "该渠道号池 Token 余额全部耗尽";
+  return `该渠道号池${units[0]}全部耗尽`;
+}
+
 /** request 事件节流：每条代理请求完成都会调用，高流量时逐条广播只烧 IPC，
     合并为每 2 秒至多一条（带合并条数），渲染层本就以 5s 轮询展示实时流 */
 let reqEvt = { count: 0, timer: null };
@@ -668,8 +682,10 @@ async function handleChat(req, res, settings, surface) {
             }
             r = await attemptChat(chan, acc, targetModel, effectiveBody, emitTimed, chatMeta);
             if (r && r.planLimit) {
+              // coolAccount 的调用签名别动：dev-sink-golden 按调用面字节等值钉着调度核心；
+              // coolReason 文案走 pool.cjs 内部兜底（UI 不渲染它，无需逐渠道化到调用方）
               pool.coolAccount(acc.id, "credit");
-              lastErr = Object.assign(new Error("积分不足"), { status: 402 });
+              lastErr = Object.assign(new Error(planLimitNoun(acc.channel) + "不足"), { status: 402 });
               // 积分耗尽常以流中 error 事件返回（trae 1005 / workbuddy 402），此时正文可能已出线。
               // 流式下换号重发会让客户端收到「半截旧答 + 完整新答」，就地收尾不再换号；
               // 非流式可以换，下一轮 attemptChat 前的 resetAttemptState 会重建 agg 防拼接
@@ -836,8 +852,8 @@ async function handleChat(req, res, settings, surface) {
 
     // 全部渠道/账号用尽：如实报错并带渠道轨迹（单请求尝试预算用尽时由 lastErr 消息如实说明）
     const st = (lastErr && lastErr.status) || 503;
-    let msg = st === 402 ? "该渠道号池积分全部耗尽" : (lastErr && lastErr.message) || "渠道暂不可用（号池无可用账号）";
     const triedUnique = [...new Set(triedChannels)];
+    let msg = st === 402 ? poolExhaustedMsg(triedUnique) : (lastErr && lastErr.message) || "渠道暂不可用（号池无可用账号）";
     if (triedUnique.length > 1) msg = `已尝试 ${triedUnique.length} 个渠道（${triedUnique.join("→")}）均不可用：${msg}`;
     if (!wantStream || !ttftMs) {
       // 还没出过内容：流式下若响应头已发出去就得把错误塞进流，非流式还能正常回错误状态码

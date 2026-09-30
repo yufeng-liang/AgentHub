@@ -7,7 +7,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import type { ProxyUsageRow } from "../../types";
-import { fmtInt, fmtMs, fmtTime, fmtDate, channelName, statusCls } from "./format";
+import { fmtInt, fmtMs, fmtTime, fmtDate, channelName, statusCls, balanceUnit } from "./format";
 
 const props = defineProps<{ rows: ProxyUsageRow[]; scope: "home" | "stats"; loading?: boolean }>();
 const emit = defineEmits<{ (e: "detail", row: ProxyUsageRow): void }>();
@@ -139,7 +139,7 @@ const emptyText = computed(() =>
               </td>
               <el-tooltip
                 v-else-if="c.id === 'credits'"
-                :content="r.creditsUsed < 0 ? '上游未上报消耗积分' : '上游实报消耗积分'"
+                :content="r.creditsUsed < 0 ? '上游未上报消耗' + balanceUnit(r.channel) : '上游实报消耗' + balanceUnit(r.channel)"
                 placement="top"
               >
                 <td class="mono">{{ r.creditsUsed < 0 ? "-" : fmtInt(r.creditsUsed) }}</td>

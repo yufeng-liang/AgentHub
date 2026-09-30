@@ -84,6 +84,8 @@ function buildCtx({ n, channel, builtin, expanded = [], withPackages = true }) {
     expandedIds: new Set(expanded), SOURCE_NAMES: { oauth: "OAuth" },
     ACCOUNT_STATUS: { online: { text: "在线", cls: "tag-ok" } },
     fmtInt: String, fmtK: String, fmtBalance: String, fmtDate: () => "2026-09-29", uidBrief: (u) => u,
+    // 计费单位三件套（2026-09-30 逐渠道适配进模板）：桩只求绑定不炸，结构判据与文案无关
+    balanceUnit: () => "积分", isTokenChannel: () => false, pkgFallbackName: () => "积分包",
     coolLeft: () => 0, modelCoolLeft: () => 0, modelCoolTitle: () => "", isNeedCaptcha: () => false,
     pkgUsedPct: () => 10, pkgDaysText: () => "3天", pkgStatusCls: () => "tag-ok", pkgStatusText: () => "正常",
     renamingId: "", renameText: "", checkinBusy: false, refreshingId: "", ideSwitching: "", coolOffId: "",

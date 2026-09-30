@@ -4,7 +4,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import * as api from "../../api/ipc";
 import type { ProxyGatewayStatus, ProxyUsageDetail, ProxyUsageRow } from "../../types";
 import { useAppStore } from "../../stores/app";
-import { fmtInt, fmtK, fmtMs, fmtTime, statusCls, fmtBalance, balanceUnit } from "./format";
+import { fmtInt, fmtK, fmtMs, fmtTime, statusCls, fmtBalance, balanceUnit, isTokenChannel } from "./format";
 import RequestLogTable from "./RequestLogTable.vue";
 import RequestDetailDialog from "./RequestDetailDialog.vue";
 import { coalesceAsync } from "../../utils/timing";
@@ -292,7 +292,7 @@ onUnmounted(() => {
             </span>
           </div>
           <div style="display: flex; align-items: baseline; gap: 8px">
-            <el-tooltip :content="c.id === 'zcode' ? `${fmtInt(c.totalCredits)} Tokens` : ''" :disabled="c.id !== 'zcode'" placement="top">
+            <el-tooltip :content="isTokenChannel(c.id) ? `${fmtInt(c.totalCredits)} Token` : ''" :disabled="!isTokenChannel(c.id)" placement="top">
               <b class="big-num">{{ fmtBalance(c.totalCredits, c.id) }}</b>
             </el-tooltip>
             <span style="font-size: 11px; color: var(--text-3)">{{ balanceUnit(c.id) }}</span>
