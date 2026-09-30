@@ -377,43 +377,59 @@ async function removeAlias(from: string) {
 async function syncCatalog(channel: string) {
   if (syncing.value) return;
   syncing.value = channel;
+  let failMsg = "";
+  let okMsg = "";
   try {
     const r = await api.proxyModelsSync(channel);
-    if (r && r.ok === false) err.value = r.message || "拉取失败";
+    if (r && r.ok === false) failMsg = r.message || "拉取失败";
     else {
       const rateInfo = r.withRate ? `，其中 ${r.withRate} 个含倍率` : "";
-      msg.value = `已拉取 ${r.count ?? 0} 个模型到 ${channelName(channel)}目录${rateInfo}`;
-      setTimeout(() => (msg.value = ""), 3000);
+      okMsg = `已拉取 ${r.count ?? 0} 个模型到 ${channelName(channel)}目录${rateInfo}`;
     }
   } catch (e) {
-    err.value = String((e as Error).message || e);
+    failMsg = String((e as Error).message || e);
   } finally {
     syncing.value = "";
     await refresh();
   }
+  // 提示必须在 refresh 之后落：refresh 成功会清 err，先设后刷就成了「闪红」
+  if (failMsg) err.value = failMsg;
+  else {
+    msg.value = okMsg;
+    setTimeout(() => (msg.value = ""), 3000);
+  }
 }
 
-/** 全部渠道并发拉取：逐渠道汇总结果，部分失败不拖垮整体 */
+/** 全部渠道并发拉取：只打有可用账号的渠道——未配置/全离线的渠道必然失败，逐个打是纯噪声；
+ *  目录内置的渠道（AutoClaw 静态表）按「跳过」汇总进提示不算失败。真失败才亮红，且在
+ *  refresh 之后设置——refresh 成功会清 err，先设后刷就只剩一闪而过的红 */
 async function syncAll() {
   if (syncing.value) return;
   syncing.value = "__all__";
+  const targets = channels.value.filter((c) => channelAvailable(c.id));
   try {
-    const results = await Promise.all(channels.value.map((c) => api.proxyModelsSync(c.id).catch((e) => ({ ok: false as const, message: String((e as Error).message || e) }))));
+    const results = await Promise.all(targets.map((c) => api.proxyModelsSync(c.id).catch((e) => ({ ok: false as const, message: String((e as Error).message || e) }))));
     const okParts: string[] = [];
+    const skipParts: string[] = [];
     const failParts: string[] = [];
     results.forEach((r, i) => {
-      const name = channelName(channels.value[i].id);
+      const name = channelName(targets[i].id);
       if (r && r.ok !== false) okParts.push(`${name} ${r.count ?? 0} 个`);
+      else if (r && /不支持同步/.test(r.message || "")) skipParts.push(name);
       else failParts.push(`${name}：${(r && r.message) || "失败"}`);
     });
-    if (okParts.length) {
-      msg.value = `已拉取 ${okParts.join("、")}`;
-      setTimeout(() => (msg.value = ""), 3000);
-    }
-    if (failParts.length) err.value = failParts.join("；");
-  } finally {
     syncing.value = "";
     await refresh();
+    if (failParts.length) err.value = failParts.join("；");
+    let text = okParts.length ? `已拉取 ${okParts.join("、")}` : "";
+    if (skipParts.length) text = [text, `跳过 ${skipParts.join("、")}（目录内置）`].filter(Boolean).join("；");
+    if (!text && !targets.length) text = "当前没有带可用账号的渠道，无需拉取";
+    if (text) {
+      msg.value = text;
+      setTimeout(() => (msg.value = ""), 3000);
+    }
+  } finally {
+    syncing.value = "";
   }
 }
 
