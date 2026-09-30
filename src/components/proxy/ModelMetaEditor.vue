@@ -120,12 +120,15 @@ function onSave() {
             </div>
           </div>
 
-          <!-- 推理档位：允许档位多选（取代式）+ 默认档 -->
-          <div class="sec-title">
-            推理档位
-            <span v-if="overridden.has('reasoning')" class="tag tag-warn">已覆盖</span>
-            <button v-if="overridden.has('reasoning')" class="btn btn-sm clr-btn" @click="emit('clear', 'reasoning')">清除覆盖</button>
-          </div>
+           <!-- 推理档位：允许档位多选（取代式）+ 默认档。
+                与表格「思考强度」列的分工：这里是**声明**该模型接受哪些档位（影响出站透传与表格下拉选项收敛），
+                表格列是**注入**某个具体档位（写 modelCustom.reasoningEffort，随请求出站）。 -->
+           <div class="sec-title">
+             推理档位（声明模型支持哪些）
+             <span v-if="overridden.has('reasoning')" class="tag tag-warn">已覆盖</span>
+             <button v-if="overridden.has('reasoning')" class="btn btn-sm clr-btn" @click="emit('clear', 'reasoning')">清除覆盖</button>
+           </div>
+           <div class="dlg-hint">声明后，模型目录「思考强度」列的可选档位将收敛到这些值；实际注入某个档位请在表格列里选。</div>
           <div class="field">
             <span id="efforts-lbl" class="fld-label">允许档位</span>
             <div class="chips" role="group" aria-labelledby="efforts-lbl">
@@ -209,6 +212,12 @@ function onSave() {
   min-height: 0;
   overflow-y: auto;
 }
+ .dlg-hint {
+   font-size: 11px;
+   color: var(--text-3);
+   line-height: 1.5;
+   margin: -2px 0 6px;
+ }
 .sec-title {
   display: flex;
   align-items: center;

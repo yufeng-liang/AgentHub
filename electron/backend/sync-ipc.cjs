@@ -53,9 +53,12 @@ function registerSync(ctx) {
       // notifiedVersion 由主进程 updater 维护：渲染层持有的是旧快照，直接保存会把
       // 已更新的去重记录覆盖回旧值（导致同版本重复弹通知），这里合并磁盘上的最新值
       if (args.config && args.config.update && typeof args.config.update === "object") {
-        // notifiedVersion 磁盘权威值在框架 config.cjs（updater 实际读写处）
+        // notifiedVersion 磁盘权威值在框架 config.cjs（updater 实际读写处）。
+        // 兜底不能写成 config.getUpdateNotified()——这里的 config 是本模块自己的 sync-config.cjs
+        // （dataDir / webdav 那一套），从来没有这个方法，真走到兜底就是 TypeError 把整次保存打断；
+        // 取不到能力时按「没有磁盘权威值」处理，让渲染层带来的值原样保存。
         const fwConfig = require("./config.cjs");
-        const diskVersion = fwConfig.getUpdateNotified ? fwConfig.getUpdateNotified() : config.getUpdateNotified();
+        const diskVersion = typeof fwConfig.getUpdateNotified === "function" ? fwConfig.getUpdateNotified() : "";
         if (diskVersion && args.config.update.notifiedVersion !== diskVersion) {
           args.config.update.notifiedVersion = diskVersion;
         }

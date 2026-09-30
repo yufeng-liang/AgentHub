@@ -825,7 +825,11 @@ function register(ipcMain) {
     if (!verifyParam) {
       const cfg = await ad.solveCaptchaConfig(acc, secrets);
       if (!cfg.ok) return fail(cfg.message || "获取验证码配置失败");
-      return { ok: false, needCaptcha: true, captcha: cfg.captcha };
+      // 第一段必须是 ok:true：渲染层 call()（src/api/ipc.ts）把「返回体 ok===false」一律当异常抛，
+      // 抛出来 UI 就再也读不到 needCaptcha，滑块永远弹不出来，只会显示一句
+      // 「命令 proxy_zcode_solve_captcha 执行失败」。第一段的语义本就是「配置取到了，附带要过码」，
+      // 与 discovery.cjs beginOAuth 首跳同形（{ok:true, needCaptcha:true, captcha}）。
+      return { ok: true, needCaptcha: true, captcha: cfg.captcha };
     }
     const r = await ad.solveCaptchaWithParam(acc, secrets, verifyParam, region);
     if (r.ok) {

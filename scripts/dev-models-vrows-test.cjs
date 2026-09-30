@@ -128,15 +128,16 @@ async function render({ rows, firstVisible, viewRows, activeTab = "" }) {
     // 变异测试（组件里写死 9）因此漏检过一轮
     colCountFor,
     app: { config: { proxy: { modelCustom: { "model-001": { contextLength: 999 } } } } },
-    REASONING_EFFORT_OPTIONS: [{ value: "", label: "默认" }],
+    REASONING_EFFORT_ALL: [{ value: "", label: "默认" }, { value: "low", label: "低 (low)" }],
     CHANNEL_OPTIONS: [{ value: "", label: "自动" }, { value: "trae", label: "Trae" }],
     capabilityTags: () => ["工具"], channelName: () => "Trae", fmtRate: () => "—",
     // 上下文列「非编辑态 K/M 缩写 + 聚焦草稿」引入的绑定点。
     // 这段只保证模板渲染得出来，本闸的判据是行结构（⑬ 已单独钉输入框还在），
     // 所以 ctxValue 只取目录值、不复制组件里「自定义优先」那条链路。
-    ctxDraft: {}, ctxValue: (m) => Number(m.contextLength) || 0,
-    ctxDisplay: (m) => fmtCtx(Number(m.contextLength) || 0), ctxTip: () => "自定义上下文长度",
-    commitCtx: noop,
+     ctxDraft: {}, ctxValue: (m) => Number(m.contextLength) || 0,
+     ctxDisplay: (m) => fmtCtx(Number(m.contextLength) || 0), ctxTip: () => "自定义上下文长度",
+     commitCtx: noop,
+    REASONING_EFFORT_ALL: [{ value: "", label: "默认" }, { value: "low", label: "低 (low)" }], effortOptions: (m) => [], effortTip: () => "自定义思考强度",
     updateModelCustom: noop, setOverride: noop, toggleEnabled: noop, openMetaEditor: noop,
   });
   app.config.warnHandler = () => {};
@@ -201,7 +202,9 @@ async function main() {
   // ===== E. 防「为了性能砍功能」：每行该有的控件还得在 =====
   const one = dataRows(a.rowsOut)[0].inner;
   check("⑪ 数据行仍有 2 个下拉（思考强度 + 渠道覆盖）", (one.match(/el-select/g) || []).length >= 2);
-  check("⑫ 数据行仍有「编辑」元数据按钮与状态开关", /meta-edit/.test(one) && /role="switch"/.test(one));
+  // 2026-09-30 重组：编辑入口从独立按钮并入能力格（.cap-cell 整格可点开编辑器），
+  // 闸跟着钉新形状：能力格可点击（role=button）+ 状态开关仍在。
+  check("⑫ 数据行仍有「能力格编辑入口」（cap-cell role=button）与状态开关", /cap-cell/.test(one) && /role="button"/.test(one) && /role="switch"/.test(one));
   check("⑬ 数据行仍渲染上下文输入框", /custom-input/.test(one));
 
   // ===== F. 只虚拟化了目录这一张表 =====

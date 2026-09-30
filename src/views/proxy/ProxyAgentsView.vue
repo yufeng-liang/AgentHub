@@ -401,21 +401,12 @@ async function runCheckinChannel() {
   const channel = activeChannel.value; // 签到期间可能切渠道：发起渠道先存快照，结果才不会记错名下
   checkinBusy.value = true;
   try {
-    let r = await api.proxyCheckinRun({ channel, action: "checkin" });
-    if ((r as unknown as { needCaptcha?: boolean; captcha?: { region?: string; prefix?: string; sceneId?: string } }).needCaptcha) {
-      // zcode 领取的人机校验二段流：渲染层过码后带参数重试一次
-      const solved = await solveZcodeCaptcha((r as unknown as { captcha: { region?: string; prefix?: string; sceneId?: string } }).captcha);
-      if (!solved) {
-        toast("人机校验未完成，已取消领取", "err");
-        return;
-      }
-      r = await api.proxyCheckinRun({ channel, action: "checkin", captcha: solved });
-    }
+    const r = await api.proxyCheckinRun({ channel, action: "checkin" });
     if (r.ok === false) {
       toast(r.message || "签到失败", "err");
       return;
     }
-    putCheckin(channel, r.rows);
+    putCheckin(channel, await resumeCheckinWithCaptcha(channel, r.rows));
     checkinShownChannel.value = channel;
     checkinOpen.value = true;
   } catch (e) {
@@ -436,7 +427,7 @@ async function runCheckinAccount(acc: ProxyAccount) {
       toast(r.message || "签到失败", "err");
       return;
     }
-    putCheckin(acc.channel, r.rows);
+    putCheckin(acc.channel, await resumeCheckinWithCaptcha(acc.channel, r.rows));
     checkinShownChannel.value = acc.channel;
     checkinOpen.value = true;
   } catch (e) {
@@ -749,6 +740,35 @@ async function solveZcodeCaptcha(cfg: { region?: string; prefix?: string; sceneI
   if (!cfg || !cfg.sceneId) return null;
   const verifyParam = await runZcodeCaptcha(cfg.region || "", cfg.prefix || "", cfg.sceneId);
   return verifyParam ? { verifyParam, region: cfg.region || "", sceneId: cfg.sceneId } : null;
+}
+
+/** 签到/领取结果里的人机校验二段流（上游 v1.31）：就地过码 + 只补跑需要过码的那个账号。
+ *
+ *  关键事实：proxy_checkin_run 是批量接口，响应恒为 { ok:true, rows }，needCaptcha/captcha/planId
+ *  一律挂在**结果行**上，从来不是响应级字段。早先这里读的是响应体的 r.needCaptcha，永远 undefined，
+ *  于是滑块不会弹，用户只能看着那行「需过码」去号池行里点一次「过码」、再点一次领取——二段流形同虚设。
+ *
+ *  补跑只带一个账号：captcha 的 verifyParam 是按账号核销的一次性凭据，撒给同渠道其它账号既核销不了
+ *  也多打一轮上游（planId 同理，是那一行选定的套餐）。不需要过码 / 用户取消时原样返回行数组。 */
+async function resumeCheckinWithCaptcha(channel: ProxyChannelId, rows: ProxyCheckinRow[]): Promise<ProxyCheckinRow[]> {
+  const list = rows || [];
+  const need = list.find((x) => x.needCaptcha && x.captcha && x.captcha.sceneId);
+  if (!need) return list;
+  const solved = await solveZcodeCaptcha(need.captcha);
+  if (!solved) {
+    toast("人机校验未完成，已取消领取", "err");
+    return list;
+  }
+  const retry = await api.proxyCheckinRun({
+    channel,
+    accountId: need.accountId,
+    action: "checkin",
+    captcha: solved,
+    planId: need.planId,
+  });
+  // 补跑只回那一行，按 accountId 覆盖回原结果，弹窗里的其它账号结果不丢
+  const fixed = new Map((retry.rows || []).map((x) => [x.accountId, x]));
+  return list.map((x) => fixed.get(x.accountId) || x);
 }
 
 async function refreshOne(acc: ProxyAccount) {
@@ -1320,25 +1340,25 @@ onUnmounted(() => {
 <template>
   <section class="page">
     <div class="page-body">
-      <!-- 渠道主按钮：五个渠道卡片；只留名称，第二行显示 1/1 可用 -->
+      <!-- 渠道主按钮：名称 / 说明 / 状态脚 三行定高，选中才点亮 -->
       <div class="channel-switch">
         <button
           v-for="ch in pool"
           :key="ch.id"
           class="channel-btn"
-          :class="{ active: activeChannel === ch.id }"
+          :class="{ active: activeChannel === ch.id, degraded: ch.health && ch.health.until > now }"
           @click="activeChannel = ch.id"
         >
-          <span class="ch-text">
-            <!-- 名称折两行仍可能放不下（920 下名区 ~106px），全名交给 tooltip：
-                 proxy 域禁原生 title（scripts/dev-proxy-tooltip-uniform-test.cjs ①） -->
-            <el-tooltip :content="ch.display" placement="top" :show-after="200">
-              <span class="ch-name">{{ ch.display }}</span>
-            </el-tooltip>
-            <span class="ch-hint">{{ metaOf(ch).hint }}</span>
-          </span>
-          <span class="ch-badge" :class="{ ok: ch.summary.onlineCount > 0 }">
-            {{ ch.summary.accountCount ? `${ch.summary.onlineCount}/${ch.summary.accountCount} 可用` : "空号池" }}
+          <!-- 名称独占整行（最多折两行），超过两行的全名交给 tooltip：
+               proxy 域禁原生 title（scripts/dev-proxy-tooltip-uniform-test.cjs ①） -->
+          <el-tooltip :content="ch.display" placement="top" :show-after="200">
+            <span class="ch-name">{{ ch.display }}</span>
+          </el-tooltip>
+          <span class="ch-hint">{{ metaOf(ch).hint }}</span>
+          <span class="ch-foot">
+            <span class="ch-badge" :class="{ ok: ch.summary.onlineCount > 0 }">
+              {{ ch.summary.accountCount ? `${ch.summary.onlineCount}/${ch.summary.accountCount} 可用` : "空号池" }}
+            </span>
             <!-- 渠道降级：倒计时到秒，1s 一跳由 tickNow 驱动；原因放在下面的渠道卡标题徽标上 -->
             <em v-if="ch.health && ch.health.until > now" class="ch-degrade">降级 {{ channelCoolLeft(ch) }}</em>
           </span>
@@ -2065,22 +2085,30 @@ onUnmounted(() => {
     transition: none;
   }
 }
-/* ===== 渠道主按钮：三列大按钮，各自独立成区，选中才点亮 ===== */
+/* ===== 渠道主按钮：自适应列宽的大按钮，各自独立成区，选中才点亮 ===== */
 .channel-switch {
   display: grid;
   /* 下限 170 而不是 150：150 在最小窗宽 920（内容 664px）下排 4 列，名区只剩 55px，
-     "WorkBuddy AI（国际版）"折两行也放不下；170 让 920 退到 3 列（名区 ~123px），
-     而 1280（内容 900px）仍是 5 列，行数不变。 */
+     "WorkBuddy AI（国际版）"折两行也放不下；170 让 920 退到 3 列（名区 ~189px），
+     而 1280（内容 900px）仍是 5 列，行数不变。
+     grid-auto-rows: 1fr —— 名区折两行的卡片不能让所在行独自变高：所有行取同一高度，
+     整片方块始终是等高的网格，不会出现"这一行被撑高、那一行矮"的参差 */
   grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  grid-auto-rows: 1fr;
   gap: 10px;
+  align-items: stretch;
 }
+/* 卡片三行定高：名称 / 说明 / 状态脚。名区必须独占整行——可用数徽标与「降级 Ns」角标
+   都不可压缩（flex-shrink: 0），与名区同行时会把名区挤到只剩一个字宽，于是名称与说明
+   各折成一字一行的竖排，整行随之被撑到 200px+、兄弟卡片一起被拉伸。 */
 .channel-btn {
   position: relative;
   display: flex;
-  align-items: center;
-  gap: 10px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
   min-width: 0;
-  padding: 12px 13px;
+  padding: 11px 12px;
   border-radius: var(--r-ctl);
   border: 1px solid var(--line);
   background: var(--bg-soft);
@@ -2130,27 +2158,52 @@ onUnmounted(() => {
 .channel-btn.active::after {
   width: 100%;
 }
-.ch-text {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
 .ch-name {
+  min-width: 0;
   font-size: 12.5px;
   font-weight: 650;
-  /* 名称让位给徽标时曾被截成同一个字串（WorkBuddy（中国区）/（国际版）在 1280 下都成
-     "WorkBuddy…"），故允许折两行；两行仍放不下时由外层 el-tooltip 给全名 */
+  /* 折两行为上限：名区独占整行后换行点正常，"WorkBuddy AI（国际版）"这类长名能整名显示
+     （1280 下名区 146px 刚好放不下单行）；真超过两行才截断，全名交给外层 el-tooltip */
   display: -webkit-box;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
   overflow: hidden;
+  word-break: break-word;
 }
-/* 渠道降级角标（跨渠道故障转移）：红色小徽标提示该渠道暂被熔断，倒计时后回切 */
+.ch-hint {
+  min-width: 0;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--text-3);
+  /* 同样折两行为上限：说明文案（"GLM 编码套餐 · 领奖励 · 切号保远程" 之类）在 1280 下
+     名区 146px 里单行放不下，硬截会把尾巴上的关键信息吃掉，折两行即可全文可见 */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  word-break: break-word;
+}
+/* 状态脚：可用数徽标 + 降级角标，钉在卡片底部（卡片等高时脚行对齐） */
+.ch-foot {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  margin-top: auto;
+  padding-top: 4px;
+}
+/* 降级中的卡片整卡描红：远看就知道这个渠道在熔断，不必凑近读角标 */
+.channel-btn.degraded {
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--line));
+}
+.channel-btn.degraded.active {
+  border-color: color-mix(in srgb, var(--danger) 60%, var(--line));
+}
+/* 渠道降级角标（跨渠道故障转移）：红色小徽标提示该渠道暂被熔断，倒计时后回切。
+   与可用数徽标同在状态脚里，间距交给 .ch-foot 的 gap，自身不许被压缩 */
 .ch-degrade {
+  flex-shrink: 0;
   font-style: normal;
-  margin-left: 5px;
   padding: 0 5px;
   border-radius: var(--r-pill);
   background: color-mix(in srgb, var(--danger, var(--err, #e05555)) 18%, transparent);

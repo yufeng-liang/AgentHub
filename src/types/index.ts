@@ -764,6 +764,11 @@ export interface ProxyCheckinRow {
   reward?: unknown;
   /** zcode 领取奖励：需要人机校验（滑块/点选）；自动签到 tick 里出现时表示要到号池页手动领取 */
   needCaptcha?: boolean;
+  /** zcode 领取奖励：本行需要过码时的滑块配置。挂在「结果行」上而不是响应体上——
+   *  批量接口（proxy_checkin_run）的响应恒为 ok:true + rows，needCaptcha 从来不是响应级字段 */
+  captcha?: { sceneId?: string; region?: string; prefix?: string };
+  /** zcode 领取奖励：本行选定的可领套餐 id，过码后补跑时原样带回（否则会重新挑套餐） */
+  planId?: string;
   /** zcode 领取奖励 1004：设备指纹本周已被消耗，须「指纹修复」换新指纹后重试 */
   deviceBurned?: boolean;
   /** zcode 渠道：账号当前可领取的奖励套餐列表（adapters.cjs 组装） */

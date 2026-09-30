@@ -944,7 +944,7 @@ module.exports = {
   ENC_PREFIX, isEnc, defaultSecret, encDecrypt, encEncrypt, tryDecrypt,
   v2Dir, paths, isNewGen, readJson, atomicWriteJson,
   jwtPayload, uidFromJwt, parseCodingPlanKeyName, parseCredentials, readLive, readProfiles,
-  extractConfigApiKeys, pickPlanKey, accountRecord,
+  extractConfigApiKeys, pickPlanKey, accountRecord, zcodeProviderOf,
   readSwitchSnapshot, buildSwitchSnapshot, seal, unseal,
   anchorPath, readAnchor, saveAnchor, getOrCreateAnchor, findOriginalMidFromBackups,
   mergeWriteCredentials, verifyCredentialsWritten, verifySettingWritten, alignFamilyDomain, resetPlanCache,
