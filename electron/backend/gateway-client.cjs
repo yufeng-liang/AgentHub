@@ -75,12 +75,14 @@ function dropConnection() {
  * 真正的判据在**子进程侧**：token 对不上时服务端直接 destroy 连接，call 拿不到响应 → 这里回 false。
  * （gateway_echo 那一步是第二层：管道被别的实现接走时它也会露馅。握手本身没有独立 ack 帧——
  *  「hello 之后能拿回一条响应」就是 ack，所以这一腿必须在 echo 上真跑一次，不能只看 connect 成功。）
+ * budgetMs 是 connect 与 echo 各自的超时预算（默认 1500ms）：子进程单线程，poolsync 打包 /
+ * WAL checkpoint 时事件循环可停摆超 1.5s，据此做「陈旧回收 / 强杀」这类不可逆决策前应放大预算。
  */
-async function probeAlive(cur) {
+async function probeAlive(cur, budgetMs = 1500) {
   if (!cur || !cur.pid || !pidAlive(cur.pid)) return false;
-  const c = await gatewayPipe.connect({ pipePath: cur.pipe, token: cur.token, timeoutMs: 1500 }).catch(() => null);
+  const c = await gatewayPipe.connect({ pipePath: cur.pipe, token: cur.token, timeoutMs: budgetMs }).catch(() => null);
   if (!c) return false;
-  const r = await c.call("gateway_echo", { v: String(cur.token).slice(0, 8) }, { timeoutMs: 1500 }).catch(() => null);
+  const r = await c.call("gateway_echo", { v: String(cur.token).slice(0, 8) }, { timeoutMs: budgetMs }).catch(() => null);
   c.close();
   return !!(r && r.v === String(cur.token).slice(0, 8));
 }
@@ -136,7 +138,12 @@ async function startOnce({ persistent } = {}) {
     return { ok: true, persistent: false, message: "便携版不支持后台常驻" };
   }
   const cur = readGatewayFile();
-  if (cur && (await probeAlive(cur))) {
+  // 首轮探活默认 1.5s 预算，失败先别认定陈旧：子进程单线程，poolsync 打包 / WAL checkpoint
+  // 时事件循环可停摆超 1.5s，「活着但超时」的常驻网关被误判后 reap 掉 gateway.json 再 spawn
+  // 一个新的就是 split-brain（双开子进程抢同一份 store）。认定陈旧前用加长预算再探一次。
+  let alive = cur && (await probeAlive(cur));
+  if (cur && !alive) alive = await probeAlive(cur, 5000);
+  if (alive) {
     if (cur.version !== util.appVersion()) {
       // 版本不匹配（升级后 exe 路径可能已失效，尤其便携版 %TEMP% 解压目录）：先停旧再起新。
       // 反序新进程会 EADDRINUSE（规格 §5.5）。代价是打断在途 SSE，只在启动时发现一次。
@@ -204,6 +211,7 @@ async function startOnce({ persistent } = {}) {
  * 停掉子进程并等端口真的释放（Task 7 装更/卸载互锁的唯一出口）。
  * 只经已认证的管道下 gateway_shutdown：不按 pid 盲杀，因此 pid 复用场景下不会误伤别的进程。
  * 超时停不下来时**强杀兜底**（Task 7 互锁②）：子进程吞掉 gateway_shutdown / 停机上界内没退完时，
+ * 强杀前先经管道 token 双检确认 pid 仍是我们的网关（探活不过 = 可能已被复用，不动手、如实回报），
  * 到点动手杀掉并等 pid 真消失，以 {stopped:true, forced:true} 回报 —— 装更宁可背着「没排干」
  * 也要拿到解锁的映像，绝不拿一个还活着的子进程去开 NSIS。
  *
@@ -239,30 +247,39 @@ async function stopAndWait({ timeoutMs = 5000 } = {}) {
   }
   // Task 7 互锁②：到点还没退 = 子进程赖着不走（吞掉 gateway_shutdown / 停机上界内没退完）→ 强杀。
   // 强杀后必须真的等到 pid 消失再返回：返回 stopped:true 而进程还在是谎报，装更会在映像仍被锁时开跑。
-  // 句柄选择：本会话 spawn 的（child.pid 与记录一致）用 child 句柄；认领来的（无句柄）按记录 pid 杀
-  // ——那个 pid 在认领时经管道 token 双检认证过（probeAlive），且刚刚还活着，不是盲 pid。
+  // 句柄选择：本会话 spawn 的（child.pid 与记录一致）用 child 句柄；认领来的（无句柄）按记录 pid 杀。
+  // 强杀前必须再探一次管道：timeoutMs 等待期间 pid 可能已死又被内核复用，process.kill 是盲 pid
+  // 操作，Windows 上会误杀无关进程。探活成功 = token 对得上，pid 确实还是我们的网关，可杀；
+  // 探活失败但 pid 活着 = 可能已是别人的进程，绝不杀（与 reap 同一纪律），如实回报停机失败。
+  // 预算放大到 5s：单线程子进程忙时 1.5s 会假阴性，把真网关误判成复用 pid 而放走。
   let parentForced = false;
+  let killSkipped = false;
   if (pidAlive(cur.pid)) {
-    log.line("stopAndWait-force-kill", { pid: cur.pid, owned: !!(child && child.pid === cur.pid) });
-    try {
-      if (child && child.pid === cur.pid) child.kill();
-      else process.kill(cur.pid);
-    } catch (e) {
-      log.line("stopAndWait-force-kill-failed", { pid: cur.pid, message: String((e && e.message) || e) });
-    }
-    const killDeadline = Date.now() + 3000;
-    while (pidAlive(cur.pid) && Date.now() < killDeadline) {
-      await new Promise((r) => setTimeout(r, 100));
-    }
-    parentForced = !pidAlive(cur.pid);
-    // Windows 实测：TerminateProcess 之后 pid 先消失、内核还要片刻才释放监听 socket，
-    // 会撞出「pid 已死但端口仍 accept」的窗口。给一个有界宽限期再实测端口，宽限后仍占着
-    // 就由下面的 portFreed 如实报 false（调用方据此显式报错，不静默放行装更）。
-    if (parentForced && diskPort) {
-      const settleDeadline = Date.now() + 2000;
-      while ((await probePortBusy(diskPort)) && Date.now() < settleDeadline) {
+    if (await probeAlive(cur, 5000)) {
+      log.line("stopAndWait-force-kill", { pid: cur.pid, owned: !!(child && child.pid === cur.pid) });
+      try {
+        if (child && child.pid === cur.pid) child.kill();
+        else process.kill(cur.pid);
+      } catch (e) {
+        log.line("stopAndWait-force-kill-failed", { pid: cur.pid, message: String((e && e.message) || e) });
+      }
+      const killDeadline = Date.now() + 3000;
+      while (pidAlive(cur.pid) && Date.now() < killDeadline) {
         await new Promise((r) => setTimeout(r, 100));
       }
+      parentForced = !pidAlive(cur.pid);
+      // Windows 实测：TerminateProcess 之后 pid 先消失、内核还要片刻才释放监听 socket，
+      // 会撞出「pid 已死但端口仍 accept」的窗口。给一个有界宽限期再实测端口，宽限后仍占着
+      // 就由下面的 portFreed 如实报 false（调用方据此显式报错，不静默放行装更）。
+      if (parentForced && diskPort) {
+        const settleDeadline = Date.now() + 2000;
+        while ((await probePortBusy(diskPort)) && Date.now() < settleDeadline) {
+          await new Promise((r) => setTimeout(r, 100));
+        }
+      }
+    } else {
+      killSkipped = true;
+      log.line("stopAndWait-force-kill-skipped", { pid: cur.pid, why: "强杀前探活未通过（pid 可能已被复用），不按 pid 盲杀" });
     }
   }
   const stopped = !pidAlive(cur.pid);
@@ -281,7 +298,10 @@ async function stopAndWait({ timeoutMs = 5000 } = {}) {
   let message = stopped
     ? (portFreed ? (parentForced ? "子进程未在时限内自行退出，已强杀，端口已释放" : "已停止")
       : "子进程已退出但端口 " + port + " 仍被占用")
-    : "子进程未在 " + timeoutMs + "ms 内退出（强杀后 pid " + cur.pid + " 仍在）";
+    : killSkipped
+      // 未强杀不能沿用「强杀后 pid 仍在」的旧文案：探活未通过时我们刻意没动手
+      ? "子进程未在 " + timeoutMs + "ms 内退出，且强杀前探活未通过（pid 可能已被复用），未执行强杀"
+      : "子进程未在 " + timeoutMs + "ms 内退出（强杀后 pid " + cur.pid + " 仍在）";
   if (stopped && drained === false) {
     // 本任务最坏的失败形态必须在返回值里看得见（评审 I2③）：Task 7 的互锁据此决定报错文案，
     // 而不是拿一个"看起来停了"的 stopped:true 放行

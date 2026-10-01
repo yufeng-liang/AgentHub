@@ -156,6 +156,9 @@ function registerSync(ctx) {
     const p = sync.progress();
     if (p && p.running) return { ok: false, message: "同步正在进行中" };
     if (p && p.restoring) return { ok: false, message: "正在恢复备份，请稍候" };
+    // localBusy（本地统计静默运行）不进 progress() 状态机，这里单独挡下：漏检时 run() 的
+    // 同名守卫拒绝只会落进下面 fire-and-forget 的 console.error，渲染层零反馈
+    if (sync.isBusy()) return { ok: false, message: "本地统计进行中，请稍后再同步" };
     const cfg = config.loadConfig();
     const opts = args && args.mode === "backup" ? { mode: "backup" } : {};
     sync.run(cfg, opts).catch((e) => console.error("[sync]", e));
@@ -242,6 +245,11 @@ function registerSync(ctx) {
     const deviceId = args && args.deviceId;
     try {
       if (!deviceId || typeof deviceId !== "string") return { ok: false, message: "缺少设备 ID" };
+      // deviceId 下面直接拼进 WebDAV URL：`../../` 之类可穿越到账号根目录之外，必须白名单锁死
+      // （字母/数字/._-、上限 128，且显式拒 "." 与 ".."——后者拼进数据目录 DELETE 段会把整个数据目录删掉）
+      if (!/^[A-Za-z0-9._-]{1,128}$/.test(deviceId) || deviceId === "." || deviceId === "..") {
+        return { ok: false, message: "设备 ID 含非法字符，已拒绝删除" };
+      }
       const localId = db.getLocalDeviceId();
       if (deviceId === localId) return { ok: false, message: "本机设备不能删除" };
       // 同步进行中拒绝删除：否则已合并的该设备数据会在本次同步尾段被重新写回

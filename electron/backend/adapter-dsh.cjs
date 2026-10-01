@@ -24,7 +24,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const { DatabaseSync } = require("node:sqlite");
 const { normalizeModel, providerName } = require("./adapter-zcode.cjs");
-const { rmTempDir, sweepStale } = require("./temp-util.cjs");
+const { rmTempDir, sweepStale, copySqliteTrio } = require("./temp-util.cjs");
 
 const ID = "dsh";
 const NAME = "DeepSeek Harness";
@@ -90,10 +90,13 @@ function readWithWalFallback(dir) {
     sweepStale("dosage-sync-dsh-"); // 崩溃遗留的上轮临时副本，本轮顺手清理
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "dosage-sync-dsh-"));
     try {
-      for (const suffix of ["", "-wal", "-shm"]) {
-        const source = dbFile + suffix;
-        if (fs.existsSync(source)) fs.copyFileSync(source, path.join(tempDir, `tokenledger.sqlite${suffix}`));
-      }
+      // 撕裂副本防御：拷完先按下游同款只读打开验一遍，不过整组重拷（见 copySqliteTrio）；
+      // 两轮都不过时照常走 readRows，由它抛错进下面的统一包装
+      copySqliteTrio(dbFile, tempDir, (dest) => {
+        const c = new DatabaseSync(dest, { readOnly: true });
+        c.close();
+        return true;
+      });
       return readRows(path.join(tempDir, "tokenledger.sqlite"));
     } catch (fallbackError) {
       throw new Error(`读取 DeepSeek Harness 数据失败：${fallbackError.message || directError.message}`);

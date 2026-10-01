@@ -148,6 +148,9 @@ function restoreFromTrash(trashName, destParent) {
   const base = destParent || skillsDir();
   // 剥掉回收站命名里的时间戳前缀
   const original = trashName.replace(/^\d{4}-\d{2}-\d{2}T[0-9-]+Z-/, "");
+  // "."/".."（含时间戳前缀剥完剩下的）过 basename 后原样返回，join 会归一成目录本身，
+  // rename 会把 .trash 条目挪到 skillsDir/上级目录自身，与 removeSkill 同一守卫口径
+  if (!original || original === "." || original === "..") return { ok: false, message: "非法名称" };
   const dest = path.join(base, original);
   if (fs.existsSync(dest)) return { ok: false, message: `目标已存在：${dest}` };
   fs.renameSync(src, dest);
@@ -198,6 +201,9 @@ function dirSize(p) {
 function removeSkill(name) {
   name = path.basename(String(name || "")); // 技能名就是目录名，带路径一律拒收
   if (!name) return { ok: false, message: "非法技能名" };
+  // "."/".." 过 basename 后原样返回，join 会归一成 skillsDir/上级目录本身：
+  // 不拦住会把整个技能库 toTrash 移走，且 restoreFromTrash 永远报「目标已存在」无法恢复
+  if (name === "." || name === "..") return { ok: false, message: "非法技能名" };
   const dir = path.join(skillsDir(), name);
   if (!fs.existsSync(dir)) return { ok: false, message: "技能不存在" };
   const m = loadManifest();

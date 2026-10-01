@@ -628,6 +628,7 @@ async function run(cfg, opts = {}) {
   if (state.running) throw new Error("同步正在进行中");
   if (localBusy) throw new Error("本地统计进行中");
   state = { running: true, cancelled: false, stage: "extract", percent: 0, message: "准备抽取", lastSyncAt: state.lastSyncAt || null, localOnly: false, backupOnly: false, restoring: false };
+  settledResult = null; // 开启新一轮结算窗口
   currentAbort = new AbortController();
   webdav.setActiveSignal(currentAbort.signal);
 
@@ -728,6 +729,7 @@ async function runRemote(cfg) {
   if (state.running) throw new Error("同步正在进行中");
   if (localBusy) throw new Error("本地统计进行中，远程同步已跳过");
   state = { running: true, cancelled: false, stage: "upload", percent: 0, message: "准备上传", lastSyncAt: state.lastSyncAt || null, localOnly: false, backupOnly: false, restoring: false };
+  settledResult = null; // 开启新一轮结算窗口
   currentAbort = new AbortController();
   webdav.setActiveSignal(currentAbort.signal);
   try {
@@ -757,7 +759,13 @@ async function runRemote(cfg) {
   }
 }
 
+// 一次性结算守卫：取消路径内外层都会 return finish("cancelled")（如 pushRemote 内层结算后，
+// run 外层的 state.cancelled 检查仍为真会再调一次），重复结算会重复写日志、重复置 stage。
+// 首次结算后的返回值被缓存，重复调用原样返回不再产生副作用；新一轮 run/runRemote 开头重置。
+let settledResult = null;
+
 function finish(result) {
+  if (settledResult) return settledResult;
   state.running = false;
   if (result === "completed") {
     state.stage = "done";
@@ -767,12 +775,14 @@ function finish(result) {
     log("done", "ok", state.backupOnly ? "备份完成" : state.localOnly ? "同步完成（仅本机数据，未配置 WebDAV）" : "同步完成");
     try { db.pruneLogs(); } catch { /* 日志裁剪失败不影响同步 */ }
     if (onFinish) onFinish(true, state.message);
-    return { ok: true };
+    settledResult = { ok: true };
+    return settledResult;
   }
   state.stage = "cancelled";
   state.message = "已取消";
   log("done", "info", "同步已取消");
-  return { ok: false, cancelled: true };
+  settledResult = { ok: false, cancelled: true };
+  return settledResult;
 }
 
 function cancel() {

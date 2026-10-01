@@ -59,6 +59,33 @@ function registerExitCleanup(dir) {
   });
 }
 
+/**
+ * SQLite db+wal+shm 三件套拷贝到 destDir（副本与源同名，返回副本主库路径）。
+ * 逐文件 copyFileSync 非原子，拷贝间隙源端写入/checkpoint 会产出主库与 wal 不匹配的撕裂副本
+ * （下游偶发「解密失败/库损坏」假告警）。verify(destDbPath) 按下游开副本的方式给
+ * （能只读打开/能解密打开即算过），验证不过就整组重拷一次再验；两轮都不过时返回 null，
+ * 交回调用方按原路径打开——由真正的下游打开报出权威错误（密钥变更/库真损坏），这里不抢话。
+ * verify 缺省（无法校验的场景）退化为拷两遍取第二遍：两份之间间隔拉开，撕裂概率大幅降低。
+ */
+function copySqliteTrio(srcFile, destDir, verify) {
+  const base = path.basename(srcFile);
+  const attempt = () => {
+    for (const ext of ["", "-wal", "-shm"]) {
+      const src = srcFile + ext;
+      if (fs.existsSync(src)) fs.copyFileSync(src, path.join(destDir, base + ext));
+    }
+    if (!verify) return true;
+    try {
+      return verify(path.join(destDir, base)) === true;
+    } catch {
+      return false;
+    }
+  };
+  if (attempt()) return path.join(destDir, base);
+  if (attempt()) return path.join(destDir, base);
+  return null;
+}
+
 function openReadOnly(file, tmpPrefix) {
   try {
     return new DatabaseSync(file, { readOnly: true });
@@ -72,10 +99,13 @@ function openReadOnly(file, tmpPrefix) {
     registerExitCleanup(tmp);
     try {
       const base = path.basename(file);
-      for (const ext of ["", "-wal", "-shm"]) {
-        const src = file + ext;
-        if (fs.existsSync(src)) fs.copyFileSync(src, path.join(tmp, base + ext));
-      }
+      // 撕裂副本防御：拷完先按下游同款只读打开验一遍，不过整组重拷（见 copySqliteTrio）；
+      // 两轮都不过时照常走下面的真实打开，由它抛出权威错误
+      copySqliteTrio(file, tmp, (dest) => {
+        const c = new DatabaseSync(dest, { readOnly: true });
+        c.close();
+        return true;
+      });
       // 副本目录须等连接用完才能删，exit 钩子兜底 + 下轮 sweepStale 自愈
       return new DatabaseSync(path.join(tmp, base), { readOnly: true });
     } catch (e) {
@@ -87,4 +117,4 @@ function openReadOnly(file, tmpPrefix) {
   }
 }
 
-module.exports = { rmTempDir, sweepStale, openReadOnly };
+module.exports = { rmTempDir, sweepStale, copySqliteTrio, openReadOnly };

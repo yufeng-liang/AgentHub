@@ -522,6 +522,9 @@ function repairMounts(cfg) {
 function adoptHubSkill(raw, cfg) {
   const name = path.basename(String(raw || ""));
   if (!name) return { ok: false, message: "非法技能名" };
+  // "."/".." 过 basename 后原样返回，join 会归一成 skillsDir 本身，existsSync 会命中中央仓库根，
+  // 把整库当技能目录读账（与 hub.removeSkill 同一守卫口径）
+  if (name === "." || name === "..") return { ok: false, message: "非法技能名" };
   const dir = path.join(hub.skillsDir(), name);
   const m = hub.loadManifest();
   if (m.skills[name]) return { ok: false, message: `「${name}」已在库中` };

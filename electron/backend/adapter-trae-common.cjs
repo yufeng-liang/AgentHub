@@ -22,7 +22,7 @@ const os = require("node:os");
 const path = require("node:path");
 const sqlcipher = require("./sqlcipher.cjs");
 const { normalizeModel, providerName } = require("./adapter-zcode.cjs");
-const { rmTempDir, sweepStale } = require("./temp-util.cjs");
+const { rmTempDir, sweepStale, copySqliteTrio } = require("./temp-util.cjs");
 
 function homeDir() {
   return process.env.USERPROFILE || process.env.HOME || ".";
@@ -93,12 +93,12 @@ function makeTraeAdapter(id, name, appDirName, envKey) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), `dosage-trae-${id}-`));
     try {
       const src = dbFile(root);
-      for (const suffix of ["", "-wal", "-shm"]) {
-        const from = src + suffix;
-        if (fs.existsSync(from)) {
-          fs.copyFileSync(from, path.join(dir, "database.db" + suffix));
-        }
-      }
+      // SQLCipher 加密库无明文头部可校验：按下游同款解密打开验一遍，撕裂副本重拷一次
+      // （见 copySqliteTrio）；两轮都不过时照常返回，由 extract 的真实打开抛「解密失败」权威错误
+      copySqliteTrio(src, dir, (dest) => {
+        sqlcipher.close(sqlcipher.open(dest));
+        return true;
+      });
     } catch (e) {
       rmTempDir(dir);
       throw e;
