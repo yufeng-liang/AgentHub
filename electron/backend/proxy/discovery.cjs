@@ -359,7 +359,15 @@ function scanTrae() {
   const channels = { trae: TRAE_APP_DIRS.trae, trae_solo_cn: TRAE_APP_DIRS.trae_solo_cn };
   const seenPaths = new Set();
   for (const [channel, dirs] of Object.entries(channels)) {
-    const paths = traeStoragePaths(dirs).sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+    // mtime 比较器里的 statSync 在登录文件被并发删除（升级/退出登录）时会抛错炸掉整轮扫描：
+    // 先逐个预取 mtime（取不到的丢弃），排序只比预取值，比较器不再碰盘
+    const paths = traeStoragePaths(dirs)
+      .map((p) => {
+        try { return { p, mtime: fs.statSync(p).mtimeMs }; } catch { return null; }
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.mtime - a.mtime)
+      .map((x) => x.p);
     for (const p of paths) {
       if (seenPaths.has(p)) continue;
       seenPaths.add(p);
@@ -547,9 +555,19 @@ function scanAutoClaw() {
   return out;
 }
 
-/** 全量扫描（本机全渠道候选）：六渠道 = 上游四家 + fork 的 cline/autoclaw + 上游 zcode */
+/** 全量扫描（本机全渠道候选）：六渠道 = 上游四家 + fork 的 cline/autoclaw + 上游 zcode。
+ *  逐扫描器 try/catch：单渠道扫描抛错（如登录文件在扫描间隙被删）只跳过该渠道并留痕，
+ *  不中断整轮——其余渠道的候选照常返回（与 currentLocalLogins 的单渠道隔离同一口径） */
 function scanAll() {
-  return [...scanTrae(), ...scanWorkBuddy(), ...scanRaccoon(), ...scanCline(), ...scanAutoClaw(), ...scanZcode()];
+  const out = [];
+  for (const scan of [scanTrae, scanWorkBuddy, scanRaccoon, scanCline, scanAutoClaw, scanZcode]) {
+    try {
+      out.push(...scan());
+    } catch (e) {
+      console.warn(`[proxy.discovery] scanAll 单渠道扫描失败，跳过：${String((e && e.message) || e)}`);
+    }
+  }
+  return out;
 }
 
 // ===== ZCode 本机登录态扫描 =====
@@ -668,7 +686,11 @@ function importCandidate(candidate, channelOverride) {
     const seed = crypto.createHash("sha256").update(`agenthub:raccoon:${candidate.uid || "anon"}`).digest("hex");
     meta = { ...meta, deviceId: `${seed.slice(0, 8)}-${seed.slice(8, 12)}-4${seed.slice(13, 16)}-a${seed.slice(17, 20)}-${seed.slice(20, 32)}` };
   }
-  const existing = store.listAccounts(channel).find((a) => a.uid && a.uid === candidate.uid);
+  // 查重口径与 poolsync.accountKeyOf 的身份键一致：uid 非空按 uid；uid 为空退回 channel+name——
+  // 旧条件 `a.uid && a.uid === candidate.uid` 对无 uid 的候选永不命中，重复导入会堆出一堆重复账号
+  const existing = store.listAccounts(channel).find((a) =>
+    candidate.uid ? a.uid === candidate.uid : !!candidate.name && a.name === candidate.name
+  );
   if (existing) {
     const curMeta = readAccountMeta(existing.id);
     store.updateAccount(existing.id, {
@@ -1377,11 +1399,12 @@ async function saveZcodeAccount(channel, cred) {
   let id;
   let updated = false;
   if (existing) {
-    // 合并 meta：保留旧 meta 里可能存在的 relayPassHash、历史画像与专属 deviceMid
+    // 合并 meta：保留旧 meta 里可能存在的 relayPassHash、历史画像与专属 deviceMid。
+    // 落库走 mergeAccountMeta 原子收口（store.cjs 的规矩：往 meta 补键一律走它，不自己读快照
+    // spread 回写）——这里只算要覆盖的增量，合并与写回都收在 store 一层
     const oldMeta = readAccountMeta(existing.id);
     const existingCodingPlanKeys = (oldMeta.sw && oldMeta.sw.codingPlanKeys) ? oldMeta.sw.codingPlanKeys : "";
-    const merged = {
-      ...oldMeta,
+    store.mergeAccountMeta(existing.id, {
       ...meta,
       deviceMid: oldMeta.deviceMid || meta.deviceMid,
       sw: {
@@ -1390,8 +1413,8 @@ async function saveZcodeAccount(channel, cred) {
         codingPlanKeys: existingCodingPlanKeys || meta.sw.codingPlanKeys,
         relayPassHash: (oldMeta.sw && oldMeta.sw.relayPassHash) || "",
       },
-    };
-    store.updateAccount(existing.id, { token: cred.jwt, meta: merged, status: "online", coolUntil: 0, coolReason: "" });
+    });
+    store.updateAccount(existing.id, { token: cred.jwt, status: "online", coolUntil: 0, coolReason: "" });
     id = existing.id;
     updated = true;
   } else {
@@ -1429,10 +1452,9 @@ function readAccountMeta(id) {
  */
 async function activateZcodeAccount(accountId, cred) {
   const c = zcodeCfg();
-  const mark = (patch) => {
-    const meta = readAccountMeta(accountId);
-    store.updateAccount(accountId, { meta: { ...meta, ...patch } });
-  };
+  // meta 合并统一走 store.mergeAccountMeta 原子收口（store.cjs 的规矩：往 meta 补键一律走它），
+  // 不再自己读快照 spread 回写
+  const mark = (patch) => store.mergeAccountMeta(accountId, patch);
   // ① business login（0/3/10s 三次重试；服务端初始化是异步的）
   for (const delay of [0, 3000, 10000]) {
     if (delay) await new Promise((r) => setTimeout(r, delay));
@@ -1508,14 +1530,13 @@ async function activateZcodeAccount(accountId, cred) {
     const fullKey = `${apiKey}.${secret}`;
     const uid = String((store.getAccount(accountId) || {}).uid || "");
     const keyName = `account-provider:coding-plan:account:zai-individual-coding-plan:account:${uid}:api-key`;
-    const meta = readAccountMeta(accountId);
-    store.updateAccount(accountId, {
-      refreshToken: fullKey,
-      meta: {
-        ...meta,
-        codingPlanResolved: true,
-        sw: { ...(meta.sw || {}), codingPlanKeys: zcodeLocal.seal(JSON.stringify([{ keyName, plain: fullKey }])) },
-      },
+    store.updateAccount(accountId, { refreshToken: fullKey });
+    // sw 是嵌套键、合并要拿现值参与运算：先读一份算好增量，落库仍走 mergeAccountMeta 原子收口
+    // （读用 store.accountMeta，与 mergeAccountMeta 配对）
+    const meta = store.accountMeta(accountId);
+    store.mergeAccountMeta(accountId, {
+      codingPlanResolved: true,
+      sw: { ...(meta.sw || {}), codingPlanKeys: zcodeLocal.seal(JSON.stringify([{ keyName, plain: fullKey }])) },
     });
   } catch (e) {
     mark({ codingPlanResolved: false, codingPlanError: String((e && e.message) || e).slice(0, 200) });

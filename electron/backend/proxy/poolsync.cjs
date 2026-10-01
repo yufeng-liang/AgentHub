@@ -179,6 +179,23 @@ function accountStamp(a) {
   );
 }
 
+/** 账号的「用户意图时刻」——墓碑仲裁专用，与 accountStamp 分尺。
+ *  creditsAt 绝不能进这把尺：它由额度定时刷新（默认 30 分钟）在后台自动推进，不是用户动作，
+ *  拿它比墓碑，本机「刚刷过额度」就能把他机显式删除的账号复活；lastUsed 同理（随每次请求自动推进）。
+ *  这里只收真正的用户意图：入池/重新入池（createdAt）与改名（renamedAt）。就地换 token 的写入全部
+ *  走自动链路（credits.cjs 临期预刷新 / 401 重试），用户换 token 走删了重加 ⇒ 落在 createdAt 里。
+ *  快照行没有 createdAt/renamedAt 字段，由导出侧按同一把尺算好落 intentUpdatedAt（见 exportPool）；
+ *  老版本快照没有该字段时退回 meta.renamedAt，再没有即 0——墓碑赢，删除照常传播。 */
+function accountIntentStamp(a) {
+  if (!a || typeof a !== "object") return 0;
+  return Math.max(
+    Number(a.intentUpdatedAt || 0),
+    Number(a.createdAt || 0),
+    Number(a.renamedAt || 0),
+    Number((a.meta && a.meta.renamedAt) || 0),
+  );
+}
+
 /** 导出前元数据脱敏/明文化：DPAPI 密文无法跨机解密，将切号快照等敏感字段还原为明文 JSON 结构。
  *  由于快照整体会打入 AES-256-GCM 加密压缩包，凭据在网络传输与存储中受统一密码严格保护。 */
 function prepareMetaForExport(meta, channel) {
@@ -253,6 +270,9 @@ function exportPool(channel) {
         // 上游这里换成了含 updated_at 的 rawUpdatedAt——那个列每刷一次额度就前进，改名会永久输给
         // 「刚刷过额度」的对端，正是本文件修过的那个缺陷。updated_at 只留给上游的凭据仲裁用。
         updatedAt: accountStamp(view),
+        // 墓碑仲裁专用的意图戳（不含 creditsAt/lastUsed，见 accountIntentStamp）：凭据/改名 LWW 仍用
+        // 上面的 accountStamp 尺，两把尺各管各的，别混用
+        intentUpdatedAt: accountIntentStamp(view),
       };
     })
     .filter(Boolean);
@@ -331,7 +351,9 @@ function mergeSnapshot(snap, channel) {
     // 墓碑命中且本机没有该账号：尊重删除，不回捞
     const local = localByKey.get(ra.key);
     if (!local) {
-      if (tombstones[ra.key] && Number(tombstones[ra.key]) >= raUpdatedAt) continue;
+      // 墓碑比较必须用意图戳（accountIntentStamp）：accountStamp 含 creditsAt，额度定时刷新会
+      // 不断推进它，使他机显式删除的账号在下一轮同步里总显得「比删除新」而必然复活
+      if (tombstones[ra.key] && Number(tombstones[ra.key]) >= accountIntentStamp(ra)) continue;
       // 远端空凭据不入池：无 token 的账号不可调度，还会继续向下一台设备传播坏号
       if (!ra.token) {
         skipped++;
@@ -357,7 +379,11 @@ function mergeSnapshot(snap, channel) {
     // 本机已有同身份账号：自动冲突仲裁
     const localRow = store.getAccount(local.id);
     const localSecrets = localRow ? store.accountSecrets(localRow) : { token: "", refreshToken: "" };
-    const localUpdatedAt = Number(local.updatedAt || local.creditsAt || local.lastUsed || local.createdAt || 0);
+    // 凭据 LWW 的本地阈值必须与远端同一把 accountStamp 尺（导出侧 ra.updatedAt 就是它）。
+    // 不能用 updated_at：store.updateAccount 无条件推进它（noteError/cooling/额度刷新都走），
+    // 拿它当阈值，本机任意一次记账写都会把远端的凭据修复挡回去——updated_at 不能当 LWW 时钟
+    // （见 store.cjs 建列注释），与下面改名比较用 accountStamp 是同一处对称补齐。
+    const localUpdatedAt = accountStamp(local);
 
     // 检查凭据是否实质不同
     const tokenDiffers = (ra.token || "") !== (localSecrets.token || "") || (ra.refreshToken || "") !== (localSecrets.refreshToken || "");
@@ -393,7 +419,21 @@ function mergeSnapshot(snap, channel) {
       patch.token = ra.token;
       patch.refreshToken = ra.refreshToken || "";
       patch.expiresAt = ra.expiresAt || 0;
-      patch.meta = restoreMetaForLocal(ra.meta, ra.channel);
+      // meta 合并而非整体替换（远端 restoreMetaForLocal 结果为底）：
+      // - 设备指纹类键保留本机现值——repairDeviceMid 刚在本机重派的随机指纹、扫描/OAuth 绑定的
+      //   deviceId/officeIdentity 不能被远端快照里的旧值滚回去（指纹冲突是出在远端那台机器上的事，
+      //   本机刚修复过反而更新）；
+      // - lastError 是本机诊断态：远端快照里的旧错误不采纳，本机没有就保持干净。
+      // 其余键（sw/provider/画像等）与凭据是一对，随凭据一起采纳远端。
+      const remoteMeta = restoreMetaForLocal(ra.meta, ra.channel);
+      delete remoteMeta.lastError;
+      patch.meta = {
+        ...remoteMeta,
+        deviceMid: local.meta.deviceMid || remoteMeta.deviceMid,
+        deviceId: local.meta.deviceId || remoteMeta.deviceId,
+        officeIdentity: local.meta.officeIdentity || remoteMeta.officeIdentity,
+        ...(local.meta.lastError ? { lastError: local.meta.lastError } : {}),
+      };
       patch.updatedAt = raUpdatedAt || now;
       // 只要采纳了远端较新且有效的凭据，重置冷却与解除上游错误，自愈恢复调度
       patch.coolUntil = 0;
@@ -447,7 +487,9 @@ function applyTombstones(remote, channel) {
     const local = accounts.find((a) => accountKeyOf(a) === key);
     if (!local) continue;
     // 本机账号比墓碑新（删完后又重新添加了同身份账号）：不删，并视为复活（下面合并墓碑时本机包会盖过它）
-    if (Number(local.creditsAt || local.createdAt || 0) > Number(at)) continue;
+    // 阈值用意图戳（不含 creditsAt/lastUsed）：两者都被后台自动推进（额度定时刷新/请求记账），
+    // 拿它们比墓碑，从未被用户碰过的账号也能顶掉他机的显式删除——与 mergeSnapshot 里的墓碑比较同一把尺
+    if (accountIntentStamp(local) > Number(at)) continue;
     if (store.removeAccount(local.id)) removed++;
   }
   return removed;
@@ -646,21 +688,18 @@ async function backupAnchorMid() {
   const mid = String(anchor.remoteMid || "");
   if (!mid) return { action: "skipped", reason: "锚定指纹未初始化" };
   const w = wd();
-  const payload = JSON.stringify({
-    v: 1,
-    deviceMid: mid,
-    deviceName: deviceName(),
-    updatedAt: Date.now(),
-    appVersion: util.appVersion(),
-  });
-  const hash = sha1(Buffer.from(payload));
+  // 记账 hash 只算内容部分（v/deviceMid/deviceName/appVersion）：updatedAt 是「本次上传时刻」，
+  // 每次必变，混进 hash 会让「内容未变不重传」永不生效——它只进上传 payload
+  const content = { v: 1, deviceMid: mid, deviceName: deviceName(), appVersion: util.appVersion() };
+  const hash = sha1(Buffer.from(JSON.stringify(content)));
   const st = loadPersisted();
   const forRemote = `${w.endpoint}${w.root}`;
   if (st.uploadedAnchorHash === hash && st.uploadedAnchorFor === forRemote) {
     return { action: "unchanged" };
   }
   await webdav.ensureDir(remoteUrl(w, POOL_DIR, ANCHOR_REMOTE_DIR), w);
-  await webdav.put(remoteUrl(w, POOL_DIR, ANCHOR_REMOTE_DIR, `${deviceId() || "local"}.json`), w, payload);
+  await webdav.put(remoteUrl(w, POOL_DIR, ANCHOR_REMOTE_DIR, `${deviceId() || "local"}.json`), w,
+    JSON.stringify({ ...content, updatedAt: Date.now() }));
   savePersisted({ ...st, uploadedAnchorHash: hash, uploadedAnchorFor: forRemote });
   return { action: "uploaded", deviceMid: mid };
 }
@@ -684,4 +723,4 @@ async function restoreAnchorMidFromRemote() {
   return { action: "restored", deviceMid: mid };
 }
 
-module.exports = { run, cancel, progress, configured, noteRemoved, onSharedPasswordMaybeChanged, accountKeyOf, accountStamp, renameWouldChangeIdentity, backupAnchorMid, restoreAnchorMidFromRemote };
+module.exports = { run, cancel, progress, configured, noteRemoved, onSharedPasswordMaybeChanged, accountKeyOf, accountStamp, accountIntentStamp, renameWouldChangeIdentity, backupAnchorMid, restoreAnchorMidFromRemote };
