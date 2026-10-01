@@ -35,19 +35,18 @@ const capDraft = ref<Record<Cap, boolean | undefined>>({ images: undefined, vide
 const efforts = ref<string[]>([]);
 const defaultEffort = ref<string>("");
 const maxOut = ref<number | null>(null);
-// 打开或切换模型时，从当前稀疏覆盖回填草稿
-watch(
-  () => props.model?.id,
-  () => {
-    const ov = props.override || {};
-    const c = ov.capabilities || {};
-    capDraft.value = { images: c.images, video: c.video, reasoning: c.reasoning, tools: c.tools };
-    efforts.value = [...(ov.reasoning?.supportedEfforts || [])];
-    defaultEffort.value = ov.reasoning?.defaultEffort || "";
-    maxOut.value = typeof ov.maxOutputTokens === "number" ? ov.maxOutputTokens : null;
-  },
-  { immediate: true },
-);
+// 打开或切换模型时，从当前稀疏覆盖回填草稿；覆盖本身变化（清除覆盖/保存落盘）也要回填——
+// 只盯 id 的话，「清除覆盖」后行对象 id 不变、草稿留旧值，再点保存会把刚删的覆盖原样写回
+function refillDraft() {
+  const ov = props.override || {};
+  const c = ov.capabilities || {};
+  capDraft.value = { images: c.images, video: c.video, reasoning: c.reasoning, tools: c.tools };
+  efforts.value = [...(ov.reasoning?.supportedEfforts || [])];
+  defaultEffort.value = ov.reasoning?.defaultEffort || "";
+  maxOut.value = typeof ov.maxOutputTokens === "number" ? ov.maxOutputTokens : null;
+}
+watch(() => props.model?.id, refillDraft, { immediate: true });
+watch(() => props.override, refillDraft);
 
 /** 哪些组已被用户覆盖（来自后端 metaOverridden 出处标记） */
 const overridden = computed(() => new Set(props.model?.metaOverridden || []));

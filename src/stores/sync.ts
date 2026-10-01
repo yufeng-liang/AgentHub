@@ -68,7 +68,9 @@ export const ALL_SOURCES = "all";
 
 export const useSyncStore = defineStore("sync", {
   state: () => ({
-    config: { ...defaultConfig } as SyncConfig,
+    // 深拷贝：浅拷贝会让嵌套对象（webdav/schedule…）与模块级 defaultConfig 共享引用，
+    // 就地写会污染「兜底默认值」，reloadConfig 失败分支会被当成默认值恢复
+    config: JSON.parse(JSON.stringify(defaultConfig)) as SyncConfig,
     loaded: false,
     activeSource: ALL_SOURCES as string,
     // 数据源清单（id/name 来自后端适配器，唯一事实源；enabled 为磁盘配置中的状态）
@@ -183,7 +185,8 @@ export const useSyncStore = defineStore("sync", {
       // 口径兜底：后端已归一化，这里再防 mock/异常值（platform 选项已移除，等效 compact）
       if (!TOTAL_MODES[this.config.totalMode]) this.config.totalMode = "compact";
       } catch {
-        this.config = { ...defaultConfig };
+        // 同样要深拷贝：整体替换若仍浅拷贝，污染依旧会传导回 defaultConfig
+        this.config = JSON.parse(JSON.stringify(defaultConfig));
       }
       // 两级结构迁移：旧扁平 order 插入 g:组条目（有变更才落盘）
       try {

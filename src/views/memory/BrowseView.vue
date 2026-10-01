@@ -253,6 +253,7 @@ async function purgeTrash() {
   }
 }
 
+let pickDaySeq = 0;
 async function pickDay(day: string) {
   // 点已经选中的那天＝收起当日清单（与「再点一次取消」的心智一致）
   if (dayPick.value === day) {
@@ -260,12 +261,15 @@ async function pickDay(day: string) {
     return;
   }
   dayPick.value = day;
+  // 竞态防护：连点两天时慢的第一天响应不得顶着第二天的标题渲染第一天的清单
+  const seq = ++pickDaySeq;
   try {
     const start = new Date(`${day}T00:00:00`).getTime();
     const r = await api.memoryList({ after: start, before: start + 86400000, pageSize: 200, includeSuperseded: true });
+    if (seq !== pickDaySeq) return;
     dayRows.value = r.rows;
   } catch {
-    dayRows.value = [];
+    if (seq === pickDaySeq) dayRows.value = [];
   }
 }
 

@@ -58,9 +58,15 @@ const defaultConfig: AppConfig = {
 /** 技能仓库内的页面 id（skill-detail 为隐藏详情页，不进横条菜单，由技能库卡片进入） */
 export type SkillsPageId = "dashboard" | "library" | "skill-detail" | "sync" | "webdav" | "dedup";
 
+// 保存串行链：save_config 在主进程并发执行，「后写完者赢」——快速连续保存时旧快照可能
+// 最后落盘，磁盘落后于 UI。链条保证写入顺序 = 发起顺序；快照在 save() 发起瞬间取
+let saveChain: Promise<unknown> = Promise.resolve();
+
 export const useAppStore = defineStore("app", {
   state: () => ({
-    config: { ...defaultConfig } as AppConfig,
+    // 深拷贝：浅拷贝会让嵌套对象（proxy/schedule/webdav…）与模块级 defaultConfig 共享引用，
+    // 任何就地写都会污染「兜底默认值」，load() 失败时被当成默认值恢复
+    config: JSON.parse(JSON.stringify(defaultConfig)) as AppConfig,
     loaded: false,
     activeModule: "skills" as ModuleKey,
     activePage: MODULES[0].pages[0].id,
@@ -134,8 +140,12 @@ export const useAppStore = defineStore("app", {
       if (this.activeModule === "skills") this.refreshSkillsStats();
     },
     async save() {
+      // 发起瞬间取快照进链：保存期间的后续编辑留给下一次 save，不与本轮混
+      const snapshot = JSON.parse(JSON.stringify(this.config));
+      const run = saveChain.then(() => api.saveConfig(snapshot));
+      saveChain = run.catch(() => {});
       try {
-        return await api.saveConfig(this.config);
+        return await run;
       } catch (e) {
         // 保存失败不抛断：设置弹窗内的表单区有自己的错误展示
         console.warn("配置保存失败", e);

@@ -6,6 +6,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import * as api from "../../api/ipc";
 import type { ProxyChannelView, ProxyCreditPackage } from "../../types";
 import { useAppStore } from "../../stores/app";
+import { coalesceAsync } from "../../utils/timing";
 import { fmtDate, fmtBalance, balanceUnit, pkgFallbackName } from "./format";
 import {
   STATUS_OPTIONS,
@@ -25,6 +26,7 @@ const pool = ref<ProxyChannelView[]>([]);
 const loading = ref(false);
 const err = ref("");
 let offEvent: (() => void) | undefined;
+let scheduleRefresh: (ReturnType<typeof coalesceAsync>) | undefined;
 
 const statusFilter = ref<ExpiryStatusFilter>("usable");
 const channelFilter = ref("all");
@@ -53,7 +55,8 @@ const allRows = computed<ExpiryRow[]>(() => {
     if (!isBuiltin(ch)) continue;
     for (const acc of ch.accounts) {
       for (const [i, pkg] of (acc.packages || []).entries()) {
-        out.push({ key: `${acc.id}:${pkg.code || i}`, channelId: ch.id, channelDisplay: ch.display, accountName: acc.name || "（未命名）", pkg });
+        // key 带下标：同一账号两个包的 code 可能同为空/相同，仅 code 作 key 会撞
+        out.push({ key: `${acc.id}:${i}:${pkg.code || ""}`, channelId: ch.id, channelDisplay: ch.display, accountName: acc.name || "（未命名）", pkg });
       }
     }
   }
@@ -121,14 +124,18 @@ function rowCls(pkg: ProxyCreditPackage): string {
 
 onMounted(() => {
   refresh();
+  // 主进程批量签到/额度刷新时逐账号广播 credits/status 事件，裸调 refresh 会打出 N 次
+  // proxyPool IPC + N 次全表重渲染（号池页/总览页已同款合流，这里是第三处）
+  scheduleRefresh = coalesceAsync(refresh, 1200);
   offEvent = api.onUpdateEvent((e) => {
     const p = e as { event?: string; type?: string };
     if (p.event !== "proxy") return;
-    if ((p.type === "credits" || p.type === "status") && active.value) refresh();
+    if ((p.type === "credits" || p.type === "status") && active.value) scheduleRefresh?.();
   });
 });
 onUnmounted(() => {
   if (offEvent) offEvent();
+  scheduleRefresh?.cancel();
 });
 </script>
 

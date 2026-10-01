@@ -323,7 +323,12 @@ async function testOne(r: ModelRow) {
     return;
   }
   if (!key) {
-    keyPickList.value = (await api.proxyPool()).find((c) => c.id === editingId.value)?.accounts || [];
+    try {
+      keyPickList.value = (await api.proxyPool()).find((c) => c.id === editingId.value)?.accounts || [];
+    } catch (e) {
+      formErr.value = `拉取号池失败：${String((e as Error).message || e)}`;
+      return;
+    }
     keyPickId.value = keyPickList.value[0]?.id || "";
     keyPickModel.value = model;
     keyPickOpen.value = true;
@@ -372,7 +377,12 @@ async function doTest() {
       formErr.value = "请先在「API Key」里填一把 Key 再测试";
       return;
     }
-    keyPickList.value = (await api.proxyPool()).find((c) => c.id === editingId.value)?.accounts || [];
+    try {
+      keyPickList.value = (await api.proxyPool()).find((c) => c.id === editingId.value)?.accounts || [];
+    } catch (e) {
+      formErr.value = `拉取号池失败：${String((e as Error).message || e)}`;
+      return;
+    }
     keyPickId.value = keyPickList.value[0]?.id || "";
     keyPickModel.value = "";
     keyPickOpen.value = true;
@@ -521,7 +531,12 @@ async function openKeys(row: ProxyProvider) {
   keysRow.value = row;
   newKey.value = { name: "", key: "" };
   keyErr.value = "";
-  await reloadKeys(row.id);
+  try {
+    await reloadKeys(row.id);
+  } catch (e) {
+    keyErr.value = `拉取号池失败：${String((e as Error).message || e)}`;
+    return;
+  }
   keysOpen.value = true;
 }
 async function reloadKeys(id: string) {

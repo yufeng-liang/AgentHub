@@ -57,9 +57,23 @@ function raccoonAuthFile() {
   return raccoonAuth.authFile();
 }
 
+/** store.getAccount 返回数据库原始行，meta 列是 JSON 字符串（getAccount 不做解析）——
+ *  直接当对象读只会拿到恒 undefined。这里统一安全解析：字符串走 JSON.parse，
+ *  已是对象原样返回，坏串/空值回空对象。 */
+function metaOf(acc) {
+  const raw = acc && acc.meta;
+  if (raw && typeof raw === "object") return raw;
+  try {
+    const m = JSON.parse(raw || "{}");
+    return m && typeof m === "object" && !Array.isArray(m) ? m : {};
+  } catch {
+    return {};
+  }
+}
+
 /** 取小浣熊账号专属的设备指纹 UUID（优先取 meta.deviceId，没有则按账号 UID/ID 稳定哈希派生合法的 UUID v4） */
 function getRaccoonDeviceIdentity(acc) {
-  const meta = (acc && acc.meta) || {};
+  const meta = metaOf(acc);
   if (meta.deviceId && typeof meta.deviceId === "string" && meta.deviceId.trim()) {
     return meta.deviceId.trim();
   }
@@ -355,7 +369,7 @@ async function switchRaccoonAccount(acc, opts) {
 
 /** 从账号 meta 取 office_identity（团队版 org code；个人版为 "personal"；缺失则不写该键） */
 function resultOfficeIdentity(acc) {
-  const meta = (acc && acc.meta) || {};
+  const meta = metaOf(acc);
   return String(meta.officeIdentity || "").trim();
 }
 
@@ -860,7 +874,7 @@ function switchWorkbuddyAccount(acc, opts) {
     }
   }
 
-  const accountFor = { uid: acc.uid, name: acc.name, expiresAt: acc.expires_at, tokenType: acc.meta && acc.meta.tokenType };
+  const accountFor = { uid: acc.uid, name: acc.name, expiresAt: acc.expires_at, tokenType: metaOf(acc).tokenType };
   const merged = encrypted ? mergeAuthFieldsEncrypted(json, accountFor, secrets) : mergeAuthFields(json, accountFor, secrets);
   // 两边各留一半：mkdir 是上游 v1.38.1 补的（目标目录还不存在时——IDE 没装过就切号——
   // writeFileSync 会 ENOENT）；tmp 带 pid 是 fork 侧 42b465c 补的（并发切号/探针共用

@@ -176,11 +176,14 @@ async function doSwitch(accountId, opts) {
   // 闸① sync-back：当前 live 账号的最新凭据先回写号池（防丢号）
   const sync = syncBackLiveToPool(acc.id);
 
-  const liveRaw = fs.readFileSync(p.credentials, "utf8");
-  const liveJson = JSON.parse(liveRaw); // readLive 已验证过可解析；这里若抛说明刚坏，按失败处理
-  const backup = backupV2Files();
   let relaunch = false;
+  let backup; // 备份未建成时保持 undefined：catch 里 rollbackFrom 的抛错已有兜底并如实报告
   try {
+    // 读 live / 建备份纳入 try：读坏或备份失败同样走下方失败返回路径，而非裸异常穿透
+    const liveRaw = fs.readFileSync(p.credentials, "utf8");
+    const liveJson = JSON.parse(liveRaw); // readLive 已验证过可解析；这里若抛说明刚坏，按失败处理
+    backup = backupV2Files();
+
     // 闸② 写前哈希：备份完毕到动手之间文件被改过 → 作废
     const beforeHash = sha256(liveRaw);
     const nowRaw = fs.readFileSync(p.credentials, "utf8");

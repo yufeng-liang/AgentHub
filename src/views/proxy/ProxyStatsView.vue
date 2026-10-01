@@ -66,10 +66,13 @@ const sinceTs = computed(() => {
   return 0;
 });
 
+let detailSeq = 0;
 async function loadDetail() {
+  // 竞态防护：快速连切筛选/翻页时旧响应不得覆盖新筛选的结果（同 stores/usage.ts 的 requestId 范式）
+  const seq = ++detailSeq;
   listLoading.value = true;
   try {
-    detail.value = await api.proxyStatsDetail({
+    const res = await api.proxyStatsDetail({
       page: page.value,
       pageSize,
       channel: channel.value || undefined,
@@ -78,10 +81,13 @@ async function loadDetail() {
       status: status.value || undefined,
       sinceTs: sinceTs.value || undefined,
     });
+    if (seq !== detailSeq) return;
+    detail.value = res;
+    err.value = ""; // 成功路径也清错：此前只有 refresh() 清，失败横幅会滞留到下一次总览刷新
   } catch (e) {
-    err.value = String((e as Error).message || e);
+    if (seq === detailSeq) err.value = String((e as Error).message || e);
   } finally {
-    listLoading.value = false;
+    if (seq === detailSeq) listLoading.value = false;
   }
 }
 watch([range, status, channel, model, keyId], () => {
@@ -92,14 +98,19 @@ watch([range, status, channel, model, keyId], () => {
 // ===== 详情弹窗：按 id 取单条（列表不带 2KB 级 error_body）=====
 const detailReq = ref<ProxyUsageDetail | null>(null);
 const detailLoading = ref(false);
+let detailReqSeq = 0;
 async function openDetail(row: ProxyUsageRow) {
+  // 连点两行时旧详情不得覆盖新详情（同 loadDetail 的竞态防护）
+  const seq = ++detailReqSeq;
   detailLoading.value = true;
   try {
-    detailReq.value = await api.proxyStatsRequest(row.id);
+    const res = await api.proxyStatsRequest(row.id);
+    if (seq !== detailReqSeq) return;
+    detailReq.value = res;
   } catch (e) {
     err.value = String((e as Error).message || e);
   } finally {
-    detailLoading.value = false;
+    if (seq === detailReqSeq) detailLoading.value = false;
   }
 }
 

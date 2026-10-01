@@ -87,11 +87,13 @@ async function loadShared() {
 }
 
 // ---- 用量统计模块附带项（跟随共享服务器；预设与电脑名仍存用量模块自己配置里） ----
-const syncCfg = syncApp.config;
+// 经 computed 取配置：sync store 的 reloadConfig 失败分支会整体替换 config 对象，
+// 捕获旧引用的话 v-model 会写进脱钩对象，save() 序列化的是新 config，编辑静默丢失
+const syncCfg = computed(() => syncApp.config);
 // 存储预设（仅备忘记忆）：跟随用量模块配置里的 webdav.preset 字段
 const usagePreset = computed({
-  get: () => syncCfg.webdav.preset,
-  set: (v) => { syncCfg.webdav.preset = v; },
+  get: () => syncCfg.value.webdav.preset,
+  set: (v) => { syncCfg.value.webdav.preset = v; },
 });
 const usagePresets = [
   { key: "feiniu", label: "飞牛 fnOS" },

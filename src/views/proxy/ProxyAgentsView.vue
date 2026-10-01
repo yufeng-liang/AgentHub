@@ -352,6 +352,10 @@ async function refresh() {
   if (!pool.value.length) loading.value = true;
   try {
     pool.value = await api.proxyPool();
+    // 选中渠道被删除/下线后不悬空：回退到第一个渠道，否则整个号池面板区消失、下半屏空白
+    if (pool.value.length && !pool.value.some((ch) => ch.id === activeChannel.value)) {
+      activeChannel.value = pool.value[0].id as ProxyChannelId;
+    }
     ideStatus.value = await api.proxyIdeStatus().catch(() => null);
     void checkZcodeReward();
   } catch (e) {
@@ -690,48 +694,66 @@ function ideTitle(acc: ProxyAccount) {
 // planId 由适配器自动选当前可领套餐，本组件只负责过码这一段。
 const zcapOpen = ref(false);
 let zcapTimer: number | undefined = undefined;
+let zcapCancel: (() => void) | null = null;
+
+/** 关闭弹窗 = 取消本次过码：必须真实结算挂起的 promise——只置 zcapOpen=false 会让
+ *  runZcodeCaptcha 挂满 120s 超时才 resolve，期间 checkinBusy 恒 true、全部签到按钮禁用 */
+function cancelZcap() {
+  zcapOpen.value = false;
+  if (zcapCancel) zcapCancel();
+}
 
 /** 领取专用阿里云滑块：复用 loadAliyunCaptcha，挂到 zcap-captcha-* 节点，回调返回 verify param */
 function runZcodeCaptcha(region: string, prefix: string, sceneId: string): Promise<string> {
-  return new Promise<string>(async (resolve) => {
-    try {
-      await loadAliyunCaptcha(region, prefix);
-    } catch {
-      zcapOpen.value = false;
-      resolve("");
-      return;
-    }
-    const w = window as unknown as AliyunCaptchaWindow;
-    if (typeof w.initAliyunCaptcha !== "function") { zcapOpen.value = false; resolve(""); return; }
+  // 不用 async executor 的 Promise 构造：初始化链路任何同步抛出都必须落到 finish("") 结算，
+  // 否则外层 promise 永不 resolve，checkinBusy 永久卡死
+  return new Promise<string>((resolve) => {
     let done = false;
     const finish = (v: string) => {
       if (done) return;
       done = true;
+      zcapCancel = null;
       if (zcapTimer) { clearTimeout(zcapTimer); zcapTimer = undefined; }
       zcapOpen.value = false;
       resolve(v);
     };
-    zcapOpen.value = true;
-    await nextTick(); // 挂载节点随弹窗渲染，先等 DOM 就绪
-    const mount = document.getElementById("zcap-captcha-element");
-    if (mount) mount.innerHTML = "";
-    w.initAliyunCaptcha!({
-      SceneId: sceneId,
-      mode: "popup",
-      element: "#zcap-captcha-element",
-      button: "#zcap-captcha-trigger",
-      slideStyle: { width: 360, height: 40 },
-      language: "cn",
-      captchaVerifyCallback: async (param: string) => {
-        finish(param);
-        return { captchaResult: true, bizResult: true }; // 领取结果由 checkin 重试判定，这里只负责取到 param
-      },
-      onBizResultCallback: () => {},
-      getInstance: (inst) => { aclawInstance = inst || null; },
-      onError: () => finish(""),
-    });
-    setTimeout(() => (document.getElementById("zcap-captcha-trigger") as HTMLButtonElement | null)?.click(), 2100);
-    zcapTimer = window.setTimeout(() => finish(""), ACLAW_CAPTCHA_TIMEOUT_MS);
+    zcapCancel = () => finish("");
+    (async () => {
+      try {
+        await loadAliyunCaptcha(region, prefix);
+      } catch {
+        finish("");
+        return;
+      }
+      const w = window as unknown as AliyunCaptchaWindow;
+      if (typeof w.initAliyunCaptcha !== "function") { finish(""); return; }
+      zcapOpen.value = true;
+      await nextTick(); // 挂载节点随弹窗渲染，先等 DOM 就绪
+      try {
+        const mount = document.getElementById("zcap-captcha-element");
+        if (mount) mount.innerHTML = "";
+        w.initAliyunCaptcha!({
+          SceneId: sceneId,
+          mode: "popup",
+          element: "#zcap-captcha-element",
+          button: "#zcap-captcha-trigger",
+          slideStyle: { width: 360, height: 40 },
+          language: "cn",
+          captchaVerifyCallback: async (param: string) => {
+            finish(param);
+            return { captchaResult: true, bizResult: true }; // 领取结果由 checkin 重试判定，这里只负责取到 param
+          },
+          onBizResultCallback: () => {},
+          getInstance: (inst) => { aclawInstance = inst || null; },
+          onError: () => finish(""),
+        });
+      } catch {
+        finish(""); // initAliyunCaptcha 同步抛出也必须结算
+        return;
+      }
+      setTimeout(() => (document.getElementById("zcap-captcha-trigger") as HTMLButtonElement | null)?.click(), 2100);
+      zcapTimer = window.setTimeout(() => finish(""), ACLAW_CAPTCHA_TIMEOUT_MS);
+    })();
   });
 }
 
@@ -1334,6 +1356,8 @@ onUnmounted(() => {
   scheduleRefresh.cancel();
   if (nowTimer) clearInterval(nowTimer);
   if (aclawCaptchaTimer) clearTimeout(aclawCaptchaTimer); // 滑块等待定时器别留到页面销毁之后
+  if (zcapTimer) clearTimeout(zcapTimer);
+  zcapCancel = null;
 });
 </script>
 
@@ -1927,7 +1951,7 @@ onUnmounted(() => {
       </div>
 
       <!-- ZCode 领取过码弹窗（极简：只承载阿里云滑块挂载点） -->
-      <div v-if="zcapOpen" class="p-mask" @click.self="zcapOpen = false">
+      <div v-if="zcapOpen" class="p-mask" @click.self="cancelZcap()">
         <div class="p-dlg glass">
           <div class="p-title"><i class="ph ph-shield-check"></i> 完成人机验证</div>
           <div class="set-desc">验证通过后自动继续领取；关闭弹窗即取消本次领取。</div>

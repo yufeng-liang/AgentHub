@@ -77,7 +77,8 @@ function parseSessionFile(file, deviceId, deviceName, since) {
 
     if (t === "request/header") {
       const model = d.header?.config?.model;
-      if (model) byStep[key] = byStep[key] || {};
+      // 初始化必须在赋值前无条件执行：header 行可缺 model，若该 step 无前序 message，裸赋值会在 undefined 上抛 TypeError
+      byStep[key] = byStep[key] || {};
       byStep[key].model = model;
       byStep[key].reqTime = item.time;
     } else if (t === "assistant/message") {
