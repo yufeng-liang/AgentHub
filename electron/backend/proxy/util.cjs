@@ -369,6 +369,7 @@ class Aggregator {
     this.content = "";
     this.reasoning = "";
     this.toolCalls = new Map(); // index -> {id, type, function:{name, arguments}}
+    this.toolSynthKey = 0; // index 缺失流的当前合成桶（新工具头推进）
     this.finishReason = "stop";
     this.usage = null;
   }
@@ -379,9 +380,17 @@ class Aggregator {
     if (Array.isArray(delta.tool_calls)) {
       for (const tc of delta.tool_calls) {
         if (!tc || typeof tc !== "object") continue;
-        const i = tc.index || 0;
-        const existing = this.toolCalls.get(i);
         const fn = tc.function && typeof tc.function === "object" ? tc.function : null;
+        // index 缺失（部分中转/聚合器不回传）时的分桶：带 id/name 的分片是新工具头，推进
+        // 合成桶；纯 arguments 分片延续当前桶。兜底 || 0 会把多个工具的增量并进同一桶
+        // 拼出损坏调用。0 是合法 index，缺失判定必须用 == null
+        let i;
+        if (tc.index != null && Number.isFinite(Number(tc.index))) i = Number(tc.index);
+        else {
+          if (tc.id || (fn && fn.name)) this.toolSynthKey++;
+          i = this.toolSynthKey;
+        }
+        const existing = this.toolCalls.get(i);
         // 全空分片（`{}` 或 function 既无 name 也无 arguments）不得凭空建条目：
         // 否则 result() 会输出一条 id 自动生成、name/arguments 全空的假工具调用，
         // 客户端据此发起一次无意义调用。真实首片必带 id 或 name、增量片必带 arguments，

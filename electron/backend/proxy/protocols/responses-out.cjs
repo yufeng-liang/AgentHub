@@ -54,6 +54,7 @@ function create(ctx) {
   let textItem = null;
   let thinkItem = null;
   const toolOf = new Map();   // OpenAI tool_call index → function_call item
+  let synthToolKey = 0;       // index 缺失流的当前合成桶（新工具头推进，resetAttempt 归零）
   const acc = { text: "", thinking: "" };
 
   /** 发一帧：未开流时进缓冲（deferredOpen），已开流时直接落盘 */
@@ -168,8 +169,15 @@ function create(ctx) {
   function toolDelta(tcs) {
     for (const tc of tcs) {
       if (!tc || typeof tc !== "object") continue;
-      const key = String(tc.index || 0);
       const fn = (tc.function && typeof tc.function === "object") ? tc.function : {};
+      // index 缺失（部分中转不回传）时分桶：带 id/name 的分片是新工具头，推进合成桶；
+      // 纯 arguments 分片延续当前桶。|| 0 会把多个工具并进同一项拼出损坏调用
+      let key;
+      if (tc.index != null && Number.isFinite(Number(tc.index))) key = String(Number(tc.index));
+      else {
+        if (tc.id || fn.name) synthToolKey++;
+        key = String(synthToolKey);
+      }
       let it = toolOf.get(key);
       if (!it) {
         it = mkItem("function_call");
@@ -251,8 +259,13 @@ function create(ctx) {
 
     keepAlive() {
       // 用 SSE 注释行而不是编造一个 "*.delta" 事件：Codex 只读 data 里的 type，注释行按 SSE 规范
-      // 被忽略，既能重置它的 stream_idle_timeout_ms，又不污染事件流
-      if (wantStream) write(": keep-alive\n\n");
+      // 被忽略，既能重置它的 stream_idle_timeout_ms，又不污染事件流。
+      // 但写之前必须先 flush：裸 res.write 会触发隐式发头（200、无 content-type），
+      // response.created 还扣在 deferred 里时客户端收到的流没有协议头
+      if (wantStream) {
+        flushDeferred();
+        write(": keep-alive\n\n");
+      }
     },
 
     endOk() {
@@ -295,6 +308,7 @@ function create(ctx) {
       textItem = null;
       thinkItem = null;
       toolOf.clear();
+      synthToolKey = 0;
       acc.text = "";
       acc.thinking = "";
     },

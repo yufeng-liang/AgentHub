@@ -162,7 +162,7 @@ function parseRateResetMs(text) {
 function classifyGeneric(e, planLimit) {
   if (planLimit || (e && e.status === 402)) return { kind: "credit", switchable: true, status: 402 };
   const st = Number((e && e.status) || 0);
-  if (st === 429) return { kind: "rate", switchable: true, status: 429, resetMs: (e && e.retryAfterMs) || 0 };
+  if (st === 429) return { kind: "rate", switchable: true, status: 429, resetMs: e && e.retryAfterMs ? Date.now() + e.retryAfterMs : 0 };
   if (st === 401) return { kind: "relogin", switchable: true, status: 401 };
   if (st === 404) return { kind: "not_found", switchable: true, status: 404 };
   if (st === 400) return { kind: "bad_params", switchable: true, status: 400 };
@@ -190,7 +190,9 @@ function classifyUpstream(e, planLimit, channel) {
   }
   if (/\b11101\b/.test(msg)) return { kind: "bad_params", switchable: true, status: 400 };
   if (e && e.status === 429) {
-    return { kind: "rate", switchable: true, status: 429, resetMs: parseRateResetMs(msg) || (e.retryAfterMs || 0) };
+    // resetMs 统一为绝对时刻：parseRateResetMs 本就返回墙钟；retryAfterMs 是剩余时长，必须换算。
+    // 二者混装会让 coolAccountMs 把时长当时刻，Retry-After 被兜底成 1s 冷却（墙钟对齐失效）
+    return { kind: "rate", switchable: true, status: 429, resetMs: parseRateResetMs(msg) || (e.retryAfterMs ? Date.now() + e.retryAfterMs : 0) };
   }
   if (e && e.status === 401) return { kind: "relogin", switchable: true, status: 401 };
   if (e && e.status === 404) return { kind: "not_found", switchable: true, status: 404 }; // 短冷却不累计，防雪崩

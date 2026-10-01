@@ -144,7 +144,9 @@ function toInternal(raw) {
     const textParts = [];
     const images = [];
     const toolCalls = [];
-    let toolResult = null;
+    // tool_result 收集成数组：Anthropic 允许单条 user 消息带多个 tool_result 块（并行工具调用的
+    // 标准形态），单变量覆盖会只留最后一个，上游收到缺 response 的 tool_call 直接 400
+    const toolResults = [];
     for (const b of blocks) {
       if (!b || typeof b !== "object") continue;
       if (b.type === "text") textParts.push(String(b.text || ""));
@@ -156,8 +158,9 @@ function toInternal(raw) {
         // input 是对象，OpenAI 侧 arguments 是 JSON 字符串：序列化保真，call id 原样带上
         toolCalls.push({ id: String(b.id || ""), type: "function", function: { name: String(b.name || ""), arguments: safeStringify(b.input) } });
       } else if (b.type === "tool_result") {
-        toolResult = { role: "tool", tool_call_id: String(b.tool_use_id || ""), content: flattenToolResult(b.content) };
-        if (b.is_error) toolResult.content = `[error] ${toolResult.content}`;
+        const tr = { role: "tool", tool_call_id: String(b.tool_use_id || ""), content: flattenToolResult(b.content) };
+        if (b.is_error) tr.content = `[error] ${tr.content}`;
+        toolResults.push(tr);
       } else if (b.type === "thinking" || b.type === "redacted_thinking") {
         // 不回投：signature 是 Anthropic 对上游思考的签名，伪造不了；多数 OpenAI 上游也不认这个字段。
         // 只把内容并进 reasoning_content 供目录/统计侧看，签名丢弃
@@ -169,8 +172,8 @@ function toInternal(raw) {
       }
     }
 
-    if (toolResult) {
-      messages.push(toolResult);
+    if (toolResults.length) {
+      for (const tr of toolResults) messages.push(tr);
       // tool_result 与 text 混排时（Claude Code 会这么发），文本另起一条 user 消息，别丢
       const extra = textParts.join("");
       if (extra) messages.push({ role: "user", content: extra });

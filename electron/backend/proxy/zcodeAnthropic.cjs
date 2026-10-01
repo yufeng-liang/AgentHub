@@ -88,6 +88,15 @@ function toAnthropic(model, body) {
       out.messages.push({ role: "user", content: blocks.length ? blocks : [{ type: "text", text: "" }] });
     }
   }
+  // Anthropic 要求 user/assistant 交替：tool_result 并入 user 后紧跟 user 文本、或客户端直发
+  // 连续 user 消息，都会产出相邻同角色——按角色合并相邻消息（与 anthropic-up 的 mergeConsecutive 同语义）
+  const mergedMsgs = [];
+  for (const m of out.messages) {
+    const prev = mergedMsgs[mergedMsgs.length - 1];
+    if (prev && prev.role === m.role) prev.content.push(...m.content);
+    else mergedMsgs.push(m);
+  }
+  out.messages = mergedMsgs;
   // Anthropic 会话必须以 user 开头：历史首条是 assistant（客户端裁剪过的会话）时补一条空 user
   if (out.messages.length && out.messages[0].role !== "user") {
     out.messages.unshift({ role: "user", content: [{ type: "text", text: "(continue)" }] });

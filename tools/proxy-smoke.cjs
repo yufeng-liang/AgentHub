@@ -373,12 +373,13 @@ async function main() {
         seen.qdRawBody = reqBody;
         // 双层信封 SSE（协议参考 §3.5）：外层 {statusCodeValue:200, body:<内层 JSON 字符串>}，终帧 body 直接是 "[DONE]"。
         // body 对对象取 JSON 字符串、对字符串原样（否则 [DONE] 会被再包一层引号，适配器的 done 判定永不命中）。
-        // 内容给足 8 字符以上：TagSplitter 留 8 字符防标签半截，短内容会全部滞留到流末 flush，测不到增量出线
+        // 首帧内容给足 15 字符：TagSplitter 留 10 字符防标签半截（最长开标签 <reasoning> 的真前缀），
+        // 恰好吐出前 5 字符 "Qoder" 测到增量出线；短内容会全部滞留到流末 flush
         const qFrame = (inner) => "data: " + JSON.stringify({ statusCodeValue: 200, body: typeof inner === "string" ? inner : JSON.stringify(inner) }) + "\n\n";
         res.writeHead(200, { "content-type": "text/event-stream" });
         res.end(
-          qFrame({ choices: [{ index: 0, delta: { role: "assistant", content: "Qoder says hi" } }] }) +
-          qFrame({ choices: [{ index: 0, delta: { content: " ok" }, finish_reason: "stop" }], usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 } }) +
+          qFrame({ choices: [{ index: 0, delta: { role: "assistant", content: "Qoder says hi o" } }] }) +
+          qFrame({ choices: [{ index: 0, delta: { content: "k" }, finish_reason: "stop" }], usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 } }) +
           qFrame("[DONE]")
         );
         return;

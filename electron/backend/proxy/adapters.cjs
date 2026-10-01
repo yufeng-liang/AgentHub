@@ -3023,6 +3023,13 @@ function qoderUnpack(frame) {
 
 /** thinking 标签跨分片状态机（协议参考 §3.5）：reasoning 以 <thinking>/<think>/<reasoning>/<thought>
  *  混在 content，标签可能切在任意位置；闭标签后吃掉紧跟换行（先 \n\n 再单个）；流结束必须 flush。 */
+const QODER_TAG_OPEN = /<(thinking|think|reasoning|thought)>/;
+const QODER_TAG_CLOSE = /<\/(thinking|think|reasoning|thought)>/;
+// 无匹配时尾部要保留的「半截标签」长度：最长开标签 <reasoning> 11 字符 → 真前缀至多 10；
+// 最长闭标签 </reasoning> 12 字符 → 至多 11。硬编码 8 连 <thought>(9) 都兜不住，
+// <reasonin 切在跨片边界时首字符 < 会漏进正文且该标签内容不再被剥离
+const QODER_OPEN_KEEP = 10;
+const QODER_CLOSE_KEEP = 11;
 class TagSplitter {
   constructor() { this.buf = ""; this.inTag = false; }
   feed(piece) {
@@ -3030,9 +3037,9 @@ class TagSplitter {
     let out = "";
     for (;;) {
       if (!this.inTag) {
-        const m = this.buf.match(/<(thinking|think|reasoning|thought)>/);
+        const m = this.buf.match(QODER_TAG_OPEN);
         if (!m) {
-          const keep = Math.min(this.buf.length, 8); // 最长开标签半截（"<thought>" 8 字符内）
+          const keep = Math.min(this.buf.length, QODER_OPEN_KEEP);
           const safe = this.buf.slice(0, this.buf.length - keep);
           this.buf = this.buf.slice(safe.length);
           return out + safe;
@@ -3041,9 +3048,9 @@ class TagSplitter {
         this.buf = this.buf.slice(m.index + m[0].length);
         this.inTag = true;
       } else {
-        const m = this.buf.match(/<\/(thinking|think|reasoning|thought)>/);
+        const m = this.buf.match(QODER_TAG_CLOSE);
         if (!m) {
-          const keep = Math.min(this.buf.length, 9); // "</thought>" 9 字符内
+          const keep = Math.min(this.buf.length, QODER_CLOSE_KEEP);
           const safe = this.buf.slice(0, this.buf.length - keep);
           this.buf = this.buf.slice(safe.length);
           return out;
@@ -3358,6 +3365,13 @@ function statusFromCompatError(errObj, data) {
  *  （Claude Code 对 ANTHROPIC_BASE_URL 也这么拼），OpenAI 兼容站的挂载点同样是 /v1。
  *  规则只写这一处：换协议只换 leaf。 */
 function compatUrl(base, leaf) {
+  // 完整端点形态（normalizeBaseUrl 不再剥裸 /chat/completions）：该站点不挂 /v1 前缀，
+  // chat 主链路直用 base；其余 leaf 无从推导，退回「剥掉叶子再补 /v1/leaf」——
+  // 辅助端点（models 探测等）在纯根挂载站上本就常缺，可达性让位于对话主链路
+  if (/\/chat\/completions$/i.test(base)) {
+    if (leaf === "chat/completions") return base;
+    return `${base.replace(/\/chat\/completions$/i, "")}/v1/${leaf}`;
+  }
   return `${base}/v1/${leaf}`;
 }
 

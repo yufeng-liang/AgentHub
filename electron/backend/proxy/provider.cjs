@@ -56,7 +56,9 @@ function normalizeBaseUrl(raw) {
   // /v1/responses 必须与 /v1/messages 同列：漏一条的后果不是报错而是静默拼出
   // `.../v1/responses/v1/responses`（出站一律在 base 后面补 /v1/<leaf>）。
   // 刻意不收裸 "/responses"——那是个太通用的挂载路径名，撞上的代价比省下一次手删更贵。
-  const TRAILING = ["/v1/chat/completions", "/chat/completions", "/v1/messages", "/v1/responses", "/v1"];
+  // 裸 "/chat/completions" 同样不收（归入"完整端点"形态）：挂载点不带 /v1 的站点剥掉它
+  // 就再也表达不回去（出站恒补 /v1 必 404），compatUrl 侧按完整端点直用。
+  const TRAILING = ["/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1"];
   for (let changed = true; changed; ) {
     changed = false;
     for (const suffix of TRAILING) {

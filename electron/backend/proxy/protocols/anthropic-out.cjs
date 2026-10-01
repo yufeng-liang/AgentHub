@@ -57,6 +57,7 @@ function create(ctx) {
   let stopReason = "end_turn";
   let usage = null;
   let pendingTools = new Map(); // OpenAI tool_call index → {id, name, args}
+  let synthToolKey = 0; // index 缺失流的当前合成桶（新工具头推进，resetAttempt 归零）
   // 非流式：同一批事件在本地攒成一条 Messages 对象
   const acc = { text: "", thinking: "", tools: [] };
 
@@ -155,8 +156,15 @@ function create(ctx) {
   function toolDelta(tcs) {
     for (const tc of tcs) {
       if (!tc || typeof tc !== "object") continue;
-      const key = String(tc.index || 0);
       const fn = (tc.function && typeof tc.function === "object") ? tc.function : {};
+      // index 缺失（部分中转不回传）时分桶：带 id/name 的分片是新工具头，推进合成桶；
+      // 纯 arguments 分片延续当前桶。|| 0 会把多个工具并进同一块拼出损坏调用
+      let key;
+      if (tc.index != null && Number.isFinite(Number(tc.index))) key = String(Number(tc.index));
+      else {
+        if (tc.id || fn.name) synthToolKey++;
+        key = String(synthToolKey);
+      }
       let cur = pendingTools.get(key);
       if (!cur) {
         cur = { id: String(tc.id || `toolu_${ctx.reqId}_${key}`), name: "", args: "" };
@@ -243,7 +251,12 @@ function create(ctx) {
     },
 
     keepAlive() {
-      if (wantStream) write(ev("ping", { type: "ping" }));
+      if (!wantStream) return;
+      // 保活前必须先让头与 message_start 落地：裸 res.write 会触发隐式发头（200、无
+      // content-type，按内容类型判流的客户端直接失败），且 ping 不得先于 message_start。
+      // 15s 静默本就只能走流内错误，此刻提交 200 不损失任何回错能力
+      flushDeferred();
+      write(ev("ping", { type: "ping" }));
     },
 
     endOk(finishReason) {
@@ -293,6 +306,7 @@ function create(ctx) {
       stopReason = "end_turn";
       usage = null;
       pendingTools = new Map();
+      synthToolKey = 0;
       acc.text = "";
       acc.thinking = "";
       acc.tools = [];
