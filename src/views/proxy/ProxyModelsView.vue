@@ -512,22 +512,25 @@ onMounted(refresh);
           </div>
           <!-- .table-scroll 本身就是 overflow:auto，原先那句 inline overflow-x:hidden 才是把它锁死的开关 -->
           <div class="table-scroll" :ref="bindScroller" @scroll.passive="onScrollerScroll">
-            <table class="table table-bare models-table" style="table-layout: fixed; width: 100%; min-width: 880px">
-              <!-- 列宽用百分比而非像素：写死像素在窄容器下会撑破。百分比恒等比缩放，配合
+            <table class="table table-bare models-table" style="table-layout: fixed; width: 100%; min-width: 860px">
+              <!-- 列宽用百分比而非像素：写死像素在窄容器下会撑破。配合
                    table-layout:fixed + 单元格 overflow:hidden + 控件 width:100%。
                    2026-09-30 重组：原「元数据」列（独立编辑按钮）并进「能力」格 —— 整格可点开编辑器，
-                   9/8 列收敛为 8/7 列，模型列与各控件列都多分到宽度；表挂 min-width:880px + 卡内横滚。
-                   能力列加宽（7.5%→12%）：去掉了与上下文列重复的 K/M 数字后，这列现在是
+                   9/8 列收敛为 8/7 列；表挂 min-width:860px + 卡内横滚。
+                   2026-10-01：模型列从 width:auto 改回百分比 —— auto 在 fixed 布局下吞掉全部剩余
+                   宽度，模型名短时（glm-5.3）白占 300px+，来源渠道/渠道覆盖却被截断；现在各列按
+                   百分比分摊（合计 97%，余量由浏览器按比例摊给各列），模型列只留长名所需的份额。
+                   能力列加宽（7.5%→14%）：去掉了与上下文列重复的 K/M 数字后，这列现在是
                    「chips + 编辑入口 + 覆盖徽标」三合一。 -->
               <colgroup>
-                <col style="width: auto" />
-                <col style="width: 10%" />
-                <col style="width: 12%" />
-                <col style="width: 6%" />
-                <col style="width: 12%" />
-                <col v-if="!activeTab" style="width: 10.5%" />
-                <col style="width: 12%" />
-                <col style="width: 7.5%" />
+                <col style="width: 16%" />
+                <col style="width: 11%" />
+                <col style="width: 13%" />
+                <col style="width: 6.5%" />
+                <col style="width: 14%" />
+                <col v-if="!activeTab" style="width: 13%" />
+                <col style="width: 15.5%" />
+                <col style="width: 8%" />
               </colgroup>
               <thead>
                 <tr>
