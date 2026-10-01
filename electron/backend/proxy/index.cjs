@@ -857,9 +857,9 @@ function register(ipcMain) {
     store.statsDetail({ page, pageSize, channel, keyId, model, status, sinceTs })));
   // 单条详情（详情弹窗）：列表不带 2KB 级的 error_body，点开按 id 再取
   ipcMain.handle("proxy_stats_request", handle(({ id }) => store.usageRequestById(id)));
-  // 手动清理保留线之前的流水（days 缺省取设置里的保留期）
-  ipcMain.handle("proxy_stats_cleanup", handle(({ days }) =>
-    store.cleanupUsage(Math.round(Number(days) || Number(settings().usageRetentionDays) || 90))));
+  // 手动清理流水（days 缺省取设置里的保留期；all=true 清空整表）
+  ipcMain.handle("proxy_stats_cleanup", handle(({ days, all }) =>
+    store.cleanupUsage(Math.round(Number(days)) || Number(settings().usageRetentionDays) || 90, !!all)));
   ipcMain.handle("proxy_recent", handle(({ limit }) => store.recentRequests(limit)));
 
   // ===== 规则文件 / 目录 / 安全 =====

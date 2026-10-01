@@ -1213,7 +1213,7 @@ export const mock = {
         return row ? { ...JSON.parse(JSON.stringify(row)), errorBody: row.hasErrorBody ? 'HTTP 429 {"code":4008,"msg":"rate limited, retry after 3s"}' : "" } : null;
       }
       case "proxy_stats_cleanup":
-        return { deleted: 0 };
+        return { deleted: args?.all ? PROXY_USAGE.length : 0 };
       case "proxy_recent":
         return JSON.parse(JSON.stringify(PROXY_USAGE));
       case "proxy_rules_list":

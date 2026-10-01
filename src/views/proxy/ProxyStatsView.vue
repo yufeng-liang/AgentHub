@@ -103,14 +103,24 @@ async function openDetail(row: ProxyUsageRow) {
   }
 }
 
-// ===== 清理：按设置页保留期删旧流水 =====
+// ===== 清理：可选范围（仅超期=按设置页保留期删旧 / 全部=清空整表） =====
 const cleanOpen = ref(false);
 const cleaning = ref(false);
+const cleanScope = ref<"expired" | "all">("expired");
+function openClean() {
+  cleanScope.value = "expired"; // 每次打开回默认档，防上次选的「全部」被顺手确认
+  cleanOpen.value = true;
+}
 async function doCleanup() {
   cleaning.value = true;
   try {
-    const r = await api.proxyStatsCleanup();
-    showTip(`已清理保留期（${app.config.proxy.usageRetentionDays} 天）之前的流水 ${fmtInt(r.deleted)} 条`);
+    const all = cleanScope.value === "all";
+    const r = await api.proxyStatsCleanup(undefined, all);
+    showTip(
+      all
+        ? `已清空全部流水 ${fmtInt(r.deleted)} 条`
+        : `已清理保留期（${app.config.proxy.usageRetentionDays} 天）之前的流水 ${fmtInt(r.deleted)} 条`,
+    );
     cleanOpen.value = false;
     page.value = 1;
     await Promise.all([loadDetail(), refresh()]);
@@ -232,7 +242,7 @@ onMounted(async () => {
           <span class="right detail-title-tools">
             {{ fmtInt(detail?.total || 0) }} 条<template v-if="sinceTs"> · {{ RANGES.find((r) => r.value === range)?.label }}</template>
             <ColSettingsMenu v-model="logCols" :cols="LOG_COLS.stats" scope="stats" />
-            <button class="btn btn-sm" :disabled="cleaning" @click="cleanOpen = true">
+            <button class="btn btn-sm" :disabled="cleaning" @click="openClean">
               <i class="ph ph-broom"></i> 清理
             </button>
           </span>
@@ -271,17 +281,26 @@ onMounted(async () => {
       </div>
     </div>
 
-    <!-- 清理确认弹窗：按设置页保留期删旧流水（不可恢复，删前问一道） -->
+    <!-- 清理确认弹窗：范围二选一（仅超期=按保留期删旧 / 全部=清空整表；不可恢复，删前问一道） -->
     <Teleport to="body">
       <div v-if="cleanOpen" class="p-mask" @click.self="cleanOpen = false">
         <div class="p-dlg glass">
           <div class="p-title">清理请求流水</div>
+          <div class="chips" style="margin-bottom: 8px">
+            <button class="chip" :class="{ active: cleanScope === 'expired' }" @click="cleanScope = 'expired'">仅超期流水</button>
+            <button class="chip" :class="{ active: cleanScope === 'all' }" @click="cleanScope = 'all'">全部流水</button>
+          </div>
           <div class="set-desc">
-            将删除保留期（设置页当前为 {{ app.config.proxy.usageRetentionDays }} 天）之前的全部请求流水，此操作不可恢复。
+            <template v-if="cleanScope === 'expired'">
+              将删除保留期（设置页当前为 {{ app.config.proxy.usageRetentionDays }} 天）之前的全部请求流水，此操作不可恢复。
+            </template>
+            <template v-else>
+              将清空<b>整张请求流水表</b>（含当前筛选范围之外的历史记录），此操作不可恢复。
+            </template>
           </div>
           <div class="p-actions">
             <button class="btn" @click="cleanOpen = false">取消</button>
-            <button class="btn btn-primary danger-solid" :disabled="cleaning" @click="doCleanup">{{ cleaning ? "清理中…" : "确认清理" }}</button>
+            <button class="btn btn-primary danger-solid" :disabled="cleaning" @click="doCleanup">{{ cleaning ? "清理中…" : cleanScope === "all" ? "全部清空" : "确认清理" }}</button>
           </div>
         </div>
       </div>

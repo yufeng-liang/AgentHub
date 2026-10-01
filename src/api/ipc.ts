@@ -348,7 +348,7 @@ export const proxyStatsTop = (dim: "channel" | "model" | "key" | "account", days
 export const proxyStatsDetail = (opts: { page?: number; pageSize?: number; channel?: string; keyId?: string; model?: string; status?: "ok" | "fail" | ""; sinceTs?: number }) =>
   call<ProxyStatsDetail>("proxy_stats_detail", opts as Record<string, unknown>);
 export const proxyStatsRequest = (id: number) => call<ProxyUsageDetail | null>("proxy_stats_request", { id });
-export const proxyStatsCleanup = (days?: number) => call<{ deleted: number }>("proxy_stats_cleanup", { days });
+export const proxyStatsCleanup = (days?: number, all?: boolean) => call<{ deleted: number }>("proxy_stats_cleanup", { days, all });
 export const proxyRecent = (limit?: number) => call<ProxyUsageRow[]>("proxy_recent", { limit });
 export const proxyRulesList = () => call<ProxyRuleFile[]>("proxy_rules_list");
 export const proxyOpenRulesDir = () => call<{ ok: boolean }>("proxy_open_rules_dir");

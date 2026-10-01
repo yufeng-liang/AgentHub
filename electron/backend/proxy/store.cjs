@@ -1012,9 +1012,14 @@ function usageRequestById(id) {
   return r ? { ...usageView(r), errorBody: r.error_body || "" } : null;
 }
 
-/** 手动清理：删保留线之前的流水，返回删除条数（设置页保留期 + 统计页清理按钮共用） */
-function cleanupUsage(days) {
+/** 手动清理：删保留线之前的流水，返回删除条数（设置页保留期 + 统计页清理按钮共用）。
+ *  all=true 时清空整表（统计页「全部」范围），忽略保留线。 */
+function cleanupUsage(days, all) {
   open();
+  if (all) {
+    const r = db.prepare("DELETE FROM usage_requests").run();
+    return { deleted: r.changes, cutoff: 0 };
+  }
   const n = Math.min(3650, Math.max(1, Math.round(Number(days) || 0)));
   const cutoff = Date.now() - n * 86400000;
   const r = db.prepare("DELETE FROM usage_requests WHERE ts < ?").run(cutoff);
