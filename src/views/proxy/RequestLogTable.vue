@@ -8,7 +8,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import type { ProxyUsageRow } from "../../types";
-import { fmtInt, fmtMs, fmtTime, fmtDate, channelName, statusCls, balanceUnit } from "./format";
+import { fmtInt, fmtK, fmtMs, fmtTime, fmtDate, channelName, statusCls, balanceUnit } from "./format";
 import { LOG_COLS } from "./logCols";
 
 const props = defineProps<{ rows: ProxyUsageRow[]; scope: "home" | "stats"; loading?: boolean; visible: string[] }>();
@@ -21,6 +21,9 @@ function cacheRate(r: ProxyUsageRow): string {
   if (r.cachedTokens < 0 || !r.promptTokens) return "-";
   return Math.round((r.cachedTokens / r.promptTokens) * 1000) / 10 + "%";
 }
+// 六位数以上的 token 数换 K/M 缩写：流水表宽度紧张，"in 515,516 / out 3,216" 这种全位数
+// 会把用量列撑到 160px+；精确值要抠的话详情弹窗里有全量
+const tok = (v: number) => (v >= 1e5 ? fmtK(v) : fmtInt(v));
 const failed = (r: ProxyUsageRow) => !(r.status >= 200 && r.status < 300);
 // 无上游改写时不再复读模型名：原生 title 时代它是「格子看不全时的补充」，
 // 换成 280px 玻璃浮层后复读就是纯噪声，所以无映射即无提示
@@ -61,10 +64,10 @@ const emptyText = computed(() =>
               <el-tooltip v-if="c.id === 'time'" :content="fmtDate(r.ts)" placement="top">
                 <td class="mono">{{ fmtTime(r.ts) }}</td>
               </el-tooltip>
-              <el-tooltip v-else-if="c.id === 'model'" :content="modelTip(r)" :disabled="!modelTip(r)" placement="top">
-                <td class="mono">{{ r.model || "-" }}</td>
+              <el-tooltip v-else-if="c.id === 'model'" :content="modelTip(r) || r.model" :disabled="!modelTip(r)" placement="top">
+                <td class="mono rlt-clip">{{ r.model || "-" }}</td>
               </el-tooltip>
-              <td v-else-if="c.id === 'channel'">{{ channelName(r.channel) || "-" }}</td>
+              <td v-else-if="c.id === 'channel'" class="rlt-clip">{{ channelName(r.channel) || "-" }}</td>
               <td v-else-if="c.id === 'key'" class="mono">{{ r.keyName || "-" }}</td>
               <td v-else-if="c.id === 'account'">{{ r.accountName || "-" }}</td>
               <td v-else-if="c.id === 'status'">
@@ -76,8 +79,8 @@ const emptyText = computed(() =>
                 </el-tooltip>
               </td>
               <td v-else-if="c.id === 'usage'" class="mono usage-cell">
-                <div>in {{ fmtInt(r.promptTokens) }} / out {{ fmtInt(r.completionTokens) }}</div>
-                <div class="usage-sub" :class="{ na: r.cachedTokens < 0 }">缓存 {{ r.cachedTokens < 0 ? "-" : fmtInt(r.cachedTokens) }} · 命中 {{ cacheRate(r) }}</div>
+                <div>in {{ tok(r.promptTokens) }} / out {{ tok(r.completionTokens) }}</div>
+                <div class="usage-sub" :class="{ na: r.cachedTokens < 0 }">缓存 {{ r.cachedTokens < 0 ? "-" : tok(r.cachedTokens) }} · 命中 {{ cacheRate(r) }}</div>
               </td>
               <el-tooltip
                 v-else-if="c.id === 'credits'"
@@ -118,6 +121,17 @@ const emptyText = computed(() =>
 .tbl th.rlt-op {
   text-align: right !important;
 }
+/* 流水表列多、宽度紧：内边距比全站 .tbl 收一档，换默认列一屏放下不横滚 */
+.tbl th,
+.tbl td {
+  padding: 6px 8px;
+}
+/* 模型/渠道名超宽省略号截断（模型格本身带悬浮提示补全名；渠道截断只发生在极端长名下） */
+.rlt-clip {
+  max-width: 130px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .usage-cell {
   line-height: 1.5;
 }
@@ -134,7 +148,7 @@ const emptyText = computed(() =>
   text-underline-offset: 2px;
 }
 .rlt-err {
-  max-width: 220px;
+  max-width: 150px;
 }
 .rlt-err-text {
   display: block;
