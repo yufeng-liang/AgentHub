@@ -1,4 +1,4 @@
-// 积分到期页行过滤/排序闸：钉住「默认隐藏已用完」「-1 不限不被当 0」「过期行不被误删」。
+// 积分日历页行过滤/排序闸：钉住「默认隐藏已用完」「-1 不限不被当 0」「过期行不被误删」。
 //
 // 起因（2026-09-29）：用户反馈 0/100 这类已用完的包仍占着列表，且显示「剩 176 天」是纯噪音；
 // 这类缺陷 vue-tsc 与原有 node 门禁全看不见——过滤逻辑写在 computed 里，只有运行时才算得出来。
@@ -121,7 +121,7 @@ function main() {
   check("㉓ 侧栏列表遍历 visibleChannels，且空态也认可见集合",
     /v-for="c in visibleChannels"/.test(sidebar) && !/v-for="c in channels"/.test(sidebar) && /v-if="!visibleChannels\.length"/.test(sidebar));
 
-  console.log(`\n${failures.length ? "FAIL " + failures.length + " 项" : "OK 积分到期行过滤闸全过"}（共 ${pass + failures.length} 项）`);
+  console.log(`\n${failures.length ? "FAIL " + failures.length + " 项" : "OK 积分日历行过滤闸全过"}（共 ${pass + failures.length} 项）`);
   if (failures.length) process.exit(1);
 }
 

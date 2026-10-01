@@ -219,7 +219,7 @@ function openDataDir() {
         <div class="set-row">
           <div class="set-info">
             <div class="set-name">积分包到期预警</div>
-            <div class="set-desc">积分包剩余天数 ≤ 该值时标「即将到期」（0~3650）；号池页到期徽标与「积分到期」总览的分级配色共用此阈值</div>
+            <div class="set-desc">积分包剩余天数 ≤ 该值时标「即将到期」（0~3650）；号池页到期徽标与「积分日历」页的分级配色共用此阈值</div>
           </div>
           <input v-model.number="app.config.proxy.expiringSoonDays" class="input mono" style="width: 90px" type="number" min="0" max="3650" />
           <span style="font-size: 11px; color: var(--text-3)">天</span>

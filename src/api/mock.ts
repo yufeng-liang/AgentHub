@@ -237,7 +237,7 @@ const PROXY_KEYS = [
   { id: "k4", name: "旧测试 Key", mask: "sk-4419···0b3f", secret: "", route: "auto", dailyQuota: 100, rateLimit: 0, enabled: false, createdAt: NOW - 30 * 86400000, todayReq: 0, todayTokens: 0 },
 ];
 
-// 预览态号池。账号上的 packages 是「积分到期」页的数据源：没有它那一页在 dev:web 里永远是空的
+// 预览态号池。账号上的 packages 是「积分日历」页的数据源：没有它那一页在 dev:web 里永远是空的
 // （expired / expiringSoon 由主进程按 expiringSoonDays 派生，预览态直接写死结果值）。
 const PROXY_POOL = [
   {
@@ -290,7 +290,7 @@ const PROXY_POOL = [
   // 新增的五个生态渠道：预览态基本空号池，只为让「添加账号」弹窗里的设备码 / 滑块 / edition 切换
   // 面板在 npm run dev:web 里可达（display / domain 与 store.cjs 的 BUILTIN_CHANNELS 逐字同源）。
   // 例外是 cline_pass：它带一个「订阅到期且余额为 0」的号，用来演示侧栏「渠道额度」卡片隐藏死渠道，
-  // 以及积分到期页里「已过期但仍有余额」的行（账号 offline ⇒ 不计入 totalCredits，故汇总为 0）
+  // 以及积分日历页里「已过期但仍有余额」的行（账号 offline ⇒ 不计入 totalCredits，故汇总为 0）
   {
     id: "cline_free", display: "Cline 免费池", domain: "api.cline.bot", poolStrategy: "expire_first",
     health: null as { until: number; reason: string; streak: number } | null,

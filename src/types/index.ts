@@ -833,7 +833,7 @@ export const MODULES: ModuleDef[] = [
       { id: "keys", name: "API Keys" },
       { id: "providers", name: "自定义提供商" },
       { id: "agents", name: "号池" },
-      { id: "expiry", name: "积分到期" },
+      { id: "expiry", name: "积分日历" },
 
       { id: "models", name: "模型目录" },
       { id: "stats", name: "用量统计" },

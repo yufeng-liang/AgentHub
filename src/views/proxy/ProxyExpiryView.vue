@@ -1,4 +1,4 @@
-<!-- 积分到期总览（方案 Q3c）：把所有渠道所有账号的积分包拉平，按到期升序统一呈现，
+<!-- 积分日历（原「积分到期」，方案 Q3c）：把所有渠道所有账号的积分包拉平，按到期升序统一呈现，
      一屏看清「哪些包快过期了」。分级配色与号池页展开明细一致（主进程按 expiringSoonDays 派生）。
      默认档「有余额」滤掉剩余为 0 的包——已用完的包再谈到期没有信息量（2026-09-29）。 -->
 <script setup lang="ts">
@@ -137,7 +137,7 @@ onUnmounted(() => {
     <div class="page-body">
       <div class="expiry-head">
         <div class="expiry-title">
-          <h2>积分到期总览</h2>
+          <h2>积分日历</h2>
           <span class="hint">所有渠道的积分包 / Token 套餐按到期时间升序（长期有效排最后）；预警阈值在「设置」里调整</span>
         </div>
         <div class="expiry-actions">
@@ -263,6 +263,11 @@ onUnmounted(() => {
   font-size: 13px;
 }
 .expiry-tbl td.num {
+  text-align: right;
+}
+/* 数值列表头与 td.num 同侧（全站对齐规范）。必须写在本组件里：scoped 的
+   .expiry-tbl th[data-v] 特异性高于全局 th.num，不补这条表头会被压回左对齐 */
+.expiry-tbl th.num {
   text-align: right;
 }
 .src-ch {

@@ -1,4 +1,4 @@
-// 积分到期页的行过滤与排序：纯函数，与渲染解耦（scripts/dev-expiry-rows-test.cjs 直接断言）
+// 积分日历页的行过滤与排序：纯函数，与渲染解耦（scripts/dev-expiry-rows-test.cjs 直接断言）
 import type { ProxyCreditPackage } from "../../types";
 
 export interface ExpiryRow {
@@ -23,10 +23,10 @@ export const STATUS_OPTIONS: { value: ExpiryStatusFilter; label: string }[] = [
 ];
 
 export const SORT_OPTIONS: { value: ExpirySortKey; label: string }[] = [
-  { value: "expiryAsc", label: "到期时间 ↑" },
-  { value: "expiryDesc", label: "到期时间 ↓" },
-  { value: "remainDesc", label: "剩余额度 ↓" },
-  { value: "remainAsc", label: "剩余额度 ↑" },
+  { value: "expiryAsc", label: "到期时间 升序" },
+  { value: "expiryDesc", label: "到期时间 降序" },
+  { value: "remainDesc", label: "剩余额度 降序" },
+  { value: "remainAsc", label: "剩余额度 升序" },
 ];
 
 export type ExpiryState = "expired" | "soon" | "used" | "ok";
