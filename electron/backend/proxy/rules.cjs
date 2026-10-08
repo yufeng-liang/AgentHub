@@ -4,6 +4,7 @@
 "use strict";
 const fs = require("node:fs");
 const path = require("node:path");
+const EP = require("./qoderEndpoints.cjs"); // fork-port: qoder 双区推理网关联动到唯一真相源（见该文件顶注）
 const store = require("./store.cjs");
 
 // ===== 内置默认规则（上游变更时用户改文件即生效，无需发版） =====
@@ -520,8 +521,8 @@ const DEFAULTS = {
     // 实测签名对版本串宽容（0.4.2 ~ 9.9.9 均通过），此值仅用于对齐客户端指纹。
     // 账号与额度池两区互不相通（CN/INTL 各一套账号体系），故各自独立配置。
     qoder: {
-      gateway: "https://gateway.qoder.com.cn",
-      openApi: "https://openapi.qoder.com.cn",
+      gateway: EP.inferGateway("qoder"),
+      openApi: EP.REGIONS.cn.openApi,
       // 额度查询域（实测两区不同：CN 走 gateway 亦可，INTL 只在 openapi）
       quotaBase: "https://gateway.qoder.com.cn",
       // 推理端点基址（wasm 会补 ?FetchKeys=…&AgentId=…&Encode=1）
@@ -532,8 +533,8 @@ const DEFAULTS = {
       cosyVersion: "0.4.3",
     },
     qoder_intl: {
-      gateway: "https://api2.qoder.sh",
-      openApi: "https://openapi.qoder.sh",
+      gateway: EP.inferGateway("qoder_intl"),
+      openApi: EP.REGIONS.global.openApi,
       // ⚠ INTL 的额度端点在 openapi（gateway 返回 404，实测）
       quotaBase: "https://openapi.qoder.sh",
       inferPath: "/algo/api/v2/service/pro/sse/agent_chat_generation",

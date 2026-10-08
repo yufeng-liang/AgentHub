@@ -22,6 +22,9 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const { execFileSync } = require("node:child_process");
 const qoderInstall = require("./qoderInstall.cjs");
+// fork-port: 推理网关改读 qoderEndpoints（两路签名器共用）。上游若动这张表，
+// scripts/dev-qoder-endpoints-test.cjs 的 ② 会红而不是静默分叉。
+const EP = require("./qoderEndpoints.cjs");
 
 /** 双渠道目录定义：appId 目录名 + 用户主目录 + 产品 id */
 const PRODUCTS = {
@@ -29,12 +32,12 @@ const PRODUCTS = {
   // OAuth（PKCE 设备码）常量来自客户端主进程逆向：authBaseUrl / authClientIds.prod / authBizVariant
   qoder: {
     label: "Qoder CN", appDir: "com.qodercn.app.stable", homeDir: ".qoder-cn",
-    openApi: "https://openapi.qoder.com.cn", gateway: "https://gateway.qoder.com.cn", exeLabel: qoderInstall.EXE_LABELS.qoder,
+    openApi: EP.REGIONS.cn.openApi, gateway: EP.inferGateway("qoder"), exeLabel: qoderInstall.EXE_LABELS.qoder,
     authBase: "https://qoder.cn", clientId: "732aef47-9cf2-46a2-95fe-4cebb5d0d1fa", authBizVariant: "qoder",
   },
   qoder_intl: {
     label: "Qoder International", appDir: "com.qoder.app.stable", homeDir: ".qoder",
-    openApi: "https://openapi.qoder.sh", gateway: "https://api2.qoder.sh", exeLabel: qoderInstall.EXE_LABELS.qoder_intl,
+    openApi: EP.REGIONS.global.openApi, gateway: EP.inferGateway("qoder_intl"), exeLabel: qoderInstall.EXE_LABELS.qoder_intl,
     authBase: "https://qoder.com", clientId: "732aef47-9cf2-46a2-95fe-4cebb5d0d1fa", authBizVariant: "qoder",
   },
 };

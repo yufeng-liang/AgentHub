@@ -44,6 +44,7 @@ const raccoonAuth = require("./raccoonAuth.cjs");
 const zcodeLocal = require("./zcodeLocal.cjs");
 const wbCrypto = require("./wbCrypto.cjs");
 const qoderAuth = require("./qoderAuth.cjs");
+const EP = require("./qoderEndpoints.cjs"); // fork-port: 双区域名读唯一真相源
 
 const OAUTH_PORT = 17388; // 首选回环端口；被占用时退到系统随机端口（授权地址里会带实际端口）
 const OAUTH_TIMEOUT_MS = 180000;
@@ -2274,10 +2275,7 @@ async function beginQoderOAuth(channel, edition, onDone) {
   if (region === "global" && !store.QODER_INTL_ENABLED) {
     return { ok: false, message: "Qoder 国际版渠道尚未接入：当前仅支持中国版（CN）" };
   }
-  const cfg = {
-    global: { webOrigin: "https://qoder.com", openApi: "https://openapi.qoder.sh" },
-    cn: { webOrigin: "https://qoder.com.cn", openApi: "https://openapi.qoder.com.cn" },
-  }[region];
+  const cfg = EP.REGIONS[region]; // 域名读真相源（此前这里是第四份手抄表）
   const verifier = crypto.randomBytes(32).toString("base64url");
   const challenge = crypto.createHash("sha256").update(verifier).digest("base64url"); // S256 无填充
   const machineId = qoderMachineIdOf();
