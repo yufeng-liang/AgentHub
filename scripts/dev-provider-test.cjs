@@ -465,20 +465,31 @@ const call = async (base, secret, model, stream) => {
 
   store.addAccount({ channel: "qoder", uid: "q-uid", name: "Qoder 号", token: "eyJqb2lk", refreshToken: "", source: "paste" });
   store.addAccount({ channel: "raccoon", uid: "rc-uid", name: "小浣熊号", token: "eyJyY24", refreshToken: "", source: "paste" });
+  // 缺能力分支改用 cline_free：qoder 自上游主干接入起就有 checkin/checkinStatus/queryCredits，
+  // 再拿它测「适配器根本没有这个方法」这条守卫已经测不到目标分支了（门禁判据是 typeof === "function"）。
+  store.addAccount({ channel: "cline_free", uid: "cl-uid", name: "Cline 号", token: "eyJjbGluZQ", refreshToken: "", source: "paste" });
   const realFetch2 = globalThis.fetch;
   globalThis.fetch = async () => ({ ok: false, status: 500, text: async () => '{"code":500,"message":"boom"}' });
 
-  const ckQoder = await callIpc("proxy_checkin_run", { channel: "qoder", action: "checkin" });
-  ok("qoder 无签到方法 → 批量签到回结构化 unavailable，不是 TypeError", (() => {
-    const row = (ckQoder.rows || [])[0] || {};
-    return ckQoder.ok === true && ckQoder.total === 1 && row.ok === true && row.unavailable === true
-      && row.channel === "qoder" && /该渠道没有签到/.test(row.message || "") && !/is not a function|TypeError/.test(row.message || "");
-  })(), ckQoder);
-  const stQoder = await callIpc("proxy_checkin_status", { channel: "qoder" });
+  const ckCline = await callIpc("proxy_checkin_run", { channel: "cline_free", action: "checkin" });
+  ok("无签到方法的渠道 → 批量签到回结构化 unavailable，不是 TypeError", (() => {
+    const row = (ckCline.rows || [])[0] || {};
+    return ckCline.ok === true && ckCline.total === 1 && row.ok === true && row.unavailable === true
+      && row.channel === "cline_free" && /该渠道没有签到/.test(row.message || "") && !/is not a function|TypeError/.test(row.message || "");
+  })(), ckCline);
+  const stCline = await callIpc("proxy_checkin_status", { channel: "cline_free" });
   ok("status 动作同样不抛（缺 checkinStatus 也按 unavailable 收口）", (() => {
-    const row = (stQoder.rows || [])[0] || {};
-    return stQoder.ok === true && row.unavailable === true && !/is not a function|TypeError/.test(row.message || "");
-  })(), stQoder);
+    const row = (stCline.rows || [])[0] || {};
+    return stCline.ok === true && row.unavailable === true && !/is not a function|TypeError/.test(row.message || "");
+  })(), stCline);
+  // qoder 侧只断言「有方法、且打到接口后仍按结构化回，不冒 TypeError」，不钉具体文案：
+  // checkin 先取本机客户端的风控身份（runtime-info.exe），装没装决定它走 unavailable 分支还是真打接口，
+  // 钉文案会把这条闸变成依赖本机状态的闸。
+  const ckQoder = await callIpc("proxy_checkin_run", { channel: "qoder", action: "checkin" });
+  ok("qoder 有签到能力（上游主干接入）：批量签到回结构化行且不抛类型错", (() => {
+    const row = (ckQoder.rows || [])[0] || {};
+    return ckQoder.ok === true && row.channel === "qoder" && typeof row.ok === "boolean" && !/is not a function|TypeError/.test(String(row.message || ""));
+  })(), ckQoder);
   const ckRaccoon = await callIpc("proxy_checkin_run", { channel: "raccoon", action: "checkin" });
   ok("有签到能力的渠道不被守卫误伤（照常打到适配器）", (() => {
     const row = (ckRaccoon.rows || [])[0] || {};
@@ -494,12 +505,17 @@ const call = async (base, secret, model, stream) => {
   ok("有 fetchModels 的渠道照常进后续判断（不被能力门禁挡掉）",
     syncTrae.ok === false && /无可用账号/.test(syncTrae.message || ""), syncTrae);
 
+  const rcCline = await credits.refreshChannel("cline_free");
+  ok("无额度接口的内置渠道 → 文案说清「不提供额度查询」，不扣 API Key 的帽子",
+    rcCline.ok === false && /不提供额度查询/.test(rcCline.message || "") && !/API Key/.test(rcCline.message || ""), rcCline);
+  const clineRow = store.accountRows("cline_free")[0];
+  const raCline = await credits.refreshAccount(clineRow.id).then(() => null, (e) => String(e.message));
+  ok("单账号刷新同样按渠道类别说文案", /不提供额度查询/.test(raCline || "") && !/API Key/.test(raCline || ""), raCline);
+  // qoder 自上游主干接入后有 queryCredits（/api/v2/quota/usage）：500 时必须报真实失败，
+  // 不能再被套上「不提供额度查询」那句——那会把「接口调不通」伪装成「这渠道本来就没余额」。
   const rcQoder = await credits.refreshChannel("qoder");
-  ok("内置渠道无额度接口 → 文案说清「不提供额度查询」，不扣 API Key 的帽子",
-    rcQoder.ok === false && /不提供额度查询/.test(rcQoder.message || "") && !/API Key/.test(rcQoder.message || ""), rcQoder);
-  const qoderRow = store.accountRows("qoder")[0];
-  const raQoder = await credits.refreshAccount(qoderRow.id).then(() => null, (e) => String(e.message));
-  ok("单账号刷新同样按渠道类别说文案", /不提供额度查询/.test(raQoder || "") && !/API Key/.test(raQoder || ""), raQoder);
+  ok("qoder 有额度接口：如实回报上游结果，不误套缺能力文案",
+    /额度查询失败 HTTP 500/.test(JSON.stringify(rcQoder)) && !/不提供额度查询/.test(JSON.stringify(rcQoder)), rcQoder);
 
   globalThis.fetch = realFetch2;
 

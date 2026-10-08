@@ -17,6 +17,11 @@ const aup = require("./protocols/anthropic-up.cjs");
 const rup = require("./protocols/responses-up.cjs");
 const qcosy = require("./qoderCosy.cjs");
 const qoderSelfSign = require("./qoderSelfSign.cjs");
+// 上游 Qoder 三件套：qoderAuth / qoderSigner 只依赖 config.cjs 与 qoderInstall，
+// qoderAdapter 不反向 require 本文件（依赖注入），故此处顶层 require 不成环。
+const { makeQoder: makeUpstreamQoder } = require("./qoderAdapter.cjs");
+const qoderAuth = require("./qoderAuth.cjs");
+const qoderSigner = require("./qoderSigner.cjs");
 const config = require("../config.cjs");
 
 function proxyConfig() {
@@ -4295,208 +4300,20 @@ function makeAutoClaw(region) {
 const autoclaw = makeAutoClaw("cn");
 const autoclaw_intl = makeAutoClaw("intl");
 
-// ===== Qoder（阿里，国际/中国版单渠道按账号地区切换；协议参考 §3） =====
-// 常量与纯函数（地区表 / 域名路径 / 兜底清单 / ids / envelope / unpack / TagSplitter / classify /
-// machineId）已抽入 qoderSelfSign.cjs（归一移植 Task 2），让上游 qoderAdapter 与自签链路共用同一份实现。
-// 本工厂是 fork 的单渠道形态，归一移植 Task 3 换注上游 makeQoder 后整体删除。
-function makeQoder() {
-  return {
-    id: "qoder",
-    refreshWindowSec: 300, // 临期 5 分钟（协议参考 §3.7）
+// ===== Qoder（归一移植：上游 qoderAdapter 为主干 + fork 自签兜底，地区由渠道 id 定） =====
+// deps 必须注入：fetchStream/pumpSse/httpJson 是本模块私有（未导出），反向 require 会成循环依赖
+// （index.cjs:33 与本文件历史注释都记过同一教训：Node 下取到半初始化模块 → undefined）。
+// selfSign/selfSignUtil 是 fork 独有：上游把「客户端未装」判成 503 渠道级故障，
+// fork 还要第二条签名路（纯 JS COSY 自签，零安装可用）与一套信封分类/标签剥离工具。
+// qoder_intl 暂不注册——store.QODER_INTL_ENABLED=false，与登录归一在同批翻（归一移植计划二）。
+const qoder = makeUpstreamQoder("qoder", {
+  fetchStream, pumpSse, httpJson, rules, store, util,
+  auth: qoderAuth,
+  signer: qoderSigner,
+  selfSign: qoderSelfSign.makeSelfSign("qoder", { fetchStream, pumpSse, httpJson }),
+  selfSignUtil: qoderSelfSign,
+});
 
-    _regionOf(account) {
-      return qoderSelfSign.regionOf(account);
-    },
-
-    models() {
-      const seen = [];
-      for (const region of ["global", "cn"]) for (const [id] of qoderSelfSign.FALLBACK[region]) if (!seen.includes(id)) seen.push(id);
-      return unionIds([...catalogMap("qoder").values()].map((m) => String(m.id)), seen); // 两区并集、global 优先
-    },
-    modelEntries() {
-      const seen = new Map();
-      for (const region of ["global", "cn"]) {
-        for (const [id, key, reasoning, vision, rate] of qoderSelfSign.FALLBACK[region]) {
-          if (seen.has(id.toLowerCase())) continue;
-          // 档位唯一来源是 rules/effort_catalog.json（收编完成，方案 §3.2）；seed 缺失 → 空 allow-list，
-          // chat 侧退默认档兜底。contextLength 同源 seed 兜底（此处只保模型身份/倍率快照）。
-          const seedEff = seedEntryFor("qoder", id);
-          const eff = (seedEff && Array.isArray(seedEff.efforts)) ? seedEff.efforts : [];
-          seen.set(id.toLowerCase(), {
-            client: id, upstream: key,
-            entry: { id, name: id, rate: Number(rate) || 0, capabilities: { images: vision, reasoning, tools: true }, contextLength: 200000, maxOutputTokens: 0, _key: key, _efforts: eff },
-          });
-        }
-      }
-      for (const m of catalogMap("qoder").values()) {
-        // fetchModels 写回的 _key/_efforts 是上游真实值，必须保留（覆盖成展示 id 会 400）；DEFAULTS 条目无 _key，回落展示 id
-        const upKey = String(m._key || m.id);
-        if (!seen.has(String(m.id).toLowerCase())) seen.set(String(m.id).toLowerCase(), { client: String(m.id), upstream: upKey, entry: { ...m, _key: upKey, _efforts: (Array.isArray(m._efforts) && m._efforts) || [] } });
-      }
-      return [...seen.values()];
-    },
-    upstreamFor(model) {
-      const e = this.modelEntries().find((x) => x.client.toLowerCase() === String(model || "").toLowerCase());
-      return e ? e.upstream : String(model || "");
-    },
-    _resolveEntry(model) {
-      const s = String(model || "").toLowerCase();
-      const hit = this.modelEntries().find((x) => x.client.toLowerCase() === s || (x.entry._key || "").toLowerCase() === s);
-      if (!hit) return null;
-      // 归一化到 chat/qoderSelfSign.envelope 的消费面：目录条目的上游 key 在 _key、能力在 capabilities.{reasoning,images}，
-      // 而消费面读 key/is_reasoning/is_vl——三者不同名，直取会发 "undefined"/恒 false。浅拷贝补齐，不动缓存对象。
-      const cap = hit.entry.capabilities || {};
-      return {
-        ...hit.entry,
-        key: hit.entry._key || hit.entry.key,
-        is_reasoning: hit.entry.is_reasoning ?? !!cap.reasoning,
-        is_vl: hit.entry.is_vl ?? !!cap.images,
-      };
-    },
-
-    rewriteBody(model, body) {
-      const out = { ...(body || {}) };
-      out.stream = true;
-      if (!out.stream_options || typeof out.stream_options !== "object") out.stream_options = {};
-      out.stream_options.include_usage = true;
-      delete out.conversation_id; delete out.conversationId; delete out.prompt_cache_key;
-      return out; // 信封组装在 chat 里做（需要 account 上下文）
-    },
-
-    async chat({ account, secrets, model, body, emit }) {
-      const cfg = qoderSelfSign.REGIONS[this._regionOf(account)];
-      const entry = this._resolveEntry(model) || { key: "auto", is_reasoning: false, is_vl: false, _efforts: [] };
-      const lastUser = [...(body.messages || [])].reverse().find((m) => m.role === "user");
-      const lastUserText = typeof (lastUser && lastUser.content) === "string" ? lastUser.content : "";
-      const prepared = this.rewriteBody(model, body);
-      const requestId = util.uuid();
-      const userId = (account && ((account.meta && account.meta.user_id) || account.uid)) || "";
-      const machineId = qoderSelfSign.machineId();
-      const ids = qoderSelfSign.ids({ userId, upstreamKey: entry.key, maxTokens: prepared.max_tokens, seed: (prepared.session_id || "") || undefined });
-      const envelope = qoderSelfSign.envelope({ internal: prepared, modelEntry: entry, ids, requestId, lastUserText });
-      // 思考档位（协议参考 §3.4）：reasoning_effort → reasoning → thinking 命中即停；off/none/disabled/false 不发；
-      // true/null → enable_thinking:true 无档位；minimal/min→low、high/max→xhigh；白名单 = 目录 efforts，不支持退默认档
-      const effSrc = prepared.reasoning_effort ?? prepared.reasoning ?? prepared.thinking;
-      if (effSrc !== undefined && !["off", "none", "disabled", false].includes(effSrc)) {
-        if (effSrc === true || effSrc === null) {
-          envelope.parameters.enable_thinking = true;
-        } else {
-          const map = { minimal: "low", min: "low", high: "xhigh", max: "xhigh" };
-          let effort = map[String(effSrc)] || String(effSrc);
-          const allow = (entry._efforts && entry._efforts.length) ? entry._efforts : ["low", "medium", "xhigh"];
-          if (!allow.includes(effort)) effort = allow.includes("medium") ? "medium" : allow[0];
-          envelope.parameters.enable_thinking = true;
-          envelope.parameters.reasoning_effort = effort;
-        }
-      }
-      const encoded = qcosy.encodeBody(Buffer.from(JSON.stringify(envelope), "utf8")); // 必须先编码后签名
-      const url = `${cfg.gateway}${qoderSelfSign.CHAT_PATH}`;
-      const headers = {
-        ...qcosy.buildCosyHeaders({ url, body: encoded, uid: userId, token: (secrets && secrets.token) || "", name: (account && account.name) || "", email: (account && account.meta && account.meta.email) || "", machineId, requestId }),
-        "content-type": "application/json",
-        "accept": "text/event-stream",
-        "cache-control": "no-cache",
-        "accept-encoding": "identity",
-        "x-model-key": String(entry.key),
-        "x-model-source": "system",
-      };
-      const { resp, cancelTimer } = await fetchStream(url, { method: "POST", headers, body: encoded });
-      const result = { status: 200, planLimit: false };
-      const splitter = new qoderSelfSign.TagSplitter();
-      let usage = null; // usage 取最后一帧（协议参考 §3.5）
-      const flushUsage = () => { if (usage) emit({ type: "usage", usage }); };
-      try {
-        // HTTP 恒 200；错误在信封 statusCodeValue 里——fetchStream 的 !resp.ok 分支不会触发
-        await pumpSse(resp, (_event, raw) => {
-          if (raw === "[DONE]") { flushUsage(); emit({ type: "finish", reason: "" }); return; }
-          const frame = parseJson(raw);
-          if (!frame) return;
-          const u = qoderSelfSign.unpack(frame);
-          if (u.done) { flushUsage(); emit({ type: "finish", reason: "" }); return; }
-          if (!u.ok) {
-            const cls = qoderSelfSign.classify({ httpStatus: u.status, text: u.text });
-            if (cls.status === 402) result.planLimit = true;
-            emit({ type: "error", status: cls.status, code: 0, message: cls.message });
-            return;
-          }
-          const chunk = u.chunk;
-          if (!chunk) return;
-          const choice = Array.isArray(chunk.choices) && chunk.choices[0];
-          if (choice && choice.delta) {
-            const delta = { ...choice.delta };
-            if (typeof delta.content === "string" && delta.content) delta.content = splitter.feed(delta.content);
-            if (Object.keys(delta).length) emit({ type: "delta", delta });
-          }
-          if (choice && choice.finish_reason) { flushUsage(); emit({ type: "finish", reason: choice.finish_reason }); }
-          if (chunk.usage) usage = util.normalizeOpenAiUsage(chunk.usage);
-        });
-        const tail = splitter.flush();
-        if (tail) emit({ type: "delta", delta: { content: tail } }); // 不 flush 会丢末尾文字
-      } finally { cancelTimer(); }
-      return result;
-    },
-
-    /** 刷新（协议参考 §3.7）：secrets.refreshToken 是打包串——
-     *  5 段 `pat|<PAT>|<作业刷新令牌>|<userId>|<machineId>`（PAT 来源，重走 jobToken/exchange）
-     *  3 段 `<oauth刷新令牌>|<userId>|<machineId>`（OAuth 来源，走 center refresh_token） */
-    async refreshToken(account, secrets) {
-      const packed = String((secrets && secrets.refreshToken) || "");
-      const cfg = qoderSelfSign.REGIONS[this._regionOf(account)];
-      const segs = packed.split("|");
-      const baseHeaders = { "content-type": "application/json", "cosy-version": "1.0.1", "cosy-clienttype": "5", "user-agent": "qoder-local-proxy" };
-      if (segs.length >= 5 && segs[0] === "pat") {
-        const r = await httpJson(`${cfg.openApi}/api/v1/jobToken/exchange`, { method: "POST", headers: baseHeaders, body: JSON.stringify({ personal_token: segs[1] }) })
-          .catch((e) => ({ ok: false, status: 0, data: null, message: String(e) }));
-        const token = r.ok && r.data && r.data.data && r.data.data.token ? String(r.data.data.token) : "";
-        if (!token) return { ok: false, message: `PAT 换取失败 HTTP ${r.status}` };
-        const exp = Number(util.jwtDecode(token).exp || 0) * 1000;
-        return { ok: true, token, refreshToken: packed, expiresAt: exp };
-      }
-      if (segs.length >= 3) {
-        const r = await httpJson(`${cfg.center}${qoderSelfSign.REFRESH_PATH}`, { method: "POST", headers: { ...baseHeaders, authorization: `Bearer ${(secrets && secrets.token) || ""}` }, body: JSON.stringify({ refreshToken: segs[0] }) })
-          .catch((e) => ({ ok: false, status: 0, data: null, message: String(e) }));
-        if (r.status === 401) return { ok: false, expired: true, message: "登录态已过期，请重新登录" };
-        const d = r.data && (r.data.data || r.data);
-        const token = d && d.token ? String(d.token) : "";
-        if (!r.ok || !token) return { ok: false, message: (d && d.message) || `刷新失败 HTTP ${r.status}` };
-        // refresh_token 不得含 |（协议参考 §2.3/oauth.rs 同判据）；缺失沿用旧值
-        const nextRt = d.refresh_token && !String(d.refresh_token).includes("|") ? `${String(d.refresh_token)}|${segs[1]}|${segs[2]}` : packed;
-        const exp = Number(util.jwtDecode(token).exp || 0) * 1000;
-        return { ok: true, token, refreshToken: nextRt, expiresAt: exp };
-      }
-      return { ok: false, message: "refreshToken 打包串格式不认识（应为 3 段或 pat| 开头 5 段）" };
-    },
-
-    async userInfo(token) {
-      // 身份声明在 JWT payload（util.jwtDecode 顶层只有 token/uid/exp；简报直取 .user_id 是笔误，按真实接口修正）
-      return qoderSelfSign.jwtUserInfo(token);
-    },
-
-    /** 远程目录（COSY 签名 + 信封，按地区缓存 1h 由 proxy_models_sync 层处理）；失败如实回错由 UI 引导手填 */
-    async fetchModels(account, secrets) {
-      const cfg = qoderSelfSign.REGIONS[this._regionOf(account)];
-      const url = `${cfg.gateway}${qoderSelfSign.MODEL_LIST_PATH}`;
-      const requestId = util.uuid();
-      const encoded = qcosy.encodeBody(Buffer.from(JSON.stringify({ region: this._regionOf(account) }), "utf8"));
-      const headers = qcosy.buildCosyHeaders({ url, body: encoded, uid: (account && account.uid) || "", token: (secrets && secrets.token) || "", name: "", email: "", machineId: qoderSelfSign.machineId(), requestId });
-      const r = await httpJson(url, { method: "GET", headers }).catch((e) => ({ ok: false, status: 0, data: null, message: String(e) }));
-      const chat = r.data && (r.data.chat || (r.data.data && r.data.data.chat));
-      if (!r.ok || !Array.isArray(chat)) return { ok: false, message: `目录拉取失败（HTTP ${r.status || 0}）` };
-      const models = chat.filter((m) => m && m.key).map((m) => ({
-        id: String(m.display_name || m.key).replace(/\s+/g, ""), // 对外 id = display_name 去所有空白（协议参考 §3.8）
-        name: String(m.display_name || m.key),
-        rate: Number(m.price_factor) || 0, // 0 是合法值不能当缺失丢弃
-        capabilities: { images: !!m.is_vl, reasoning: !!m.is_reasoning, tools: true },
-        contextLength: 200000, maxOutputTokens: 0,
-        _key: String(m.key),
-        _efforts: (m.thinking_config && m.thinking_config.enabled && Object.keys(m.thinking_config.enabled.efforts || {})) || [],
-      }));
-      return models.length ? { ok: true, models } : { ok: false, message: "目录为空" };
-    },
-  };
-}
-
-const qoder = makeQoder();
 
 // ===== 自定义提供商：通用 OpenAI 兼容适配器（按 agents 行动态实例化，一张表行 = 一个上游端点） =====
 

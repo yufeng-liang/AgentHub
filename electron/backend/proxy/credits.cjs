@@ -21,8 +21,9 @@ function creditsCapable(channel) {
 }
 
 /** 无额度查询能力时的文案，按渠道类别分开说：
- *  「API Key 直连、无余额概念」只对自定义提供商成立，把它扣到 Cline/AutoClaw/Qoder 这类内置渠道身上
- *  是错的（它们是官方订阅额度，上游压根没有对外余额接口）。两条刷新入口共用，别各写一份。 */
+ *  「API Key 直连、无余额概念」只对自定义提供商成立，把它扣到 Cline/AutoClaw 这类内置渠道身上
+ *  是错的（它们是官方订阅额度，上游压根没有对外余额接口）。两条刷新入口共用，别各写一份。
+ *  （Qoder 曾和它们并列；上游主干接入后它有 /api/v2/quota/usage，已不属这一类。） */
 function noCreditsMessage(channel) {
   return store.isBuiltinChannel(channel) ? "该渠道不提供额度查询（官方无对外余额接口）" : "该渠道为 API Key 直连，无余额概念";
 }

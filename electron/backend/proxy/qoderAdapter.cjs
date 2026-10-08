@@ -217,7 +217,11 @@ function makeQoder(product, deps) {
 
   return {
     id: product,
-    refreshWindowSec: 86400, // token 30 天；提前 24h 预刷新（dt- 非 JWT，靠落库的 expiresAt 判断）
+    // fork-port：上游按 dt-（30 天、非 JWT、靠落库 expiresAt）取 86400；fork 的自签账号是 JWT，
+    // credits.cjs 的临期预刷按此窗口比较 util.jwtDecode(token).exp，24h 窗口会把每轮额度刷新都
+    // 变成一次 token 轮换（与桌面端抢同一个 refresh_token）。dt- 无 exp ⇒ 该分支对上游账号是
+    // no-op，故统一贴回 fork 的 300s。
+    refreshWindowSec: 300,
 
     cfg,
 
@@ -662,6 +666,15 @@ function makeQoder(product, deps) {
       } catch (e) {
         return { unavailable: true, message: `活动列表请求失败：${(e && e.message) || e}` };
       }
+    },
+
+    /** fork-port：自签账号的凭据是 JWT，身份直接读 payload。
+     *  discovery 的导入/扫描路径按 `adapter.userInfo(token).catch(...)` 调用——方法不存在时抛的是
+     *  **同步 TypeError**，链上的 .catch 兜不住，表现为「导入 qoder 账号直接崩」。上游适配器原本
+     *  没有这个方法（上游登录自己取身份），保留 fork 登录就必须同时保留它。 */
+    async userInfo(token) {
+      const c = U.jwtDecode(String(token || "")).payload || {};
+      return { uid: String(c.user_id || c.sub || U.jwtDecode(String(token || "")).uid || ""), name: String(c.nickname || c.name || "Qoder 账号") };
     },
 
     /**

@@ -205,11 +205,13 @@ async function checkinBatch({ channel, accountId, action, interactive, captcha, 
       const secrets = store.accountSecrets(store.getAccount(acc.id));
       try {
         let r;
-        // 能力门禁：新渠道（cline_free/cline_pass/autoclaw/autoclaw_intl/qoder）官方就没有签到体系，
+        // 能力门禁：新渠道（cline_free/cline_pass/autoclaw/autoclaw_intl）官方就没有签到体系，
         // 适配器根本不定义这两个方法。缺守卫就是 "ad.checkin is not a function" 这句英文 TypeError
         // 原样进结果行、直出到前端。判据与下方 trial 一致（typeof === "function"）；缺能力按既有约定回
         // ok:true + unavailable:true（同 adapters 的 1001 分支）——前端 checkinTagCls 先判 !r.ok 就红，
         // 用 ok:false 会把「这渠道没签到」渲染成「这个号签到失败」。
+        // （qoder 曾列在这里，据早期调研「官方无签到」；上游 v1.4x 实装了 /sash/api/v1/me/campaigns
+        //  的领取链路并证伪该说法，故自上游主干接入起 qoder 走正常签到，不在缺能力名单内。）
         if (useAct === "status") {
           r = typeof ad.checkinStatus === "function" ? await ad.checkinStatus(acc, secrets) : { ok: true, unavailable: true, checkedIn: false, message: "该渠道没有签到状态可查" };
         } else if (useAct === "checkin") {

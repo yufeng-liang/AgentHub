@@ -19,7 +19,7 @@ function ok(name, cond, extra) {
 // 一旦改成参数注入它们会全红——那是安全网，不是待重写对象。
 console.log("qoderSelfSign 模块装配:");
 const qSelf = require("../electron/backend/proxy/qoderSelfSign.cjs");
-ok("自签模块导出面齐备", ["REGIONS","PRODUCT_REGION","regionOf","machineId","classify","statusCodeOf","unpack","ids","envelope","TagSplitter","jwtUserInfo","FALLBACK","CHAT_PATH","MODEL_LIST_PATH","REFRESH_PATH"].every((k) => qSelf[k] !== undefined), ["REGIONS","PRODUCT_REGION","regionOf","machineId","classify","statusCodeOf","unpack","ids","envelope","TagSplitter","jwtUserInfo","FALLBACK","CHAT_PATH","MODEL_LIST_PATH","REFRESH_PATH"].filter((k) => qSelf[k] === undefined));
+ok("自签模块导出面齐备", ["REGIONS","PRODUCT_REGION","machineId","classify","statusCodeOf","unpack","ids","envelope","TagSplitter","jwtUserInfo","FALLBACK","CHAT_PATH","MODEL_LIST_PATH","REFRESH_PATH"].every((k) => qSelf[k] !== undefined), ["REGIONS","PRODUCT_REGION","machineId","classify","statusCodeOf","unpack","ids","envelope","TagSplitter","jwtUserInfo","FALLBACK","CHAT_PATH","MODEL_LIST_PATH","REFRESH_PATH"].filter((k) => qSelf[k] === undefined));
 ok("地区按渠道 id 判定（qoder=CN，qoder_intl=Global）", qSelf.PRODUCT_REGION.qoder === "cn" && qSelf.PRODUCT_REGION.qoder_intl === "global");
 ok("statusCodeOf 两侧信封都吃", qSelf.statusCodeOf({ statusCodeValue: 403 }) === 403 && qSelf.statusCodeOf({ statusCode: "UNAUTHORIZED" }) === 401 && qSelf.statusCodeOf({ statusCode: "OK" }) === 0);
 ok("纯函数保持历史调用元数（ids/unpack 不注入，machineId 无参）", qSelf.ids({ userId: "u1", upstreamKey: "qfmodel", maxTokens: 32768 }).sessionId.length > 0 && qSelf.unpack({ statusCodeValue: 200, body: "{}" }).ok === true && qSelf.jwtUserInfo.length === 1 && qSelf.machineId.length === 0);
@@ -99,15 +99,27 @@ ok("parameters.max_tokens 与 32768 取小", envBody.parameters.max_tokens === 1
 ok("enable_thinking 缺省不发", !("enable_thinking" in envBody.parameters));
 ok("business.name 取最后用户文本前 30 字符", envBody.business.name === "hi");
 
-// 装配面回归：上面手工造的 {key,is_reasoning,is_vl} 形状会掩盖真实形状（key 在 _key、能力在 capabilities）——
-// 用 modelEntries 的产物直接喂信封，三个字段必须都归一化到位（否则真实上游收 "undefined" 与恒 false）
+// 装配面回归：手工造的 {key,is_reasoning,is_vl} 字面量会掩盖真实形状（上游目录条目是
+// id + capabilities.{reasoning,images}）——用**上游 modelMeta 的产物形状**过一遍转换函数再喂信封，
+// 三个字段必须都归一到位，否则真实上游收 "undefined" 与恒 false。
+// （归一移植前这条走 qAd._resolveEntry；fork 内联适配器删除后，同一接缝住在
+//   qoderSelfSign.selfSignEntryFromMeta，由 qoderAdapter 的签名回落分支调用。）
+const mmShape = {
+  id: "qfmodel", name: "Qwen3.8-Flash", rate: 0.1,
+  capabilities: { reasoning: true, tools: true, images: true },
+  reasoning: { effort: null, defaultEffort: "", supportedEfforts: ["low", "xhigh"] },
+  contextLength: 200000, maxOutputTokens: 0,
+};
+const convEntry = qSelf.selfSignEntryFromMeta(mmShape, "qfmodel");
 const envReal = adapters._qoderBody({
   internal: { messages: [{ role: "user", content: "hi" }], tools: [], max_tokens: 100 },
-  modelEntry: qAd._resolveEntry("Qwen3.8-Flash"),
+  modelEntry: convEntry,
   ids, requestId: "rq-2", lastUserText: "hi",
 });
-ok("真实目录条目装配：key/is_reasoning/is_vl 全部归一化", envReal.model_config.key === "qfmodel" && envReal.model_config.is_reasoning === true && envReal.model_config.is_vl === true,
+ok("上游目录条目 → 自签入口：key/is_reasoning/is_vl 全部归一化", convEntry.key === "qfmodel" && convEntry.is_reasoning === true && convEntry.is_vl === true && JSON.stringify(convEntry.efforts) === JSON.stringify(["low", "xhigh"]), convEntry);
+ok("真实目录条目装配：model_config 收到真 key", envReal.model_config.key === "qfmodel" && envReal.model_config.is_reasoning === true && envReal.model_config.is_vl === true,
   envReal.model_config);
+ok("目录缺能力位时保守归一（不编造能力）", (() => { const e = qSelf.selfSignEntryFromMeta({ id: "x", capabilities: {} }, "x"); return e.is_reasoning === false && e.is_vl === false && Array.isArray(e.efforts) && e.efforts.length === 0; })());
 
 // 简报笔误修正：状态机语义是「过滤 thinking 段内容、保留标签外答案」（协议参考 §3.5 拆解 + chat() 集成把
 // splitter 输出直接作为 content 下发），故断言 abcdef 不在输出、答案 after 保留、标签标记被剥
@@ -126,33 +138,20 @@ ok("双层 JSON 解析", (() => {
 ok("statusCodeValue != 200 → 错误帧", adapters._qoderUnpack({ statusCodeValue: 403, body: "quota exceeded" }).ok === false);
 ok("body 为 [DONE] 字符串", adapters._qoderUnpack({ statusCodeValue: 200, body: "[DONE]" }).done === true);
 
-console.log("qoder 适配器对象:");
+console.log("qoder 适配器注册形状（归一移植后：上游 qoderAdapter 是生产主路径）:");
+const Q_NEED = ["cfg", "models", "fetchModels", "headers", "rewriteBody", "chat", "queryCredits", "refreshToken"];
 ok("qoder 已注册", !!qAd);
-ok("地区解析：meta.mode=cn → cn", qAd._regionOf({ meta: { mode: "cn" } }) === "cn" && qAd._regionOf({ meta: { mode: "intl" } }) === "global" && qAd._regionOf({}) === "global");
-ok("目录两区并集且 global 优先", qAd.models().includes("Qwen3.8-Flash") && qAd.models().includes("MiniMax-M3"));
-ok("upstreamFor 查 upstreamKey", qAd.upstreamFor("Qwen3.8-Flash") === "qfmodel" && qAd.upstreamFor("Auto") === "auto");
-// 集成回归（smoke 发现的 _key/key 错位）：modelEntries 产物的上游 key 在 _key，chat 消费面读 key——
-// _resolveEntry 归一化后两者必须相等，否则 x-model-key / model_config.key 会发 "undefined"
-ok("_resolveEntry 产物补 key（chat 消费面）", qAd._resolveEntry("Qwen3.8-Flash").key === "qfmodel" && qAd._resolveEntry("Auto").key === "auto");
-
-// catalog 同步分支（评审发现）：fetchModels 写回的 _key/_efforts 必须保留、不被展示 id 覆盖；DEFAULTS 条目无 _key 回落展示 id
-const rules = require("../electron/backend/proxy/rules.cjs");
-const catPath = path.join(rules.rulesDir(), "catalog.json");
-rules.init(); // dev 环境无人调 init，ensureFiles 不会落盘——先落 DEFAULTS 再改夹具
-const cat0 = JSON.parse(fs.readFileSync(catPath, "utf8"));
-// qoder 已不在 rules DEFAULTS 里放兜底目录（见 proxy-qoder-adapter-selftest [3d]），
-// 全新沙箱的 catalog 没有 qoder 键——此处自建空条目再继续测 fork 的 _key 保留判据。
-cat0.qoder = cat0.qoder || { syncedAt: 0, models: [] };
-cat0.qoder.models.push(
-  { id: "SyncedModel", name: "SyncedModel", rate: 1, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0, _key: "synced-upstream-key", _efforts: ["low", "xhigh"] },
-  { id: "DefaultsOnly", name: "DefaultsOnly", rate: 1, capabilities: { images: false, reasoning: false, tools: true }, contextLength: 200000, maxOutputTokens: 0 }
-);
-fs.writeFileSync(catPath, JSON.stringify(cat0));
-rules.reload("catalog.json");
-ok("catalog 同步 _key 保留（upstreamFor）", qAd.upstreamFor("SyncedModel") === "synced-upstream-key");
-ok("catalog 同步 _key 保留（chat 消费面）", qAd._resolveEntry("SyncedModel").key === "synced-upstream-key" && JSON.stringify(qAd._resolveEntry("SyncedModel")._efforts) === JSON.stringify(["low", "xhigh"]));
-ok("目录条目无 _key 回落展示 id", qAd.upstreamFor("DefaultsOnly") === "DefaultsOnly" && qAd._resolveEntry("DefaultsOnly").key === "DefaultsOnly");
-ok("refreshToken 3 段打包串走 center 刷新路径", typeof qAd.refreshToken === "function");
+ok("八件套齐备（与 proxy-smoke 同判据）", Q_NEED.every((k) => typeof qAd[k] === "function"), Q_NEED.filter((k) => typeof qAd[k] !== "function"));
+// discovery 的导入/扫描路径是 adapter.userInfo(token).catch(...)——方法不存在抛的是同步 TypeError，
+// 链上的 .catch 兜不住，表现为「导入 qoder 账号直接崩」。上游适配器本来没有这个方法，属 fork-port 补件。
+ok("userInfo 在位（防导入路径同步崩）", typeof qAd.userInfo === "function");
+// credits.cjs 只在 util.jwtDecode(token).exp 存在时按此窗口预刷：自签账号是 JWT，24h 窗口会把
+// 每轮额度刷新都变成一次 token 轮换；dt- 无 exp 不受影响，故统一取 300s。
+ok("refreshWindowSec=300", qAd.refreshWindowSec === 300);
+ok("模型 id 是上游 key 而非展示名", qAd.models().includes("dfmodel") && !qAd.models().some((m) => /[^a-z0-9_]/.test(String(m))), qAd.models());
+ok("headers() 不含 Authorization（签名每请求在 chat 内现产）", !("authorization" in qAd.headers()));
+ok("rewriteBody 把请求模型落进 model_config.key", qAd.rewriteBody("dfmodel", { messages: [{ role: "user", content: "x" }] }, { uid: "u" }, {}).model_config.key === "dfmodel");
+ok("自签纯函数仍从 adapters 转出（discovery 取 _qoderMachineId）", typeof adapters._qoderMachineId === "function" && typeof adapters._qoderClassify === "function" && typeof adapters._TagSplitter === "function");
 
 // ===== Task 11：qoder PKCE 设备授权流（假 fetch + 假时钟：不发真实网络、不真等 2s 轮询间隔） =====
 console.log("qoder 登录辅助:");
