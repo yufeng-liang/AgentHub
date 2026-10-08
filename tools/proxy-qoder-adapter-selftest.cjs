@@ -456,6 +456,67 @@ async function main() {
     assert(!r.ok, "无 refreshToken 时如实失败");
   }
 
+  // ===== 8. 自签模块的远程目录必须是 key 口径（防展示名二次污染 catalog） =====
+  // fetchModelsRemote 写回 rules/catalog.json，而 catalogIndex 只认 id=上游 key；
+  // fork 历史版本把 display_name 去空白当 id，接上远程兜底就等于把上一个提交清掉的污染再写回去。
+  console.log("\n[8] makeSelfSign().fetchModelsRemote 产出上游形状");
+  {
+    const qSS = require("../electron/backend/proxy/qoderSelfSign.cjs");
+    let called = null;
+    const stubHttpJson = async (url, o) => {
+      called = url;
+      return { ok: true, status: 200, data: { chat: [
+        { key: "dfmodel", display_name: "DeepSeek-Flash", price_factor: 0.2, is_reasoning: true, is_vl: true, thinking_config: { enabled: { efforts: { low: {}, xhigh: {} } } }, max_input_tokens: 180000 },
+        { key: "auto", display_name: "Auto", price_factor: 1, is_reasoning: false, is_vl: true },
+        { key: "freemodel", display_name: "Free Zero", price_factor: 0, is_reasoning: false, is_vl: false },
+      ] } };
+    };
+    const ss = qSS.makeSelfSign("qoder", { fetchStream: deps.fetchStream, pumpSse: deps.pumpSse, httpJson: stubHttpJson });
+    const r = await ss.fetchModelsRemote({ account: { uid: "u1" }, secrets: { token: "jwt" } });
+    assert(r.ok === true, "远程目录拉取成功");
+    assert(/model\/list/.test(String(called)), "确实打了 model/list");
+    assert(r.models.some((m) => m.id === "dfmodel"), "id 是上游 key");
+    assert(!r.models.some((m) => m.id === "DeepSeek-Flash"), "绝不产出展示名 id");
+    assert(r.models.find((m) => m.id === "dfmodel").name === "DeepSeek-Flash", "展示名落在 name");
+    assert(JSON.stringify(r.models.find((m) => m.id === "dfmodel").reasoning.supportedEfforts) === JSON.stringify(["low", "xhigh"]), "档位落在 reasoning.supportedEfforts");
+    assert(r.models.find((m) => m.id === "dfmodel").capabilities.reasoning === true && r.models.find((m) => m.id === "auto").capabilities.reasoning === false, "能力位按 is_reasoning 映射，不编造");
+    assert(r.models.find((m) => m.id === "freemodel").rate === 0 && r.models.find((m) => m.id === "freemodel").isFree === true, "price_factor=0 是合法值（当缺失丢弃会把免费档倍率抹成 null）");
+    assert(r.models.find((m) => m.id === "dfmodel").contextLength === 180000 || r.models.find((m) => m.id === "dfmodel").contextLength === 0, "contextLength 取 context_config 最大档或 max_input_tokens");
+    assert(ss.region === "cn", "qoder 产品的自签地区是 cn（不再读 meta.mode）");
+    const intl = qSS.makeSelfSign("qoder_intl", { fetchStream: deps.fetchStream, pumpSse: deps.pumpSse, httpJson: stubHttpJson });
+    assert(intl.region === "global", "qoder_intl 产品对应 global 区");
+  }
+
+  // ===== 9. 双路签名：签名器不可用 → 回落自签（fork「零安装可用」卖点） =====
+  console.log("\n[9] 签名器不可用 → 回落 qoderSelfSign");
+  {
+    let selfArgs = null;
+    const selfSign = {
+      chat: async (a) => { selfArgs = a; return { status: 200, planLimit: false, viaSelfSign: true }; },
+      refreshToken: async () => ({ ok: true, token: "t", refreshToken: "rt", expiresAt: 1 }),
+      fetchModelsRemote: async () => ({ ok: false, message: "n/a" }),
+    };
+    const qSS9 = require("../electron/backend/proxy/qoderSelfSign.cjs");
+    const adDown = makeQoder("qoder", { ...deps, selfSign, selfSignUtil: qSS9 });
+    const r = await adDown.chat({
+      account: { uid: "u1", meta: { machineId: "m1" } }, secrets: { token: "dt-x" },
+      model: "dfmodel", body: { messages: [{ role: "user", content: "hi" }] }, emit: () => {}, meta: {},
+    });
+    assert(r.viaSelfSign === true, "签名器抛错时走了自签回落");
+    assert(selfArgs && selfArgs.entry.key === "dfmodel", "回落传出的 entry.key 是请求模型 key");
+    assert(Array.isArray(selfArgs.entry.efforts), "回落传出的 entry.efforts 是数组");
+    assert(selfArgs.account.uid === "u1" && typeof selfArgs.emit === "function", "回落转出 account/emit 原样");
+    // 注入不完整（有 selfSign 没 selfSignUtil）时必须保留上游 503 语义：
+    // 否则会拿模块内兜底的 "auto" 上行，用户看到「答非所问」而不是「渠道不可用」。
+    let partialThrew = null;
+    await makeQoder("qoder", { ...deps, selfSign }).chat({ account: { uid: "u1", meta: {} }, secrets: { token: "dt-x" }, model: "dfmodel", body: { messages: [] }, emit: () => {}, meta: {} }).catch((e) => { partialThrew = e; });
+    assert(partialThrew && partialThrew.status === 503, "缺 selfSignUtil 注入时不静默兜底成 auto，仍回 503");
+    const adNo = makeQoder("qoder", { ...deps });
+    let threw = null;
+    await adNo.chat({ account: { uid: "u1", meta: {} }, secrets: { token: "dt-x" }, model: "dfmodel", body: { messages: [] }, emit: () => {}, meta: {} }).catch((e) => { threw = e; });
+    assert(threw && threw.status === 503 && threw.qoderSignerDown === true, "未注入 selfSign 时保持上游 503 语义（不静默降级）");
+  }
+
   console.log("\n[done] Qoder 适配器单元自测全部通过");
 }
 

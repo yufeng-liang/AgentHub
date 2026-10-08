@@ -359,8 +359,26 @@ function makeQoder(product, deps) {
       // rewriteBody 不依赖签名会话，先做——签名器不可用（503）时不必白跑一遍改写
       const req = this.rewriteBody(key, body, account, meta);
 
-      // 客户端未安装/结构变更：渠道级故障，不罚账号（acquireSession 已带 503 标记）
-      const entry = await acquireSession(account, secrets);
+      // fork-port：本机未装 Qoder 客户端时 signer.createSession 抛 503 qoderSignerDown。
+      // 上游对这一情形的处置是「渠道级故障、不罚账号」；fork 还有第二条签名路（qoderSelfSign，
+      // 纯 JS 复现 COSY 签名，零安装可用）。缺 selfSign 注入时保持上游原语义，绝不静默降级——
+      // 静默降级会把「客户端没装」伪装成别的错误，排查成本反而更高。
+      let entry;
+      try {
+        entry = await acquireSession(account, secrets);
+      } catch (e) {
+        if (deps.selfSign && e && e.qoderSignerDown) {
+          const conv = deps.selfSignUtil && deps.selfSignUtil.selfSignEntryFromMeta;
+          // 注入不完整时宁可回上游的 503，也不带着兜底出来的 "auto" 上行——
+          // 静默换模型比静默失败更难排查（用户看到的是「答非所问」而不是「渠道不可用」）。
+          if (typeof conv !== "function") throw e;
+          return deps.selfSign.chat({
+            account, secrets, modelKey: key, body, emit,
+            entry: conv(modelMeta(key), key),
+          });
+        }
+        throw e;
+      }
       const session = entry.session;
 
       // prepareInferRequest 抛错必须归还 inUse：池语义下该条目若卡在 inUse>0，
