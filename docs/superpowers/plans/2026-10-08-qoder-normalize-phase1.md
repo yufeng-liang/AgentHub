@@ -3,13 +3,24 @@
 > **执行结果（2026-10-08，分支 `feat/qoder-normalize-phase1`，Task 1–7 + 两条 deferred 已落地）**
 > Task 1–7 全部完成，收口时 35 项 `scripts/dev-*.cjs` 0 RED、`proxy-smoke` SMOKE OK、
 > adapter-selftest 136 ✓、`npm run build` 通过。**计划有四处被实测推翻**，执行者按下列事实为准：
-> ① 本机 wasm glue 加载失败（客户端 0.3.4 结构变化）⇒ 自签才是实际在跑的路，也反过来支持了保留
+> ① 本机 wasm glue 加载失败（**仅 CN 侧**，客户端 0.3.4 结构变化；`qoder_intl` 的 0.4.3 可加载、17 个导出）
+> ⇒ 自签才是实际在跑的路，也反过来支持了保留
 > `qoderCosy` 的决定；② `dev-sink-golden` **能**护住本次改动（`unknown-model` 场景会打印全渠道模型 id），
 > 与「零 qoder 用例」的判断相反，已按该闸流程重录基线；③ Task 1 没有换成 key 口径新表而是**删表**，
 > 否则等于放第二份会漂移的硬编码且要编造未实测的档位；④ `FAKE_HOSTS` 漏登记 CN 域会让 smoke
 > 拿假凭据往真上游发请求——已补全并加「拒绝出网」守卫。另有两处我的执行遗漏当场补掉：
 > `fetchModelsRemote` 的 key 口径形状（[8]）与 PAT/OAuth 刷新真实现（[12]）此前都无直接测试；
 > smoke 的签名器打桩第一次是惰性的（撤桩照样绿），改为 `signerCalls` 可观测断言后才可证伪。
+>
+> **收口后补的取证（同一日，只读，不动生产码）**：① 的根因查明——「通用提取」把压缩后的标识符写死了，
+> 正则里硬编码 `er(`（`__export`）与 `b(`（懒加载器）；两份 obf 结构同形、只是名字不同：
+> CN `Xn(Lir,{ProfileEncryptor:()=>…,QoderContext:()=>…})` / `Tir=S(()=>{$9s="AGFzbQEAAAA…`，
+> intl `pn(BAi,…)` / `gAi=S(()=>{…`。名字无关的提取器看着可做，但本机没有 CN 登录态，**做出来也验不了**签名
+> 是否被上游接受，而自签已覆盖 CN，故本次不改提取器；要真跑通上游路，最便宜的一步是把 CN 客户端升到 0.4.x。
+> 同时把 `tools/proxy-qoder-live.cjs` 补成能自证：开头 `[0]` 打 describe/available 两区体检，`--chat` 标明
+> 由哪条签名路服务；并修掉它落 catalog 时漏 `keyIdSchema: 1` 的陷阱（漏了会写出一份被适配器忽略的目录，
+> `[4]` 验的其实是静态兜底表）。smoke 的守卫由「按 qoder 域拒绝」升级为「非登记且非 loopback 一律拒绝」，
+> 并加一条用 RFC 2606 `.invalid` 域名的永久自证断言（撤掉守卫即红，负控制实测为 `fetch failed`）。
 > 未闭合项见文末「验证边界」与任务台账 #9。
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
@@ -33,6 +44,7 @@
 - **绝不按镜像名杀进程**；收尾按 pid 精确清理。
 - 号池当前 **0 个 qoder 账号**（`trae 2 / workbuddy 2 / workbuddy_ai 5 / zcode 3 / raccoon 1`）⇒ **不写任何「迁移存量账号」的代码**。但 `rules/catalog.json` 是第二份持久化数据，必须处理（Task 1）。
 - 本机装有 `H:\Qoder CN\resources`（qoder）与 `H:\Qoder\resources`（qoder_intl），wasm 签名路径本机可达；但真发上游请求需要已登录的 qoder 账号，号池没有 ⇒ **一切联网断言只能用 stub**。
+  （执行后更正：**「本机可达」只对 `qoder_intl` 成立**——CN 客户端 0.3.4 让提取器抛错，见顶部执行结果 ①。）
 
 ## 计划范围之外的已知遗留（不要在本计划里顺手修）
 
