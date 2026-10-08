@@ -819,11 +819,17 @@ function register(ipcMain) {
   // 合并视图 + 管理态（启停/渠道覆盖/回退模型/自定义参数）；管理态由渲染层写回整体配置（app.save），服务端每请求读盘热生效
   ipcMain.handle("proxy_models", handle(() => {
     const cfg = settings();
+    // Key 钉渠道信息一次算好、逐行分发：渲染层要能直接回答「这一行的哪几把 Key 钉在本行某个来源渠道上」
+    // （排除对这些 Key 无效，见 server.cjs resolveChannel 的 key.route 短路），不必再打一次 proxy_keys_list。
+    // 只取 id/name/route 三个字段——listKeys 会解密出 secret，绝不能顺着模型行流进渲染层。
+    const pinning = store.listKeys().filter((k) => k.enabled && k.route && k.route !== "auto");
     return adapters.mergedModels(cfg).map((m) => ({
-
       ...m,
       enabled: !(cfg.disabledModels || []).includes(m.id),
       override: (cfg.modelOverrides || {})[m.id] || "",
+      // sources 不减：被点掉的渠道必须还能点回来（要能回来就得一直在列表里）。排除态另发在 excluded。
+      excluded: (cfg.modelChannelExcludes || {})[m.id] || [],
+      pinnedKeys: pinning.filter((k) => m.sources.includes(k.route)).map((k) => ({ id: k.id, name: String(k.name || ""), route: k.route })),
       fallback: (cfg.modelFallback || {})[m.id] || "",
       custom: (cfg.modelCustom || {})[m.id] || undefined,
     }));

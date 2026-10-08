@@ -1223,7 +1223,9 @@ export const mock = {
       case "proxy_account_import_file":
         return { ok: true, canceled: true };
       case "proxy_models":
-        return JSON.parse(JSON.stringify(PROXY_MODELS));
+        // 与真实后端同形状下发管理态字段：预览面没有 Key 表与排除集的回路，两条恒空
+        // （和 override/fallback 在 mock 里也一样不随配置变化，不是新造的失真）
+        return JSON.parse(JSON.stringify(PROXY_MODELS)).map((m: Record<string, unknown>) => ({ ...m, excluded: [], pinnedKeys: [] }));
       case "proxy_models_sync":
         return { ok: true, channel: args?.channel || "workbuddy", count: 6, withRate: 4 };
       // 切号：首调只做预检（对应真实后端 —— 一律回 needConfirm + probe，由前端弹确认框），

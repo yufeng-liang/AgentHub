@@ -659,6 +659,10 @@ export interface ProxyModel {
 
   enabled: boolean;
   override: "" | ProxyChannelId;
+  /** 管理态：被用户点掉的来源渠道（自动路由时跳过）。sources 仍是全量，排除态只发在这里。 */
+  excluded?: ProxyChannelId[];
+  /** 管理态：route 钉在本行任一来源渠道上的 Key。这些 Key 不受本行排除影响（Key 优先级更高），格子里给提示角标。 */
+  pinnedKeys?: { id: string; name: string; route: string }[];
   fallback: string;
   custom?: ModelCustomEntry;
 }
