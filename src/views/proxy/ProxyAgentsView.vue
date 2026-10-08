@@ -85,7 +85,7 @@ const CHANNEL_META: Record<ProxyBuiltinChannelId, { icon: string; hint: string }
 
   // Qoder 无回环 OAuth（登录在官方客户端内完成，凭据落在加密信封里）→ 只走本机导入/文件/粘贴
   qoder: { icon: "ph-compass", hint: "设备授权登录 · 本机导入 · 去客户端领每日 Credits" },
-  qoder_intl: { icon: "ph-globe-hemisphere-west", hint: "国际版 · 本机导入（需充值才有模型）" },
+  qoder_intl: { icon: "ph-globe-hemisphere-west", hint: "国际版 · 无静态模型兜底，添加后点「拉取模型」取官方目录" },
 };
 // 自定义提供商只有 API Key：没有登录态、没有签到、没有余额概念，措辞要与生态渠道明确区分
 const PROVIDER_META = { icon: "ph-plugs-connected", hint: "API Key 轮转 · 无余额概念" };
@@ -93,7 +93,7 @@ const PROVIDER_META = { icon: "ph-plugs-connected", hint: "API Key 轮转 · 无
 // ===== 渠道能力表（与主进程一一对应，缺能力的动作一律不摆按钮）=====
 // 签到：判据是主进程适配器里 checkin/checkinStatus 这两个方法存不存在。
 // 上游 v1.50 起这张表要跟着渠道一起长：modelscope 是「每日任务」（会话触碰 + 点赞）、
-// lobster 是「每日签到 100 积分」、Qoder 双区是「活动 Credits 领取」（每日 100，需装客户端出风控身份），
+// lobster 是「每日签到 100 积分」、Qoder CN 是「活动 Credits 领取」（每日 100，需装客户端出风控身份），
 // 三家都定义了 checkin ⇒ 记 true。Cline 双池 / AutoClaw 双区官方就没有签到体系，
 // 主进程对它们只能回 unavailable，界面上摆个按钮就是骗人点一次、跑一轮空请求。
 // zcode 家记 false 是刻意的：它的「一键领取 / 过码 / 领取模式」在模板里各走专门分支，不吃这张表。
@@ -109,7 +109,7 @@ const CHECKIN_CAPABLE: Record<ProxyBuiltinChannelId, boolean> = {
   modelscope: true,
   lobster: true,
   qoder: true,
-  qoder_intl: true,
+  qoder_intl: false, // 活动 Credits 领取是 CN 侧专属（每日 100 要靠桌面端出风控身份），国际版只有充值额度
   zcode: false,
   zcode_intl: false,
 };
@@ -198,8 +198,6 @@ const oauthErr = ref(false); // 与等待态共用 oauthMsg 一条消息位，�
 let oauthRun = 0;
 // mode=device（cline / qoder）时后端回的验证码：授权页通常已自动带上，留一手给用户手输
 const oauthUserCode = ref("");
-// qoder 国际版 / 中国版是两套域名（登录与调度同源），登录入口就地切换
-const qoderEdition = ref<"intl" | "cn">("intl");
 // AutoClaw 国际版的两个上游：滑块过了之后按这个 vendor 换授权地址
 const aclawVendor = ref<"zai" | "google">("zai");
 // 浏览器没跳回回环地址时的兜底：把地址栏整段粘回来
@@ -293,10 +291,10 @@ const OAUTH_HELP: Record<string, { title: string; desc: string }> = {
     desc: "先完成滑块验证，再跳转 Zai / Google 授权页；登录后自动回到本应用。<br />没有国际版账号也可「粘贴 JSON」导入 token。",
   },
   // Qoder 双区（上游 v1.4x 起 OAuth 走 PKCE 设备码轮询，不再依赖本机客户端）：
-  // 区服切换与「粘贴 JSON」是 fork 侧保留的两条入口，故文案一并写明
+  // 两条渠道各说各的区服（区服由渠道 id 定），不再有「在弹窗里切区服」这一步
   qoder: {
     title: "用 Qoder 官方登录页登录（设备授权）",
-    desc: "跳转 Qoder 官方授权页登录并选择账号，本机每 2 秒轮询自动完成——<b>无需本机安装 Qoder 客户端</b>（PKCE 设备码，轮询直接取回设备凭据对，含刷新令牌）。<br />国际版 / 中国版在下方切换区服；也可「粘贴 JSON」导入。",
+    desc: "跳转 Qoder 官方授权页登录并选择账号，本机每 2 秒轮询自动完成——<b>无需本机安装 Qoder 客户端</b>（PKCE 设备码，轮询直接取回设备凭据对，含刷新令牌）。<br />本渠道是中国版；国际版请用「Qoder 国际」那一行。也可「粘贴 JSON」导入。",
   },
   qoder_intl: {
     title: "用 Qoder 国际版官方登录页登录",
@@ -989,9 +987,9 @@ function switchMethod(m: AddMethod) {
   if (m === "local" && !scanList.value.length) loadScan();
 }
 
-/** 渠道专属登录参数：qoder 要区服（两套域名），AutoClaw 国际版要上游 vendor（滑块两跳同值） */
+/** 渠道专属登录参数。Qoder 双区不再传 edition：区服由渠道 id 决定（主进程 EP.regionOf），
+ *  国际版是独立的一行渠道，不是 CN 渠道上的一个 radio。AutoClaw 国际版仍要上游 vendor（滑块两跳同值）。 */
 function oauthOpts(channel: ProxyBuiltinChannelId): { edition?: "intl" | "cn"; vendor?: "zai" | "google" } {
-  if (channel === "qoder") return { edition: qoderEdition.value };
   if (channel === "autoclaw_intl") return { edition: "intl", vendor: aclawVendor.value };
   return {};
 }
@@ -1836,17 +1834,8 @@ onUnmounted(() => {
               <div class="add-pane-icon"><i class="ph ph-key"></i></div>
               <div class="add-pane-title">{{ OAUTH_HELP[addChannel]?.title || "用官方登录页登录" }}</div>
               <div class="add-pane-desc" v-html="OAUTH_HELP[addChannel]?.desc || ''"></div>
-              <!-- qoder 区服切换：国际版与中国版是两套域名与账号体系，登录参数直接决定回调到哪个 openapi -->
-              <el-radio-group
-                v-if="addChannel === 'qoder'"
-                v-model="qoderEdition"
-                size="small"
-                class="oauth-radio-row"
-                :disabled="oauthWaiting || oauthBusy"
-              >
-                <el-radio-button value="intl">国际版</el-radio-button>
-                <el-radio-button value="cn">中国版</el-radio-button>
-              </el-radio-group>
+              <!-- Qoder 双区不再在这里放区服 radio：国际版是独立的一行渠道（qoder_intl），
+                   区服由渠道 id 决定。radio 留在弹窗里只会造成「渠道说 CN、参数说 intl」的分裂。 -->
               <!-- AutoClaw 国际版的两个上游：滑块通过后按这个 vendor 换授权地址 -->
               <el-radio-group
                 v-if="addChannel === 'autoclaw_intl'"
