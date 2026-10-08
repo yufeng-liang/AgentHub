@@ -2266,6 +2266,17 @@ async function beginClineOAuth(channel, onDone) {
 }
 
 // qoder：无起始请求，本地拼授权页；2s 轮询 poll（202/404 = 继续）→ userinfo 补资料 → 落库 meta.mode
+/** OAuth 落库的 meta 构造：machineId 与 machine_id **同值双写**。
+ *  读侧（qoderAdapter 五处：签名头 Cosy-MachineId / 续期 / 风控身份）只认 meta.machineId，
+ *  而这里历史上只写 machine_id；本机扫描导入路（scanQoder）又只写 machineId。
+ *  双写是零迁移的收口：老账号下次重登自然补齐，新账号两条口径都读得到。
+ *  两个键都留着而不是改读侧，是因为读侧是上游文件、且 machine_id 这个 snake_case 键
+ *  已被 refreshToken 打包串等外部格式引用过，改读侧等于同时赌两边都跟得上。
+ */
+function qoderOauthMeta(machineId, region, email, userId) {
+  return { mode: region, email, machine_id: machineId, machineId, user_id: userId };
+}
+
 async function beginQoderOAuth(channel, edition, onDone) {
   const region = qoderRegionOfMode(edition);
   // 归一移植后地区由**渠道 id** 决定（qoder=CN），Global 区要靠 qoder_intl 承载，而它尚未注册
@@ -2314,7 +2325,7 @@ async function beginQoderOAuth(channel, edition, onDone) {
             uid: userId, name, token: String(d.token),
             refreshToken: `${String(d.refresh_token)}|${userId}|${machineId}`, // 打包串（协议参考 §3.7）
             expiresAt: util.toMs(d.expires_at) || Date.now() + 30 * 86400 * 1000, // 毫秒|秒|RFC3339 自动识别（§3.7 credentials.rs:175-182）
-            meta: { mode: region, email, machine_id: machineId, user_id: userId },
+            meta: qoderOauthMeta(machineId, region, email, userId),
             source: "oauth",
           });
           finishOAuth({ ok: true, id, uid: userId });
@@ -3274,6 +3285,8 @@ module.exports = {
   // 测试窥视口（下划线前缀 = 非公共契约）：设备流的轮询判定与地区归一纯函数，dev-cline/dev-qoder-test 直测
   _workosPollVerdict: workosPollVerdict,
   _qoderRegionOfMode: qoderRegionOfMode,
+  // 自测用：OAuth 落库 meta 的构造（双写口径见函数注释）
+  _qoderOauthMetaForTest: qoderOauthMeta,
   // autoclaw 国际版回调的双 state 拆解（路径 state ≠ 查询串 state），dev-autoclaw-test 直测
   _autoclawParseCallback: autoclawParseCallback,
 };
