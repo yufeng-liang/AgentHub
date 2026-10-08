@@ -1,5 +1,17 @@
 # Qoder 渠道归一·上（接上游主干 + 双路签名）实现计划
 
+> **执行结果（2026-10-08，分支 `feat/qoder-normalize-phase1`，Task 1–7 + 两条 deferred 已落地）**
+> Task 1–7 全部完成，收口时 35 项 `scripts/dev-*.cjs` 0 RED、`proxy-smoke` SMOKE OK、
+> adapter-selftest 136 ✓、`npm run build` 通过。**计划有四处被实测推翻**，执行者按下列事实为准：
+> ① 本机 wasm glue 加载失败（客户端 0.3.4 结构变化）⇒ 自签才是实际在跑的路，也反过来支持了保留
+> `qoderCosy` 的决定；② `dev-sink-golden` **能**护住本次改动（`unknown-model` 场景会打印全渠道模型 id），
+> 与「零 qoder 用例」的判断相反，已按该闸流程重录基线；③ Task 1 没有换成 key 口径新表而是**删表**，
+> 否则等于放第二份会漂移的硬编码且要编造未实测的档位；④ `FAKE_HOSTS` 漏登记 CN 域会让 smoke
+> 拿假凭据往真上游发请求——已补全并加「拒绝出网」守卫。另有两处我的执行遗漏当场补掉：
+> `fetchModelsRemote` 的 key 口径形状（[8]）与 PAT/OAuth 刷新真实现（[12]）此前都无直接测试；
+> smoke 的签名器打桩第一次是惰性的（撤桩照样绿），改为 `signerCalls` 可观测断言后才可证伪。
+> 未闭合项见文末「验证边界」与任务台账 #9。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 把上游的 `qoderAdapter.cjs` 接成 Qoder 渠道的生产主路径，同时保住 fork 独有的能力（零客户端自签可用 / 远程模型目录 / PAT 换取 / 跨片 thinking 剥离 / 403 双语义分类 / JWT 身份解析），并摘掉 `rules.cjs` 内置默认里那份「展示名口径」的模型目录污染。
