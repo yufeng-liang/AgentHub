@@ -14,6 +14,16 @@ function ok(name, cond, extra) {
   else { fail++; console.log("  ✗", name, extra !== undefined ? `→ got ${JSON.stringify(extra)}` : ""); }
 }
 
+// ===== 0. 自签模块装配（归一移植地基：导出面齐备 + 地区由渠道 id 定 + 调用元数不变） =====
+// 元数必须与 adapters._qoder* 的历史形状逐字一致：下方约 40 条既有断言按无注入签名调用，
+// 一旦改成参数注入它们会全红——那是安全网，不是待重写对象。
+console.log("qoderSelfSign 模块装配:");
+const qSelf = require("../electron/backend/proxy/qoderSelfSign.cjs");
+ok("自签模块导出面齐备", ["REGIONS","PRODUCT_REGION","regionOf","machineId","classify","statusCodeOf","unpack","ids","envelope","TagSplitter","jwtUserInfo","FALLBACK","CHAT_PATH","MODEL_LIST_PATH","REFRESH_PATH"].every((k) => qSelf[k] !== undefined), ["REGIONS","PRODUCT_REGION","regionOf","machineId","classify","statusCodeOf","unpack","ids","envelope","TagSplitter","jwtUserInfo","FALLBACK","CHAT_PATH","MODEL_LIST_PATH","REFRESH_PATH"].filter((k) => qSelf[k] === undefined));
+ok("地区按渠道 id 判定（qoder=CN，qoder_intl=Global）", qSelf.PRODUCT_REGION.qoder === "cn" && qSelf.PRODUCT_REGION.qoder_intl === "global");
+ok("statusCodeOf 两侧信封都吃", qSelf.statusCodeOf({ statusCodeValue: 403 }) === 403 && qSelf.statusCodeOf({ statusCode: "UNAUTHORIZED" }) === 401 && qSelf.statusCodeOf({ statusCode: "OK" }) === 0);
+ok("纯函数保持历史调用元数（ids/unpack 不注入，machineId 无参）", qSelf.ids({ userId: "u1", upstreamKey: "qfmodel", maxTokens: 32768 }).sessionId.length > 0 && qSelf.unpack({ statusCodeValue: 200, body: "{}" }).ok === true && qSelf.jwtUserInfo.length === 1 && qSelf.machineId.length === 0);
+
 console.log("qoderCosy:");
 const qcosy = require("../electron/backend/proxy/qoderCosy.cjs");
 ok("sigPath 去 /algo 前缀且不含查询", qcosy.sigPathOf("https://api3.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation?Encode=1") === "/api/v2/service/pro/sse/agent_chat_generation");
