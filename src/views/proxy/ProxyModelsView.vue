@@ -6,8 +6,8 @@ import type { ComponentPublicInstance } from "vue";
 import * as api from "../../api/ipc";
 import type { ModelCustomEntry, ProxyChannelId, ProxyChannelView, ProxyModel } from "../../types";
 import { useAppStore } from "../../stores/app";
-import { channelName, fmtCtx, fmtInt, fmtRate, parseCtxInput } from "./format";
-import { capTagsFor, chanRows, chanSummary, chanTone, staleExcluded } from "./channelCell";
+import { capabilityTags, channelName, fmtCtx, fmtInt, fmtRate, parseCtxInput } from "./format";
+import { chanRows, chanSummary, chanTone, staleExcluded } from "./channelCell";
 import { ROW_H, colCountFor, winRange } from "./virtualWindow";
 import ModelMetaEditor from "../../components/proxy/ModelMetaEditor.vue";
 
@@ -83,14 +83,9 @@ const vPadBottom = computed(() => range.value.padBottom);
 
 let scrollerEl: Element | null = null;
 let scrollerRo: ResizeObserver | null = null;
-/** 滚动容器实测宽度（能力列按它选 compact 档）；0 = 还没量到，按全显档处理 */
-const tableW = ref(0);
 function measureView() {
   viewRows.value = scrollerEl ? Math.ceil(scrollerEl.clientHeight / ROW_H) : 0;
-  tableW.value = scrollerEl ? scrollerEl.clientWidth : 0;
 }
-/** 档位规则在 channelCell.capTagsFor 里（阈值只写一次，结构闸判的是同一条） */
-const capTags = (m: ProxyModel) => capTagsFor(m, tableW.value);
 /** 函数式 ref：滚动容器在 v-if 里，切子 Tab 会重建，元素到手/消失各回调一次。
  *  形参类型必须与 Vue 的 VNodeRef 一致（含 ComponentPublicInstance），
  *  写窄了 strictFunctionTypes 下会因参数逆变直接报 TS2322。 */
@@ -672,12 +667,13 @@ onMounted(refresh);
                     <!-- 2026-09-30 重组：原「元数据」列并进能力格 —— chips 一眼看能力，整格可点开编辑器，
                          悬停露出铅笔提示可编辑；有用户覆盖时「覆盖」徽标跟过来（信息不丢，列数 -1）。
                          role=button + 键盘 Enter，可访问性与原按钮打平。
-                         2026-10-08：改回五枚全显（合并列把宽度还回来了）。窄容器由 capCompact
-                         降档，而不是靠 CSS 截断——「图 视 …」这种被省略号切掉的样子最没用。 -->
+                         2026-10-08：合并列把这列加宽到 22.5%，改回五枚全显（此前是「首枚 + 计数角标」）。
+                         不需要窄宽度降档：表挂 min-width:860 + table-layout:fixed，能力格最窄也有
+                         ~204px，而五枚加铅笔约 120px（真机实测余 102px）。 -->
                     <span class="cap-chips">
-                      <el-tooltip :content="`能力：${capTags(m).join(' / ')}（点击编辑）`" placement="top">
+                      <el-tooltip :content="`能力：${capabilityTags(m).join(' / ')}（点击编辑）`" placement="top">
                         <span class="cap-list">
-                          <span v-for="t in capTags(m)" :key="t" class="tag tag-dim">{{ t }}</span>
+                          <span v-for="t in capabilityTags(m)" :key="t" class="tag tag-dim">{{ t }}</span>
                         </span>
                       </el-tooltip>
                     </span>
@@ -691,7 +687,7 @@ onMounted(refresh);
                          明细进 popover 而不是铺成 chips：这列只有 20%，渠道名最长八个字，两颗就撑破
                          ⇒ 换行 ⇒ 破 ROW_H=60 的虚拟滚动垫高数学（见 virtualWindow.ts 顶注）。
                          摘要文案与行序都走 channelCell 的真实现，模板不自己拼——两处拼迟早分叉。 -->
-                    <el-popover placement="bottom-start" :width="248" trigger="click" popper-class="glass-popper" :persistent="false">
+                    <el-popover placement="bottom-start" :width="272" trigger="click" popper-class="glass-popper" :persistent="false">
                       <template #reference>
                         <span class="chan-sum" :class="chanTone(m)" role="button" tabindex="0" :aria-label="`渠道：${chanSummary(m, activeTab)}（点开调整）`">{{ chanSummary(m, activeTab) }}</span>
                       </template>
@@ -699,14 +695,15 @@ onMounted(refresh);
                         <!-- 顶部渠道 chip 选中时整列降为一颗开关（定案 Q5=C）：这一视图里只有它可选 -->
                         <div v-if="activeTab" class="chan-pop-line">
                           <span class="chan-pop-name">{{ channelName(activeTab) }}</span>
-                          <div
-                            class="switch"
-                            :class="{ on: !(m.excluded || []).includes(activeTab as ProxyChannelId) }"
-                            role="switch"
-                            :aria-checked="!(m.excluded || []).includes(activeTab as ProxyChannelId)"
-                            :title="`点掉后此模型不可用（本视图只看 ${channelName(activeTab)}）`"
-                            @click="toggleExclude(m, activeTab)"
-                          ></div>
+                          <el-tooltip :content="`点掉后此模型不可用（本视图只看 ${channelName(activeTab)}）`" placement="left">
+                            <div
+                              class="switch"
+                              :class="{ on: !(m.excluded || []).includes(activeTab as ProxyChannelId) }"
+                              role="switch"
+                              :aria-checked="!(m.excluded || []).includes(activeTab as ProxyChannelId)"
+                              @click="toggleExclude(m, activeTab)"
+                            ></div>
+                          </el-tooltip>
                         </div>
                         <template v-else>
                           <div class="chan-pop-title">{{ m.sources.length }} 个来源渠道</div>
@@ -717,21 +714,20 @@ onMounted(refresh);
                               <span v-if="r.stale" class="chan-tag-stale">（已下架）</span>
                             </span>
                             <span class="chan-pop-acts">
-                              <button
-                                class="chan-pin"
-                                :class="{ on: r.pinned }"
-                                :disabled="r.stale"
-                                :title="r.pinned ? '已钉定到该渠道，再点一次取消' : '只走这个渠道'"
-                                @click="togglePin(m, r.id)"
-                              >📌</button>
-                              <div
-                                class="switch"
-                                :class="{ on: r.on, 'is-locked': r.pinned }"
-                                role="switch"
-                                :aria-checked="r.on"
-                                :title="r.pinned ? '已钉定到该渠道，取消钉定后才能排除' : r.on ? '走该渠道' : '已排除'"
-                                @click="r.pinned ? undefined : toggleExclude(m, r.id)"
-                              ></div>
+                              <el-tooltip :content="r.pinned ? '已钉定到该渠道，再点一次取消' : '只走这个渠道'" placement="left">
+                                <button class="chan-pin" :class="{ on: r.pinned }" :disabled="r.stale" @click="togglePin(m, r.id)">📌</button>
+                              </el-tooltip>
+                              <!-- 定案 Q8=A：钉定态下这颗开关置灰不可点——「既钉到别家、又把它排除」
+                                   是两个互相矛盾的意图，必须先取消钉定。 -->
+                              <el-tooltip :content="r.pinned ? '已钉定到该渠道，取消钉定后才能排除' : r.on ? '走该渠道：点掉即排除' : '已排除：点回即恢复'" placement="left">
+                                <div
+                                  class="switch"
+                                  :class="{ on: r.on, 'is-locked': r.pinned }"
+                                  role="switch"
+                                  :aria-checked="r.on"
+                                  @click="r.pinned ? undefined : toggleExclude(m, r.id)"
+                                ></div>
+                              </el-tooltip>
                             </span>
                           </div>
                           <div v-if="staleExcluded(m).length" class="chan-pop-foot">
@@ -741,9 +737,9 @@ onMounted(refresh);
                                所以这里只解释「为什么点了没用」，并把那几把 Key 直接列出来可点去改。 -->
                           <div v-if="(m.pinnedKeys || []).length" class="chan-pop-foot chan-pop-keys">
                             <span class="chan-keys-hint">{{ (m.pinnedKeys || []).length }} 把 Key 钉在本行渠道，排除对它无效：</span>
-                            <button v-for="k in m.pinnedKeys" :key="k.id" class="link-btn" :title="`去 API Key 页改「${k.name}」的路由`" @click="gotoKey(k)">
-                              {{ k.name }}
-                            </button>
+                            <el-tooltip v-for="k in m.pinnedKeys" :key="k.id" :content="`去 API Key 页改「${k.name}」的路由`" placement="top">
+                              <button class="link-btn" @click="gotoKey(k)">{{ k.name }}</button>
+                            </el-tooltip>
                           </div>
                         </template>
                       </div>
@@ -1284,6 +1280,13 @@ onMounted(refresh);
   padding: 0;
   border: 0;
 }
+/* 数据行必须正好 ROW_H=60：占位行按 60 垫总高，行矮了就会在滚到底时垫出一段空白
+   （实测：合并列删掉那张 34px 高的渠道覆盖 select 后，单行模型从 60 掉到 52，
+     138 行按 8px 累积就是 ~1100px 幽灵空间）。
+   显式钉住高度，而不是靠某个控件「顺带」把行撑到 60 —— 控件一换就悄悄破。 */
+.models-table tbody tr:not(.v-spacer) {
+  height: 60px;
+}
 .models-table tbody tr.v-spacer {
   cursor: default;
 }
@@ -1344,6 +1347,19 @@ onMounted(refresh);
   font-size: 10px;
   padding: 1px 4px;
   flex-shrink: 0;
+}
+/* 渠道格：摘要 chip 与「已排除 N」角标必须同一行。实测两者宽 97+46=143px，
+   而格子内容宽 167px 却仍然换行——inline-block 的空白符与基线对齐在表格里不可靠，
+   所以显式 flex + nowrap。换行的后果不是"难看"而是行高变化破 ROW_H=60 的垫高数学。 */
+.chan-cell {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: nowrap;
+}
+.chan-cell .chan-sum {
+  flex: 0 1 auto;
+  min-width: 0;
 }
 .chan-pop {
   display: flex;

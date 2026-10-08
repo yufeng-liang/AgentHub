@@ -195,26 +195,22 @@ export const fmtRate = (r: number | null | undefined) => (r == null || Number.is
 
  /** 模型能力 → 紧凑标签列表：图=图片输入 / 视=视频输入 / 思=思考链 / 工=工具调用 / ↑=输出上限。
   *  2026-10-08：合并列腾出的宽度还给这列，改回全显（此前是「首枚 + 计数角标」）。
-  *  compact 档给窄容器（滚动容器实测宽度 < CAP_COMPACT_BELOW）：降级顺序固定为
-  *  「先把↑的缩写后缀去掉（↑131.1K→↑131），再砍视频」，且不靠 CSS 省略号——
-  *  被截成「↑13…」比「↑131」难读得多（定案 Q13）。
+  *  实测不需要窄宽度降档：表挂 min-width:860 + table-layout:fixed，能力格最窄也有 ~204px，
+  *  而五枚加铅笔图标约 120px —— 降档只会在默认窗口下把「视」白白藏掉。
   *  2026-09-30 去重：上下文长度不进这列（表里有独立且可编辑的「上下文」列）。 */
  export function capabilityTags(m: {
    capabilities?: { images?: boolean; video?: boolean; reasoning?: boolean; tools?: boolean };
    maxOutputTokens?: number;
- }, opts?: { compact?: boolean }): string[] {
+ }): string[] {
    const out: string[] = [];
    const c = m.capabilities || {};
-   const compact = !!opts?.compact;
    if (c.images) out.push("图");
-   if (c.video && !compact) out.push("视");
+   if (c.video) out.push("视");
    if (c.reasoning) out.push("思");
    if (c.tools) out.push("工");
    const n = Number(m.maxOutputTokens) || 0;
-   // 未知也要出一枚：静默不显会让人以为「这模型没有输出上限」，而真实含义是「目录里没给」
-   if (!n) out.push("↑—");
-   else if (compact) out.push("↑" + (n >= 1000 ? String(Math.round(n / 1000)) : String(n)));
-   else out.push("↑" + fmtK(n));
+   // 未知也要出一枚：静默不显等于替用户宣布「这模型没有输出上限」，而真实含义是目录里没给
+   out.push("↑" + (n ? fmtK(n) : "—"));
    return out;
  }
 
