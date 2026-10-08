@@ -75,5 +75,25 @@ const walk = (d) => fs.readdirSync(d, { withFileTypes: true }).forEach((e) => {
 walk(path.join(ROOT, "electron", "backend"));
 check(`⑥ electron/backend 里 api2/api3 字面量只在真相源出现（实得 ${dupes.join(", ") || "无"}）`, dupes.length === 0, "第二处域名就是下一个漂移点");
 
+// ===== F. 区服只有一个来源：渠道 id =====
+// 上游 ProxyAgentsView 历史上没有区服 radio（fork 加的），下次合并可能把它带回来；
+// 而主进程一旦又读 edition，就会出现「渠道说 CN、参数说 intl」的分裂账号（meta.mode=global
+// 打在 CN 网关上，答非所问且无从察觉）。两头都钉住。
+ok7();
+function ok7() {
+  const disc = read("electron/backend/proxy/discovery.cjs");
+  // 必须按**三参签名**锁定：本文件里有两个 beginQoderOAuth 声明，
+  // 前面那个 (channel, onDone) 的被后面同名声明整体遮蔽（函数声明提升 + 后者覆盖），是死码。
+  // 按名字匹配会命中死的那份 ⇒ 判据看着绿、实际什么也没测到（本闸第一次跑就是这么撞出来的）。
+  const qFn = /async function beginQoderOAuth\(channel, edition, onDone\) \{[\s\S]{0,900}/.exec(disc);
+  check("⑦ 主进程区服读渠道 id（活的 beginQoderOAuth 内不读 edition）",
+    !!qFn && /EP\.regionOf\(channel\)/.test(qFn[0]) && !/qoderRegionOfMode\(edition\)/.test(qFn[0]),
+    qFn ? "没看到 EP.regionOf(channel)" : "按三参签名找不到 beginQoderOAuth（签名变了？判据要跟着改，别改成宽松匹配）");
+  const decls = (disc.match(/async function beginQoderOAuth/g) || []).length;
+  check(`⑦c beginQoderOAuth 声明数已知（当前 2 个，第二个才活着）`, decls === 2, `实得 ${decls} 个：若变成 1 说明死码被清理，本条与上一条的锚点都要复核`);
+  const agents = read("src/views/proxy/ProxyAgentsView.vue");
+  check("⑦b 渲染层没有 qoder 区服 radio（qoderEdition 已删）", !/qoderEdition/.test(agents), "radio 回来了就会与「区服跟随渠道」冲突");
+}
+
 console.log(`\n${failures.length ? "FAIL " + failures.length + " 项" : "OK Qoder 端点表闸全过"}（共 ${pass + failures.length} 项）`);
 if (failures.length) process.exit(1);
