@@ -242,25 +242,36 @@ function makeQoder(product, deps) {
     },
 
     /**
-     * 拉取官方目录：解密本机 catalog-v6（零网络、绑定 uid）→ 整形为统一模型对象。
-     * 对齐既有约定：拉取失败不写空（保留旧目录）；本实现无网络失败面，仅解密可能失败。
+     * 拉取官方目录：优先解密本机 catalog-v6（零网络、绑定 uid）→ 整形为统一模型对象。
+     * 对齐既有约定：拉取失败不写空（保留旧目录）。
+     * fork-port：本机不可用的五种诱因逐一回落远程 model/list，故本实现**有**网络失败面；
+     * 两条都失败才回 ok:false，且 message 同时含本机与远程两侧原因。
      */
     async fetchModels(account, secrets) {
       const uid = (account && account.uid) || "";
-      if (!uid) return { ok: false, message: "缺少 uid，无法定位模型目录缓存" };
+      // fork-port：上游目录来自本机 catalog-v6 解密（需装客户端且该 uid 用过）；任何一种不可用
+      // 都回落远程 model/list?Encode=1（qcosy 自签，零安装可用）。两条都失败才如实回错，
+      // 且 message 同时带本机原因与远程原因——只留一个会把排查方向带偏。
+      // 用 bail() 而不是就地 return：五种诱因各写一遍兜底必漏。
+      const bail = (localMsg) => (deps.selfSign
+        ? deps.selfSign.fetchModelsRemote({ account, secrets }).then((r) => (r && r.ok
+            ? r
+            : { ok: false, message: `${localMsg}；远程兜底：${(r && r.message) || "失败"}` }))
+        : Promise.resolve({ ok: false, message: localMsg }));
+      if (!uid) return bail("缺少 uid，无法定位模型目录缓存");
       const blob = auth.readCatalogBlob(product, uid);
-      if (!blob) return { ok: false, message: "本机无模型目录缓存（该客户端尚未登录使用过）" };
+      if (!blob) return bail("本机无模型目录缓存（该客户端尚未登录使用过）");
       let entry;
       try {
         entry = await acquireSession(account, secrets);
       } catch (e) {
-        return { ok: false, message: `签名器不可用：${String((e && e.message) || e).slice(0, 120)}` };
+        return bail(`签名器不可用：${String((e && e.message) || e).slice(0, 120)}`);
       }
       let json;
       try {
         json = JSON.parse(entry.session.modelCacheDecrypt(blob, uid));
       } catch (e) {
-        return { ok: false, message: `目录解密失败：${String((e && e.message) || e).slice(0, 120)}` };
+        return bail(`目录解密失败：${String((e && e.message) || e).slice(0, 120)}`);
       } finally {
         entry.release();
       }
@@ -297,7 +308,7 @@ function makeQoder(product, deps) {
         }
       }
       const models = [...seen.values()];
-      if (!models.length) return { ok: false, message: "目录为空（结构可能已变更）" };
+      if (!models.length) return bail("目录为空（结构可能已变更）");
       return { ok: true, models, scene: DEFAULT_SCENE, modelCount: Object.keys(seen).length };
     },
 

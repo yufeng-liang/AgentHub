@@ -630,6 +630,45 @@ async function main() {
     assert(rb.ok === false && /格式不认识/.test(rb.message), "段数不足如实报错，不静默当 OAuth 分支");
   }
 
+  // ===== 13. 目录双轨：本机 catalog 解密不可用的每种诱因都要落到远程兜底 =====
+  // 上游目录来自本机 catalog-v6 解密（需装客户端且该 uid 用过）。fork 的远程 model/list 是
+  // 「零安装也能拿到目录」的唯一来源，所以五种失败（无 uid / 无 blob / 签名器不可用 / 解密失败 /
+  // 目录为空）逐一都要接上兜底——漏一种就是那种机器上目录永远拉不到。
+  console.log("\n[13] fetchModels 远程兜底（逐诱因）");
+  {
+    const remoteModels = [{ id: "dfmodel", name: "DeepSeek-Flash", capabilities: { reasoning: true, tools: true, images: true } }];
+    let remoteHits = 0;
+    const selfSign13 = {
+      chat: async () => ({}), refreshToken: async () => ({ ok: false }),
+      fetchModelsRemote: async () => { remoteHits += 1; return { ok: true, models: remoteModels, scene: "assistant", modelCount: 1 }; },
+    };
+    const mk13 = (auth, signer) => makeQoder("qoder", { ...deps, selfSign: selfSign13, auth, signer });
+    const cases = [
+      ["无 uid", mk13({ PRODUCTS: { qoder: {} }, readCatalogBlob: () => "B" }, deps.signer), { uid: "", meta: {} }],
+      ["本机无 blob", mk13({ PRODUCTS: { qoder: {} }, readCatalogBlob: () => null }, deps.signer), { uid: "u1", meta: {} }],
+      ["签名器不可用", mk13({ PRODUCTS: { qoder: {} }, readCatalogBlob: () => "B" }, { createSession: async () => { throw Object.assign(new Error("glue 加载失败"), { status: 503, qoderSignerDown: true }); } }), { uid: "u1", meta: {} }],
+      ["解密抛错", mk13({ PRODUCTS: { qoder: {} }, readCatalogBlob: () => "B" }, { createSession: async () => ({ modelCacheDecrypt: () => { throw new Error("bad blob"); }, free() {} }) }), { uid: "u1", meta: {} }],
+      ["目录结构为空", mk13({ PRODUCTS: { qoder: {} }, readCatalogBlob: () => "B" }, { createSession: async () => ({ modelCacheDecrypt: () => JSON.stringify({ assistant: [] }), free() {} }) }), { uid: "u1", meta: {} }],
+    ];
+    for (const [name, ad, acct] of cases) {
+      const before = remoteHits;
+      const r = await ad.fetchModels(acct, { token: "dt-x" });
+      assert(r.ok === true && remoteHits === before + 1, `${name} → 落远程兜底成功`);
+      assert(r.models[0].id === "dfmodel", `${name} → 远程条目形状保持上游口径`);
+    }
+    // 远程也失败时，message 必须同时带上本机原因与远程原因——只留一个就会把人引向错误的排查方向
+    const adBoth = mk13({ PRODUCTS: { qoder: {} }, readCatalogBlob: () => null }, deps.signer);
+    const saved = selfSign13.fetchModelsRemote;
+    selfSign13.fetchModelsRemote = async () => ({ ok: false, message: "目录拉取失败（HTTP 403）" });
+    const rf = await adBoth.fetchModels({ uid: "u1", meta: {} }, { token: "dt-x" });
+    selfSign13.fetchModelsRemote = saved;
+    assert(rf.ok === false && /本机无模型目录缓存/.test(rf.message) && /远程兜底/.test(rf.message) && /HTTP 403/.test(rf.message), "两侧都失败时两个原因一并上报: " + rf.message);
+    // 未注入 selfSign 时必须保持上游原失败语义（不能凭空变成功）
+    const adUp13 = makeQoder("qoder", { ...deps, auth: { PRODUCTS: { qoder: {} }, readCatalogBlob: () => null } });
+    const ru = await adUp13.fetchModels({ uid: "u1", meta: {} }, { token: "dt-x" });
+    assert(ru.ok === false && /本机无模型目录缓存/.test(ru.message) && !/远程兜底/.test(ru.message), "未注入 selfSign 时仍是上游语义");
+  }
+
   console.log("\n[done] Qoder 适配器单元自测全部通过");
 }
 
