@@ -26,10 +26,25 @@ const FILE = "src/views/proxy/ProxyModelsView.vue";
 const TOTAL = 133; // 与真机 catalog 同量级（实测 proxy_models 返回 133 条）
 
 // ---- 从 TS 源里取真实的窗口数学（与组件用的是同一份，改错了这里一起红） ----
+const tsCache = new Map();
 function loadTsModule(rel) {
-  const js = esbuild.transformSync(fs.readFileSync(path.join(ROOT, rel), "utf8"), { loader: "ts", format: "cjs" }).code;
+  if (tsCache.has(rel)) return tsCache.get(rel);
+  const abs = path.join(ROOT, rel);
+  const js = esbuild.transformSync(fs.readFileSync(abs, "utf8"), { loader: "ts", format: "cjs" }).code;
   const mod = { exports: {} };
-  new Function("module", "exports", js)(mod, mod.exports);
+  // new Function 的作用域里没有 require，而 format.ts 自上游 v1.54.0 起把 fmtCtx
+  // 转出到 utils/format.ts —— 多出一层相对依赖，不接 require 就是闸自身 ReferenceError
+  // （红在门禁身上，与被测组件无关）。相对路径递归走同一个加载器，保持「取真实现」的口径。
+  const localRequire = (spec) => {
+    if (!spec.startsWith(".")) return require(spec);
+    const base = path.resolve(path.dirname(abs), spec);
+    for (const cand of [`${base}.ts`, `${base}.js`, path.join(base, "index.ts")]) {
+      if (fs.existsSync(cand)) return loadTsModule(path.relative(ROOT, cand).replace(/\\/g, "/"));
+    }
+    throw new Error(`闸的 TS 加载器解析不到 ${spec}（从 ${rel}）`);
+  };
+  new Function("module", "exports", "require", js)(mod, mod.exports, localRequire);
+  tsCache.set(rel, mod.exports);
   return mod.exports;
 }
 const { ROW_H, OVERSCAN, MIN_ROWS, winRange, colCountFor } = loadTsModule("src/views/proxy/virtualWindow.ts");
