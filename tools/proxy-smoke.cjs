@@ -21,6 +21,28 @@ async function main() {
   const rules = require("../electron/backend/proxy/rules.cjs");
   const util = require("../electron/backend/proxy/util.cjs");
   const pool = require("../electron/backend/proxy/pool.cjs");
+  // qoder 端到端场景测的是「wasm 签名器不可用」时的自签回落（COSY 头 + qcosy 编码体 + 双层信封）。
+  // 为什么必须自己逼：AGENTHUB_QODER_RESOURCES 只是定位器的**首选候选**、不是排他覆盖
+  // （qoderInstall.findResources 之后仍会扫 Programs / launcher / 注册表），逼不出「未安装」；
+  // 而本机实测是「定位成功、glue 加载失败」（客户端 0.3.4 的 worker 结构变了，缺
+  // loaderWasm/glueVar/loaderGlue/initAsync）——那种情况下回落会自己发生，桩看起来像没起作用，
+  // 换一台 glue 能加载的机器 §11.5 就会红。所以桩既要真的逼出路，也要被观测到（signerCalls）。
+  // 手法用 require.cache 打桩（dev-provider-test 同款），不给生产码加只有测试会碰的开关。
+  // ⚠ 代价要说清：打桩后 smoke 不覆盖 wasm 签名路的端到端——那条只有
+  //   proxy-qoder-adapter-selftest 的单元级 stub 会话覆盖，真实端到端需要已登录的 qoder 账号。
+  let signerCalls = 0;
+  const qSignerPath = require.resolve("../electron/backend/proxy/qoderSigner.cjs");
+  require.cache[qSignerPath] = {
+    id: qSignerPath,
+    filename: qSignerPath,
+    loaded: true,
+    exports: {
+      createSession: async () => { signerCalls += 1; throw Object.assign(new Error("自测：按签名器不可用处理"), { status: 503, qoderSignerDown: true }); },
+      locate: () => null,
+      available: () => false,
+      describe: async () => ({ product: "qoder", installed: false }),
+    },
+  };
   const adapters = require("../electron/backend/proxy/adapters.cjs");
   const qcosy = require("../electron/backend/proxy/qoderCosy.cjs"); // qoder 场景：逆变换还原编码体后与 encodeBody 互拍
   const discovery = require("../electron/backend/proxy/discovery.cjs");
@@ -818,11 +840,21 @@ async function main() {
     "api.cline.bot": "cline", // chat/auth/refresh 同域，路径原样保留
     "autoglm-acceleration-api.zhipuai.cn": "autoclaw",
     "autoglm-api.autoglm.ai": "autoclaw_intl",
+    // qoder 两区的**全部**域都要在册：改写表按 hostname 精确匹配，漏一个就是 realFetch
+    // ——fork 期只写 global 区（api3.qoder.sh）就够，归一移植后 qoder=CN，
+    // 自签与 PAT/签到都打在 .com.cn 域上，漏映射等于拿假凭据往真上游发请求。
     "api3.qoder.sh": "qoder",
+    "gateway.qoder.com.cn": "qoder",
+    "openapi.qoder.com.cn": "qoder",
   };
   globalThis.fetch = (url, opts) => {
     const u = new URL(String(url));
     const seg = FAKE_HOSTS[u.hostname];
+    // 守卫：qoder 的域必须逐个登记。漏一个不是「测试覆盖不到」，而是拿假凭据往真上游发请求
+    // （归一移植后 qoder 从 global 区换成 CN 域，就差点踩中这一条）。宁可当场红，不静默出网。
+    if (!seg && /(^|\.)qoder\.(sh|com\.cn)$/.test(u.hostname)) {
+      throw new Error(`smoke 守卫：qoder 域 ${u.hostname} 未登记进 FAKE_HOSTS，拒绝出网`);
+    }
     if (!seg) return realFetch(url, opts);
     // 取末两级路径做假上游端点名（cline: chat/completions 与 auth/refresh；其余上游单端点）
     const tail = u.pathname.split("/").filter(Boolean).slice(-2).join("/");
@@ -897,18 +929,23 @@ async function main() {
   assert(seenHeaders.acIntl["x-request-model"] === "zai_glm-5.3-flash", "intl 侧 flash 路由 id");
   assert(!("x-harness-type" in seenHeaders.acIntl), "intl 同样禁发 X-Harness-Type");
 
-  // 11.5 qoder：COSY 头 + 编码体逆变换还原信封 + 双层信封 SSE 出线
-  rr = await callAs(kQd.secret, { model: "Qwen3.8-Flash", stream: true, messages: [{ role: "user", content: "hi" }] });
+  // 11.5 qoder（自签回落路）：COSY 头 + 编码体逆变换还原信封 + 双层信封 SSE 出线
+  // 请求模型用上游 key（qfmodel）：归一移植后 id 口径就是 key，展示名不再进目录。
+  // 签名器已被 require.cache 打桩成「未安装」，故本段确定性走自签路，断言的 COSY 头与
+  // qcosy 逆变换才成立；夹具首帧给足 15 字符正是为了同时测到 TagSplitter 的留 10 与流末 flush。
+  rr = await callAs(kQd.secret, { model: "qfmodel", stream: true, messages: [{ role: "user", content: "hi" }] });
   assert(rr.status === 200, "qoder 流式 200: " + rr.status);
   const qdText = await rr.text();
   assert(qdText.includes('"content":"Qoder"') && qdText.includes("data: [DONE]") && !qdText.includes("upstream_error"), "qoder 双层信封解包正文出线: " + qdText.slice(0, 160));
   assert(qdText.includes('"total_tokens":5'), "qoder usage 透传");
   // 非流式聚合：全量正文（含流末 flush 的尾段）拼装完整，证明标签状态机 flush 不丢字
-  rr = await callAs(kQd.secret, { model: "Qwen3.8-Flash", stream: false, messages: [{ role: "user", content: "hi" }] });
+  rr = await callAs(kQd.secret, { model: "qfmodel", stream: false, messages: [{ role: "user", content: "hi" }] });
   const qdBody = await rr.json();
   assert(rr.status === 200 && qdBody.choices[0].message.content === "Qoder says hi ok", "qoder 非流式聚合（含 flush 尾段）: " + JSON.stringify(qdBody.choices[0] && qdBody.choices[0].message));
   assert(/^Bearer COSY\.[A-Za-z0-9+/=]+\.[0-9a-f]{32}$/.test(String(seenHeaders.qd.authorization)), "authorization 是 Bearer COSY.x.y 三段式");
   assert(seenHeaders.qd["cosy-sigpath"] === "/api/v2/service/pro/sse/agent_chat_generation", "cosy-sigpath 去 /algo 前缀");
+  // 回落是被逼出来的、不是碰巧：签名器必须真的被调用过并抛错，否则本段断言的是「本机 glue 恰好坏了」
+  assert(signerCalls > 0, `qoder chat 确实问过签名器（${signerCalls} 次）后才回落自签，而非跳过签名路`);
   // 逆变换（encodeBody 三步各自的逆）：'$'→'='、CUSTOM 字母表反查、三段旋转还原（头尾互换的旋转是自逆变换）
   const qSTD = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   const qCUS = "_doRTgHZBKcGVjlvpC,@aFSx#DPuNJme&i*MzLOEn)sUrthbf%Y^w.(kIQyXqWA!";
