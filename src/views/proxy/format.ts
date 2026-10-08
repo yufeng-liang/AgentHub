@@ -165,8 +165,8 @@ export const CHANNEL_NAMES: Record<string, string> = {
   lobster: "LobsterAI（有道）",
   zcode: "ZCode（智谱）",
   zcode_intl: "ZCode 智谱（国际）",
-  qoder: "Qoder CN",
-  qoder_intl: "Qoder International",
+  qoder: "Qoder",
+  qoder_intl: "Qoder 国际",
 };
 export const channelName = (id: string) => CHANNEL_NAMES[id] || id || "-";
 

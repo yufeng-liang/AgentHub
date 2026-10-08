@@ -257,7 +257,7 @@ const PROXY_POOL = [
     ],
   },
   {
-    id: "workbuddy", display: "WorkBuddy（中国区）", domain: "copilot.tencent.com", costTier: "", poolStrategy: "credit_first",
+    id: "workbuddy", display: "WorkBuddy CN", domain: "copilot.tencent.com", costTier: "", poolStrategy: "credit_first",
     health: null as { until: number; reason: string; streak: number } | null,
     summary: { channel: "workbuddy", totalCredits: 34120, accountCount: 2, onlineCount: 1, earliestExpire: NOW + 12 * 86400000, expired: false, expiringSoon: false, todayReq: 203, todayTokens: 41200, lastCreditsAt: NOW - 40 * 60000 },
 
@@ -269,7 +269,7 @@ const PROXY_POOL = [
     ],
   },
   {
-    id: "workbuddy_ai", display: "WorkBuddy AI（国际版）", domain: "www.workbuddy.ai", costTier: "", poolStrategy: "expire_first",
+    id: "workbuddy_ai", display: "WorkBuddy AI", domain: "www.workbuddy.ai", costTier: "", poolStrategy: "expire_first",
     health: null as { until: number; reason: string; streak: number } | null,
     summary: { channel: "workbuddy_ai", totalCredits: 8120, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 33 * 86400000, expired: false, expiringSoon: false, todayReq: 66, todayTokens: 14800, lastCreditsAt: NOW - 70 * 60000 },
 
@@ -363,7 +363,7 @@ const PROXY_POOL = [
   },
   {
     // Qoder 双区：credits 用浮点演示（整数化会丢计量，见 format.ts fmtCredits）
-    id: "qoder", display: "Qoder CN", domain: "gateway.qoder.com.cn", costTier: "", poolStrategy: "expire_first",
+    id: "qoder", display: "Qoder", domain: "gateway.qoder.com.cn", costTier: "", poolStrategy: "expire_first",
     health: null as { until: number; reason: string; streak: number } | null,
     summary: { channel: "qoder", totalCredits: 199.9934, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 30 * 86400000, expiringSoon: false, todayReq: 9, todayTokens: 48200, lastCreditsAt: NOW - 6 * 60000 },
     accounts: [
@@ -371,7 +371,7 @@ const PROXY_POOL = [
     ],
   },
   {
-    id: "qoder_intl", display: "Qoder International", domain: "api2.qoder.sh", costTier: "", poolStrategy: "expire_first",
+    id: "qoder_intl", display: "Qoder 国际", domain: "api2.qoder.sh", costTier: "", poolStrategy: "expire_first",
     health: null as { until: number; reason: string; streak: number } | null,
     summary: { channel: "qoder_intl", totalCredits: 0.0066, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 30 * 86400000, expiringSoon: false, todayReq: 1, todayTokens: 2100, lastCreditsAt: NOW - 30 * 60000 },
     accounts: [
