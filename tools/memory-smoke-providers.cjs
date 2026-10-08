@@ -76,6 +76,11 @@ async function main() {
   store.saveModel({ id: idR1, providerId: provId, modelId: "deepseek-r1", tags: ["heavy"] });
   m = store.listModels(provId).find((x) => x.modelId === "deepseek-r1");
   check("编辑不传 reasoning 保留原值", !!m && m.reasoning.effort === "medium", JSON.stringify(m && m.reasoning));
+  // 显式传空数组 = 用户明确清空标签，不能被静默改回按名字预填（编辑弹窗的标签输入框允许清空）
+  store.saveModel({ id: idR1, providerId: provId, modelId: "deepseek-r1", tags: [] });
+  m = store.listModels(provId).find((x) => x.modelId === "deepseek-r1");
+  check("显式清空标签时真的清空（不改回预填）", !!m && m.tags.length === 0, JSON.stringify(m && m.tags));
+  store.saveModel({ id: idR1, providerId: provId, modelId: "deepseek-r1", tags: ["heavy"] });
 
   console.log("[3] 写库失败必须上抛（不再静默成功）");
   const realSet = store.memCfg;
@@ -87,6 +92,23 @@ async function main() {
   try { store.save({ name: "y", baseUrl: "https://api.example.com" }); } catch (e) { threw = String(e.message || e); }
   check("saveProvider 抛出真实错误", /磁盘只读/.test(threw), threw || "(未抛错)");
   store.memCfg = realSet;
+
+  console.log("[3b] 供应商启用/停用行内开关（列表状态显示）");
+  const withKey = store.save({ name: "带Key供应商", baseUrl: "https://api.key-test.example.com", apiKey: "sk-test-abcd1234" });
+  const kp = store.list().find((p) => p.id === withKey.id);
+  check("新建供应商默认启用", !!kp && kp.enabled === true, JSON.stringify(kp && kp.enabled));
+  const enabledCount = () => Number((store.sources().sources.find((s) => s.key === "custom").detail.match(/\d+/) || [0])[0]);
+  const n0 = enabledCount();
+  const t1 = store.toggleProvider(withKey.id, false);
+  const kp2 = store.list().find((p) => p.id === withKey.id);
+  check("停用返回 ok 且落盘 enabled=false", t1.ok === true && t1.enabled === false && kp2.enabled === false, JSON.stringify(t1));
+  // 开关是独立通道：不走 save()，所以既不触发「改地址必须重填 Key」的改道防护，也不会碰 Key
+  check("停用不碰地址与 Key 掩码", kp2.baseUrl === kp.baseUrl && kp2.apiKeyMasked === kp.apiKeyMasked, JSON.stringify({ u: kp2.baseUrl, m: kp2.apiKeyMasked }));
+  check("停用后不计入来源解析的启用供应商数", enabledCount() === n0 - 1, `${n0} → ${enabledCount()}`);
+  const t2 = store.toggleProvider(withKey.id, true);
+  check("重新启用后计数恢复", t2.ok === true && t2.enabled === true && enabledCount() === n0, `${t2.enabled} / ${enabledCount()}`);
+  const t3 = store.toggleProvider("prov_not_exist", false);
+  check("不存在的供应商返回 ok:false", t3.ok === false, JSON.stringify(t3));
 
   console.log("[4] 网关列表（gw-local 列表行）");
   const gws = store.gateways();
