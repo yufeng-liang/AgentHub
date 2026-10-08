@@ -725,6 +725,16 @@ function makeQoder(product, deps) {
      * refresh_token 轮换制：新旧两个 token 必须同时返回并落库。
      */
     async refreshToken(account, secrets) {
+      const packed = String((secrets && secrets.refreshToken) || "");
+      // fork-port：fork 的 device 登录落的是打包串（3 段 `<rt>|<uid>|<machineId>`，或 `pat|` 开头 5 段），
+      // PAT 换取与 center 域 refresh 只有自签路会做；上游的 deviceToken 刷新吃裸 dt-。
+      // 判据只看「含 |」——dt-/drt- 系列不含该字符，无需分辨段数。
+      if (packed.includes("|")) {
+        // 没注入 selfSign 时**不能**把打包串交给 deviceToken：那是一次注定失败的请求，而且报出来的
+        // 是上游的错，看不出「凭据形态与刷新器不匹配」这个真原因。宁可 fail-closed 说清缺什么。
+        if (!deps.selfSign) return { ok: false, message: "打包串凭据需要自签刷新器（未注入 selfSign），请用本机登录或重新导入" };
+        return deps.selfSign.refreshToken({ account, secrets });
+      }
       if (!secrets.refreshToken) return { ok: false, message: "无 refreshToken，请从本机重新导入" };
       const machineId = (account.meta && account.meta.machineId) || account.machineId || "";
       const r = await auth.refreshDeviceToken(product, secrets.refreshToken, machineId);

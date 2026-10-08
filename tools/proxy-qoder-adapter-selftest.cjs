@@ -550,6 +550,86 @@ async function main() {
     assert(!/think/.test(text), "正文不残留标签碎片");
   }
 
+  // ===== 11. 续期双判据：打包串走自签（含 PAT 换取），裸 dt- 走 deviceToken =====
+  // fork 的 device 登录落的是打包串（3 段 <rt>|<uid>|<mid>，或 pat| 开头 5 段）：PAT 换取与
+  // center 域 refresh 只有自签路会做；上游 deviceToken 刷新吃裸 dt-，喂打包串必失败。
+  // 判据只看「含 |」——dt-/drt- 系列不含该字符，不必分辨段数就不至于漏。
+  console.log("\n[11] refreshToken 按凭据形态分流");
+  {
+    let authCalled = null;
+    const selfSign11 = {
+      chat: async () => ({}),
+      fetchModelsRemote: async () => ({ ok: false }),
+      refreshToken: async (a) => ({ ok: true, via: "self", token: a.secrets.token, refreshToken: a.secrets.refreshToken }),
+    };
+    const fakeAuth11 = {
+      PRODUCTS: { qoder: { gateway: "https://gw.invalid" } },
+      refreshDeviceToken: async (product, rt, machineId) => { authCalled = { product, rt, machineId }; return { ok: true, token: "T2", refreshToken: "drt2", expiresAt: 111, refreshTokenExpiresAt: 222 }; },
+      readCatalogBlob: () => null, readRiskIdentity: () => null,
+    };
+    const ad11 = makeQoder("qoder", { ...deps, selfSign: selfSign11, auth: fakeAuth11 });
+    const packed = await ad11.refreshToken({ uid: "u", meta: { machineId: "m" } }, { refreshToken: "RT|u|m", token: "jwt.x.y" });
+    assert(packed.via === "self" && packed.refreshToken === "RT|u|m", "3 段打包串走自签刷新");
+    const pat = await ad11.refreshToken({ uid: "u", meta: {} }, { refreshToken: "pat|PAT|RT|u|m", token: "jwt.x.y" });
+    assert(pat.via === "self", "pat| 5 段走自签（PAT 换取在自签内部完成）");
+    const bare = await ad11.refreshToken({ uid: "u", meta: { machineId: "m" } }, { refreshToken: "drt-abc", token: "dt-abc" });
+    assert(bare.ok === true && bare.token === "T2" && bare.refreshTokenExpiresAt === 222, "裸 dt- 走上游 deviceToken 刷新（含双到期时间）");
+    assert(authCalled && authCalled.product === "qoder" && authCalled.rt === "drt-abc" && authCalled.machineId === "m", "deviceToken 刷新带 product/旧 rt/machineId");
+    const none = await ad11.refreshToken({ uid: "u", meta: {} }, {});
+    assert(none.ok === false && /无 refreshToken/.test(String(none.message)), "无凭据如实报错");
+    // 未注入 selfSign 时，打包串不能被悄悄交给 deviceToken 刷新（那会是一次注定失败的请求）
+    const adNo11 = makeQoder("qoder", { ...deps, auth: fakeAuth11 });
+    let calledNo = null;
+    authCalled = null;
+    const rNo = await adNo11.refreshToken({ uid: "u", meta: {} }, { refreshToken: "RT|u|m", token: "jwt" });
+    calledNo = authCalled;
+    assert(rNo.ok === false, "缺 selfSign 注入时打包串不硬塞给 deviceToken");
+    assert(calledNo === null, "且确实没发起那次注定失败的 deviceToken 请求");
+  }
+
+  // ===== 12. 自签刷新器内部：PAT 换取 与 3 段 OAuth 刷新（真实现，不打桩） =====
+  // [11] 用桩验分流，这段验被搬进来的真码：PAT 走 jobToken/exchange 且原串回写（换了作业令牌
+  // 也不丢 PAT），OAuth 走 center 域且新 rt 含 | 时必须沿用旧串（打包分隔符不能被污染）。
+  console.log("\n[12] 自签刷新器真实现（PAT / OAuth 两分支）");
+  {
+    const qSS12 = require("../electron/backend/proxy/qoderSelfSign.cjs");
+    const jwtWithExp = (() => {
+      const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
+      return b64({ alg: "none" }) + "." + b64({ user_id: "u9", exp: 2000000000 }) + ".sig";
+    })();
+    const mkSs = (handler) => qSS12.makeSelfSign("qoder", { fetchStream: deps.fetchStream, pumpSse: deps.pumpSse, httpJson: handler });
+    const seen12 = [];
+    const ssPat = mkSs(async (url, o) => { seen12.push({ url, body: o && o.body }); return { ok: true, status: 200, data: { data: { token: jwtWithExp } } }; });
+    const rp = await ssPat.refreshToken({ account: { uid: "u9" }, secrets: { refreshToken: "pat|SECRET_PAT|oldjobrt|u9|m9", token: "old" } });
+    assert(rp.ok === true && rp.token === jwtWithExp, "PAT 换取成功并回新 token");
+    assert(rp.refreshToken === "pat|SECRET_PAT|oldjobrt|u9|m9", "PAT 原串回写（作业令牌轮换不得把 PAT 丢掉）");
+    assert(rp.expiresAt === 2000000000 * 1000, "到期时间取 JWT exp 并换成毫秒");
+    assert(/jobToken\/exchange/.test(seen12[0].url) && JSON.parse(seen12[0].body).personal_token === "SECRET_PAT", "打的是 openApi 域 jobToken/exchange 且带 personal_token");
+    const ssPatFail = mkSs(async () => ({ ok: false, status: 403, data: null }));
+    const rpf = await ssPatFail.refreshToken({ account: {}, secrets: { refreshToken: "pat|P|a|b|c" } });
+    assert(rpf.ok === false && /PAT 换取失败 HTTP 403/.test(rpf.message), "PAT 换取失败如实带状态码");
+
+    const seenO = [];
+    const ssOauth = mkSs(async (url, o) => { seenO.push({ url, headers: o && o.headers, body: o && o.body }); return { ok: true, status: 200, data: { data: { token: jwtWithExp, refresh_token: "brand-new-rt" } } }; });
+    const ro = await ssOauth.refreshToken({ account: { uid: "u9" }, secrets: { refreshToken: "oldrt|u9|m9", token: "cur" } });
+    assert(ro.ok === true && ro.refreshToken === "brand-new-rt|u9|m9", "OAuth 刷新重组三段串（uid/machineId 沿用）");
+    assert(/\/algo\/api\/v3\/user\/refresh_token$/.test(seenO[0].url) || seenO[0].url.includes("refresh_token"), "打的是 center 域 refresh_token");
+    assert(String(seenO[0].headers.authorization) === "Bearer cur", "刷新带当前 token 的 Bearer");
+    assert(JSON.parse(seenO[0].body).refreshToken === "oldrt", "请求体只带首段旧 rt（不带 uid/machineId）");
+
+    // 上游若回一个含 | 的 refresh_token，绝不能拼进打包串（分隔符被污染后下次分段就错）
+    const ssDirty = mkSs(async () => ({ ok: true, status: 200, data: { data: { token: jwtWithExp, refresh_token: "bad|rt" } } }));
+    const rd = await ssDirty.refreshToken({ account: {}, secrets: { refreshToken: "oldrt|u9|m9", token: "cur" } });
+    assert(rd.ok === true && rd.refreshToken === "oldrt|u9|m9", "含 | 的新 rt 被拒收，沿用旧串");
+
+    const ss401 = mkSs(async () => ({ ok: false, status: 401, data: null }));
+    const r4 = await ss401.refreshToken({ account: {}, secrets: { refreshToken: "oldrt|u9|m9" } });
+    assert(r4.ok === false && r4.expired === true, "401 标 expired（触发 relogin 而非无限重试）");
+    const ssBogus = mkSs(async () => ({ ok: true, status: 200, data: {} }));
+    const rb = await ssBogus.refreshToken({ account: {}, secrets: { refreshToken: "只有一段" } });
+    assert(rb.ok === false && /格式不认识/.test(rb.message), "段数不足如实报错，不静默当 OAuth 分支");
+  }
+
   console.log("\n[done] Qoder 适配器单元自测全部通过");
 }
 

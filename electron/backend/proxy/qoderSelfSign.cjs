@@ -35,6 +35,10 @@ const REFRESH_PATH = "/algo/api/v3/user/refresh_token"; // center 域
 // 兜底清单（协议参考 §3.8；upstreamKey/reasoning/vision/倍率快照 2026-09-20 实测；global 17 / cn 10）。
 // 档位已全部收编进 rules/effort_catalog.json（统一 seed loader，方案 §3.2），此处不再内联 efforts——
 // seed 解析失败时按 §5.1 退空表，chat 侧 allow-list 自有默认档兜底，不需要第二份档位数据。
+// ⚠ 归一移植后这份表在生产路径上已无人调用（fork 的单渠道 models() 并集逻辑被上游
+//  「有目录只认目录、绝不并静态表」取代，issue #74）。保留理由：global 那 17 行是实测事实，
+//  仓库里没有第二个落点，而计划二注册 qoder_intl 时它要搬进 STATIC_MODELS_BY_PRODUCT.qoder_intl
+//  ——那边目前刻意没有 intl 兜底（proxy-qoder-adapter-selftest [3b] 有专门断言钉着）。
 const FALLBACK = {
   global: [
     ["Qwen3.8-Flash", "qfmodel", true, true, "0.1"],
