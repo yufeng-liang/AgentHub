@@ -5,9 +5,9 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch, nextTick } from "vue";
 import * as api from "../../api/ipc";
-import type { ProxyChannelView, ProxyAccount, ProxyChannelId, ProxyBuiltinChannelId, ProxyChannelKind, ProxyPoolStrategy, ProxyScanCandidate, ProxyCheckinRow, ZcodeDeviceRow } from "../../types";
+import type { ProxyChannelView, ProxyAccount, ProxyChannelId, ProxyBuiltinChannelId, ProxyChannelKind, ProxyPoolStrategy, ProxyCostTier, ProxyScanCandidate, ProxyCheckinRow, ZcodeDeviceRow } from "../../types";
 import { useAppStore } from "../../stores/app";
-import { fmtInt, fmtK, fmtDate, fmtAgo, ACCOUNT_STATUS, SOURCE_NAMES, channelName, fmtBalance, balanceUnit, isTokenChannel, pkgFallbackName } from "./format";
+import { fmtInt, fmtK, fmtDate, fmtAgo, fmtCredits, ACCOUNT_STATUS, SOURCE_NAMES, channelName, fmtBalance, balanceUnit, isTokenChannel, isQoderChannel, costTierName, pkgFallbackName } from "./format";
 import { coalesceAsync } from "../../utils/timing";
 
 const app = useAppStore();
@@ -62,7 +62,7 @@ function toast(text: string, kind: "info" | "err" = "info") {
 // 渠道主按钮：顶部三个大按钮切换，下方整块区域只显示当前渠道号池
 const activeChannel = ref<ProxyChannelId>("trae");
 // 本地 IDE 快捷切换
-const ideStatus = ref<{ workbuddyInstalled: boolean; workbuddyAiInstalled?: boolean; traeInstalled?: boolean; raccoonInstalled?: boolean; zcodeInstalled?: boolean; currentUid: string } | null>(null);
+const ideStatus = ref<{ workbuddyInstalled: boolean; workbuddyAiInstalled?: boolean; traeInstalled?: boolean; raccoonInstalled?: boolean; lobsterInstalled?: boolean; zcodeInstalled?: boolean; qoderInstalled?: boolean; qoderIntlInstalled?: boolean; currentUid: string } | null>(null);
 const ideSwitching = ref("");
 let offEvent: (() => void) | undefined;
 
@@ -78,18 +78,25 @@ const CHANNEL_META: Record<ProxyBuiltinChannelId, { icon: string; hint: string }
   cline_pass: { icon: "ph-crown", hint: "设备授权登录 · 粘贴 · 本机导入" },
   autoclaw: { icon: "ph-robot", hint: "粘贴 · 本机导入（官方无网页登录）" },
   autoclaw_intl: { icon: "ph-globe", hint: "OAuth 登录（滑块验证）· 粘贴" },
-  qoder: { icon: "ph-cursor", hint: "设备授权登录 · 粘贴" },
+  modelscope: { icon: "ph-cube", hint: "OAuth 全功能（推理 + 每日任务 + 点赞）· 兜底可粘贴 ms- 令牌" },
+  lobster: { icon: "ph-bowl-food", hint: "回环登录 · 每日签到 100 积分" },
   zcode: { icon: "ph-lightning", hint: "GLM 编码套餐 · 领奖励 · 切号保远程" },
   zcode_intl: { icon: "ph-lightning", hint: "GLM 编码套餐 · 国际区（薄别名渠道）" },
 
+  // Qoder 无回环 OAuth（登录在官方客户端内完成，凭据落在加密信封里）→ 只走本机导入/文件/粘贴
+  qoder: { icon: "ph-compass", hint: "设备授权登录 · 本机导入 · 去客户端领每日 Credits" },
+  qoder_intl: { icon: "ph-globe-hemisphere-west", hint: "国际版 · 本机导入（需充值才有模型）" },
 };
 // 自定义提供商只有 API Key：没有登录态、没有签到、没有余额概念，措辞要与生态渠道明确区分
 const PROVIDER_META = { icon: "ph-plugs-connected", hint: "API Key 轮转 · 无余额概念" };
 
 // ===== 渠道能力表（与主进程一一对应，缺能力的动作一律不摆按钮）=====
-// 签到：判据是 adapters.cjs 里 checkin/checkinStatus 这两个方法存不存在——只有这四家定义了。
-// Cline 双池 / AutoClaw 双区 / Qoder 官方就没有签到体系，主进程对它们只能回 unavailable，
-// 界面上摆个按钮就是骗人点一次、跑一轮空请求。
+// 签到：判据是主进程适配器里 checkin/checkinStatus 这两个方法存不存在。
+// 上游 v1.50 起这张表要跟着渠道一起长：modelscope 是「每日任务」（会话触碰 + 点赞）、
+// lobster 是「每日签到 100 积分」、Qoder 双区是「活动 Credits 领取」（每日 100，需装客户端出风控身份），
+// 三家都定义了 checkin ⇒ 记 true。Cline 双池 / AutoClaw 双区官方就没有签到体系，
+// 主进程对它们只能回 unavailable，界面上摆个按钮就是骗人点一次、跑一轮空请求。
+// zcode 家记 false 是刻意的：它的「一键领取 / 过码 / 领取模式」在模板里各走专门分支，不吃这张表。
 const CHECKIN_CAPABLE: Record<ProxyBuiltinChannelId, boolean> = {
   trae: true,
   workbuddy: true,
@@ -99,12 +106,16 @@ const CHECKIN_CAPABLE: Record<ProxyBuiltinChannelId, boolean> = {
   cline_pass: false,
   autoclaw: false,
   autoclaw_intl: false,
-  qoder: false,
+  modelscope: true,
+  lobster: true,
+  qoder: true,
+  qoder_intl: true,
   zcode: false,
   zcode_intl: false,
 };
-// 写回本地客户端登录态：主进程 ideswitch.cjs 只认这三家（WB 双区 auth 文件 + 小浣熊 config/auth.json），
-// Trae 是 ByteCrypto 加密信封、明确不做。必须是白名单而不是"内置渠道里排除 trae"——
+// 写回本地客户端登录态：主进程 ideswitch.cjs 只认这几家（WB 双区 auth 文件 + 小浣熊 config/auth.json + ZCode 双区），
+// Trae 是 ByteCrypto 加密信封、明确不做；上游 v1.50 新增的 modelscope / lobster / Qoder 双区本机没有
+// 可写回的登录态文件，同样进不了这道白名单。必须是白名单而不是"内置渠道里排除 trae"——
 // 先前那样写让 cline_*/autoclaw*/qoder 的按钮全点亮、标题还承诺"写为本地当前登录态"，
 // 点下去才被主进程拒掉（后端那道门禁保留，这里是纵深不是替代）。
 const IDE_WRITEBACK_CHANNELS: ProxyBuiltinChannelId[] = ["workbuddy", "workbuddy_ai", "raccoon", "zcode", "zcode_intl"];
@@ -120,10 +131,14 @@ function ideWritebackCapable(id: ProxyChannelId) {
 function isBuiltin(ch: ProxyChannelView) {
   return ch.kind !== "openai_compat";
 }
-/** zcode 家的余额单位是 Token（智谱套餐按 Token 计，口径表见 format.ts CHANNEL_UNITS），格子里
- *  显示的是换算值，浮层给原值。其余渠道余额本就是积分，浮层成了复读 ⇒ 返回空串，模板配 :disabled 用，不飘空泡 */
+/** 本页「总余额」浮层只补换算值之外的原值：
+ *  · Token 渠道（智谱家）：格子里是亿/万换算值，浮层给原值 + Token；
+ *  · Qoder 家（上游 v1.50 双区）：官方是浮点 Credits，格子里 fmtCredits 最多留 2 位小数，浮层补精确原值；
+ *  其余渠道余额本就是积分，浮层成了复读 ⇒ 返回空串，模板配 :disabled 用，不飘空泡 */
 function tokensTip(ch: ProxyChannelView) {
-  return isTokenChannel(ch.id) ? `${fmtInt(ch.summary.totalCredits)} Token` : "";
+  if (isTokenChannel(ch.id)) return `${fmtInt(ch.summary.totalCredits)} Token`;
+  if (isQoderChannel(ch.id)) return `${fmtCredits(ch.summary.totalCredits)} Credits（精确值 ${ch.summary.totalCredits}）`;
+  return "";
 }
 /** 账号级余额同上：只有 Token 渠道需要把原值补出来，其余渠道返回空串即不出浮层 */
 function creditTip(acc: ProxyAccount) {
@@ -202,13 +217,22 @@ const scanImporting = ref("");
 const renamingId = ref("");
 const renameText = ref("");
 
-// 添加方式可用性：oauth 这一档按渠道门禁，其余三档所有内置渠道都开放
-// · AutoClaw 国内版：官方只有客户端手机号+验证码登录，没有可代收的网页授权（主进程 beginOAuth 直接拒）
+// 添加方式可用性：oauth 档按渠道门禁（NO_OAUTH_CHANNELS 这道机制位取上游），其余方式按渠道凭据形态收窄。
+// · AutoClaw 国内版：官方只有客户端手机号+验证码登录，没有可代收的网页授权（主进程 beginOAuth 直接拒），
+//   它是当前唯一挡 OAuth 的渠道；
 // · 小浣熊：上游 v1.18.0 起已支持应用内登录（打开官方授权页 → 粘回 office-raccoon:// 深链换码），
-//   本分支基点（b476f52）时还没有，合并时按上游事实放行（不再挡）
+//   本分支基点（b476f52）时还没有，合并时按上游事实放行（不再挡）；
+// · Qoder：上游 v1.4x 起是 PKCE 设备码轮询（弹官方登录页 → 本机轮询直接取回 dt-/drt- 凭据对，
+//   无需本机装客户端），照上游放行——CHANNEL_META 里"Qoder 无回环 OAuth"那句注释已经过期；
+// · ModelScope（魔搭）：凭据不是 JSON 快照而是 ms- 访问令牌 ⇒ 隐藏不适用的「文件 / 本机导入」两种方式，
+//   「粘贴」页签改成专用令牌输入（见 METHOD_TABS 与粘贴面板）
+const NO_OAUTH_CHANNELS: ProxyBuiltinChannelId[] = ["autoclaw"];
 function addTabAllowed(key: AddMethod): boolean {
-  if (key !== "oauth") return true;
-  return addChannel.value !== "autoclaw";
+  // 判据用 addChannel（弹窗自己的渠道，openAdd 里已按 kind 把自定义提供商分流去「自定义提供商」页），
+  // 不用 activeChannel——后者是页面级选中态，弹窗打开期间不保证同步
+  if (key === "oauth" && NO_OAUTH_CHANNELS.includes(addChannel.value)) return false;
+  if (addChannel.value === "modelscope" && (key === "file" || key === "local")) return false;
+  return true;
 }
 
 // 渠道允许的添加方式（分段控件按渠道过滤）
@@ -219,7 +243,10 @@ const METHOD_TABS = computed(
       { key: "local" as const, label: "从本机软件导入", icon: "ph-desktop-tower" },
       { key: "file" as const, label: "从 JSON/ZIP 文件", icon: "ph-file-arrow-up" },
       { key: "paste" as const, label: "粘贴 JSON", icon: "ph-clipboard-text" },
-    ].filter((t) => addTabAllowed(t.key)) as { key: AddMethod; label: string; icon: string }[]
+    ]
+      // ModelScope 的「粘贴」是令牌而非 JSON，标签如实改名（避免误导用户去粘 JSON）
+      .map((t) => (addChannel.value === "modelscope" && t.key === "paste" ? { ...t, label: "粘贴令牌", icon: "ph-key" } : t))
+      .filter((t) => addTabAllowed(t.key)) as { key: AddMethod; label: string; icon: string }[]
 );
 
 // OAuth 面板文案按渠道切换（两种登录形态完全不同，说清楚用户才知道要做什么）
@@ -240,11 +267,19 @@ const OAUTH_HELP: Record<string, { title: string; desc: string }> = {
     title: "用「商汤小浣熊」官方授权页登录",
     desc: "在应用内弹出的授权窗里完成登录，授权码由本应用直接截获入池——不经过系统浏览器，也不会拉起或顶掉本机小浣熊客户端的登录（深链永不出本应用）。<br />每账号独立执行一次，可反复添加多账号；3 分钟无响应即超时。<br /><span style=\"color: var(--warn, #e5b454); font-weight: 500;\">⚠️ 注意：多账号入池请统一在此处「OAuth 登录」。切勿在电脑端小浣熊软件点击「退出登录」，否则商汤服务端会吊销旧号凭证导致号池旧号失效。</span><br />授权窗被意外拦截时，可把 office-raccoon://auth/callback?code=… 整段粘到下方兜底。",
   },
+  modelscope: {
+    title: "用 ModelScope（魔搭）官方授权页登录",
+    desc: "点「打开授权页」会弹出应用内授权窗口，登录后点一次「授权」即自动入池。<br /><b>无需安装任何客户端，也无需手动建应用</b>——AgentHub 会自动完成互联应用注册（OAuth 动态注册）。<br />授权时会一并取得 Web 会话，因此<b>推理、每日登录奖励、点赞任务全部可用</b>，凭据自动续期（30 天）。<br />⚠️ 调用推理前需先在魔搭绑定阿里云账号并完成实名认证（否则会提示 401 / 403）。",
+  },
+  lobster: {
+    title: "用「LobsterAI（网易有道龙虾）」官方登录页登录",
+    desc: "跳转官方登录页（lobsterai.youdao.com），登录完成后回调本机回环地址自动入池——<b>无需本机安装 LobsterAI 客户端</b>，也无需手动粘贴回调。<br />每账号独立执行一次，可反复添加多账号；3 分钟无响应即超时。<br />入池后可「每日签到」领 100 积分（常驻活动，桌面端侧边栏同款）。",
+  },
   zcode: {
     title: "用 Z.ai 官方授权页登录 ZCode（智谱）",
     desc: "跳转 Z.ai 授权页完成登录后，本机按服务端轮询自动完成入池（无需粘贴回调）。<br />登录后后台自动初始化套餐并解析编码套餐 API Key（约几十秒），期间账号已可用于 Start 套餐对话。<br />若浏览器停在 zcode:// 回调页，可把地址栏整段粘到下方兜底。",
   },
-  // ===== 新增五渠道（autoclaw 国内版无网页登录，不出 OAuth 档，故本表无它的条目） =====
+  // ===== fork 新增渠道（autoclaw 国内版无网页登录，不出 OAuth 档，故本表无它的条目） =====
   cline_free: {
     title: "用 Cline 账号设备授权登录（免费池）",
     desc: "跳转 Cline 授权页并自动携带验证码，确认后本机自动轮询完成登录。<br />也可改用「从本机软件导入」（读取 ~/.cline 登录态）或「粘贴 JSON」。",
@@ -257,9 +292,15 @@ const OAUTH_HELP: Record<string, { title: string; desc: string }> = {
     title: "用 AutoClaw 国际版 OAuth 登录",
     desc: "先完成滑块验证，再跳转 Zai / Google 授权页；登录后自动回到本应用。<br />没有国际版账号也可「粘贴 JSON」导入 token。",
   },
+  // Qoder 双区（上游 v1.4x 起 OAuth 走 PKCE 设备码轮询，不再依赖本机客户端）：
+  // 区服切换与「粘贴 JSON」是 fork 侧保留的两条入口，故文案一并写明
   qoder: {
-    title: "用 Qoder 账号设备授权登录",
-    desc: "跳转 Qoder 授权页登录并选择账号，本机每 2 秒轮询自动完成。<br />国际版 / 中国版在下方切换；也可「粘贴 JSON」导入。",
+    title: "用 Qoder 官方登录页登录（设备授权）",
+    desc: "跳转 Qoder 官方授权页登录并选择账号，本机每 2 秒轮询自动完成——<b>无需本机安装 Qoder 客户端</b>（PKCE 设备码，轮询直接取回设备凭据对，含刷新令牌）。<br />国际版 / 中国版在下方切换区服；也可「粘贴 JSON」导入。",
+  },
+  qoder_intl: {
+    title: "用 Qoder 国际版官方登录页登录",
+    desc: "跳转 Qoder 国际版登录页（qoder.com），登录完成后本机自动轮询取回设备凭据，<b>无需本机安装客户端</b>。<br />注意：国际版免费额度不含 DeepSeek / GLM Flash 系列，需充值才有可用模型。",
   },
   zcode_intl: {
     title: "用 ZCode 智谱（国际 / Z.AI）订阅登录态登录",
@@ -318,6 +359,13 @@ const STRATEGIES: { value: ProxyPoolStrategy; label: string }[] = [
   { value: "expire_first", label: "到期优先" },
   { value: "credit_first", label: "余额优先" },
   { value: "round_robin", label: "轮询" },
+];
+
+// 渠道成本档（cost-first 路由排序的标注来源；全局「免费优先」只在有 free/low 标注时才有排序效果）
+const COST_TIERS: { value: ProxyCostTier; label: string }[] = [
+  { value: "free", label: "免费" },
+  { value: "low", label: "低成本" },
+  { value: "normal", label: "普通" },
 ];
 
 const loading = ref(false);
@@ -671,6 +719,9 @@ function ideSupported(acc: ProxyAccount) {
   // 必须挡在最前面：下面的分支对未知渠道会回落到 WorkBuddy 的判定，
   // 放过去就会把中转站 Key 写进 WorkBuddy 的登录文件。
   if (channelKind(acc.channel) !== "builtin") return false;
+  // 白名单式判定（IDE_WRITEBACK_CHANNELS）：上游 v1.50 新增的 lobster / modelscope 与 Qoder 双区
+  // 都不在这几家里（龙虾登录态在客户端 SQLite、魔搭只有用户自建令牌），
+  // 所以它们天然落进这道门，不必再逐个写 return false
   if (!ideWritebackCapable(acc.channel)) return false;
   if (!ideStatus.value) return true;
   if (acc.channel === "raccoon") return ideStatus.value.raccoonInstalled !== false;
@@ -683,6 +734,11 @@ function ideTitle(acc: ProxyAccount) {
   if (channelKind(acc.channel) !== "builtin") return "自定义提供商只有一把 API Key，本机没有对应的客户端登录态可写回";
   if (acc.channel === "trae") return "Trae 本地登录态为 ByteCrypto 加密信封（绑定设备密钥），无法构造合法信封，暂不支持写回";
   // 新渠道（Cline / AutoClaw / Qoder）本机就没有这套登录文件，别说成"未安装"
+  // ——上游 v1.50 的 lobster / modelscope 同理，各自给明确文案
+  if (acc.channel === "lobster") return "LobsterAI 渠道走应用内回环 OAuth 登录（无需安装官方客户端），不支持写回本机登录态";
+  if (acc.channel === "modelscope") return "ModelScope 渠道用你自建的 ms- 访问令牌（官方公开 API，无客户端登录态），不支持写回本机";
+  // 白名单（IDE_WRITEBACK_CHANNELS）之外的内置渠道一律走这道兜底，别落到下面那句"未安装"
+  if (!ideWritebackCapable(acc.channel)) return "该渠道本机没有对应的客户端登录态文件，不支持写回本机";
   if (acc.channel === "raccoon") return "把该账号写为小浣熊本机登录态（~/.box-agent/config/auth.json）；点击后弹确认框，确认即自动关闭客户端、写入、再重新打开，登录文件缺失时按号池凭据重建";
   if (acc.channel === "zcode" || acc.channel === "zcode_intl") return "把该账号写为本机 ZCode 当前登录态（合并式写回，移动端远程连接地址保持不变）；点击后弹确认框，确认即自动关闭客户端、写入、再重新打开";
   if (!ideSupported(acc)) return "本机未找到对应客户端的登录文件（未安装或从未登录过）";
@@ -808,6 +864,15 @@ async function refreshOne(acc: ProxyAccount) {
 async function setStrategy(ch: ProxyChannelView, strategy: ProxyPoolStrategy) {
   try {
     await api.proxyPoolStrategy(ch.id, strategy);
+    await refresh();
+  } catch (e) {
+    toast(String((e as Error).message || e), "err");
+  }
+}
+
+async function setCostTier(ch: ProxyChannelView, tier: ProxyCostTier) {
+  try {
+    await api.proxyPoolTier(ch.id, tier);
     await refresh();
   } catch (e) {
     toast(String((e as Error).message || e), "err");
@@ -1198,6 +1263,18 @@ async function doPasteJson() {
   pasteBusy.value = true;
   pasteMsg.value = "";
   try {
+    // ModelScope（魔搭）：凭据是 ms- 访问令牌，走专用入池路径
+    // （主进程先校验令牌有效性、取真实用户名作 uid 再落库，并顺带探测阿里云绑定门槛）
+    if (addChannel.value === "modelscope") {
+      const r = await api.proxyAccountAdd({ channel: "modelscope", token: pasteJson.value.trim() });
+      pasteErr.value = !r.ok;
+      pasteMsg.value = r.message || (r.ok ? "令牌有效，已加入号池" : "入池失败");
+      if (r.ok) {
+        await refresh();
+        pasteJson.value = "";
+      }
+      return;
+    }
     const r = await api.proxyAccountImportJson(addChannel.value, pasteJson.value);
     pasteErr.value = !r.ok;
     pasteMsg.value = r.message || (r.ok ? "导入完成" : "导入失败");
@@ -1403,7 +1480,9 @@ onUnmounted(() => {
           <span v-if="ch.summary.expired" class="tag tag-err">有账号已过期</span>
           <!-- 文案跟随 expiringSoonDays 阈值（默认 7 天，与后端 poolSummary/expiresBadge 同源），别写死 24h -->
           <span v-else-if="ch.summary.expiringSoon" class="tag tag-warn">{{ app.config.proxy.expiringSoonDays ?? 7 }} 天内有到期</span>
-          <!-- 工具栏：只属于当前渠道（策略 / 添加 / 签到或加油包 / 刷新），与其他渠道互不关联 -->
+          <!-- 成本档徽标（上游 v1.50）：只有 free/low 才挂标，"普通"是默认值不占位 -->
+          <span v-if="costTierName(ch.costTier) !== '普通'" class="tag" :class="ch.costTier === 'free' ? 'tag-ok' : 'tag-dim'">{{ costTierName(ch.costTier) }}</span>
+          <!-- 工具栏：只属于当前渠道（策略 / 成本档 / 添加 / 签到或加油包 / 刷新），与其他渠道互不关联 -->
           <span class="panel-tools">
             <select
               class="f-select strategy-select"
@@ -1412,6 +1491,18 @@ onUnmounted(() => {
             >
               <option v-for="s in STRATEGIES" :key="s.value" :value="s.value">{{ s.label }}</option>
             </select>
+            <!-- 成本档（上游 v1.50，cost-first 路由的排序依据）：控件形态跟本页的原生 f-select 统一，
+                 浮层仍走 el-tooltip（门禁①），解释文案取上游 -->
+            <el-tooltip content="成本档位：全局开启「免费 / 低成本优先」排序时，免费渠道的额度先消耗（配置 → 反代网关）" placement="top">
+              <select
+                class="f-select strategy-select"
+                style="width: 108px"
+                :value="ch.costTier || 'normal'"
+                @change="setCostTier(ch, ($event.target as HTMLSelectElement).value as ProxyCostTier)"
+              >
+                <option v-for="t in COST_TIERS" :key="t.value" :value="t.value">{{ t.label }}</option>
+              </select>
+            </el-tooltip>
             <button class="btn btn-sm" @click="openAdd(ch)">{{ isBuiltin(ch) ? "添加账号" : "管理 Key" }}</button>
             <!-- 签到 / 加油包 / 额度刷新都是生态渠道专属动作：自定义提供商只有一把 API Key，
                  既没有每日签到可领，也没有余额可查（主进程一律明确拒答，不该在界面上摆出来） -->
@@ -1428,6 +1519,16 @@ onUnmounted(() => {
               >
                 <button class="btn btn-sm" :disabled="checkinBusy" @click="runCheckinChannel">
                   {{ checkinBusy ? "领取中…" : "一键领取" }}
+                </button>
+              </el-tooltip>
+              <!-- Qoder 双区（上游 v1.50）：官方没有「每日签到」，是活动 Credits 领取，文案与动作名如实区分 -->
+              <el-tooltip
+                v-else-if="isQoderChannel(ch.id)"
+                content="领取当前可领的活动 Credits（每日 100，10:00 UTC+8 刷新，领取后 30 天有效）。只处理可领取的活动，需完成任务的活动会跳过"
+                placement="top"
+              >
+                <button class="btn btn-sm" :disabled="checkinBusy" @click="runCheckinChannel">
+                  {{ checkinBusy ? "领取中…" : "领 Credits" }}
                 </button>
               </el-tooltip>
               <button v-else-if="checkinCapable(ch.id)" class="btn btn-sm" :disabled="checkinBusy" @click="runCheckinChannel">
@@ -1470,7 +1571,7 @@ onUnmounted(() => {
             <el-tooltip :content="tokensTip(ch)" :disabled="!tokensTip(ch)" placement="top">
               <b>{{ fmtBalance(ch.summary.totalCredits, ch.id) }}</b>
             </el-tooltip>
-            <span v-if="isTokenChannel(ch.id)" style="font-size: 11px; font-weight: normal; color: var(--text-3); margin-left: 2px">{{ balanceUnit(ch.id) }}</span>
+            <span v-if="isTokenChannel(ch.id) || isQoderChannel(ch.id)" style="font-size: 11px; font-weight: normal; color: var(--text-3); margin-left: 2px">{{ balanceUnit(ch.id) }}</span>
             <!-- 本页浮层已整页统一到 el-tooltip（上游 v1.38.0 口径，工具栏 / 聚合行 / 账号行三处一起换），
                  原生 title 不许在本页复活：scripts/dev-proxy-tooltip-uniform-test.cjs 会逐文件查。 -->
           </div>
@@ -1569,11 +1670,11 @@ onUnmounted(() => {
                   </button>
                   <el-tooltip
                     v-if="acc.hasToken && isBuiltin(ch) && (checkinCapable(acc.channel) || acc.channel === 'zcode')"
-                    :content="acc.channel === 'workbuddy_ai' ? '国际版无每日签到，用上方工具栏「领加油包」' : acc.channel === 'raccoon' ? '登录送积分（幂等，锁定当日积分 7 天）' : acc.channel === 'zcode' ? '领取当前可领的奖励套餐（如需人机校验会弹官方验证窗）' : '对该账号执行每日签到'"
+                    :content="acc.channel === 'workbuddy_ai' ? '国际版无每日签到，用上方工具栏「领加油包」' : acc.channel === 'raccoon' ? '登录送积分（幂等，锁定当日积分 7 天）' : acc.channel === 'zcode' ? '领取当前可领的奖励套餐（如需人机校验会弹官方验证窗）' : acc.channel === 'modelscope' ? '执行每日任务：会话触碰（登录 200 + 绑云 50）+ 收藏/喜欢至 20 次（+40 魔粒）。点赞是公开星标动作' : acc.channel === 'lobster' ? '每日签到领 100 积分（常驻活动，需客户端版本 ≥ 2026.9.4）' : isQoderChannel(acc.channel) ? '领取该账号当前可领的活动 Credits（每日 100，10:00 UTC+8 刷新，领取后 30 天有效）' : '对该账号执行每日签到'"
                     placement="top"
                   >
                     <button class="btn-link btn-sm" :disabled="checkinBusy" @click="runCheckinAccount(acc)">
-                      {{ acc.channel === "zcode" ? "领取" : "签到" }}
+                      {{ acc.channel === "zcode" || isQoderChannel(acc.channel) ? "领取" : "签到" }}
                     </button>
                   </el-tooltip>
                   <el-tooltip
@@ -1620,6 +1721,22 @@ onUnmounted(() => {
                   >
                     <button class="btn-link btn-sm" :disabled="coolOffId === acc.id" @click="releaseCool(acc)">
                       {{ coolOffId === acc.id ? "解除中…" : "解冷却" }}
+                    </button>
+                  </el-tooltip>
+                  <!-- 上游 v1.4x 的重登入口：账号登录态过期（status=relogin）时给一条重新授权的出路。
+                       没有它，reauthAccount 就是死代码，而上方注释还在声称「重登按钮只在
+                       status==='relogin' 时出现」——文案与实现脱节的形态本仓已经栽过几次。 -->
+                  <el-tooltip
+                    v-if="acc.status === 'relogin'"
+                    content="该账号登录态已过期，点击重新授权登录以恢复在线"
+                    placement="top"
+                  >
+                    <button
+                      class="btn-link btn-sm"
+                      style="color: var(--warn, #e5b454);"
+                      @click="reauthAccount(acc)"
+                    >
+                      重登
                     </button>
                   </el-tooltip>
                   <button class="btn-link btn-sm" @click="toggleAccount(acc)">{{ acc.status === "disabled" ? "启用" : "停用" }}</button>
@@ -1811,16 +1928,35 @@ onUnmounted(() => {
               <div v-if="fileMsg" class="add-msg" :class="{ err: fileErr }">{{ fileMsg }}</div>
             </div>
 
-            <!-- 粘贴 JSON -->
+            <!-- 粘贴 JSON（ModelScope 例外：它的凭据是 ms- 访问令牌，非 JSON 快照） -->
             <div v-else class="add-pane paste-pane">
-              <div class="paste-label">凭据 JSON</div>
-              <div v-if="pasteHint" class="paste-hint">{{ pasteHint }}</div>
-              <textarea
-                v-model="pasteJson"
-                class="input mono paste-area"
-                :placeholder="pastePlaceholder"
-                spellcheck="false"
-              ></textarea>
+              <!-- ModelScope 的凭据是 ms- 访问令牌而不是 JSON 快照，走专用输入与获取指引（上游 v1.50） -->
+              <template v-if="addChannel === 'modelscope'">
+                <div class="paste-label">ModelScope 访问令牌</div>
+                <textarea
+                  v-model="pasteJson"
+                  class="input mono paste-area"
+                  placeholder="粘贴 ms- 开头的访问令牌（在魔搭「访问令牌」页新建后复制整串）"
+                  spellcheck="false"
+                ></textarea>
+                <div class="add-pane-desc" style="margin-top: 8px">
+                  获取方式：打开
+                  <a href="https://modelscope.cn/my/myaccesstoken" target="_blank" rel="noreferrer">魔搭「访问令牌」页</a>
+                  → 新建令牌 → 复制整串粘贴到这里。<br />
+                  <b>无需安装任何客户端</b>；令牌长期有效、可随时吊销。<br />
+                  <span style="color: var(--warn, #e5b454)">⚠️ 调用推理前需先在魔搭绑定阿里云账号</span>（未绑定会提示 401）。
+                </div>
+              </template>
+              <template v-else>
+                <div class="paste-label">凭据 JSON</div>
+                <div v-if="pasteHint" class="paste-hint">{{ pasteHint }}</div>
+                <textarea
+                  v-model="pasteJson"
+                  class="input mono paste-area"
+                  :placeholder="pastePlaceholder"
+                  spellcheck="false"
+                ></textarea>
+              </template>
               <div v-if="pasteMsg" class="add-msg" :class="{ err: pasteErr }">{{ pasteMsg }}</div>
             </div>
           </div>
@@ -1852,7 +1988,7 @@ onUnmounted(() => {
               class="btn btn-cta"
               :disabled="!pasteJson.trim() || pasteBusy"
               @click="doPasteJson"
-            >{{ pasteBusy ? "导入中…" : "解析并加入号池" }}</button>
+            >{{ pasteBusy ? "导入中…" : addChannel === "modelscope" ? "校验令牌并加入号池" : "解析并加入号池" }}</button>
             <button
               v-else
               class="btn btn-cta"

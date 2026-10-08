@@ -30,7 +30,8 @@ function yamlScalar(v) {
   if (v === null || v === undefined || v === "") return "";
   if (typeof v === "number" || typeof v === "boolean") return String(v);
   const s = String(v);
-  if (/[:#\[\]{}"'\n]/.test(s) || /^\s|\s$/.test(s) || s === "" ) return escapeYamlString(s);
+  // 逗号也必须加引号：数组元素含逗号时（如标签拼接串）不加引号，会在 splitCsvRespectQuotes 处被拆成两段
+  if (/[:#\[\]{}"',\n]/.test(s) || /^\s|\s$/.test(s)) return escapeYamlString(s);
   return s;
 }
 
@@ -92,7 +93,7 @@ function parseFrontmatter(text) {
 
 // ---------- daily 分节解析 ----------
 
-const META_KEYS = new Set(["importance", "tags", "session", "supersededBy"]);
+const META_KEYS = new Set(["importance", "tags", "session", "supersededBy", "files"]);
 
 function parseSectionMeta(line) {
   const m = SECTION_META.exec(line);
@@ -172,6 +173,7 @@ function renderDailyFile(fm, sections) {
     if (s.meta && s.meta.tags) metaBits.push(`tags: ${oneLine(Array.isArray(s.meta.tags) ? s.meta.tags.join(", ") : s.meta.tags)}`);
     if (s.meta && s.meta.session) metaBits.push(`session: ${oneLine(s.meta.session)}`);
     if (s.meta && s.meta.supersededBy) metaBits.push(`supersededBy: ${oneLine(s.meta.supersededBy)}`);
+    if (s.meta && s.meta.files) metaBits.push(`files: ${oneLine(Array.isArray(s.meta.files) ? s.meta.files.join(", ") : s.meta.files)}`);
     if (metaBits.length) parts.push(`> ${metaBits.join(" · ")}`);
     parts.push("", s.body || "", "");
   }
@@ -272,6 +274,8 @@ class MemoryStore {
     this._locks = new Map();
     /** 延迟落盘会话（批量导入用）：同一批里落到同一文件的改动攒在内存，批次结束统一写盘 */
     this._deferred = null;
+    /** 批量只读遍历期间信任路径（免去每文件的符号链接检查），见 withTrustedWalk */
+    this._trustedWalk = false;
     // root 本身也可能是符号链接：以真实路径作为越界判定的锚
     try {
       this._rootReal = fs.realpathSync(rootDir);
@@ -286,6 +290,10 @@ class MemoryStore {
     const relToRoot = path.relative(rootResolved, p);
     // 只拦真正的越界段：startsWith("..") 会误伤 "..foo" 这类合法文件名
     if (relToRoot === ".." || relToRoot.startsWith(".." + path.sep) || path.isAbsolute(relToRoot)) throw new Error(`路径越界：${rel}`);
+    // 批量重建时跳过符号链接检查：调用方用的是 walkMemoryFiles() 自己遍历出来的路径，
+    // 天然在 root 内，逐文件再往上找祖先做 realpath 纯属重复（实测 4751 个文件多花 0.7s）。
+    // 只影响批量只读遍历（重建/重建的 legacy 读取），单文件写入/删除仍走完整检查。
+    if (this._trustedWalk) return p;
     // junction/符号链接逃逸：root 内的链接指向外部时词法检查拦不住。
     // 在「词法 root 范围内」找最近存在的祖先做真实路径比对；
     // root 本身还没建（首次写入前）时不可能藏链接，词法检查已够，直接放行
@@ -306,8 +314,51 @@ class MemoryStore {
     return p;
   }
 
+  /**
+   * 批量遍历期间信任路径（免去每文件的符号链接检查）。
+   * 只应在「路径由 walkMemoryFiles() 产出」的只读批量场景使用，用完必须复位；
+   * 写入/删除路径绝不走这条快路——那里是用户可控输入，逃逸检查是安全边界。
+   */
+  withTrustedWalk(fn) {
+    const prev = this._trustedWalk;
+    this._trustedWalk = true;
+    try { return fn(); } finally { this._trustedWalk = prev; }
+  }
+
   exists(rel) {
     try { fs.accessSync(this.abs(rel)); return true; } catch { return false; }
+  }
+
+  /**
+   * 把相对路径归一为磁盘真实大小写。NTFS/APFS 大小写不敏感，同一次写入里
+   * writeMemory 拼出的是 slug 小写路径、而 watcher 走 reindexFile 拿到的是目录真名路径，
+   * 两者在大小写敏感的 SQLite 里就是两条行（同一 id 双 path，界面显示两遍）。
+   * 以磁盘真名为唯一事实源：存在的目录段取 realpath 真名，尚不存在的段原样保留
+   * （新建子目录时父目录真名已经生效，所以拼接结果仍然是磁盘口径）。
+   */
+  canonicalRel(rel) {
+    const norm = String(rel == null ? "" : rel).replace(/\\/g, "/");
+    if (!norm) return norm;
+    const segs = norm.split("/");
+    const base = segs.pop();
+    if (!segs.length) return norm;
+    // 从最深的已存在祖先往上找，避免整段都不存在时退化为原样返回
+    for (let take = segs.length; take > 0; take--) {
+      const candidate = segs.slice(0, take).join("/");
+      let real;
+      try {
+        real = fs.realpathSync.native(this.abs(candidate));
+      } catch {
+        continue;
+      }
+      const relReal = path.relative(this._rootReal, real).replace(/\\/g, "/");
+      // 祖先 realpath 落到根外（根内的 junction/符号链接指向外部）：不能拿带 .. 的路径当索引口径
+      // ——isIndexableRel 会判范围外直接跳过，该文件的行反而静默陈旧。原样返回，越界交给上层守卫
+      if (relReal === ".." || relReal.startsWith("../")) return norm;
+      const rest = segs.slice(take);
+      return [relReal, ...rest, base].filter(Boolean).join("/");
+    }
+    return norm;
   }
 
   read(rel) {
@@ -589,8 +640,8 @@ class MemoryStore {
       this.writeAtomic(rel, content, opts);
       return;
     }
-    const { fm } = parseFrontmatter(existing);
-    const sections = parseDailySections(parseFrontmatter(existing).body);
+    const { fm, body } = parseFrontmatter(existing);
+    const sections = parseDailySections(body);
     sections.push(section);
     this.writeAtomic(rel, renderDailyFile({ ...fileFm, ...fm }, sections), opts);
   }

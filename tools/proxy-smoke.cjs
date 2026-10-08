@@ -146,6 +146,77 @@ async function main() {
   });
   assert(wPack.messages[0].role === "assistant" && wPack.messages[1].role === "tool" && wPack.messages[2].role === "user" && wPack.messages[2].content.includes("夹在中间"), "工具组重排：tool 在非 tool 消息前");
 
+  // ===== 角色归一（issue #47）=====
+  // 入口 util.normalizeRoles 负责把 role 收敛到各渠道上游白名单的交集，
+  // 否则「workbuddy 拒 developer / raccoon 拒 function」在 400 渠道回退下表现为
+  // 「trace 一用就断、且复现不稳定」。这里锁住映射规则本身。
+  const nrOut = util.normalizeRoles([
+    { role: "developer", content: "sys" },
+    { role: "user", content: "hi" },
+    { role: "assistant", content: "", tool_calls: [{ id: "c1", type: "function", function: { name: "f", arguments: "{}" } }] },
+    { role: "function", content: "legacy result", name: "f" },                 // 无 tool_call_id → user
+    { role: "function", content: "typed result", tool_call_id: "c1" },          // 有 tool_call_id → tool
+  ]);
+  assert(nrOut[0].role === "system", "developer → system");
+  assert(nrOut[1].role === "user", "user 原样保留");
+  assert(nrOut[3].role === "user" && nrOut[3].content === "legacy result", "legacy function（无 tool_call_id）→ user，content 不丢");
+  assert(nrOut[4].role === "tool" && nrOut[4].tool_call_id === "c1", "function（带 tool_call_id）→ tool");
+  // 幂等 + 非法输入不抛：归一后重复调用不得二次改写
+  const nrTwice = util.normalizeRoles(nrOut);
+  assert(nrTwice === nrOut && nrTwice.every((m) => ["system", "user", "assistant", "tool"].includes(m.role)), "归一后 role 全在交集内且幂等");
+  assert(util.normalizeRoles(null) === null, "normalizeRoles 对非数组原样返回");
+  assert(util.normalizeRoles([null, "x", { noRole: 1 }]) !== undefined, "非法消息项不抛（不因此拒绝请求）");
+  // 未知 role：保持原样不猜语义，但必须留下 warning，不再无声丢弃
+  const nrWarn = [];
+  const nrRealWarn = console.warn;
+  console.warn = (...a) => { nrWarn.push(a.join(" ")); };
+  let nrUnknown;
+  try {
+    nrUnknown = util.normalizeRoles([
+      { role: "tool_result", content: "a" },
+      { role: "user", content: "hi" },
+      { role: "tool_result", content: "b" },   // 同 role 重复 → 应合并计数
+      { role: "__bogus__", content: "c" },
+    ]);
+  } finally {
+    console.warn = nrRealWarn;
+  }
+  assert(nrUnknown[0].role === "tool_result" && nrUnknown[3].role === "__bogus__", "未知 role 保持原样（不猜语义、不改写）");
+  assert(nrWarn.length === 1 && nrWarn[0].includes("tool_result") && nrWarn[0].includes("__bogus__") && nrWarn[0].includes("×2"), "未知 role 记 warning 且同 role 合并计数（长会话不刷屏）");
+  const nrWarnClean = [];
+  console.warn = (...a) => { nrWarnClean.push(a.join(" ")); };
+  try { util.normalizeRoles([{ role: "system", content: "s" }, { role: "user", content: "u" }]); } finally { console.warn = nrRealWarn; }
+  assert(nrWarnClean.length === 0, "全部已知 role 时不产生 warning 噪音");
+  // 交集角色的大小写/首尾空白变体无损归一为小写（上游枚举校验区分大小写）
+  const nrCase = util.normalizeRoles([{ role: "User", content: "a" }, { role: " ASSISTANT ", content: "b" }, { role: "System", content: "c" }]);
+  assert(nrCase[0].role === "user" && nrCase[1].role === "assistant" && nrCase[2].role === "system", "大小写/空白变体（User/ASSISTANT/System）归一为小写");
+  // 归一后各渠道的 rewriteBody 都不再收到白名单外角色（trae / raccoon 均不做 developer 归一）
+  const nrBody = util.normalizeRoles([
+    { role: "developer", content: "sys" },
+    { role: "user", content: "hi" },
+  ]);
+  const nrTrae = adapters.get("trae").rewriteBody("Doubao-Seed-2.1-Pro", { model: "Doubao-Seed-2.1-Pro", messages: nrBody.map((m) => ({ ...m })) }, { id: "acc1", uid: "u1" });
+  const nrRaccoon = adapters.get("raccoon").rewriteBody("raccoon-chat-ml-5-5", { model: "raccoon-chat-ml-5-5", messages: nrBody.map((m) => ({ ...m })) });
+  const nrOk = (out) => out.messages.every((m) => ["system", "user", "assistant", "tool"].includes(m.role));
+  assert(nrOk(nrTrae) && nrOk(nrRaccoon), "归一后 trae / raccoon 均只收到交集角色");
+  // 静默丢消息的两条路径也一并被堵住：qoderAdapter.toQoderMessages 对交集外 role
+  // 直接 continue（无报错、消息消失），zcodeAnthropic 把 developer 并进 system、
+  // 但 legacy function 会被静默丢弃。归一后两者都拿得到完整内容。
+  const qoderAdapter = require("../electron/backend/proxy/qoderAdapter.cjs");
+  const zcodeAnthropic = require("../electron/backend/proxy/zcodeAnthropic.cjs");
+  const nrLegacy = util.normalizeRoles([
+    { role: "developer", content: "sys-directive" },
+    { role: "user", content: "hi" },
+    { role: "function", content: "legacy-result", name: "f" },
+  ]);
+  const qMsgs = qoderAdapter.toQoderMessages(nrLegacy);
+  const qText = JSON.stringify(qMsgs);
+  assert(qMsgs.length === 3 && qText.includes("sys-directive") && qText.includes("legacy-result"), "qoder：归一后 developer/function 不再被 toQoderMessages 静默丢弃");
+  const zOut = zcodeAnthropic.toAnthropic("glm-5.3-flash", { model: "glm-5.3-flash", messages: nrLegacy.map((m) => ({ ...m })) });
+  const zText = JSON.stringify(zOut);
+  assert(zText.includes("sys-directive") && zText.includes("legacy-result"), "zcode：归一后 developer 并入 system、legacy function 不再被丢弃");
+  console.log("role layer ok（developer→system / function→tool|user / 幂等 / 非法输入不抛 / qoder+zcode 静默丢弃已堵）");
+
   assert(adapters.mergedModels().length > 5, "合并模型目录");
   assert(adapters.modelOwners("gpt-5").length === 1 && adapters.modelOwners("gpt-5")[0] === "workbuddy", "gpt-5 归属 CN workbuddy（AI 区目录已无此型号）");
   assert(adapters.modelOwners("deepseek-v4.1-flash").length === 1 && adapters.modelOwners("deepseek-v4.1-flash")[0] === "workbuddy_ai", "deepseek-v4.1-flash 归属国际版 workbuddy_ai");
@@ -156,6 +227,59 @@ async function main() {
   assert(rc && rc.id === "raccoon", "raccoon 适配器注册");
   assert(store.BUILTIN_CHANNELS.some((c) => c.id === "raccoon"), "store.BUILTIN_CHANNELS 含 raccoon");
   assert(adapters.modelOwners("raccoon-chat-ml-5-5")[0] === "raccoon", "raccoon-chat-ml-5-5 归属 raccoon");
+
+  // ===== Qoder 注册 =====
+  // 与既有渠道的关键差异：签名是每请求的（wasm 驱动），headers() 只返回非签名基础头。
+  // qoder_intl 暂停启用（store.QODER_INTL_ENABLED）——断言按开关实际状态校验，
+  // 防止「隐藏渠道仍参与路由」的静默回归（ADAPTERS 参与 modelOwners）。
+  const qd = adapters.get("qoder");
+  assert(qd && qd.id === "qoder", "qoder 适配器注册");
+  assert(store.CHANNELS.some((c) => c.id === "qoder"), "store.CHANNELS 含 qoder");
+  const intlOn = !!store.QODER_INTL_ENABLED;
+  assert(!!adapters.get("qoder_intl") === intlOn, `qoder_intl 适配器注册状态与开关(${intlOn}) 一致`);
+  assert(store.CHANNELS.some((c) => c.id === "qoder_intl") === intlOn, `CHANNELS 中 qoder_intl 与开关一致`);
+  const qoderList = [["qoder", qd, "https://gateway.qoder.com.cn"]];
+  if (intlOn) qoderList.push(["qoder_intl", adapters.get("qoder_intl"), "https://api2.qoder.sh"]);
+  for (const [id, ad, gw] of qoderList) {
+    const need = ["cfg", "models", "fetchModels", "headers", "rewriteBody", "chat", "queryCredits", "refreshToken"];
+    assert(need.every((k) => typeof ad[k] === "function"), `${id} 适配器十件套齐备`);
+    assert(ad.cfg().gateway === gw, `${id} cfg.gateway 指向 ${gw}`);
+    // 静态兜底表按产品隔离（issue #74）：CN 有 14 个兜底模型；intl 未实测过其目录、
+    // 不设兜底（模型清单应来自拉取目录）。此前这里对两者都断言 ≥14，等于把「intl 凭空
+    // 宣称拥有 CN 专属模型」固化成契约——modelOwners 据此把请求 failover 到无账号的
+    // intl 渠道，上游回 400 code=11102（幽灵模型）。
+    if (id === "qoder") {
+      assert(ad.models().length >= 14, `${id} 静态兜底模型表 ≥14`);
+    } else {
+      assert(Array.isArray(ad.models()), `${id} models() 返回数组`);
+      assert(ad.models().length === 0, `${id} 不得继承 CN 静态兜底（无目录时清单为空）`);
+    }
+    // headers() 必须**不含** Authorization：签名由 chat() 内 wasm 现场产出，
+    // 静态头里出现 Authorization 即为「照抄 WB 静态头组」的错误实现
+    const h = ad.headers();
+    assert(!("authorization" in h) && !("Authorization" in h), `${id} headers() 不含 Authorization（签名下沉 chat()）`);
+    assert(typeof h["user-agent"] === "string" && h.accept === "text/event-stream", `${id} headers() 基础头正确`);
+  }
+  // 模型归属（issue #74）：dfmodel 必须只归 qoder。
+  // 此前 INTL 开启时断言「归属双区」——那是把 bug 当契约：qoder_intl 的静态兜底表与 CN
+  // 共用，于是无账号的 intl 也宣称拥有 dfmodel，failover 打过去必然 400 code=11102。
+  // 现在兜底表按产品隔离，intl 无目录时清单为空 → 不可能出现跨区幽灵归属。
+  const dfOwners = adapters.modelOwners("dfmodel");
+  assert(dfOwners.length === 1 && dfOwners[0] === "qoder", "dfmodel 仅归 qoder（INTL 不得幽灵归属）");
+  if (intlOn) {
+    const intlAd = adapters.get("qoder_intl");
+    assert(!intlAd.models().includes("dfmodel"), "qoder_intl 清单不含 CN 专属模型 dfmodel");
+  }
+  const qModels = qd.models();
+  for (const other of ["trae", "workbuddy", "workbuddy_ai", "raccoon", "zcode", "lobster", "modelscope"]) {
+    const om = adapters.get(other).models();
+    const clash = qModels.filter((m) => om.includes(m));
+    assert(clash.length === 0, `qoder 模型与 ${other} 零重名（无路由歧义）`);
+  }
+  const qBody = qd.rewriteBody("dfmodel", { messages: [{ role: "user", content: "hi" }], temperature: 0.2 }, { uid: "u" }, {});
+  assert(qBody.model_config && qBody.model_config.key === "dfmodel" && qBody.model_config.format === "openai", "qoder rewriteBody 产出 QoderInferRequest");
+  assert(qBody.request_id === qBody.request_set_id && Array.isArray(qBody.messages) && Array.isArray(qBody.tools), "qoder rewriteBody 结构正确");
+  assert(qBody.messages[0].content[0].type === "text" && qBody.temperature === 0.2, "qoder rewriteBody 消息归一 + 采样参数透传");
   assert(rc.mapModel("raccoon-chat") === "raccoon-chat-ml-5-5" && rc.mapModel("raccoon-chat-ml") === "raccoon-chat-ml-5-5", "raccoon 模型别名归一");
   const rbody = rc.rewriteBody("raccoon-chat", { model: "raccoon-chat", conversation_id: "x", prompt_cache_key: "y", messages: [{ role: "user", content: "hi" }], temperature: 0.7 });
   assert(rbody.model === "raccoon-chat-ml-5-5" && rbody.stream === true && rbody.stream_options.include_usage === true, "raccoon rewriteBody 强制流式+include_usage");
@@ -186,6 +310,83 @@ async function main() {
   // ⑤ 401 旋转竞态重试（针头：值变了才重试，没变不原地打转）
   // 这个行为留在集成测试里跑（需要打点 fetch 与文件），smoke 只验证接口存在
   console.log("raccoon adapter ok");
+
+  // ===== LobsterAI（网易有道龙虾，lobster 渠道）离线断言 =====
+  // 与既有渠道的形态差异：上游是**原生 OpenAI 协议**（无需翻译层），头组静态（无签名），
+  // 登录走应用内回环 OAuth（无需本机安装客户端）。两个已知陷阱必须守住：
+  //   ① 上游只接受 stream=true（非流式返回 500）；
+  //   ② 签到活动按 clientVersion 门禁（旧版本号 slotState=empty，静默领不到分）。
+  const lb = adapters.get("lobster");
+  assert(lb && lb.id === "lobster", "lobster 适配器注册");
+  assert(store.CHANNELS.some((c) => c.id === "lobster"), "store.CHANNELS 含 lobster");
+  const lbCfg = rules.get("headers.json").lobster;
+  assert(lbCfg.chatUrl === "https://lobsterai-server.youdao.com/api/proxy/v1/chat/completions", "lobster 对话端点为原生 OpenAI 路径");
+  assert(lbCfg.checkinPlacement === "desktop_sidebar", "lobster 签到活动槽 = desktop_sidebar");
+  assert(typeof lbCfg.versionUrl === "string" && lbCfg.versionUrl.includes("api-overmind.youdao.com"), "lobster 版本号来源为官方更新接口");
+  assert(lb.models().length >= 16, `lobster 静态模型表 ≥16（实际 ${lb.models().length}）`);
+  assert(adapters.modelOwners("deepseek-v4-pro").includes("lobster"), "deepseek-v4-pro 归属含 lobster");
+  // 陷阱①：非流式请求必须被改写为 stream=true，否则上游 500
+  const lbBody = lb.rewriteBody("deepseek-v4-pro", { model: "deepseek-v4-pro", messages: [{ role: "user", content: "hi" }], stream: false, conversation_id: "x" });
+  assert(lbBody.stream === true && lbBody.stream_options.include_usage === true, "lobster rewriteBody 强制流式 + include_usage");
+  assert(!("conversation_id" in lbBody), "lobster rewriteBody 剥离内部字段");
+  assert(lb.mapModel("DeepSeek-V4-Pro") === "deepseek-v4-pro" && lb.mapModel("deepseek_v4_pro") === "deepseek-v4-pro", "lobster 模型名归一（大小写/下划线容错）");
+  // 陷阱②：版本号必须动态取（写死会在官方发版后静默失效）
+  assert(typeof lb.refreshVersion === "function", "lobster 具备动态版本号获取（签到门禁依赖）");
+  // 签到与刷新接口齐备
+  for (const k of ["checkin", "checkinStatus", "queryCredits", "refreshToken", "fetchModels"]) {
+    assert(typeof lb[k] === "function", `lobster 具备 ${k}`);
+  }
+  // 回环 OAuth：起本地服务器并返回官方登录 URL（本地监听，不发网络请求）
+  const lbBegin = await discovery.beginOAuth("lobster", () => {});
+  assert(lbBegin.ok === true && lbBegin.mode === "loopback", "lobster OAuth 走回环（mode=loopback）");
+  assert(/lobsterai\.youdao\.com\/portal#\/login/.test(lbBegin.url || ""), "lobster 登录 URL 指向官方门户");
+  assert(/redirect_uri=http%3A%2F%2F127\.0\.0\.1%3A\d+%2Fauth%2Fcallback/.test(lbBegin.url || ""), "lobster 回调地址为本机回环 /auth/callback");
+  discovery.cancelOAuth();
+  console.log("lobster adapter ok");
+
+  // ===== ModelScope（魔搭，modelscope 渠道）离线断言 =====
+  // 与 raccoon/lobster 节同款：只测离线可判的改写/头/凭据形态。
+  // 非流式 Content-Type 分流的路径可达性由 proxy-modelscope-selftest T26b 锁定，此处不重复。
+  const msAd = adapters.get("modelscope");
+  assert(msAd && msAd.id === "modelscope", "modelscope 适配器注册");
+  assert(store.CHANNELS.some((c) => c.id === "modelscope"), "store.CHANNELS 含 modelscope");
+  assert(adapters.modelOwners("deepseek-ai/DeepSeek-V4.1-Flash")[0] === "modelscope", "deepseek-ai/DeepSeek-V4.1-Flash 归属 modelscope");
+  // 模型零重名（无路由歧义）：静态目录全名带 org 前缀，与既有渠道天然不撞
+  const msModels = msAd.models();
+  assert(msModels.length >= 20, `modelscope 静态模型表 ≥20（实际 ${msModels.length}）`);
+  for (const other of ["trae", "workbuddy", "workbuddy_ai", "raccoon", "zcode", "lobster", "qoder"]) {
+    const om = adapters.get(other).models();
+    const clash = msModels.filter((m) => om.includes(m));
+    assert(clash.length === 0, `modelscope 模型与 ${other} 零重名（无路由歧义）`);
+  }
+  const msBody = msAd.rewriteBody("deepseek-ai/DeepSeek-V4.1-Flash", {
+    model: "deepseek-ai/DeepSeek-V4.1-Flash",
+    messages: [{ role: "user", content: "hi" }],
+    stream: true,
+    max_completion_tokens: 128,
+  }, { uid: "msub_abc123" });
+  assert(msBody.model === "deepseek-ai/DeepSeek-V4.1-Flash", "modelscope 全名模型直通");
+  assert(msAd.mapModel("GLM-5.3-Flash") === "ZhipuAI/GLM-5.3-Flash", "modelscope 简写回退（GLM-5.3-Flash → ZhipuAI/GLM-5.3-Flash）");
+  assert(msBody.max_tokens === 128 && !("max_completion_tokens" in msBody), "modelscope max_completion_tokens → max_tokens 翻译");
+  assert(msBody.stream_options && msBody.stream_options.include_usage === true, "modelscope 流式注入 include_usage");
+  assert(typeof msBody.prompt_cache_key === "string" && msBody.prompt_cache_key.startsWith("agenthub-msub_abc"), "modelscope prompt_cache_key 注入（账号段硬隔离）");
+  assert(!("conversation_id" in msBody), "modelscope 不注入 conversation_id（WB/raccoon 私有字段，严格 OpenAI 端点 400 风险）");
+  const msKeep = msAd.rewriteBody("deepseek-ai/DeepSeek-V4.1-Flash", { model: "deepseek-ai/DeepSeek-V4.1-Flash", messages: [], prompt_cache_key: "KEEP" }, { uid: "u" });
+  assert(msKeep.prompt_cache_key === "KEEP", "modelscope 已有 prompt_cache_key 不覆盖");
+  const msNoAcc = msAd.rewriteBody("deepseek-ai/DeepSeek-V4.1-Flash", { model: "deepseek-ai/DeepSeek-V4.1-Flash", messages: [{ role: "user", content: "hi" }] });
+  assert(typeof msNoAcc.prompt_cache_key === "string", "modelscope account 缺失降级注入不抛错");
+  const msNonStream = msAd.rewriteBody("deepseek-ai/DeepSeek-V4.1-Flash", { model: "deepseek-ai/DeepSeek-V4.1-Flash", messages: [{ role: "user", content: "hi" }], stream: false }, { uid: "u" });
+  assert(msNonStream.stream_options === undefined, "modelscope 非流式不注入 stream_options");
+  // 头分面：推理面单令牌（chatHeaders），控制面三头同发防风控（apiHeaders）——两端点族形态不同
+  const msh = msAd.chatHeaders("ms-token-x");
+  assert(msh.authorization === "Bearer ms-token-x" && msh["content-type"] === "application/json", "modelscope chatHeaders 推理面单令牌");
+  const msah = msAd.apiHeaders("ms-token-x");
+  assert(msah.authorization === "Bearer ms-token-x" && msah["OpenAPI-Token"] === "ms-token-x" && msah["X-Modelfun-Token"] === "ms-token-x" && msah["user-agent"], "modelscope apiHeaders 控制面三头 + 浏览器上下文");
+  // 星标族凭据判别：OAuth 令牌不算（该族 401），Cookie / ms- 才算
+  assert(msAd.hasStarCredential({ token: "ms_oauthXXXX" }) === false, "modelscope OAuth 令牌不算星标凭据");
+  assert(msAd.hasStarCredential({ token: "ms-abc123" }) === true, "modelscope ms- 令牌算星标凭据");
+  assert(msAd.hasStarCredential({ meta: { [msAd.cfg().cookieMetaKey]: "sessionid=x" } }) === true, "modelscope Cookie 算星标凭据");
+  console.log("modelscope adapter ok");
 
   // 6. 统计链路
   store.insertUsage({ reqId: "r1", keyId: k.id, keyName: "自测", channel: "trae", accountId: aid, accountName: "测试号", model: "deepseek-v4-flash", promptTokens: 10, completionTokens: 20, ttftMs: 100, latencyMs: 500, status: 200 });
@@ -564,7 +765,16 @@ async function main() {
   });
   const disBody = await rr.json();
   assert(rr.status === 400 && disBody.error.code === "model_disabled", "禁用模型 400: " + rr.status);
+  // 10.9a 停用模型不对外列出：/v1/models 减去 disabledModels，恢复启用后回归
+  const probe = adapters.mergedModels(e2eSettings())[0].id;
+  e2eDisabledFlag.push(probe);
+  let modelsBody = await (await fetch(base2 + "/v1/models")).json();
+  assert(!modelsBody.data.some((m) => m.id.toLowerCase() === probe.toLowerCase()), "停用模型不出现在 /v1/models: " + probe);
+  assert(modelsBody.data.length > 0, "未停用模型仍在 /v1/models（剩余 " + modelsBody.data.length + " 条）");
+  assert(adapters.mergedModels(e2eSettings()).some((m) => m.id.toLowerCase() === probe.toLowerCase()), "管理视图 mergedModels 仍含停用模型（过滤只发生在对外出口）");
   e2eDisabledFlag.length = 0;
+  modelsBody = await (await fetch(base2 + "/v1/models")).json();
+  assert(modelsBody.data.some((m) => m.id.toLowerCase() === probe.toLowerCase()), "恢复启用后 /v1/models 回归: " + probe);
 
   // 10.10 本地 IDE 快捷切换（确认协议 + WB auth 文件合并写回 + 备份 + Trae 诚实降级）
   process.env.LOCALAPPDATA = fs.mkdtempSync(path.join(os.tmpdir(), "ah-lappdata-"));

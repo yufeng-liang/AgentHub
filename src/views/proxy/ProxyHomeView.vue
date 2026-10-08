@@ -4,7 +4,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import * as api from "../../api/ipc";
 import type { ProxyGatewayStatus, ProxyUsageDetail, ProxyUsageRow } from "../../types";
 import { useAppStore } from "../../stores/app";
-import { fmtInt, fmtK, fmtMs, fmtTime, statusCls, fmtBalance, balanceUnit, isTokenChannel } from "./format";
+import { fmtInt, fmtK, fmtMs, fmtTime, statusCls, fmtBalance, balanceUnit, isTokenChannel, isQoderChannel } from "./format";
 import RequestLogTable from "./RequestLogTable.vue";
 import RequestDetailDialog from "./RequestDetailDialog.vue";
 import ColSettingsMenu from "./ColSettingsMenu.vue";
@@ -190,7 +190,7 @@ const cliCmd = computed(() => {
 const active = computed(() => app.activeModule === "proxy" && app.activePage === "home");
 
 // 事件合流 + 轮询防重入：refresh 在跑（或主进程正慢）时再触发只补一次，不叠加并发；
-// poolsync/credits 等高频事件经 1s 窗口合并，不再逐条全量刷新
+// request（后端已节流为每 2s 至多一条）与 poolsync/credits 等事件经 1s 窗口合并刷新
 const scheduleRefresh = coalesceAsync(refresh, 1000);
 
 function startPoll() {
@@ -220,7 +220,9 @@ onMounted(() => {
     const p = e as { event?: string; type?: string };
     if (p.event !== "proxy") return;
     // request 事件（主进程 2s 节流合并）驱动实时流追加；本地再压一道 2s 间隔，
-    // 且只刷流水区不刷 KPI——高流量下全量刷新会把页面打满（原实现直接忽略该事件，靠 5s 轮询）
+    // 且只刷流水区不刷 KPI——高流量下全量刷新会把页面打满（原实现直接忽略该事件，靠 5s 轮询）。
+    // 上游 v1.4x 把这段特例整段删了、让 request 走通用 scheduleRefresh；这里保留收窄口径：
+    // 后端节流到秒只是频率降下来，KPI 全量刷仍会反复触发全局数字补间，比只刷流水贵得多。
     if (p.type === "request") {
       if (!active.value) return;
       refreshRecent();
@@ -296,7 +298,11 @@ onUnmounted(() => {
             </span>
           </div>
           <div style="display: flex; align-items: baseline; gap: 8px">
-            <el-tooltip :content="isTokenChannel(c.id) ? `${fmtInt(c.totalCredits)} Token` : ''" :disabled="!isTokenChannel(c.id)" placement="top">
+            <el-tooltip
+              :content="isTokenChannel(c.id) ? `${fmtInt(c.totalCredits)} Token` : (isQoderChannel(c.id) ? `${c.totalCredits} Credits（精确值）` : '')"
+              :disabled="!isTokenChannel(c.id) && !isQoderChannel(c.id)"
+              placement="top"
+            >
               <b class="big-num">{{ fmtBalance(c.totalCredits, c.id) }}</b>
             </el-tooltip>
             <span style="font-size: 11px; color: var(--text-3)">{{ balanceUnit(c.id) }}</span>

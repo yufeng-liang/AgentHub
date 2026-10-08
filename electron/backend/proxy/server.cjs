@@ -45,8 +45,9 @@ function sendError(res, status, message, type, code) {
 }
 
 /** 402 文案的逐渠道计费口径（unit 真相源在 store.BUILTIN_CHANNELS，见其注释）：
- *  Trae/WorkBuddy/小浣熊是积分制 → 「积分」；zcode 家是智谱 Token 套餐 → 「Token 余额」；
- *  cline/autoclaw/qoder 无余额概念 → 「额度」。跨渠道 failover 一轮混过多种口径时退中性「额度」。 */
+ *  Trae/WorkBuddy/小浣熊/龙虾是积分制 → 「积分」；zcode 家是智谱 Token 套餐 → 「Token 余额」；
+ *  qoder 双区叫 Credits；cline/autoclaw/modelscope 无余额概念 → 「额度」。
+ *  跨渠道 failover 一轮混过多种口径时退中性「额度」。 */
 function planLimitNoun(chan) {
   const u = store.channelUnit(chan);
   return u === "Token" ? "Token 余额" : u;
@@ -56,6 +57,27 @@ function poolExhaustedMsg(channels) {
   if (units.length !== 1) return "该渠道号池额度全部耗尽";
   if (units[0] === "Token") return "该渠道号池 Token 余额全部耗尽";
   return `该渠道号池${units[0]}全部耗尽`;
+}
+
+/**
+ * 账号名脱敏：失败轨迹会返回给 API 客户端并落请求日志，而号池账号名常是邮箱
+ * （chiheng.zhu@gmail.com 这类）——原样透出等于把账号标识传播到下游工具/IDE 的报错弹窗。
+ * 保留「能认出是哪个号」的最小信息量：
+ *   · 邮箱 → 本地部分前 2 字符 + 域名（ch····@gmail.com）
+ *   · 其它 → 前 4 字符 + 省略号
+ * 单字符名不脱敏（脱了反而认不出）。
+ */
+function maskAccountName(name) {
+  const s = String(name || "").trim();
+  if (s.length <= 1) return s;
+  const at = s.indexOf("@");
+  if (at > 0) {
+    const local = s.slice(0, at);
+    const domain = s.slice(at);
+    const keep = local.length <= 2 ? 1 : 2;
+    return local.slice(0, keep) + "····" + domain;
+  }
+  return s.length <= 4 ? s : s.slice(0, 4) + "…";
 }
 
 /** request 事件节流：每条代理请求完成都会调用，高流量时逐条广播只烧 IPC，
@@ -87,7 +109,7 @@ function resolveChannel(key, model, settings) {
     const ov = (settings.modelOverrides || {})[model];
     if (ov && owners.includes(ov)) return { channel: ov };
     if (settings.routeStrategy === "fixed" && owners.includes(settings.fixedChannel)) return { channel: settings.fixedChannel };
-    return { channel: bestByScore(owners) };
+    return { channel: pickByOrder(routeOrderOf(key, settings), owners, tierGroups()) };
   }
   // 模型不在任何目录：auto 且固定渠道策略时放行指定渠道（透传试错），否则 400 给可用模型提示
   if (settings.routeStrategy === "fixed") return { channel: settings.fixedChannel };
@@ -105,18 +127,75 @@ function channelScore(channel) {
   return (s.onlineCount > 0 ? 1 : 0) * (1 + s.totalCredits);
 }
 
-/** 智能路由打分：可用账号数 × 号池总余额（方案 §6.2 auto） */
-function bestByScore(candidates) {
-  let best = candidates[0];
-  let bestScore = -1;
-  for (const c of candidates) {
-    const score = channelScore(c);
-    if (score > bestScore) {
-      bestScore = score;
-      best = c;
-    }
-  }
-  return best;
+// ===== 渠道成本感知排序（cost-first 档） =====
+// 成本档 = 渠道级的离散标注（agents.cost_tier：free=免费额度 / low=签到白送 / normal=普通），
+// 解决「跨渠道余额单位不可比」：不折算余额数值（智谱 Tokens ≠ 魔搭魔粒，无可靠换算依据），
+// 只用档位表达相对成本，档内仍按健康×余额打分。
+const COST_GROUPS = { free: 0, low: 1, normal: 2 };
+const COST_TIER_LABELS = { free: "免费", low: "低成本" }; // normal 不拼标签（轨迹降噪）
+
+/** 全渠道成本档一次取全（比较器内逐个查库是 O(n log n) 次 SELECT，提前物化成 Map） */
+function tierGroups() {
+  const m = new Map();
+  for (const a of store.listAgents()) m.set(a.id, COST_GROUPS[a.costTier || "normal"] ?? 2);
+  return m;
+}
+
+/** cost-first 组内排序分：同 channelScore，但池内含 -1 无限账号的渠道按超大余额参与。
+ *  totalCredits 不含 -1 哨兵，现状按 1+0 计分会把全无限账号的渠道垫到最底 */
+function costFirstScore(channel) {
+  const s = pool.poolSummary(channel);
+  if (channelCooling(channel)) return 0;
+  const base = (s.onlineCount > 0 ? 1 : 0) * (1 + s.totalCredits);
+  return s.unlimited ? base + 1e12 : base;
+}
+
+/** 渠道此刻是否真的出得了请求：**与 pickAccount 的静态判据同口径**（不写库、每请求实时派生）。
+ *  后两条必须一起算——「已知余额为 0」「余额已到期」的号在池视图里仍是 online
+ *  （把号标 exhausted 的是 pickAccount 自己），只看 onlineCount 会把它们当可用渠道继续占预算。 */
+function routeUsable(channel) {
+  if (channelCooling(channel)) return false;
+  const now = Date.now();
+  return pool.poolAccounts(channel).some((a) =>
+    a.status === "online" && a.hasToken &&
+    !(a.creditsAt > 0 && a.credits === 0) &&
+    !(a.expiresAt > 0 && a.expiresAt <= now));
+}
+
+/** 渠道排序比较器（按生效档）：
+ *  score = 现状（健康×余额打分，行为与旧 bestByScore 逐字节等同）；
+ *  cost-first = **能出请求的渠道优先**，其内再按成本档升序（免费额度优先消耗的产品语义不变）。
+ *  可用性必须当第一键：原实现只按成本档排，空池/熔断的便宜渠道会抢占主渠道位并吃掉
+ *  channelFailoverMax 预算，把唯一可用的渠道挤出队列 → 明明有账号却 503，轨迹里连它都不出现（issue #86）。
+ *  可用性表按比较器实例惰性记忆化：比较器里逐个查库是 O(n log n) 次（与 score 档现状同量级，不额外放大）；
+ *  调用方已有物化表可直接传入。
+ *  恢复回切零新状态：可用性每请求实时派生、不做缓存，打光/熔断自然让位，恢复后自然排回最前 */
+function cmpByOrder(order, groups, usableTable) {
+  if (order !== "cost-first") return (a, b) => channelScore(b) - channelScore(a);
+  const memo = usableTable || new Map();
+  const usableOf = (ch) => {
+    if (!memo.has(ch)) memo.set(ch, routeUsable(ch));
+    return memo.get(ch);
+  };
+  return (a, b) => {
+    const ua = usableOf(a);
+    const ub = usableOf(b);
+    if (ua !== ub) return ua ? -1 : 1;
+    const ga = groups.get(a) ?? 2;
+    const gb = groups.get(b) ?? 2;
+    if (ga !== gb) return ga - gb;
+    return costFirstScore(b) - costFirstScore(a);
+  };
+}
+
+/** 生效档：per-key 覆盖 → 全局默认（缺省 score = 现状） */
+function routeOrderOf(key, settings) {
+  return key.routeOrder || settings.routeOrder || "score";
+}
+
+/** 按生效档取最优渠道（resolveChannel 智能分支）；sort 稳定，同分保持 modelOwners 返回序 */
+function pickByOrder(order, candidates, groups) {
+  return [...candidates].sort(cmpByOrder(order, groups))[0];
 }
 
 /** 单账号尝试：401 就地刷新凭证、同渠道重试一次（方案 §6.3 WB 实证，Trae 同理）。
@@ -191,12 +270,15 @@ function classifyUpstream(e, planLimit, channel) {
   if (/\b11101\b/.test(msg)) return { kind: "bad_params", switchable: true, status: 400 };
   if (e && e.status === 429) {
     // resetMs 统一为绝对时刻：parseRateResetMs 本就返回墙钟；retryAfterMs 是剩余时长，必须换算。
-    // 二者混装会让 coolAccountMs 把时长当时刻，Retry-After 被兜底成 1s 冷却（墙钟对齐失效）
+    // 二者混装会让 coolAccountMs 把时长当时刻，Retry-After: 7200 被 Math.max(now+1s) 兜成 1s 冷却（墙钟对齐失效）
     return { kind: "rate", switchable: true, status: 429, resetMs: parseRateResetMs(msg) || (e.retryAfterMs ? Date.now() + e.retryAfterMs : 0) };
   }
   if (e && e.status === 401) return { kind: "relogin", switchable: true, status: 401 };
   if (e && e.status === 404) return { kind: "not_found", switchable: true, status: 404 }; // 短冷却不累计，防雪崩
   if (e && e.status === 400) return { kind: "fatal", switchable: false, status: 400 };
+  // 首字节超时（上游迟迟不吐第一个 token）：多为"这次 prompt 太大 / 上游这一刻忙"，
+  // 不是账号故障——单独分类，只换号不冷却、也不计入 5xx/网络熔断
+  if (e && e.firstByteTimeout) return { kind: "slow", switchable: true, status: 504 };
   return { kind: "server", switchable: true, status: 502 }; // 5xx / 网络 / 超时
 }
 
@@ -319,13 +401,16 @@ function channelHealthSnapshot() {
 function applyCool(accId, model, cls, message) {
   if (!accId) return;
   // 参数/模型配置类错误与账号无关，不罚号也不记错；其余落冷却的错误都记入账号最近错误（号池气泡展示）
-  if (cls.kind !== "model_config" && cls.kind !== "bad_params" && cls.kind !== "prompt_too_long" && message) {
+  // slow（首字节超时）同样不记错：它是"这次请求太大/上游这一刻慢"，记在账号上只会留下误导性的
+  // 长期错误气泡（实测一次 54 万 token 请求超时，账号卡片挂了两天的"上游首字节超时"）
+  if (cls.kind !== "model_config" && cls.kind !== "bad_params" && cls.kind !== "prompt_too_long" && cls.kind !== "slow" && message) {
     store.noteError(accId, message);
   }
   switch (cls.kind) {
     case "model_config": // 4001 模型配置为空：模型问题不是账号问题，不罚号
     case "bad_params": // 11101：参数问题不罚号（换号仍会发生，由外层轮转决定）
     case "prompt_too_long": // 11115：同一 body 换任何号都超限，零动作
+    case "slow": // 首字节超时：请求/上游侧的慢，账号本身没问题，零冷却（外层仍会换号重试）
       return;
     case "model_rate":
       pool.coolAccountModel(accId, model, cls.resetMs || Date.now() + 600000, message); // 6004：对齐墙钟优先，缺省 10min
@@ -440,6 +525,10 @@ async function handleChat(req, res, settings, surface) {
     record({ status: 400, error: bad });
     return sink.endErr(400, bad, "invalid_request_error", "invalid_params");
   }
+  // 角色归一（issue #47）：各渠道上游 role 白名单互相冲突（workbuddy 拒 developer、
+  // raccoon 拒 function），而 400 会触发渠道回退，导致同一条请求能否成功取决于命中
+  // 哪个渠道。入口处统一收敛到所有渠道都接受的交集角色，避免逐渠道维护白名单表。
+  util.normalizeRoles(body.messages);
   // 上游并发上限（默认 8）
   if (runtime.active >= settings.concurrency) {
     record({ status: 429, error: "concurrency limit" });
@@ -470,7 +559,7 @@ async function handleChat(req, res, settings, surface) {
   }
 
   if (!resolveChannel(key, actualModel, settings).channel && !fallback) {
-    const hint = adapters.mergedModels(settings).map((m) => m.id).join(", ");
+    const hint = adapters.listableModels(settings).map((m) => m.id).join(", ");
     record({ status: 400, error: "unknown model" });
     return sink.endErr(400, `模型 "${actualModel}" 不在任何渠道目录中。可用模型：${hint}`, "invalid_request_error", "model_not_found");
   }
@@ -568,7 +657,10 @@ async function handleChat(req, res, settings, surface) {
     // 两个计数器各长各的，记账里的 attempts 迟早和实际尝试次数悄悄脱钩。
     const maxTries = 6 * modelChain.length; // 每个模型 6 次上游尝试（跨渠道共享；429 就地重试、
     // 401 刷新重试各计 1）。按模型链长度放大：预算按请求计但逐模型消耗，避免主模型耗尽预算后饿死回退模型
-    const triedChannels = []; // 本请求跳过或耗尽的渠道轨迹（最终错误消息用）
+    const triedChannels = []; // 本请求跳过或耗尽的渠道轨迹（最终错误消息用）：{ chan, accounts: string[], note?: string }
+    // 轨迹同时记「渠道名」与该渠道实际用过的「账号名」（渲染时脱敏）。只报渠道名会让用户
+    // 误判「我已经停用了这个账号怎么还在用」——渠道名 ≠ 账号名（issue #74 的困惑来源）
+    // 注：这里不复制上游的 upstreamTries 计数器——本分支已把它与 attemptsUsed 统一成一个（见上方注释）
     let failoverFrom = "";    // 成功渠道 ≠ 主渠道时记录 failover:主→实（记账轨迹）
     let planLimitEnd = false; // planLimit（402）流中已出线的就地收尾：不是真成功，不清渠道降级态
     for (const chainModel of modelChain) {
@@ -581,12 +673,13 @@ async function handleChat(req, res, settings, surface) {
       }
       usedModel = chainModel;
       // ===== 渠道候选队列（跨渠道故障转移）：主渠道尊重全部现有路由语义（单源强制 /
-      // key.route / per-model 覆盖 / fixed / 智能打分 / 提供商前缀直达），备选 = 拥有该模型的
-      // 其余内置渠道按综合分（健康×余额）降序。主渠道降级或耗尽时请求内直接跳备选（客户端无感），
-      // 全部候选走完才报错。两条边界：单渠道模型无备选可跳（模型目录的物理边界，靠回退模型兜底）；
+      // key.route / per-model 覆盖 / fixed / 生效档排序 / 提供商前缀直达），备选 = 拥有该模型的
+      // 其余内置渠道按生效档排序（score=综合分（健康×余额）降序 / cost-first=成本档升序、组内按分）。
+      // 主渠道降级或耗尽时请求内直接跳备选（客户端无感），全部候选走完才报错。
+      // 两条边界：单渠道模型无备选可跳（模型目录的物理边界，靠回退模型兜底）；
       // 提供商路由天生无备选——modelOwners 只认内置适配器，绝不能把用户自定义的中转静默改投别家渠道。
       const owners = adapters.modelOwners(chainModel, settings).filter((c) => c !== resolved.channel);
-      owners.sort((a, b) => channelScore(b) - channelScore(a));
+      owners.sort(cmpByOrder(routeOrderOf(key, settings), tierGroups()));
       const queue = [resolved.channel, ...owners];
       queue.length = Math.min(
         queue.length,
@@ -602,7 +695,9 @@ async function handleChat(req, res, settings, surface) {
           if (!lastErr) {
             lastErr = Object.assign(new Error(`渠道 ${chan} 降级中（${chCool.reason || "渠道级退避"}），${Math.ceil((chCool.until - Date.now()) / 1000)}s 后回切重试`), { status: 503 });
           }
-          triedChannels.push(chan);
+          // 渠道级降级：根本没进号池，无账号可记。note 区分「降级中」与「号池空」——
+          // 两者都不带账号名，但原因不同：把熔断报成「无可用账号」是同类歧义（issue #74）
+          triedChannels.push({ chan, accounts: [], note: "渠道降级中" });
           continue;
         }
         usageRow.channel = chan;
@@ -627,6 +722,7 @@ async function handleChat(req, res, settings, surface) {
         }
         const strategy = (store.listAgents().find((a) => a.id === chan) || {}).poolStrategy || "expire_first";
         const tried = new Set();
+        const triedAccountNames = []; // 本渠道实际选中的账号名（最终错误文案用；去重保序）
         const rateRetried = new Set(); // 无明示时间的 429 同号退避重试标记（每号限一次）
         // 每账号并发租约：expire_first 排序与并发无关，同窗口并发会话否则全打同一账号（参考项目租约语义）
         const perAccountLimit = Number(settings.concurrencyPerAccount) > 0 ? Number(settings.concurrencyPerAccount) : 3;
@@ -646,6 +742,10 @@ async function handleChat(req, res, settings, surface) {
             attempt--;
             continue;
           }
+          // 账号名进轨迹（去重）：用户据此确认「用的到底是哪个号」，不再被渠道名误导。
+          // 必须在负缓存跳过之后收集——被模型级负缓存跳过的账号根本没发请求，
+          // 记进「实际用过的账号」会让轨迹失真（用户以为它在跑，实际它在冷却）
+          if (!triedAccountNames.includes(acc.name)) triedAccountNames.push(acc.name);
           pool.acquireAccount(acc.id);
           attemptsUsed += 1; // 全局上游尝试预算，同时就是记账里的 attempts（负缓存跳过不计；429 就地重试走下一轮自然再计）
           realTries++;
@@ -796,7 +896,7 @@ async function handleChat(req, res, settings, surface) {
         // 渠道级再缓存一份反而会把「已恢复」的渠道错误地挡在门外。
         // 预算用尽跳出与 WAF/11128 已就地降级的不重复处理
         if (!done && !fatalErr && !budgetOut) {
-          triedChannels.push(chan);
+          triedChannels.push({ chan, accounts: triedAccountNames });
           if (!degradedHere && realTries > 0 && lastErr) {
             const cls = classifyUpstream(lastErr, false, chan);
             if (DEGRADABLE.has(cls.kind) && noteChannelFail(chan) >= 2) {
@@ -843,6 +943,9 @@ async function handleChat(req, res, settings, surface) {
       else if (targetModel !== actualModel) errParts.push("rev→" + targetModel);
       record({
         status: 200, ttftMs, promptTokens: usage.prompt_tokens, completionTokens: usage.completion_tokens,
+        // 缓存 token：OpenAI 语义取 prompt_tokens_details.cached_tokens，Anthropic 上游取 cache_read_input_tokens
+        cacheReadTokens: (usage.prompt_tokens_details && usage.prompt_tokens_details.cached_tokens) ?? usage.cache_read_input_tokens ?? 0,
+        cacheCreationTokens: usage.cache_creation_input_tokens ?? usage.cache_creation_tokens ?? 0,
         error: errParts.join(" "),
         // 缓存字段由适配器归一成 cached_tokens/cache_write_tokens（未上报时缺省 → 落库 -1 哨兵）
         cachedTokens: usage.cached_tokens, cacheWriteTokens: usage.cache_write_tokens,
@@ -852,13 +955,49 @@ async function handleChat(req, res, settings, surface) {
       return;
     }
 
-    // 全部渠道/账号用尽：如实报错并带渠道轨迹（单请求尝试预算用尽时由 lastErr 消息如实说明）
+    // 全部渠道/账号用尽：如实报错并带渠道轨迹（单请求尝试预算用尽时由 lastErr 消息如实说明）。
+    // 轨迹形如 `qoder(账号A) → qoder_intl(无可用账号)`：渠道名后括号内是该渠道实际用过的账号名，
+    // 空括号说明该渠道压根没进号池（降级中/无可用账号）——用户据此区分「停用的账号是否真被用了」
     const st = (lastErr && lastErr.status) || 503;
-    const triedUnique = [...new Set(triedChannels)];
-    let msg = st === 402 ? poolExhaustedMsg(triedUnique) : (lastErr && lastErr.message) || "渠道暂不可用（号池无可用账号）";
-    // 措辞用「N 个渠道均不可用」而不是「已尝试 N 个」：triedChannels 里既有真打过的，也有
-    // 降级中直接跳过 / 号池空没打就过的——它们都确实不可用，但「尝试」只对前者成立
-    if (triedUnique.length > 1) msg = `${triedUnique.length} 个渠道均不可用（${triedUnique.join("→")}）：${msg}`;
+    const seenChan = new Map(); // chan → 轨迹项（同一渠道可能在多个模型上被尝试，账号名取并集）
+    for (const t of triedChannels) {
+      if (!t) continue;
+      const prev = seenChan.get(t.chan);
+      if (prev) {
+        // 合并而非丢弃：模型链上有多个模型时，同一渠道的第二轮可能用了别的账号——
+        // 只保留首次会让轨迹漏掉实际用过的号
+        for (const a of t.accounts || []) if (a && !prev.accounts.includes(a)) prev.accounts.push(a);
+        if (!prev.note && t.note) prev.note = t.note;
+        continue;
+      }
+      seenChan.set(t.chan, { chan: t.chan, accounts: [...(t.accounts || [])], note: t.note });
+    }
+    const triedUnique = [...seenChan.values()].map((t) => {
+      const accs = t.accounts.filter(Boolean).map(maskAccountName);
+      // 空括号的含义由 note 区分：降级中（熔断，账号可能在线）vs 号池无可用账号。
+      // 账号名一律脱敏——消息会回到 API 客户端并落日志，原样带邮箱等于外泄账号标识
+      const label = accs.length ? accs.join(",") : t.note || "无可用账号";
+      // cost-first 档给渠道名拼成本档后缀，一眼看出「为什么先试它」：
+      // modelscope(免费·账*,*) → zcode(账*)；score 档不拼（用户没开成本感知，拼了反而困惑）
+      const tierLabel = routeOrderOf(key, settings) === "cost-first"
+        ? COST_TIER_LABELS[store.listAgents().find((a) => a.id === t.chan)?.costTier || "normal"] || ""
+        : "";
+      const parts = [tierLabel, label].filter(Boolean);
+      return `${t.chan}(${parts.join("·")})`;
+    });
+    // 402 文案按各渠道计费口径组词（poolExhaustedMsg 要的是渠道 id，不是上面渲染好的轨迹串）
+    let msg = st === 402 ? poolExhaustedMsg([...seenChan.keys()]) : (lastErr && lastErr.message) || "渠道暂不可用（号池无可用账号）";
+    // 一个候选就失败时也要报渠道名与原因：只说「渠道暂不可用（号池无可用账号）」的话，
+    // 用户只能去明细表里猜到底试了谁、为什么失败（issue #86）。
+    // 措辞用「均不可用」而不是「已尝试 N 个」：triedChannels 里既有真打过的，也有降级中直接
+    // 跳过 / 号池空没打就过的——它们都确实不可用，但「尝试」只对前者成立
+    if (triedUnique.length === 1) msg = `渠道 ${triedUnique[0]} 不可用：${msg}`;
+    else if (triedUnique.length > 1) msg = `${triedUnique.length} 个渠道均不可用（${triedUnique.join(" → ")}）：${msg}`;
+    // 一次上游都没发过（号池空/候选全在降级中）：明说——失败行的「渠道」列取的是最后到达的候选，
+    // 不点明的话会被读成「用这个渠道发过请求」（上游 v1.50.1，issue #86）。
+    // 判定用 attemptsUsed：本分支把上游的 upstreamTries 预算计数器统一收成了它（见上方声明处注释）。
+    // 不用轨迹里的账号名判：fatal（上游 400 透传）那条路径刻意不往轨迹里 push，用轨迹会误报「没发过请求」
+    if (!attemptsUsed) msg = `未发起任何上游请求（候选渠道号池为空或降级中）：${msg}`;
     if (!wantStream || !ttftMs) {
       // 还没出过内容：流式下若响应头已发出去就得把错误塞进流，非流式还能正常回错误状态码
       if (wantStream && res.headersSent) sink.endErr(st, msg);
@@ -918,6 +1057,7 @@ function buildApp(settings) {
       if (!res.headersSent) res.status(500).json({ type: "error", error: { type: "api_error", message: String((e && e.message) || e) } });
     });
   });
+
   // 官方文档把 count_tokens 列为可选（缺了客户端退化成字符估算）。这里用网关自己的
   // length/4 口径实现——与客户端兜底同量级，胜在 /status 与统计页能看到同一个数。
   app.post("/v1/messages/count_tokens", (req, res) => res.json(anthropicIn.countTokens(req.body || {})));
@@ -949,7 +1089,9 @@ function buildApp(settings) {
   // 所以必须同步返回、绝不打上游；② 任何 redirect 都被它判失败，故连尾斜杠都单独注册；
   // ③ 有 anthropic-version 头时按 Messages 形状回，否则按 OpenAI 形状回。
   const modelsPayload = (req) => {
-    const list = adapters.mergedModels(settings() || {});
+    // listableModels 而非 mergedModels：上游 v1.42 的「停用模型不对外列出」，本分支的对外面同样适用
+    // （口径与请求路径的 400 拦截一致，见 adapters.listableModels）
+    const list = adapters.listableModels(settings() || {});
     if (req.headers["anthropic-version"]) {
       // Anthropic 形状维持精简（Claude Code 只读 id/display_name），不追加扁平字段
       return {
@@ -1128,5 +1270,10 @@ function status() {
 }
 
 // channelHealthSnapshot 给号池 IPC 与 /status 展示渠道降级；CLOSE_BUDGET_MS / _resolveChannel
-// 是 fork 侧探针的挂钩点（dev-gateway-pipe-test 钉停机预算、dev-provider-test 钉路由），三样都得导出
-module.exports = { start, stop, stopAsync, status, channelHealthSnapshot, CLOSE_BUDGET_MS, _resolveChannel: resolveChannel };
+// 是 fork 侧探针的挂钩点（dev-gateway-pipe-test 钉停机预算、dev-provider-test 钉路由）；
+// classifyUpstream 与下面那组成本感知路由纯函数是上游自带自检的行为断言入口
+// （tools/proxy-cost-route-selftest.cjs / proxy-empty-pool-route-selftest.cjs）。
+// 两侧探针各钉一半，导出面少一个就是「自检全绿但产品坏」。
+module.exports = { start, stop, stopAsync, status, channelHealthSnapshot, CLOSE_BUDGET_MS, _resolveChannel: resolveChannel, classifyUpstream,
+  // 成本感知路由纯函数（tools/proxy-cost-route-selftest.cjs / proxy-empty-pool-route-selftest.cjs 行为断言用）
+  channelScore, costFirstScore, tierGroups, cmpByOrder, routeOrderOf, pickByOrder, routeUsable };

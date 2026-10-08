@@ -6,7 +6,7 @@ import type {
   WebDavStatus, RemoteDevice, WebDavLog, HubExtraRow, WatchStatus,
   ProxyGatewayStatus, ProxyKeyRow, ProxyChannelView, ProxyAccount, ProxyStatsOverview, ProxyStatsDetail,
   ProxyUsageRow, ProxyUsageDetail, ProxyModel, ProxyScanCandidate, ProxyRuleFile, ProxyRoute, ProxyChannelId,
-  ProxyBuiltinChannelId, ProxyPoolStrategy,
+  ProxyBuiltinChannelId, ProxyPoolStrategy, ProxyCostTier,
   ProxyCheckinRow, ProxyProvider, ProxyProviderKind, ProxyProviderModel, ProxyProviderTestResult,
   CcSwitchStatus, CcSwitchRegisterResult, CcSwitchAppType, ZcodeDeviceStatusResult, ZcodeClaimModeResult,
   MemoryRow, MemoryDetail, MemoryStats, MemoryIndexStatus, MemoryTimelineNode, MemoryProjectCard,
@@ -20,7 +20,7 @@ export type {
   WebDavStatus, RemoteDevice, WebDavLog, WebDavEvent, HubExtraRow, WatchStatus,
   ProxyGatewayStatus, ProxyKeyRow, ProxyChannelView, ProxyAccount, ProxyStatsOverview, ProxyStatsDetail,
   ProxyUsageRow, ProxyUsageDetail, ProxyModel, ProxyScanCandidate, ProxyRuleFile, ProxyRoute, ProxyChannelId,
-  ProxyBuiltinChannelId, ProxyPoolStrategy,
+  ProxyBuiltinChannelId, ProxyPoolStrategy, ProxyCostTier,
   ProxyAccountStatus, ProxyEvent, ProxyCheckinRow,
   ProxyProvider, ProxyProviderKind, ProxyProviderModel, ProxyProviderTestResult,
   CcSwitchStatus, CcSwitchRegisterResult,
@@ -224,9 +224,9 @@ export const proxyRestart = () => call<{ ok: boolean; port?: number; message?: s
 
 // ===== 反代网关：API Keys =====
 export const proxyKeysList = () => call<ProxyKeyRow[]>("proxy_keys_list");
-export const proxyKeyCreate = (opts: { name: string; route: ProxyRoute; dailyQuota: number; rateLimit?: number }) =>
+export const proxyKeyCreate = (opts: { name: string; route: ProxyRoute; routeOrder?: string; dailyQuota: number; rateLimit?: number }) =>
   call<ProxyKeyRow & { secret: string }>("proxy_key_create", opts as unknown as Record<string, unknown>);
-export const proxyKeyUpdate = (id: string, patch: Partial<Pick<ProxyKeyRow, "name" | "route" | "dailyQuota" | "rateLimit" | "enabled">>) =>
+export const proxyKeyUpdate = (id: string, patch: Partial<Pick<ProxyKeyRow, "name" | "route" | "routeOrder" | "dailyQuota" | "rateLimit" | "enabled">>) =>
   call<{ ok: boolean; message?: string }>("proxy_key_update", { id, ...patch });
 export const proxyKeyDelete = (id: string) => call<{ ok: boolean; message?: string }>("proxy_key_delete", { id });
 
@@ -234,6 +234,9 @@ export const proxyKeyDelete = (id: string) => call<{ ok: boolean; message?: stri
 export const proxyPool = () => call<ProxyChannelView[]>("proxy_pool");
 export const proxyPoolStrategy = (channel: ProxyChannelId, strategy: ProxyPoolStrategy) =>
   call<{ ok: boolean; message?: string }>("proxy_pool_strategy", { channel, strategy });
+/** 渠道成本档（cost-first 路由排序的标注来源） */
+export const proxyPoolTier = (channel: ProxyChannelId, tier: ProxyCostTier) =>
+  call<{ ok: boolean; message?: string }>("proxy_pool_tier", { channel, tier });
 export const proxyAccountAdd = (opts: { channel: ProxyChannelId; name?: string; token: string; refreshToken?: string; uid?: string }) =>
   call<{ ok: boolean; id?: string; message?: string }>("proxy_account_add", opts as unknown as Record<string, unknown>);
 export const proxyAccountRemove = (id: string) => call<{ ok: boolean; message?: string }>("proxy_account_remove", { id });
@@ -320,7 +323,7 @@ export interface IdeSwitchProbe {
  *  预检判定「切不了」时直接回 ok:false，不弹框。确认后关客户端等退出时长不可控，故关闭看门狗） */
 export const proxyIdeSwitch = (accountId: string, confirmAck?: boolean) =>
   call<{ ok: boolean; channel?: string; file?: string; backup?: string; needConfirm?: boolean; probe?: IdeSwitchProbe; relaunched?: boolean; message?: string }>("proxy_ide_switch", { accountId, confirmAck }, 0);
-export const proxyIdeStatus = () => call<{ workbuddyInstalled: boolean; workbuddyAiInstalled?: boolean; traeInstalled?: boolean; raccoonInstalled?: boolean; zcodeInstalled?: boolean; currentUid: string }>("proxy_ide_status");
+export const proxyIdeStatus = () => call<{ workbuddyInstalled: boolean; workbuddyAiInstalled?: boolean; traeInstalled?: boolean; raccoonInstalled?: boolean; modelscopeInstalled?: boolean; lobsterInstalled?: boolean; zcodeInstalled?: boolean; qoderInstalled?: boolean; qoderIntlInstalled?: boolean; currentUid: string }>("proxy_ide_status");
 /** zcode 切号回滚（切出问题 / 远程连接异常时一键还原最近一次切前状态） */
 export const proxyZcodeSwitchRollback = () =>
   call<{ ok: boolean; message?: string }>("proxy_zcode_switch_rollback");
@@ -458,17 +461,21 @@ export const memoryProjectSuggest = () =>
   call<{ items: { id: string; slug: string; name: string; score: number; candidate: string; memoryId: string; title: string; path: string }[] }>("memory_project_suggest");
 export const memoryProjectConfirm = (id: string, slug: string | null) =>
   call<{ ok: boolean; memoryId: string; slug: string | null }>("memory_project_confirm", { id, slug });
+/** 关联本地目录到既有项目卡：补全远程地址与本地路径（非 Git 目录只记路径） */
+export const memoryProjectAttach = (slug: string, dir: string) =>
+  call<{ ok: boolean; message?: string; isRepo?: boolean; addedRemotes?: string[]; localPath?: string }>("memory_project_attach", { slug, dir });
 
 // ===== 记忆中枢：索引 / 检索 =====
 export const memoryIndexStatus = () => call<MemoryIndexStatus>("memory_index_status");
 export const memoryIndexBuild = () =>
-  call<{ ok: boolean; files: number; pruned: number; diagnose?: { consistent: boolean; broken: number; orphan: number; unindexed: number } }>("memory_index_build");
+  call<{ ok: boolean; files: number; pruned: number; caseFixed?: number; diagnose?: { consistent: boolean; broken: number; orphan: number; unindexed: number } }>("memory_index_build");
 export const memoryIndexRebuild = () => call<{ ok: boolean; files: number; tookMs: number }>("memory_index_rebuild");
 export const memoryIndexDiagnose = () =>
   call<{ diagnose: { orphanRows: string[]; unindexed: string[]; fts: { rebuilt: boolean } }; graph: { nodes: number; edges: number; broken: number; isolated: number } }>("memory_index_diagnose");
 export const memoryIndexVacuum = () => call<{ ok: boolean; before: number; after: number }>("memory_index_vacuum");
 export const memorySearch = (query: string, opts?: {
   project?: string; agent?: string; layer?: string; limit?: number; offset?: number; includeSuperseded?: boolean;
+  type?: string; tag?: string; starred?: boolean; pinned?: boolean;
 }) => call<{ results: MemoryRow[]; total: number; tookMs: number; text: string }>("memory_search", { query, ...(opts || {}) } as Record<string, unknown>);
 export const memorySearchDebug = (query: string, opts?: { project?: string; layer?: string }) =>
   call<{

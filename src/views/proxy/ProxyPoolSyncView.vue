@@ -26,10 +26,12 @@ const CHANNELS: { id: ProxyBuiltinChannelId | ""; label: string }[] = [
   { id: "cline_pass", label: "Cline 订阅池" },
   { id: "autoclaw", label: "智谱 AutoClaw（国内）" },
   { id: "autoclaw_intl", label: "智谱 AutoClaw（国际）" },
-  { id: "qoder", label: "Qoder" },
+  { id: "modelscope", label: "ModelScope（魔搭）" },
+  { id: "lobster", label: "LobsterAI（有道）" },
   { id: "zcode", label: "ZCode（智谱）" },
   { id: "zcode_intl", label: "ZCode（智谱·国际）" },
-
+  { id: "qoder", label: "Qoder CN" },
+  { id: "qoder_intl", label: "Qoder International" },
 ];
 
 const running = computed(() => !!st.value?.running);

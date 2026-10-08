@@ -370,6 +370,8 @@ const ALL_PROXY_CMDS = [
   "proxy_status", "proxy_start", "proxy_stop", "proxy_restart",
   "proxy_keys_list", "proxy_key_create", "proxy_key_update", "proxy_key_delete",
   "proxy_pool", "proxy_pool_strategy",
+  // 上游 v1.50 的渠道成本档读写（cost-first 排序）：实现体在子进程 index.cjs，主进程只转发
+  "proxy_pool_tier",
   "proxy_account_add", "proxy_account_remove", "proxy_account_toggle", "proxy_account_rename", "proxy_account_cool_off",
   "proxy_account_refresh", "proxy_credits_refresh", "proxy_credits_refresh_channel",
   "proxy_checkin_status", "proxy_checkin_run",

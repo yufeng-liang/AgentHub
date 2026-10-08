@@ -85,14 +85,17 @@ async function probeGateway() {
   // fallbackModel（反代网关设置里的全局统一回退模型）必须带出去：模型池没配时 LlmClient 靠它
   // 回退到网关号池当前模型——此前探测结果漏了这个字段，「什么都不配回退号池」实际永不生效
   const value = { available: false, baseUrl, port, fallbackModel: String((framework.proxy && framework.proxy.fallbackModel) || "") };
+  let timer = null;
   try {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 1200);
+    timer = setTimeout(() => controller.abort(), 1200);
     const res = await fetch(`http://127.0.0.1:${port}/healthz`, { signal: controller.signal });
-    clearTimeout(timer);
     value.available = res.ok;
   } catch {
     value.available = false;
+  } finally {
+    // fetch 在超时前就失败（如连接被拒）时也要清掉定时器，否则句柄会存活到 1.2s 后才自解
+    if (timer) clearTimeout(timer);
   }
   gatewayCache = { at: now, value };
   return value;
@@ -196,6 +199,8 @@ function init() {
   syncer = new MemorySync({
     service,
     deviceName: require("os").hostname(),
+    // 设备登记文件名取自它：不传的话 state.deviceId 恒空、多台设备都写成 devices/local.json 互相覆盖
+    deviceId: deviceId(),
     getConfig: () => service.flat(),
     moduleWebdav: (key) => configMod.moduleWebdav(key),
     emit,
@@ -242,6 +247,16 @@ async function boot() {
   }
   startWatch();
   if (scheduler) scheduler.start();
+  // 存量项目元数据自愈：老版本用显式项目名写入时不探测 Git，项目卡因此缺远程/本地路径。
+  // 延后到启动流程之外异步跑，且逐项目最多读少量文件——不能阻塞启动（曾因同步扫描主进程冻结数十秒）。
+  setTimeout(() => {
+    try {
+      const r = service && service.reconcileProjectMetadata();
+      if (r && r.healed) emit({ type: "projects", healed: r.healed });
+    } catch (e) {
+      emit({ type: "projects", healed: 0, message: String((e && e.message) || e) });
+    }
+  }, 6000);
   if (flatSettings()["agents.autoVerify"] !== false) {
     // 异步巡检，不阻塞启动
     setTimeout(() => reconcileAgents().catch(() => {}), 4000);
@@ -424,6 +439,13 @@ function register(ipcMain) {
     if (invalid.length) return fail(invalid.join("；"));
     memCfg.set(entries, { local: !!local });
     emit({ type: "config-changed", keys: Object.keys(entries) });
+    // 预算闸门相关改动立即重算一次到期任务：否则要等下一个 60s tick，
+    // 用户「把预算调高」后会觉得没生效（尤其按天/按周任务本来就要等到点）
+    if (Object.keys(entries).some((k) => k === "auto.dailyTokenLimit" || k === "auto.overBudgetAction" || k === "auto.enabled")) {
+      // _tick 会 reject（调度器自己的定时器回调也一律带 catch）：漏接会变成未处理拒绝，
+      // 由全局兜底记进 crash.log。调度器未启用时 scheduler 为 null，同步抛错由 catch 吃掉
+      try { void scheduler._tick().catch(() => {}); } catch { /* 调度器未启用时忽略 */ }
+    }
     return ok({});
   }));
   ipcMain.handle("memory_config_reset", handle(({ keys }) => {
@@ -432,10 +454,12 @@ function register(ipcMain) {
     return ok({});
   }));
   ipcMain.handle("memory_config_export", handle(() => {
-    // 导出不带 Key：apiKeyRef 自 v1.23.0 起是明文，随 JSON 外发即泄密
-    const tree = settings();
+    // 导出不带 Key：apiKeyRef 自 v1.23.0 起是明文，随 JSON 外发即泄密。
+    // settings() 返回的是 MemoryConfig 的内存缓存对象（all() 直接返回 _cache），必须深拷贝后再抹 Key——
+    // 原地改会把运行中配置的 apiKeyRef 清空，此后所有 LLM 调用取不到 Key，直到配置文件被重新读取。
+    const tree = JSON.parse(JSON.stringify(settings() || {}));
     if (tree && tree.models && Array.isArray(tree.models.providers)) {
-      tree.models = { ...tree.models, providers: tree.models.providers.map((p) => ({ ...p, apiKeyRef: "" })) };
+      tree.models.providers = tree.models.providers.map((p) => ({ ...p, apiKeyRef: "" }));
     }
     return {
       ok: true,
@@ -526,6 +550,8 @@ function register(ipcMain) {
   ipcMain.handle("memory_project_assign", handle(({ ids, slug }) => need().projectAssign(ids, slug)));
   ipcMain.handle("memory_project_suggest", handle(() => ok({ items: need().projectSuggestions() })));
   ipcMain.handle("memory_project_confirm", handle(({ id, slug }) => need().confirmSuggestion(id, slug)));
+  // 正式关联入口：选一个本地目录补全项目卡的远程/路径（不新建卡、不改 slug）
+  ipcMain.handle("memory_project_attach", handle(({ slug, dir }) => need().projectAttachPath(slug, dir)));
 
   // ===== 索引与检索 =====
   // 重建完成后随事件带上诊断快照，前端据此即时刷新健康卡，不必再猜修没修好
@@ -561,17 +587,49 @@ function register(ipcMain) {
       if (done % BATCH === 0) await yieldUi();
     }
     const pruned = need().pruneOrphans(new Set(files));
+    // 存量大小写脏数据收口：同 id 双 path（写入折小写 slug、watcher 取目录真名留下的）在这里合并成一行，
+    // project 列与项目台账一并折小写。不做的话用户升级后仍是「显示两遍 + 两张卡」，要等下一次自愈扫描
+    const caseFixed = need().normalizeCase(new Set(files));
     need().index.setMeta("lastScanAt", String(Date.now()));
     const diagnose = diagnoseSnapshot();
     emit({ type: "index", running: false, done, total: files.length, diagnose });
     // 返回值直接带诊断快照：前端不必再发一次 memory_index_diagnose（又一次全量扫描）
-    return ok({ files: files.length, pruned, failed, diagnose });
+    return ok({ files: files.length, pruned, caseFixed, failed, diagnose });
   })));
   ipcMain.handle("memory_index_rebuild", handle(() => need().withWrite(async () => {
-    emit({ type: "index", running: true, done: 0, total: need().store.walkMemoryFiles().length });
-    const r = need().rebuildIndex((p) => emit({ type: "index", running: true, ...p }));
-    emit({ type: "index", running: false, done: r.files, total: r.files, tookMs: r.tookMs, diagnose: diagnoseSnapshot() });
-    return ok(r);
+    const total = need().store.walkMemoryFiles().length;
+    emit({ type: "index", running: true, done: 0, total });
+    // 优先走 worker 建旁路库 + 事务换入：全量重建是几十秒的同步 CPU/IO，跑在主进程会把
+    // 界面、记忆中枢本地 API 与 9527 模型网关一起冻住（实测 43~56s）。worker 期间主进程
+    // 照常服务读写，只有最后的换入需要独占写（实测 ~1.5s，且是单事务）。
+    try {
+      const { rebuildInWorker, snapshotDb, checkpointWithRetry } = require("./rebuild-worker.cjs");
+      const dbFile = path.join(rootDir, "index", "memory.sqlite");
+      const sidecar = path.join(configMod.dataDir(), "memory-rebuild-sidecar.sqlite");
+      // 先把主库 WAL 落盘再复制，保证旁路库拿到的是完整快照（占用时重试后放弃，拿陈旧快照兜底）
+      checkpointWithRetry(need().index.db);
+      snapshotDb(dbFile, sidecar);
+      const r = await rebuildInWorker({
+        servicePath: __filename.replace(/index\.cjs$/, "service.cjs"),
+        root: rootDir,
+        sidecar,
+        deviceId: deviceId(),
+        onProgress: (p) => emit({ type: "index", running: true, done: p.done, total: p.total }),
+      });
+      const sw = need().swapInRebuiltIndex(sidecar);
+      try { fs.rmSync(sidecar, { force: true }); fs.rmSync(sidecar + "-wal", { force: true }); fs.rmSync(sidecar + "-shm", { force: true }); } catch {}
+      const result = { files: r.files, failed: r.failed, tookMs: r.tookMs, swapMs: sw.tookMs, mode: "worker" };
+      emit({ type: "index", running: false, done: r.files, total: r.files, tookMs: r.tookMs, diagnose: diagnoseSnapshot() });
+      return ok(result);
+    } catch (e) {
+      // 退化路径：worker 不可用（环境异常/超时熔断）时仍走主进程同步重建，保证功能不丢；
+      // 失败的旁路库（可能带着 worker 写了一半的 WAL）一并清掉，不留垃圾文件
+      try { fs.rmSync(sidecar, { force: true }); fs.rmSync(sidecar + "-wal", { force: true }); fs.rmSync(sidecar + "-shm", { force: true }); } catch {}
+      emit({ type: "index", running: true, done: 0, total, detail: `worker 重建不可用（${String(e.message || e).slice(0, 80)}），改用主进程重建` });
+      const r = need().rebuildIndex((p) => emit({ type: "index", running: true, ...p }));
+      emit({ type: "index", running: false, done: r.files, total: r.files, tookMs: r.tookMs, diagnose: diagnoseSnapshot() });
+      return ok({ ...r, mode: "inline", fallbackReason: String(e.message || e) });
+    }
   })));
   ipcMain.handle("memory_index_diagnose", handle(() => ok({ diagnose: need().diagnose(), graph: need().graphStats() })));
   ipcMain.handle("memory_index_vacuum", handle(() => need().vacuum()));
@@ -680,12 +738,13 @@ function register(ipcMain) {
     if (truncated) lines.push("", `> 超出 32MB 导出上限，省略 ${truncated} 个文件（完整备份请用「导出压缩包」）`);
     return ok({ content: lines.join("\n"), files: files.length, truncated });
   }));
-  ipcMain.handle("memory_export_zip", handle(() => {
+  ipcMain.handle("memory_export_zip", handle(async () => {
     const dir = path.join(configMod.dataDir(), "memory-export");
     fs.mkdirSync(dir, { recursive: true });
     const out = path.join(dir, `memory-backup-${new Date().toISOString().replace(/[:.]/g, "-")}.tar.gz`);
-    const { packDir } = require("../tarpack.cjs");
-    const count = packDir(rootDir, out);
+    // worker 化：整树 tar+gzip 是几十秒的同步 CPU/IO 大头，原先在主进程里做会把 UI 与模型网关一起冻住
+    const { packDirAsync } = require("../tarpack.cjs");
+    const count = await packDirAsync(rootDir, out);
     const bytes = (() => { try { return fs.statSync(out).size; } catch { return 0; } })();
     return ok({ file: out, files: count, bytes });
   }));
@@ -695,7 +754,8 @@ function register(ipcMain) {
     if (rel) {
       const candidate = path.resolve(rootDir, String(rel));
       const relToRoot = path.relative(path.resolve(rootDir), candidate);
-      if (relToRoot.startsWith("..") || path.isAbsolute(relToRoot)) return fail("路径越界：只能打开仓库目录内的路径");
+      // 只拦真正的越界段：startsWith("..") 会误伤仓库内名为 "..foo" 的合法条目
+      if (relToRoot === ".." || relToRoot.startsWith(".." + path.sep) || path.isAbsolute(relToRoot)) return fail("路径越界：只能打开仓库目录内的路径");
       target = candidate;
     }
     if (!electron || !electron.shell) return fail("当前环境不支持打开目录");

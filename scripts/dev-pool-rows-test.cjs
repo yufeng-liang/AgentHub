@@ -86,6 +86,10 @@ function buildCtx({ n, channel, builtin, expanded = [], withPackages = true }) {
     fmtInt: String, fmtK: String, fmtBalance: String, fmtDate: () => "2026-09-29", uidBrief: (u) => u,
     // 计费单位三件套（2026-09-30 逐渠道适配进模板）：桩只求绑定不炸，结构判据与文案无关
     balanceUnit: () => "积分", isTokenChannel: () => false, pkgFallbackName: () => "积分包",
+    // 上游 v1.43/v1.50 新增的两个绑定：isQoderChannel 给真谓词（结构判据要能走到 Qoder 那一支），
+    // costTierName 只求绑定不炸（成本档徽标是文案，与行列计数无关）
+    isQoderChannel: (id) => id === "qoder" || id === "qoder_intl",
+    fmtCredits: String, costTierName: () => "普通",
     coolLeft: () => 0, modelCoolLeft: () => 0, modelCoolTitle: () => "", isNeedCaptcha: () => false,
     pkgUsedPct: () => 10, pkgDaysText: () => "3天", pkgStatusCls: () => "tag-ok", pkgStatusText: () => "正常",
     renamingId: "", renameText: "", checkinBusy: false, refreshingId: "", ideSwitching: "", coolOffId: "",

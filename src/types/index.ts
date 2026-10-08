@@ -271,6 +271,8 @@ export interface ProxyConfig {
   routeStrategy: "smart" | "fixed";
   /** fixed 策略下的优先渠道（渠道 id；渠道可扩充，故为字符串） */
   fixedChannel: string;
+  /** 渠道成本感知排序：score=按打分（现状）/ cost-first=按成本档升序（免费→低成本→普通，组内按打分） */
+  routeOrder: "score" | "cost-first";
   rateLimitPerMin: number;
   concurrency: number;
   creditsRefreshMin: number;
@@ -331,8 +333,10 @@ export interface ProxyConfig {
 
 // ===== 反代网关：数据结构（跟 electron/backend/proxy/* 返回一一对应） =====
 
-/** 内置生态渠道：有 OAuth / 本机扫描 / 签到 / 号池同步这些"生态"概念（自建提供商没有） */
-export type ProxyBuiltinChannelId = "trae" | "workbuddy" | "workbuddy_ai" | "raccoon" | "cline_free" | "cline_pass" | "autoclaw" | "autoclaw_intl" | "qoder" | "zcode" | "zcode_intl";
+/** 内置生态渠道：有 OAuth / 本机扫描 / 签到 / 号池同步这些"生态"概念（自建提供商没有）
+ *  modelscope/lobster/qoder_intl 由上游 v1.47–v1.50 批次并入（qoder 与 qoder_intl 是两套独立号池，
+ *  分别对应 CN 与国际区，见 proxy/rules.cjs 的渠道配置）。 */
+export type ProxyBuiltinChannelId = "trae" | "workbuddy" | "workbuddy_ai" | "raccoon" | "cline_free" | "cline_pass" | "autoclaw" | "autoclaw_intl" | "modelscope" | "lobster" | "qoder" | "qoder_intl" | "zcode" | "zcode_intl";
 /** 渠道 id = 内置渠道 + 用户自建提供商的 slug。
  *  自建 slug 是运行期数据，编译期无从枚举，所以这里放宽成普通字符串（同 ProxyRoute 的既有做法），
  *  保留字面量联合只为了 IDE 补全。**需要"仅内置"约束的地方请用 ProxyBuiltinChannelId。** */
@@ -341,17 +345,22 @@ export type ProxyChannelId = ProxyBuiltinChannelId | (string & {});
  *  值集合与后端 provider.cjs 的 KINDS 同源，漂移由 dev-provider-test 断言守住。 */
 export type ProxyProviderKind = "openai_compat" | "anthropic_messages" | "openai_responses";
 export type ProxyChannelKind = "builtin" | ProxyProviderKind;
-
 /** Key 路由：auto 或任一渠道 id（渠道后续扩充即为普通字符串，保留字面量仅为补全提示） */
 export type ProxyRoute = "auto" | ProxyChannelId | (string & {});
 export type ProxyAccountStatus = "online" | "cooling" | "exhausted" | "relogin" | "disabled";
 export type ProxyPoolStrategy = "expire_first" | "credit_first" | "round_robin";
+/** 渠道成本档（cost-first 路由排序用；'' = 未标注按 normal 解释） */
+export type ProxyCostTier = "free" | "low" | "normal";
+/** per-key 路由策略（'' = 跟随全局） */
+export type ProxyRouteOrder = "" | "score" | "cost-first";
 
 export interface ProxyKeyRow {
   id: string;
   name: string;
   mask: string;
   route: ProxyRoute;
+  /** per-key 路由策略覆盖（'' = 跟随全局默认） */
+  routeOrder: ProxyRouteOrder;
   dailyQuota: number;
   rateLimit: number;
   enabled: boolean;
@@ -483,6 +492,8 @@ export interface ProxyChannelView {
   /** 仅 openai_compat：已归一化的上游地址（写入侧一次成型，展示与拼接同源） */
   baseUrl?: string;
   poolStrategy: ProxyPoolStrategy;
+  /** 成本档（cost-first 路由排序用；空串 = 未标注按 normal） */
+  costTier: ProxyCostTier | "";
   summary: ProxyPoolSummary;
   accounts: ProxyAccount[];
   /** 降级状态：null = 正常 */
@@ -568,6 +579,8 @@ export interface ProxyUsageRow {
   model: string;
   promptTokens: number;
   completionTokens: number;
+  cacheReadTokens?: number;
+  cacheCreationTokens?: number;
   ttftMs: number;
   latencyMs: number;
   status: number;
@@ -876,6 +889,8 @@ export type MemoryRow = {
   summary: string;
   tags: string[];
   project: string | null;
+  /** 项目显示名（后端按台账解析；slug 是机器标识，界面展示用这个） */
+  projectName?: string | null;
   agent: string;
   device?: string | null;
   session?: string | null;

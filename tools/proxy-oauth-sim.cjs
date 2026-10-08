@@ -113,7 +113,7 @@ function check(name, ok, detail) {
     `http://127.0.0.1:1/authorize?state=${encodeURIComponent(m4.state)}&login_trace_id=${encodeURIComponent(m4.traceId)}&authCodeInfo=${encodeURIComponent(JSON.stringify({ AuthCode: "some-code" }))}`,
     "trae"
   );
-  await sleep(2500);
+  await sleep(200);
   log(`  粘贴authCodeInfo形态: ${JSON.stringify(authCodeInfoForm)} onDone=${JSON.stringify(done4)}`);
   check("④ authCodeInfo 被解析并进入授权码换令牌流程", authCodeInfoForm.ok === true && done4 !== null && done4.ok === false && /HTTP|授权码|令牌/i.test(done4.message || ""));
   await discovery.cancelOAuth();

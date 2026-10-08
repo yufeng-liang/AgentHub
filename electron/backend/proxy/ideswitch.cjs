@@ -958,8 +958,23 @@ function verifyWritten(file, token, uid, beforeKeys) {
 function ideSwitchStatus() {
   const out = {
     traeInstalled: false, workbuddyInstalled: false, workbuddyAiInstalled: false, raccoonInstalled: false, zcodeInstalled: false,
+    qoderInstalled: false, qoderIntlInstalled: false, lobsterInstalled: false, modelscopeInstalled: false,
     currentUid: "", channels: {},
   };
+  // Qoder 双区安装探测：凭据文件存在即视为「已安装且已登录」
+  // （注意与「签名器可用」区分：签名还需安装目录下的 wasm，此处只驱动 UI 的导入入口）
+  // 启用门：暂停的区不上报 installed=true——否则 UI 会给出一个点进去也导不进来的入口
+  try {
+    const qoderAuth = require("./qoderAuth.cjs");
+    const qDetect = qoderAuth.detectAll();
+    const enabled = (id) => store.CHANNELS.some((c) => c.id === id);
+    out.qoderInstalled = enabled("qoder") && !!qDetect.qoder;
+    out.qoderIntlInstalled = enabled("qoder_intl") && !!qDetect.qoder_intl;
+    for (const p of ["qoder", "qoder_intl"]) {
+      const paths = qoderAuth.pathsOf(p);
+      out.channels[p] = { file: paths ? paths.authFile : "", installed: enabled(p) && !!qDetect[p], uid: "" };
+    }
+  } catch { /* 模块异常不影响其它渠道探测 */ }
   for (const [channel, name] of Object.entries(WB_AUTH_FILES)) {
     const file = path.join(discovery.wbAuthDir(), name);
     let uid = "";
@@ -1005,6 +1020,21 @@ function ideSwitchStatus() {
   } catch { /* 未安装 / 未登录 */ }
   // zcode_intl 是 fork 的薄别名渠道（同一 ZCode 客户端登录态），状态与 zcode 同源
   if (out.channels.zcode) out.channels.zcode_intl = out.channels.zcode;
+  // LobsterAI：登录走应用内回环 OAuth，**不需要本机安装官方客户端**。这里如实上报
+  // installed=true（渠道在册即「可用」，不代表本机有客户端——本机导入/写回对龙虾都不适用，
+  // 前端 ideSupported() 对 lobster 直接返回 false）。file/uid 留空以示没有本机登录态可读。
+  try {
+    const enabled = store.CHANNELS.some((c) => c.id === "lobster");
+    out.lobsterInstalled = enabled;
+    out.channels.lobster = { file: "", installed: enabled, uid: "" };
+  } catch { /* 渠道未启用 */ }
+  // ModelScope（魔搭）：与 LobsterAI 同类——**纯官方 API，不需要本机安装任何客户端**，
+  // 凭据是用户自建的 ms- 访问令牌（自助创建/吊销，长期有效）。前端 ideSupported() 返回 false。
+  try {
+    const enabled = store.CHANNELS.some((c) => c.id === "modelscope");
+    out.modelscopeInstalled = enabled;
+    out.channels.modelscope = { file: "", installed: enabled, uid: "" };
+  } catch { /* 渠道未启用 */ }
   return out;
 }
 

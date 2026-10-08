@@ -33,6 +33,28 @@ function check(name, cond, extra) {
   return false;
 }
 
+/**
+ * 跨平台的同路径判定。
+ *
+ * 为什么不能直接 `path.resolve(a) === path.resolve(b)`：resolve 只归一化分隔符，
+ * 不归一化大小写，也不解 8.3 短名 / junction / 符号链接。git 输出的是它自己的写法
+ * （实测 `git rev-parse --show-toplevel` 返回 `C:/Users/...` 正斜杠形式），而
+ * os.tmpdir()/path.join 给的是另一种；在 CI（GitHub runner）上直接比会假失败。
+ *
+ * 故：先用 realpathSync.native 取真实路径（解短名/链接/大小写），再 resolve，
+ * win32 上折叠大小写。任一步失败则退回原值，绝不让归一化本身抛异常。
+ */
+function samePath(a, b) {
+  const norm = (x) => {
+    const raw = String(x || "");
+    let r = raw;
+    try { r = fs.realpathSync.native(raw); } catch { /* 路径不存在或平台不支持：退回原名 */ }
+    r = path.resolve(r);
+    return process.platform === "win32" ? r.toLowerCase() : r;
+  };
+  return norm(a) === norm(b);
+}
+
 const fakeClient = { quirksMemo: {}, async call() { return { text: "{}", usage: { input: 1, output: 1 } }; } };
 
 async function main() {
@@ -275,6 +297,322 @@ async function main() {
   const keep = await svc.writeMemory({ title: "正常条", body: "正常记忆文件必须照常入索引，守卫不得误伤。", type: "note", project: "R" });
   svc.reindexFile(keep.path);
   check("范围内文件照常入索引", svc.index.db.prepare("SELECT COUNT(*) AS c FROM mem WHERE path = ?").get(keep.path).c >= 1, keep.path);
+
+  console.log("[P23b] 存量大小写脏行自愈（同 id 双 path / 项目卡裂开）");
+  // v1.42.1 之前 writeMemory 拼小写 slug 路径、watcher 拿目录真名，NTFS 上同一文件在索引里
+  // 留下两行只差大小写（同 id 同内容）：界面显示两遍、删一条留幽灵；项目卡也按大小写裂成两张。
+  // 这里照原样造出那两行，断言 normalizeCase 收敛成磁盘口径的一行、且用户状态不丢。
+  const cased = await svc.writeMemory({ title: "大小写脏行条", body: "同一文件在索引里留下两行只差大小写，收敛必须只留磁盘口径的一行。", type: "note", project: "AgentHub" });
+  const casedRow = svc.index.db.prepare("SELECT * FROM mem WHERE id = ?").get(cased.id);
+  const segs = casedRow.path.split("/");
+  const segIdx = segs.indexOf("agenthub") >= 0 ? segs.indexOf("agenthub") : segs.indexOf("AgentHub");
+  segs[segIdx] = segs[segIdx] === "agenthub" ? "AgentHub" : "agenthub";
+  const ghostPath = segs.join("/");
+  const cols = Object.keys(casedRow);
+  // 只给「索引独有」的状态上值：pinned/starred 在 note 类文件里以 frontmatter 为准（reindexFile 的
+  // fm.pinned 优先），拿它断言测不到合并；dup_index / dedup_status / ai_processed 只存在索引里
+  svc.index.db.prepare(`INSERT OR REPLACE INTO mem (${cols.join(",")}) VALUES (${cols.map(() => "?").join(",")})`)
+    .run(...cols.map((c) => (c === "path" ? ghostPath : c === "dup_index" ? 3 : c === "ai_processed" ? 1 : c === "dedup_status" ? "dedup-l2" : casedRow[c])));
+  svc.index.db.prepare("UPDATE mem SET project = 'AgentHub' WHERE id = ?").run(cased.id); // 历史行的 project 还留着目录真名
+  check("造出同 id 双 path 的历史状态",
+    svc.index.db.prepare("SELECT COUNT(*) AS c FROM mem WHERE id = ?").get(cased.id).c === 2, ghostPath);
+  const caseFixed = svc.normalizeCase();
+  const afterCase = svc.index.db.prepare("SELECT id, path, project, dup_index, dedup_status, ai_processed FROM mem WHERE id = ?").all(cased.id);
+  check("normalizeCase 收敛为磁盘口径一行",
+    caseFixed >= 1 && afterCase.length === 1 && afterCase[0].path === casedRow.path, JSON.stringify(afterCase));
+  check("收敛时索引独有的状态不丢（重复序号/去重结论/AI 标记）",
+    afterCase.length === 1 && afterCase[0].dup_index === 3 && afterCase[0].dedup_status === "dedup-l2" && !!afterCase[0].ai_processed,
+    JSON.stringify(afterCase[0]));
+  check("project 列折小写（项目卡条数不再裂开）", afterCase.length === 1 && afterCase[0].project === "agenthub", afterCase.length === 1 ? afterCase[0].project : "");
+  check("幂等：再跑一次零改动", svc.normalizeCase() === 0);
+  // 台账里同项目的两条大小写条目（老版本新建卡留下）：normalize 合并成一条，卡片随之只剩一张
+  const regFile = path.join(root, "projects", "_index.json");
+  const regJson = JSON.parse(fs.readFileSync(regFile, "utf8"));
+  regJson.projects.push({ slug: "AgentHub", name: "AgentHub", remotes: ["r2"], aliases: ["ah"], localPaths: [], agents: [], origin: "git", created: 2, updated: 2 });
+  fs.writeFileSync(regFile, JSON.stringify(regJson, null, 2));
+  const cardsBefore = svc.projects().projects.filter((p) => p.slug.toLowerCase() === "agenthub").length;
+  svc.registry.normalize();
+  const regAfter = JSON.parse(fs.readFileSync(regFile, "utf8")).projects.filter((p) => String(p.slug).toLowerCase() === "agenthub");
+  const cardsAfter = svc.projects().projects.filter((p) => p.slug.toLowerCase() === "agenthub");
+  check("台账大小写重复条目合并成一条", cardsBefore === 2 && regAfter.length === 1, JSON.stringify({ cardsBefore, regAfter: regAfter.map((p) => p.slug) }));
+  check("合并后卡片条数仍含该项目的记忆", cardsAfter.length === 1 && cardsAfter[0].count >= 1, JSON.stringify(cardsAfter.map((p) => ({ slug: p.slug, count: p.count }))));
+
+  console.log("[P23c] 大小写归一的三个易漏点（台账单条大写 / 链接保留 / 孪生项目合并与指派）");
+  // 1) 台账里只有一条大写 slug（没有小写孪生条目）：也要折——索引侧 reindexFile 已把 project 折成小写，
+  //    台账不折就永远对不上，卡片显示 0 条（早期实现只在「合并重复条目」时落盘，单条会被丢掉）
+  regJson.projects.push({ slug: "LegacyOnly", name: "LegacyOnly", remotes: [], aliases: [], localPaths: [], agents: [], origin: "git", created: 1, updated: 1 });
+  fs.writeFileSync(regFile, JSON.stringify(regJson, null, 2));
+  const normChanged = svc.registry.normalize();
+  const legacySlugs = JSON.parse(fs.readFileSync(regFile, "utf8")).projects.map((p) => p.slug).filter((s) => String(s).toLowerCase() === "legacyonly");
+  check("台账里单条大写 slug 也折小写", normChanged >= 1 && legacySlugs.length === 1 && legacySlugs[0] === "legacyonly", JSON.stringify({ normChanged, legacySlugs }));
+
+  // 2) 收敛同 id 双 path 时不能清掉 mem_link：removeByPath 会按 id 连带删链接，
+  //    而两条行是同一个 id —— 先重索引后删行会把刚重建的链接（相关记忆/图谱边）清空
+  const linked = await svc.writeMemory({ title: "带引用条", body: "验证收敛时相关记忆的边不被清掉。", type: "note", project: "R", refs: ["project:R", "topic:回归"] });
+  const linksOf = () => svc.index.db.prepare("SELECT COUNT(*) AS c FROM mem_link WHERE src = ?").get(linked.id).c;
+  const linkedRow = svc.index.db.prepare("SELECT * FROM mem WHERE id = ?").get(linked.id);
+  const linkCols = Object.keys(linkedRow);
+  svc.index.db.prepare(`INSERT OR REPLACE INTO mem (${linkCols.join(",")}) VALUES (${linkCols.map(() => "?").join(",")})`)
+    .run(...linkCols.map((c) => (c === "path" ? linkedRow.path.toLowerCase() : linkedRow[c])));
+  const linksBefore = linksOf();
+  svc.normalizeCase();
+  const linksAfter = linksOf();
+  check("收敛后 mem_link 不被连带清空", linksBefore > 0 && linksAfter === linksBefore, JSON.stringify({ linksBefore, linksAfter }));
+
+  // 3) 大小写孪生项目「合并到自身」必须被拦：NTFS 上 projects/AgentHub 与 projects/agenthub 是同一目录，
+  //    放过去会把目标项目的文件当残留整目录进回收站（老代码只认精确相等）
+  const twinReg = JSON.parse(fs.readFileSync(regFile, "utf8"));
+  twinReg.projects.push({ slug: "AgentHub", name: "AgentHub", remotes: [], aliases: [], localPaths: [], agents: [], origin: "git", created: 3, updated: 3 });
+  fs.writeFileSync(regFile, JSON.stringify(twinReg, null, 2));
+  const filesBeforeMerge = svc.store.walkMemoryFiles().length;
+  const twinMerge = await svc.projectMerge("AgentHub", "agenthub");
+  check("大小写孪生项目合并被拦下且不动磁盘",
+    twinMerge.ok === false && svc.store.walkMemoryFiles().length === filesBeforeMerge,
+    JSON.stringify({ twinMerge, filesBeforeMerge, filesAfter: svc.store.walkMemoryFiles().length }));
+
+  // 4) 把记忆指派到「大小写不同的同名项目」：目标路径按磁盘真名归一后应判定为原地，不得写一遍再送进回收站
+  const filesBeforeAssign = svc.store.walkMemoryFiles().length;
+  const twinAssign = await svc.projectAssign([linked.id], "R");
+  check("指派到大小写不同的同名项目不误删文件",
+    twinAssign.ok === true && twinAssign.moved === 0 && svc.store.walkMemoryFiles().length === filesBeforeAssign,
+    JSON.stringify({ twinAssign, filesBeforeAssign, filesAfter: svc.store.walkMemoryFiles().length }));
+
+  console.log("[P24] 外部编辑/全量重建保留索引态（dedup_status / dup_index / ai_processed）");
+  const kept = await svc.writeMemory({ title: "索引态继承条", body: "外部编辑与全量重建都不该把去重结论和 AI 处理标记抹掉。", type: "note", project: "R", tags: ["状态"] });
+  // 模拟事后状态：L2 判定完成、重复序号、AI 任务已处理（这些都只存在索引里，文件无对应字段位）
+  svc.index.db.prepare("UPDATE mem SET dedup_status = 'dedup-l2', dup_index = 2, ai_processed = 1 WHERE id = ?").run(kept.id);
+  svc.reindexFile(kept.path); // 单文件重建：外部编辑走这条
+  const afterSingle = svc.index.db.prepare("SELECT dedup_status, dup_index, ai_processed FROM mem WHERE id = ?").get(kept.id);
+  check("单文件重建后索引态仍在", !!afterSingle && afterSingle.dedup_status === "dedup-l2" && afterSingle.dup_index === 2 && afterSingle.ai_processed === 1, JSON.stringify(afterSingle));
+  svc.rebuildIndex(); // 全量重建：legacyRows 快照走这条
+  const afterFull = svc.index.db.prepare("SELECT dedup_status, dup_index, ai_processed FROM mem WHERE id = ?").get(kept.id);
+  check("全量重建后索引态仍在", !!afterFull && afterFull.dedup_status === "dedup-l2" && afterFull.dup_index === 2 && afterFull.ai_processed === 1, JSON.stringify(afterFull));
+  // 内容真变了就必须把旧结论作废，否则改过的正文会沿用「已去重/已处理」的结论
+  fs.appendFileSync(svc.store.abs(kept.path), "\n补充一段：外部改动的正文。\n", "utf8");
+  svc.reindexFile(kept.path);
+  const afterEdit = svc.index.db.prepare("SELECT dedup_status, ai_processed FROM mem WHERE id = ?").get(kept.id);
+  check("内容变更后去重结论与 AI 标记作废", !!afterEdit && afterEdit.dedup_status === "pending" && afterEdit.ai_processed === 0, JSON.stringify(afterEdit));
+
+  console.log("[P25] 目录名反解：深层 cwd 不再因段数上限归 general");
+  const layoutMod = require("../electron/backend/memory/layout.cjs");
+  const deepRoot = path.join(os.tmpdir(), "agenthub-deep-probe");
+  fs.rmSync(deepRoot, { recursive: true, force: true });
+  const deep = path.join(deepRoot, ..."abcdefgh".split("").map((c) => `lvl-${c}`), "repo-x");
+  fs.mkdirSync(deep, { recursive: true });
+  const encodedDeep = `${deep[0].toLowerCase()}-${deep.slice(3).split(path.sep).join("-")}`;
+  check("段数确实超过旧上限 8", encodedDeep.split("-").length - 1 > 8, String(encodedDeep.split("-").length - 1));
+  check("深层路径可反解", layoutMod.reverseSessionDirName(encodedDeep) === deep, layoutMod.reverseSessionDirName(encodedDeep));
+  // 不存在的深层路径必须返回空串：宁可不猜，也不要挂到别的项目下
+  check("不存在的深层路径仍返回空串", layoutMod.reverseSessionDirName("c-NoSuch-A-B-C-D-E-F-G-H-I-J") === "");
+  fs.rmSync(deepRoot, { recursive: true, force: true });
+
+  console.log("[P26] 项目 Git 元数据：显式项目补全 / 多远程 / 存量自愈 / 正式关联入口");
+  // 全部用临时仓库与虚构身份（example-org / upstream-org 等占位组织名），不引入任何真实账号或仓库
+  const { execFileSync } = require("child_process");
+  const git = (cwd, args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "ignore"] });
+  const repoA = path.join(os.tmpdir(), `agenthub-meta-repo-${Date.now()}`);
+  fs.rmSync(repoA, { recursive: true, force: true });
+  fs.mkdirSync(repoA, { recursive: true });
+  git(repoA, ["init", "-q"]);
+  git(repoA, ["remote", "add", "origin", "https://github.com/example-org/demo-app.git"]);
+  git(repoA, ["remote", "add", "upstream", "https://github.com/upstream-org/demo-app.git"]);
+  // ssh 与 https 指向同一仓库：归一化后必须只留一条
+  git(repoA, ["remote", "set-url", "--add", "origin", "git@github.com:example-org/demo-app.git"]);
+
+  const all = layoutMod.detectGitRemotes(repoA);
+  check("枚举全部远程（origin 优先，upstream 也在）",
+    all.length === 2 && all[0].display === "example-org/demo-app" && all.some((r) => r.display === "upstream-org/demo-app"),
+    JSON.stringify(all.map((r) => r.display)));
+  check("同一仓库的 ssh/https 两种 URL 归一化去重", all.filter((r) => r.display === "example-org/demo-app").length === 1);
+  check("兼容入口 detectGitRemote 仍取 origin", (layoutMod.detectGitRemote(repoA) || {}).display === "example-org/demo-app");
+  check("非 Git 目录返回空数组且不抛", layoutMod.detectGitRemotes(os.tmpdir()).length === 0);
+
+  // 显式项目名 + cwd：slug/名字保持显式，同时补上全部远程与 git root
+  const explicit = layoutMod.classify({ project: "DemoApp", cwd: repoA, agent: "probe" }, svc.registry, undefined);
+  const expEntry = svc.registry.get(explicit.slug);
+  check("显式项目名仍作 slug（不裂成 owner--repo 卡）", explicit.slug === "demoapp", explicit.slug);
+  check("显式项目补上全部远程", (expEntry.remotes || []).length === 2, JSON.stringify(expEntry.remotes));
+  check("显式项目补上 git root 作本地路径",
+    (expEntry.localPaths || []).some((x) => samePath(x, repoA)), JSON.stringify(expEntry.localPaths));
+  check("显式归类来源仍是 explicit", explicit.origin === "explicit");
+
+  // 不带 project：走 git 分支，slug 由远程决定，同样记全部远程
+  const auto = layoutMod.classify({ cwd: repoA, agent: "probe" }, svc.registry, undefined);
+  const autoEntry = svc.registry.get(auto.slug);
+  check("无 project 时按 origin 生成 owner--repo slug", auto.slug === "example-org--demo-app", auto.slug);
+  check("git 分支也记全部远程", (autoEntry.remotes || []).length === 2, JSON.stringify(autoEntry.remotes));
+
+  // 写记忆落 frontmatter：git 字段不再以 origin==="git" 为条件
+  const wExplicit = await svc.writeMemory({ title: "显式项目带 cwd 写入", body: "显式项目名写入也应记下 git 元数据，供项目卡与存量自愈使用。", type: "note", project: "DemoApp", cwd: repoA });
+  const fmExplicit = S.parseFrontmatter(svc.store.read(wExplicit.path)).fm;
+  check("显式项目写入的 frontmatter 带 cwd", String(fmExplicit.cwd || "").length > 0, JSON.stringify(fmExplicit.cwd));
+  check("显式项目写入的 frontmatter 带 git", String(fmExplicit.git || "").length > 0, JSON.stringify(fmExplicit.git));
+
+  // 存量自愈：手工造一个「只有 cwd/git 的旧卡」——台账空、记忆文件带元数据
+  const legacySlug = "legacy-project";
+  svc.registry.upsert({ slug: legacySlug, name: "LegacyProject", origin: "explicit" });
+  const legacyFile = path.join(root, "projects", legacySlug, "l1", "probe", "2026-01-01-legacy.md");
+  fs.mkdirSync(path.dirname(legacyFile), { recursive: true });
+  fs.writeFileSync(legacyFile, S.serializeFrontmatter({
+    id: "mem_legacy_probe", type: "note", layer: "l1", title: "存量旧卡",
+    project: legacySlug, projectName: "LegacyProject", agent: "probe", device: "dev_fix",
+    created: new Date().toISOString(), updated: new Date().toISOString(), validFrom: new Date().toISOString(),
+    tags: "probe", importance: 3, summary: "存量自愈探针", cwd: repoA, git: "example-org/demo-app",
+  }) + "\n\n存量项目卡缺远程与本地路径，应从已有 frontmatter 自愈回来。\n", "utf8");
+  svc.reindexFile(`projects/${legacySlug}/l1/probe/2026-01-01-legacy.md`);
+  const healRes = svc.reconcileProjectMetadata();
+  const healedEntry = svc.registry.get(legacySlug);
+  check("存量自愈从 frontmatter 补回远程", healRes.healed >= 1 && (healedEntry.remotes || []).includes("example-org/demo-app"), JSON.stringify({ healRes, remotes: healedEntry.remotes }));
+  check("存量自愈同时补回本地路径", (healedEntry.localPaths || []).length > 0, JSON.stringify(healedEntry.localPaths));
+  check("自愈幂等：再跑一次不再改动", svc.reconcileProjectMetadata().healed === 0);
+
+  // 只有本地路径、没有远程的卡：也应从已关联目录探到远程（早期只关联目录的场景）
+  const pathOnlySlug = "path-only-project";
+  svc.registry.upsert({ slug: pathOnlySlug, name: "PathOnly", origin: "explicit", localPaths: [repoA] });
+  const healPathOnly = svc.reconcileProjectMetadata();
+  const pathOnlyEntry = svc.registry.get(pathOnlySlug);
+  check("缺远程但有本地路径的项目也能自愈出远程",
+    healPathOnly.healed >= 1 && (pathOnlyEntry.remotes || []).length === 2, JSON.stringify({ healPathOnly, remotes: pathOnlyEntry.remotes }));
+  check("自愈保留有 origin 项目的 origin+upstream（fork 与上游都在）",
+    (() => { const r = svc.registry.get(legacySlug).remotes || []; return r.length === 2 && r.includes("example-org/demo-app") && r.includes("upstream-org/demo-app"); })(),
+    JSON.stringify(svc.registry.get(legacySlug).remotes));
+
+  // 反向缺口：有远程但缺本地路径的卡也要补齐（只补远程的写法会漏掉这一类）
+  const remoteOnlySlug = "remote-only-project";
+  svc.registry.upsert({ slug: remoteOnlySlug, name: "RemoteOnly", origin: "explicit", remotes: ["example-org/demo-app"] });
+  const remoteOnlyRel = `projects/${remoteOnlySlug}/l1/probe/2026-01-01-remote-only.md`;
+  const remoteOnlyAbs = path.join(root, remoteOnlyRel);
+  fs.mkdirSync(path.dirname(remoteOnlyAbs), { recursive: true });
+  fs.writeFileSync(remoteOnlyAbs, S.serializeFrontmatter({
+    id: "mem_remote_only", type: "note", layer: "l1", title: "有远程缺路径",
+    project: remoteOnlySlug, agent: "probe", created: new Date().toISOString(), updated: new Date().toISOString(),
+    validFrom: new Date().toISOString(), tags: "probe", importance: 3, summary: "反向缺口探针", cwd: repoA, git: "example-org/demo-app",
+  }) + "\n\n有远程但缺本地路径的项目，也应从 frontmatter 的 cwd 补回路径。\n", "utf8");
+  svc.reindexFile(remoteOnlyRel);
+  const healRemoteOnly = svc.reconcileProjectMetadata();
+  const remoteOnlyEntry = svc.registry.get(remoteOnlySlug);
+  check("有远程但缺路径的项目补回本地路径",
+    healRemoteOnly.healed >= 1 && (remoteOnlyEntry.localPaths || []).some((x) => samePath(x, repoA)),
+    JSON.stringify({ healRemoteOnly, localPaths: remoteOnlyEntry.localPaths }));
+  check("补路径时记 Git 根而非子目录", (remoteOnlyEntry.localPaths || []).length === 1, JSON.stringify(remoteOnlyEntry.localPaths));
+
+  // 正式关联入口：不新建卡、不改 slug；非 Git 目录只记路径
+  const attachTarget = svc.registry.get(legacySlug);
+  const plainDir = path.join(os.tmpdir(), `agenthub-plain-${Date.now()}`);
+  fs.mkdirSync(plainDir, { recursive: true });
+  const attachPlain = svc.projectAttachPath(legacySlug, plainDir);
+  check("关联非 Git 目录成功且如实说明不是仓库", attachPlain.ok === true && attachPlain.isRepo === false, JSON.stringify(attachPlain));
+  const attachRepo2 = svc.projectAttachPath(legacySlug, repoA);
+  const afterAttach = svc.registry.get(legacySlug);
+  check("关联 Git 仓库识别到远程", attachRepo2.ok === true && attachRepo2.isRepo === true && (attachRepo2.addedRemotes || []).length === 2, JSON.stringify(attachRepo2.addedRemotes));
+  check("关联不新建卡、slug 不变", afterAttach.slug === attachTarget.slug && svc.registry.list().filter((p) => p.slug === legacySlug).length === 1);
+  check("关联到不存在的项目被拒", svc.projectAttachPath("no-such-project", repoA).ok === false);
+  check("关联不存在的目录被拒", svc.projectAttachPath(legacySlug, path.join(os.tmpdir(), "no-such-dir-xyz")).ok === false);
+  check("关联文件而非目录被拒", svc.projectAttachPath(legacySlug, legacyFile).ok === false);
+
+  // ===== 身份只认 origin：非 origin 的 remote（upstream / 误配）不得当身份 =====
+  // 背景（实测）：某项目目录只挂了一个指向别的仓库的 upstream，旧实现「取第一个远程」会把它
+  // 当成本项目身份；slug 与 frontmatter.git 都派生自身份，判错就会把项目归到别的仓库下。
+  const upstreamOnly = path.join(os.tmpdir(), `agenthub-upstream-only-${Date.now()}`);
+  fs.rmSync(upstreamOnly, { recursive: true, force: true });
+  fs.mkdirSync(upstreamOnly, { recursive: true });
+  git(upstreamOnly, ["init", "-q"]);
+  git(upstreamOnly, ["remote", "add", "upstream", "https://github.com/other-org/unrelated.git"]);
+  check("无 origin 时身份为空（不拿 upstream 顶替）", layoutMod.detectGitRemote(upstreamOnly) === null,
+    JSON.stringify((layoutMod.detectGitRemote(upstreamOnly) || {}).display));
+  // 台账「远程仓库」列的口径：有 origin 才算身份。无 origin 时不得写入远程（否则项目卡会显示成别人的仓库）
+  check("无 origin 时台账远程为空（不把 upstream 当身份展示）",
+    layoutMod.displayRemotesFor(upstreamOnly).length === 0, JSON.stringify(layoutMod.displayRemotesFor(upstreamOnly)));
+  check("有 origin 时台账远程含 origin 与 upstream（fork + 上游都看得到）",
+    (() => { const r = layoutMod.displayRemotesFor(repoA); return r.length === 2 && r[0] === "example-org/demo-app" && r.includes("upstream-org/demo-app"); })(),
+    JSON.stringify(layoutMod.displayRemotesFor(repoA)));
+  check("有 origin 时身份就是 origin（不被其它远程抢走）",
+    (layoutMod.detectGitRemote(repoA) || {}).display === "example-org/demo-app",
+    JSON.stringify((layoutMod.detectGitRemote(repoA) || {}).display));
+  fs.rmSync(upstreamOnly, { recursive: true, force: true });
+
+  // 纠正：台账里已写入的「无 origin 远程」必须被清掉（历史污染），有 origin 的项目保留并集
+  const noOriginSlug = "no-origin-demo";
+  const noOriginDir = path.join(os.tmpdir(), `agenthub-no-origin-${Date.now()}`);
+  fs.mkdirSync(noOriginDir, { recursive: true });
+  git(noOriginDir, ["init", "-q"]);
+  git(noOriginDir, ["remote", "add", "upstream", "https://github.com/other-org/unrelated.git"]);
+  svc.registry.upsert({ slug: noOriginSlug, name: "NoOriginDemo", origin: "explicit", remotes: ["other-org/unrelated"], localPaths: [noOriginDir] });
+  svc.reconcileProjectMetadata();
+  const noOriginEntry = svc.registry.get(noOriginSlug);
+  check("自愈清掉「无 origin」项目的历史远程（不再显示成别人仓库）",
+    (noOriginEntry.remotes || []).length === 0, JSON.stringify(noOriginEntry.remotes));
+  fs.rmSync(noOriginDir, { recursive: true, force: true });
+
+  // ===== 历史脏路径必须被清除，但用户手动关联的路径不得被误删 =====
+  // 台账里的路径不天然可信：旧版本没做归属校验，会话 cwd 里的无关目录就是这么进来的
+  const dirtySlug = "dirty-paths-demo";
+  const dirtyDir = path.join(os.tmpdir(), `agenthub-dirty-${Date.now()}`);
+  const manualDir = path.join(os.tmpdir(), `agenthub-manual-${Date.now()}`);
+  fs.mkdirSync(dirtyDir, { recursive: true });
+  fs.mkdirSync(manualDir, { recursive: true });
+  // 直接写台账模拟「历史遗留」：两条路径都无归属证明，但 manualDir 被标记为用户手动关联
+  svc.registry.upsert({ slug: dirtySlug, name: "DirtyPathsDemo", origin: "explicit", localPaths: [dirtyDir, manualDir], manualPaths: [manualDir] });
+  const dirtyRes = svc.reconcileProjectMetadata();
+  const dirtyEntry = svc.registry.get(dirtySlug);
+  check("自愈清除无归属证明的历史脏路径",
+    !(dirtyEntry.localPaths || []).includes(dirtyDir), JSON.stringify({ dirtyRes, paths: dirtyEntry.localPaths }));
+  check("用户手动关联的路径不被误删",
+    (dirtyEntry.localPaths || []).some((x) => samePath(x, manualDir)), JSON.stringify(dirtyEntry.localPaths));
+  check("清除计入 pruned", dirtyRes.pruned >= 1, JSON.stringify(dirtyRes));
+  check("清完即幂等（不再每轮重写台账）", svc.reconcileProjectMetadata().healed === 0);
+  fs.rmSync(dirtyDir, { recursive: true, force: true });
+  fs.rmSync(manualDir, { recursive: true, force: true });
+
+  // ===== 过浅路径过滤：家目录 / 盘符根 / 家目录下通用目录不得当项目路径 =====
+  const home = os.homedir();
+  check("家目录本身不算项目路径", layoutMod.isProjectDirCandidate(home) === false, home);
+  check("盘符根不算项目路径", layoutMod.isProjectDirCandidate(path.parse(home).root) === false, path.parse(home).root);
+  check("家目录下的 Desktop 不算项目路径", layoutMod.isProjectDirCandidate(path.join(home, "Desktop")) === false);
+  check("普通项目目录算项目路径", layoutMod.isProjectDirCandidate(repoA) === true, repoA);
+
+  // ===== 归属证明：只记能证明属于本项目的路径（会话 cwd 可能是无关目录） =====
+  // 实测踩过：~/.dsh 与 WorkBuddy 会话目录被当成项目路径挂到卡上
+  const unrelated = path.join(os.tmpdir(), `agenthub-unrelated-${Date.now()}`);
+  fs.mkdirSync(unrelated, { recursive: true }); // 存在但非仓库、名字也不匹配
+  check("无关目录不算项目路径（名字不匹配且非本项目仓库）",
+    layoutMod.isPathForProject(unrelated, { slug: "demoapp", name: "DemoApp", aliases: [], remotes: [] }) === false, unrelated);
+  // 真实场景里项目目录名与项目名一致（如 ~/_work/my-proj ↔ 项目 my-proj）；夹具必须同样命名才测得到这条
+  const namedDir = path.join(os.tmpdir(), `proj-named-${Date.now()}`, "demo-app");
+  fs.mkdirSync(namedDir, { recursive: true });
+  check("目录名与项目名归一后相同 → 算项目路径",
+    layoutMod.isPathForProject(namedDir, { slug: "demo-app", name: "DemoApp", aliases: [], remotes: [] }) === true, namedDir);
+  check("origin 与项目远程一致 → 算项目路径（目录名可不同）",
+    layoutMod.isPathForProject(repoA, { slug: "whatever", name: "whatever", aliases: [], remotes: ["example-org/demo-app"] }) === true);
+  check("过浅路径即使名字匹配也不算",
+    layoutMod.isPathForProject(os.homedir(), { slug: path.basename(os.homedir()), name: path.basename(os.homedir()), aliases: [], remotes: [] }) === false);
+  fs.rmSync(unrelated, { recursive: true, force: true });
+  fs.rmSync(path.dirname(namedDir), { recursive: true, force: true });
+
+  // 自愈必须能**纠正**已写入的无效路径（upsert 是并集，只增不减 → 需覆盖式写）
+  const pruneSlug = "prune-demo";
+  svc.registry.upsert({ slug: pruneSlug, name: "PruneDemo", origin: "explicit", localPaths: [home, repoA] });
+  const beforePrune = svc.registry.get(pruneSlug).localPaths.slice();
+  const pruneRes = svc.reconcileProjectMetadata();
+  const afterPrune = svc.registry.get(pruneSlug).localPaths.slice();
+  check("自愈剔除家目录等过浅路径（纠正已写入的脏值）",
+    beforePrune.length === 2 && !afterPrune.includes(home) && afterPrune.some((x) => samePath(x, repoA)),
+    JSON.stringify({ beforePrune, afterPrune, pruneRes }));
+  check("纠正计入 pruned 计数", pruneRes.pruned >= 1, JSON.stringify(pruneRes));
+
+  // 手选目录也挡过浅路径：语义上它不成立，应明确拒绝而非默默记录
+  const shallowAttach = svc.projectAttachPath(pruneSlug, home);
+  check("关联家目录被拒并给出原因",
+    shallowAttach.ok === false && /过浅|项目根/.test(String(shallowAttach.message || "")),
+    JSON.stringify(shallowAttach));
+
+  // 写入路径同样过滤：以家目录为 cwd 写记忆，不得把家目录记成项目路径
+  const shallowWrite = await svc.writeMemory({ title: "家目录 cwd 写入", body: "会话可能在家目录启动，这种 cwd 不该被当成项目路径记下来。", type: "note", project: "ShallowProbe", cwd: home });
+  const shallowEntry = svc.registry.get("shallowprobe");
+  check("以家目录为 cwd 写入不记本地路径", (shallowEntry.localPaths || []).length === 0, JSON.stringify({ path: shallowWrite.path, localPaths: shallowEntry.localPaths }));
+
+  fs.rmSync(repoA, { recursive: true, force: true });
+  fs.rmSync(plainDir, { recursive: true, force: true });
 
   svc.close();
   console.log(`\n结果：${pass} 通过 / ${failCount} 失败`);

@@ -22,6 +22,18 @@ const zcodeLocal = require("./zcodeLocal.cjs");
 const zip = require("../zip.cjs");
 const secretbox = require("./secretbox.cjs");
 
+// 休眠唤醒守卫：避免唤醒瞬间逾期定时任务集中爆发（见 backend/wakeGuard.cjs 的实测说明）。
+// 本模块跑在网关子进程里，所以只用它纯逻辑的那半边（noteTick / checkinAllowed）；powerMonitor
+// 那半边由主进程 main.cjs 注入注册——wakeGuard 自身不 require("electron")，子进程 require 得到。
+const wakeGuard = require("../wakeGuard.cjs");
+/** 签到自动检查的 tick 间隔：既用于 setInterval，也作为 B（时间跳跃检测）的预期间隔 */
+const CHECKIN_TICK_MS = 60000;
+
+// ModelScope（魔搭）续期实现注入：discovery.cjs 顶部 require 了 adapters.cjs，
+// 适配器反向 require 会形成循环依赖（Node 下取到半初始化模块），故与 qoderAdapter
+// 同款处理——由编排层在这里把实现注入给适配器。
+adapters.setModelScopeRefresh(discovery.refreshModelScopeToken);
+
 // getShell 只在 2 条「留主进程」命令的**同名实现体**里被引用：proxy_open_rules_dir /
 // proxy_open_data_dir 的 openPath。这两条在主进程由 gateway-client.cjs 用真 shell 另行实现
 // （UI_LOCAL 四条之二），子进程表里的这份实现体只是命令表完整性的一部分，永远不会被派发到 ——
@@ -228,7 +240,10 @@ async function checkinBatch({ channel, accountId, action, interactive, captcha, 
     // 只有真正改了状态的 checkin/trial 才广播：status 是纯读取。广播它会让「收到 credits 就刷新」
     // 的号池页被自己触发的刷新再次唤醒，形成约 1.2 秒一轮的自激刷新循环（每轮还白打一次上游接口）
     if (act !== "status") events.emit({ type: "credits" });
-    return { ok: true, action: act, total: rows.length, okCount, rows };
+    // 渠道可声明「领取窗口未开」（Qoder 每日 Credits 10:00 UTC+8 重置）：
+    // 聚合最晚的重试时刻，供 checkinAutoTick 延后当天的自动签到
+    const deferredRetryAt = rows.reduce((n, x) => Math.max(n, (x && x.deferred && Number(x.retryAt)) || 0), 0);
+    return { ok: true, action: act, total: rows.length, okCount, rows, ...(deferredRetryAt ? { deferredRetryAt } : {}) };
   } finally {
     if (act !== "status") checkinBusy = false;
   }
@@ -239,10 +254,23 @@ async function checkinBatch({ channel, accountId, action, interactive, captcha, 
 // 重启应用后当天会再跑一次：签到/加油包都是幂等语义（already 不算失败），无害
 let checkinTimer = null;
 let lastAutoCheckinDay = "";
+// 领取窗口未开（渠道 deferred）时的延后重试时刻：窗口开放前 60s tick 直接跳过，
+// 且不标记当天已完成——否则一天一次的语义会永久错过当日窗口（Qoder 每日 10:00 UTC+8 重置）
+let autoDeferredUntil = 0;
 function checkinAutoTick() {
   try {
     const cfg = settings();
     if (!cfg.checkinAuto) return;
+    // 唤醒守卫（见 backend/wakeGuard.cjs）：
+    //   B. 先做时间跳跃检测——不依赖电源事件的兜底：睡眠期间定时器被冻结，
+    //      唤醒后本轮间隔远大于 60s，推定刚唤醒并置静默窗（必须**先于** A/C 判定调用）
+    //   A. 唤醒后 15 秒静默窗内不启动签到——否则一醒就开跑，与 Chromium 会话/GPU 恢复叠加
+    //   C. 还要求「应用已连续唤醒 ≥ 30 秒」——签到批量本身持续 20~30 秒且带抖动，
+    //      静默窗一过就开跑仍会压在用户刚开始操作的时刻上
+    // ⚠ 此处**不能**先写 lastAutoCheckinDay：直接 return 让下一轮 tick 自然重试，
+    //   否则当天签到会被永久跳过（本函数末尾才落标记）
+    wakeGuard.noteTick("checkin-auto", CHECKIN_TICK_MS);
+    if (!wakeGuard.checkinAllowed()) return;
     const now = new Date();
     const [h, m] = String(cfg.checkinAutoTime || "09:00").split(":").map((x) => Number(x) || 0);
     const planned = new Date(now);
@@ -250,15 +278,26 @@ function checkinAutoTick() {
     if (now < planned) return;
     const day = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
     if (lastAutoCheckinDay === day) return;
+    if (Date.now() < autoDeferredUntil) return;
     lastAutoCheckinDay = day;
-    checkinBatch({ action: "checkin" }).catch(() => {});
+    checkinBatch({ action: "checkin" }).then((res) => {
+      // deferred：撤销当天标记并记录重试时刻——60s tick 到点自会重跑并真正完成签到
+      if (res && res.deferredRetryAt && res.deferredRetryAt > Date.now()) {
+        lastAutoCheckinDay = "";
+        // 延后只在当天内生效：retryAt 一旦落在明天及以后（远期活动实例/字段异常），
+        // 窗口交由次日的例行签到重新评估——不让一个渠道的 deferred 停摆其它渠道好几天
+        const endOfDay = new Date(now);
+        endOfDay.setHours(24, 0, 0, 0);
+        autoDeferredUntil = Math.min(res.deferredRetryAt, endOfDay.getTime());
+      }
+    }).catch(() => {});
   } catch {
     /* 配置读取失败下轮再试 */
   }
 }
 function startCheckinAuto() {
   stopCheckinAuto();
-  checkinTimer = setInterval(checkinAutoTick, 60000);
+  checkinTimer = setInterval(checkinAutoTick, CHECKIN_TICK_MS);
 }
 function stopCheckinAuto() {
   if (checkinTimer) clearInterval(checkinTimer);
@@ -361,12 +400,15 @@ function currentLocalLogins() {
   return map;
 }
 
-// 上游 v1.38.0 在这里加了 openAuthWindow（小浣熊内嵌授权窗 + 深链网络层拦截）。刻意不合：
-// 本文件跑在网关子进程（ELECTRON_RUN_AS_NODE），require("electron") 给的是路径字符串，
-// new BrowserWindow 必抛。fork 的等价链路是 proxy_oauth_begin 只建会话、推 oauth-open 事件交
-// 主进程去开窗，discovery 那边的 helpers.openAuthWindow 因此恒缺省。
-// 代价：上游「深链不进系统浏览器、免得官方客户端消费掉一次性授权码」这条网络层拦截，
-// fork 侧还没有对应实现——要补得补在主进程的授权窗上，别补回这个文件。
+// 上游在这里实现的 openAuthWindow（Electron 沙箱授权窗）刻意不合：本文件跑在网关子进程
+// （ELECTRON_RUN_AS_NODE），require("electron") 给的是路径字符串，new BrowserWindow 必抛。
+// fork 的等价链路是 proxy_oauth_begin 只建会话、推 oauth-open 事件交主进程去开浏览器，
+// 因此 helpers.openAuthWindow 恒缺省。两条已知代价，都写了就地注释、不是漏看：
+//   ① 小浣熊：上游「深链不进系统浏览器、免得官方客户端消费掉一次性授权码」的网络层拦截没有对应实现；
+//   ② ModelScope：上游 discovery.beginModelScopeOAuth 在 openAuthWindow 缺失时**自己就降级**为
+//      系统浏览器 + 回环回调（见其函数头），OAuth 令牌与推理链路照常，只是采不到 Web 会话 Cookie，
+//      于是「点赞 / 每日登录(daily_active)」两类魔粒任务不可用、签到会如实提示缺 Cookie。
+// 要补齐得在主进程做授权窗 + 把采到的 Cookie 回传子进程，属独立改动，不塞进合并里顺手做。
 /** 号池页/状态页的渠道列表：内置 4 家 + **全部**自建提供商（含已停用）。
  *  这里刻意不用 store.channelList()——那是路由视图，只给启用中的；停用的提供商总得在界面上
  *  看得见才可能被重新打开，从视图里消失等于让用户没法把它恢复。 */
@@ -403,10 +445,14 @@ function poolView() {
       ...withPackages(a),
       liveHere: !!(localUid && a.uid && String(a.uid) === localUid),
     }));
-
+    // 上游把这条从 return 里提到局部变量（costTier 与 poolStrategy 两处都要用），
+    // fork 原来是在 return 里内联 agents.find(...)，同一意图
+    const agent = agents.find((a) => a.id === c.id) || {};
     return {
       ...c,
-      poolStrategy: (agents.find((a) => a.id === c.id) || {}).poolStrategy || "expire_first",
+      // 成本档：库内值优先（用户可能改过），空值回落 CHANNELS 种子默认
+      costTier: agent.costTier || c.costTier || "",
+      poolStrategy: agent.poolStrategy || "expire_first",
       summary,
       accounts,
       health: health[c.id] || null, // 降级状态（until/reason/streak），null=正常
@@ -523,14 +569,14 @@ function register(ipcMain) {
 
   // ===== API Keys =====
   ipcMain.handle("proxy_keys_list", handle(() => store.listKeys()));
-  ipcMain.handle("proxy_key_create", handle(({ name, route, dailyQuota, rateLimit }) => {
-    const r = store.createKey({ name, route, dailyQuota, rateLimit });
+  ipcMain.handle("proxy_key_create", handle(({ name, route, routeOrder, dailyQuota, rateLimit }) => {
+    const r = store.createKey({ name, route, routeOrder, dailyQuota, rateLimit });
     const row = store.listKeys().find((k) => k.id === r.id);
     // 完整 Key 已以 DPAPI 信封存库，列表接口随时可取（列表行内即带 secret）
     return { ...row, secret: r.secret };
   }));
-  ipcMain.handle("proxy_key_update", handle(({ id, name, route, dailyQuota, rateLimit, enabled }) => {
-    if (!store.updateKey(id, { name, route, dailyQuota, rateLimit, enabled })) return fail("Key 不存在");
+  ipcMain.handle("proxy_key_update", handle(({ id, name, route, routeOrder, dailyQuota, rateLimit, enabled }) => {
+    if (!store.updateKey(id, { name, route, routeOrder, dailyQuota, rateLimit, enabled })) return fail("Key 不存在");
     return ok({});
   }));
   ipcMain.handle("proxy_key_delete", handle(({ id }) => {
@@ -544,10 +590,26 @@ function register(ipcMain) {
     if (!store.setPoolStrategy(channel, strategy)) return fail("不支持的调度策略");
     return ok({});
   }));
+  ipcMain.handle("proxy_pool_tier", handle(({ channel, tier }) => {
+    if (!store.setAgentCostTier(channel, tier)) return fail("不支持的成本档位");
+    return ok({});
+  }));
   // 手动粘贴（方案 §2.4 三途径之一）；token 仅本地加密存储
   ipcMain.handle("proxy_account_add", handle(({ channel, name, token, refreshToken, uid }) => {
     if (!adapters.get(channel)) return fail("未知渠道");
     if (!String(token || "").trim()) return fail("请粘贴 token / JWT");
+    // ModelScope（魔搭）：凭据形态与其它渠道不同（ms- 访问令牌，非 JWT），且必须先校验
+    // 令牌有效性、并用真实用户名作 uid（否则号池去重失效、credit_first 排序错乱）。
+    // 故走专用导入路径，不做 JWT 解码。
+    if (channel === "modelscope") {
+      return discovery.importModelScopeToken(String(token).trim()).then((r) => {
+        if (!r.ok) return fail(r.message);
+        credits.refreshAccount(r.id).catch(() => {});
+        // 入池即跑一次每日任务（登录 200/绑云 50 自动 + 点赞补足）——与 OAuth 路径行为对齐
+        checkinBatch({ accountId: r.id, action: "checkin" }).catch(() => {});
+        return ok({ id: r.id, uid: r.uid, updated: r.updated, message: r.message });
+      }).catch((e) => fail(String((e && e.message) || e)));
+    }
     const clean = String(token).trim().replace(/^Cloud-IDE-JWT\s+/i, "").replace(/^Bearer\s+/i, "");
     const dec = util.jwtDecode(clean);
     const id = store.addAccount({
@@ -672,7 +734,20 @@ function register(ipcMain) {
   }));
   ipcMain.handle("proxy_oauth_cancel", handle(() => ok({ cancelled: discovery.cancelOAuth() })));
   // 浏览器没跳回回环地址时的兜底：把地址栏内容整段粘回来完成登录
-  ipcMain.handle("proxy_oauth_submit_callback", handle(({ channel, url }) => discovery.submitCallbackUrl(url, channel)));
+  ipcMain.handle("proxy_oauth_submit_callback", handle(async ({ channel, url }) => {
+    const r = await discovery.submitCallbackUrl(url, channel);
+    // LobsterAI 的「晚到回调」补交路径不经过 beginOAuth 的 onDone（会话可能已超时关闭），
+    // 故这里自行补跑「刷新余额 + 自动签到」——否则新入池账号停在 credits=0 / creditsAt=0，
+    // 会被 credit_first 策略误判为最末位（与 onDone 路径行为对齐）。
+    // 必须限定 channel：其它渠道的 submit（raccoon / zcode）内部已调 finishOAuth→onDone，
+    // 同一套副作用会被执行第二遍（重复余额请求 / 重复签到 / 重复 oauth-done 事件）。
+    if (r && r.ok && r.id && String(channel || "") === "lobster") {
+      credits.refreshAccount(r.id).catch(() => {});
+      checkinBatch({ accountId: r.id, action: "checkin" }).catch(() => {});
+      events.emit({ type: "oauth-done", channel: String(channel || ""), ok: true, id: r.id, uid: r.uid });
+    }
+    return r;
+  }));
 
   // ===== 凭据接入：粘贴 JSON / 从 JSON/ZIP 文件添加（批量，字段容忍别名） =====
   ipcMain.handle("proxy_account_import_json", handle(({ channel, json }) => {

@@ -33,6 +33,9 @@ const http = require("node:http");
 const crypto = require("node:crypto");
 const store = require("./store.cjs");
 const rules = require("./rules.cjs");
+// config：仅用其 encryptSecret（DPAPI 信封）给 ModelScope 的 Web 会话 Cookie 加密。
+// config.cjs 只依赖 node 内置模块（fs/os/path/crypto），不反向依赖本模块，无循环依赖风险。
+const config = require("../config.cjs");
 const util = require("./util.cjs");
 const adapters = require("./adapters.cjs");
 const clineAuth = require("./clineAuth.cjs");
@@ -40,6 +43,7 @@ const acCred = require("./autoclawCredentials.cjs");
 const raccoonAuth = require("./raccoonAuth.cjs");
 const zcodeLocal = require("./zcodeLocal.cjs");
 const wbCrypto = require("./wbCrypto.cjs");
+const qoderAuth = require("./qoderAuth.cjs");
 
 const OAUTH_PORT = 17388; // 首选回环端口；被占用时退到系统随机端口（授权地址里会带实际端口）
 const OAUTH_TIMEOUT_MS = 180000;
@@ -555,12 +559,66 @@ function scanAutoClaw() {
   return out;
 }
 
-/** 全量扫描（本机全渠道候选）：六渠道 = 上游四家 + fork 的 cline/autoclaw + 上游 zcode。
+/**
+ * Qoder 本机登录态扫描（qoder / qoder_intl 双区）。
+ *
+ * 凭据来源：%APPDATA%\com.qoder[.cn].app.stable\
+ *   ├─ auth.v1.dat  v10 信封（AES-256-GCM），密钥在 Local State 的 os_crypt.encrypted_key
+ *   │               （剥 "DPAPI" 魔数后 CryptUnprotectData CurrentUser）——需与客户端同一 Windows 用户
+ *   └─ ~/.qoder{,-cn}/.auth/machine_id  设备标识（签名与续期都要用，必须随账号落库）
+ *
+ * 与 WB 扫描的差异：
+ *   · 无 .logged-out 标记、无历史快照——只有当前一份凭据（多账号采集靠分时登录）
+ *   · 解密失败多为「AgentHub 与客户端不同 Windows 用户」，如实回报而非静默跳过
+ *   · 渠道启用门：未启用的区不产出候选（对齐 store.QODER_INTL_ENABLED）
+ */
+function scanQoder() {
+  const out = [];
+  for (const product of Object.keys(qoderAuth.PRODUCTS)) {
+    // 渠道启用门：暂停的区不产出候选（避免导入后无法签名的死账号）
+    if (!store.CHANNELS.some((c) => c.id === product)) continue;
+    const paths = qoderAuth.pathsOf(product);
+    if (!paths || !fs.existsSync(paths.authFile)) continue;
+    try {
+      const c = qoderAuth.readCredentials(product);
+      if (!c.token || !c.user || !c.user.id) continue;
+      out.push({
+        channel: product,
+        uid: String(c.user.id),
+        name: String(c.user.name || c.user.email || ""),
+        token: c.token,
+        refreshToken: c.refreshToken,
+        expiresAt: c.expiresAt || undefined,
+        // machineId 必须随账号入 meta：签名（QoderContext）与续期（deviceToken/refresh）都要用
+        meta: { machineId: c.machineId || "", product },
+        source: "scan",
+        file: `auth.v1.dat（${qoderAuth.PRODUCTS[product].label}）`,
+      });
+    } catch (e) {
+      // 如实回报解密失败原因（常见：与客户端不同 Windows 用户 / 未登录）
+      out.push({
+        channel: product,
+        uid: "",
+        name: "",
+        token: "",
+        refreshToken: "",
+        source: "scan",
+        encrypted: true,
+        file: `auth.v1.dat（${qoderAuth.PRODUCTS[product].label}）：${String((e && e.message) || e).slice(0, 90)}`,
+      });
+    }
+  }
+  return out;
+}
+
+/** 全量扫描（本机全渠道候选）：七路 = 上游四家 + fork 的 cline/autoclaw + 上游的 qoder 双区与 zcode。
  *  逐扫描器 try/catch：单渠道扫描抛错（如登录文件在扫描间隙被删）只跳过该渠道并留痕，
  *  不中断整轮——其余渠道的候选照常返回（与 currentLocalLogins 的单渠道隔离同一口径） */
 function scanAll() {
   const out = [];
-  for (const scan of [scanTrae, scanWorkBuddy, scanRaccoon, scanCline, scanAutoClaw, scanZcode]) {
+  // 单渠道异常只跳过该渠道：一个扫失败就让整台机器的候选列表变空，比少扫一家严重得多
+  // （上游那版是裸 spread，任一个 scan 抛错全表皆空）。scanQoder 是上游 v1.43 的双区本机扫描。
+  for (const scan of [scanTrae, scanWorkBuddy, scanRaccoon, scanCline, scanAutoClaw, scanQoder, scanZcode]) {
     try {
       out.push(...scan());
     } catch (e) {
@@ -675,6 +733,16 @@ function currentLocalLogins() {
 function importCandidate(candidate, channelOverride) {
   const channel = channelOverride || candidate.channel;
   if (!candidate.token && !candidate.refreshToken) {
+    // 各渠道的"解不开"含义不同，提示要能指向真正可执行的下一步。
+    // Qoder：原因（冒号后的部分）+ 指引（同一 Windows 用户）都给——只给技术原因用户无从下手，
+    // 只给指引又会丢掉上游的真实失败信息（例如 os_crypt 前缀异常）。
+    const isQoder = channel === "qoder" || channel === "qoder_intl";
+    if (candidate.encrypted && isQoder) {
+      const reason = String(candidate.file || "").split("：").slice(1).join("：").trim();
+      throw new Error(
+        `Qoder 登录态解密失败${reason ? `：${reason}` : ""}。请确认 AgentHub 与 Qoder 客户端以同一 Windows 用户运行，且客户端已登录`
+      );
+    }
     throw new Error(
       candidate.encrypted
         ? "该本地登录态是加密信封，离线解不开，请改用「OAuth 登录」"
@@ -813,12 +881,51 @@ function buildTraeAuthUrl(host, opts) {
   return url.toString();
 }
 
-const OK_PAGE = (text) => `<meta charset=utf-8><body style="font-family:system-ui,'Microsoft YaHei UI',sans-serif;background:#0b0d0f;color:#44e07f;display:grid;place-items:center;height:100vh;margin:0">${text}</body>`;
-const ERR_PAGE = (text) => `<meta charset=utf-8><body style="font-family:system-ui,'Microsoft YaHei UI',sans-serif;background:#0b0d0f;color:#f26d6d;display:grid;place-items:center;height:100vh;margin:0">${text}</body>`;
+/** 回调页外壳：自包含单页（无外部资源），tone=ok/err/wait 决定图标与主色。
+ *  响应头 charset 由 server 入口统一设置，页面内再放规范 <meta charset> 双保险——
+ *  旧版只写无引号 meta 且无响应头，中文环境浏览器按 GBK 解码 UTF-8 字节出乱码 */
+const oauthPageShell = (tone, title, detail, extraBodyHtml = "") => `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AgentHub 登录</title><style>
+*{box-sizing:border-box}
+body{font-family:system-ui,'Microsoft YaHei UI','PingFang SC',sans-serif;background:radial-gradient(1100px 560px at 50% -12%,rgba(68,224,127,.07),transparent 60%),#0b0d0f;color:#dfe5ea;display:grid;place-items:center;min-height:100vh;margin:0;-webkit-font-smoothing:antialiased}
+.card{background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.08);border-radius:20px;padding:42px 52px;text-align:center;max-width:520px;margin:16px;box-shadow:0 24px 70px rgba(0,0,0,.45);animation:in .5s ease both}
+@keyframes in{from{opacity:0;transform:translateY(14px) scale(.97)}to{opacity:1;transform:none}}
+.mark{width:62px;height:62px;border-radius:50%;display:grid;place-items:center;margin:0 auto 16px;font-size:30px;line-height:1;animation:pop .45s .1s cubic-bezier(.2,1.4,.4,1) both}
+.ok .mark{background:rgba(68,224,127,.12);color:#44e07f;box-shadow:0 0 0 8px rgba(68,224,127,.05)}
+.err .mark{background:rgba(242,109,109,.12);color:#f26d6d;box-shadow:0 0 0 8px rgba(242,109,109,.05)}
+h1{font-size:19px;margin:0 0 8px;font-weight:600}
+.ok h1{color:#44e07f}.err h1{color:#f26d6d}.wait h1{color:#c3ccd4}
+p{font-size:13.5px;line-height:1.9;color:#97a1ac;margin:0;max-width:400px}
+.spin{width:32px;height:32px;border-radius:50%;border:3px solid rgba(255,255,255,.1);border-top-color:#8fa0ad;animation:sp 1s linear infinite;margin:0 auto 16px}
+@keyframes sp{to{transform:rotate(360deg)}}
+</style></head><body class="${tone}"><div class="card">${tone === "wait" ? '<div class="spin"></div>' : `<div class="mark">${tone === "ok" ? "✓" : "✕"}</div>`}<h1>${title}</h1><p id="hint">${detail}</p>${extraBodyHtml}</div></body></html>`;
+
+const OK_PAGE = (text) => oauthPageShell("ok", "登录成功", String(text).replace(/^登录成功[，,]?/, ""));
+const ERR_PAGE = (text) => {
+  const s = String(text);
+  const m = s.match(/^(登录失败|授权失败)[：:]/);
+  return oauthPageShell("err", m ? m[1] : "登录失败", m ? s.slice(m[0].length) : s);
+};
 // 官方授权页登录前会先空参探测回调地址可达性，回 200 挂起页并继续等待。
 // 脚本把 fragment 里的参数（#refreshToken=…）转成 query 后自动重载——官方某些回流形态把参数放在 hash 里，
 // hash 不会发给服务器，只能靠页面脚本回捞（参考项目 callback_pending_html 同款）
-const PENDING_PAGE = `<meta charset=utf-8><body style="font-family:system-ui,'Microsoft YaHei UI',sans-serif;background:#0b0d0f;color:#97a1ac;display:grid;place-items:center;height:100vh;margin:0;text-align:center"><div id="hint" style="font-size:14px;line-height:2">正在等待授权结果…<br>请回到官方授权页完成登录，本页将自动完成回调</div><script>(function(){if(window.location.hash&&window.location.hash.length>1){var hash=window.location.hash.slice(1);window.location.replace(window.location.origin+window.location.pathname+'?'+hash);return;}document.getElementById('hint').textContent='未检测到授权参数：请回到官方授权页完成登录；若已登录仍停在本页，请复制地址栏整段链接粘回应用。';})();</script></body>`;
+const PENDING_PAGE = oauthPageShell(
+  "wait",
+  "正在等待授权结果…",
+  "请回到官方授权页完成登录，本页将自动完成回调",
+  `<script>(function(){if(window.location.hash&&window.location.hash.length>1){var hash=window.location.hash.slice(1);window.location.replace(window.location.origin+window.location.pathname+'?'+hash);return;}document.getElementById('hint').textContent='未检测到授权参数：请回到官方授权页完成登录；若已登录仍停在本页，请复制地址栏整段链接粘回应用。';})();</script>`
+);
+
+/** 响应写完的回调里再收尾会话：finishOAuth→server.close() 若与 res.end 同步连续执行，
+ *  Windows 上响应可能尚未送达就被 RST，浏览器看到的是 ERR_CONNECTION_RESET 而不是提示页。
+ *  res 缺省（手动粘贴回调兜底）时直接收尾。所有回环 OAuth 渠道共用（Trae/ModelScope）。 */
+function endPageThenFinish(res, code, html, result) {
+  if (!res) {
+    finishOAuth(result);
+    return;
+  }
+  res.statusCode = code;
+  res.end(html, () => finishOAuth(result));
+}
 
 /** 回环服务：绑定首选端口，占用则退到系统随机端口（授权地址里带的是实际端口，不写死） */
 function listenLoopback(server) {
@@ -854,18 +961,17 @@ function listenLoopback(server) {
 function validateTraeCallback(q, session) {
   const state = q.get("state");
   if (state != null && state !== "") {
-    return state === session.state ? { ok: true } : { ok: false, message: "state 校验不通过（非本次发起的授权回调）" };
+    if (state !== session.state) {
+      return { ok: false, message: "state 校验不通过（非本次发起的授权会话）" };
+    }
   }
+  // ②/③ 口径：login_trace_id 官方可能自行改写（参考项目只告警不拦截），回环地址仅本机可达，
+  // 携带凭据即放行——但 traceId 对不上时留一条告警日志，出问题时留得查
   const traceId = q.get("login_trace_id") || q.get("loginTraceID");
-  if (traceId != null && traceId !== "") {
-    return traceId === session.traceId ? { ok: true } : { ok: false, message: "login_trace_id 校验不通过（非本次发起的授权会话）" };
+  if (traceId != null && traceId !== "" && session.traceId && traceId !== session.traceId) {
+    console.warn(`[trae-oauth] login_trace_id 与本次会话不一致（${String(traceId).slice(0, 8)}…），告警放行`);
   }
-  // 既无 state 也无 traceId 时：仅放行须经 PKCE code_verifier 校验的 authCode 模式，杜绝未经授权直接注入裸 Token
-  const hasAuthCode = !!(q.get("authCode") || q.get("code") || q.get("authCodeInfo") || q.get("auth_code_info"));
-  if (hasAuthCode) {
-    return { ok: true };
-  }
-  return { ok: false, message: "安全拦截：回调缺少会话校验标识（state/login_trace_id），拒绝直接注入裸凭据" };
+  return { ok: true };
 }
 
 /** 解回调里 URL 编码的 JSON 参数（userInfo / userJwt / authCodeInfo），参考项目 parse_json_param */
@@ -914,7 +1020,7 @@ async function resolveTraeCredentials(q, session) {
     lastErr = r.message || "refreshToken 换取令牌失败";
   }
   if (authCode) {
-    const r = await exchangeTraeAuthCode(authCode, session.verifier, cbHost);
+    const r = await exchangeTraeAuthCode(authCode, session, cbHost);
     if (r.ok) return { accessToken: r.token, refreshToken: r.refreshToken, extra };
     lastErr = r.message || "授权码换取令牌失败";
   }
@@ -933,33 +1039,83 @@ function cbOrigin(host) {
   }
 }
 
-/** 授权码换令牌：CN 走 /trae/api/v3/oauth/ExchangeToken + PKCE code_verifier；回调带的 loginHost 优先 */
-async function exchangeTraeAuthCode(authCode, codeVerifier, cbHost) {
+/** 授权码换令牌：CN 走 /trae/api/v3/oauth/ExchangeToken + PKCE code_verifier + DeviceInfo；回调带的 loginHost 优先 */
+async function exchangeTraeAuthCode(authCode, sessionOrVerifier, cbHost) {
   const c = traeCfg();
-  const origins = Array.isArray(c.accountOrigins) && c.accountOrigins.length ? c.accountOrigins : ["https://api.trae.cn", "https://api.trae.com.cn"];
-  const o = cbOrigin(cbHost);
-  const candidates = [...(o ? [o] : []), ...origins.filter((x) => String(x).replace(/\/+$/, "") !== o)];
+  const session = typeof sessionOrVerifier === "object" && sessionOrVerifier !== null ? sessionOrVerifier : {};
+  const codeVerifier = typeof sessionOrVerifier === "string" ? sessionOrVerifier : (session.verifier || "");
+  const deviceId = session.deviceId || deviceFingerprint("trae:oauth").deviceId;
+  const machineId = session.machineId || deviceFingerprint("trae:oauth").machineId;
+
+  // 生成符合 EC P-256 (prime256v1) SPKI PEM 标准的设备公钥（官方客户端与 cockpit-tools 同款）
+  let devicePublicKey = "";
+  try {
+    const pair = crypto.generateKeyPairSync("ec", {
+      namedCurve: "P-256",
+      publicKeyEncoding: { type: "spki", format: "pem" },
+    });
+    devicePublicKey = pair.publicKey;
+  } catch { /* 容错 */ }
+
+  const deviceInfo = {
+    DeviceID: deviceId,
+    MachineID: machineId,
+    PlatformCode: "SOLO_PC",
+    DeviceType: "PC",
+    DeviceName: "PC",
+    DeviceModel: c.deviceBrand || "CREFG-XX",
+    ClientVersion: c.authAppVersion || "3.5.66",
+    DevicePublicKey: devicePublicKey,
+    DeviceBrand: "Microsoft",
+    DeviceCPU: "",
+    OSInfo: "windows",
+    OSVersion: c.osVersion || "Windows 11 Home China",
+  };
+
   const body = JSON.stringify({
     ClientID: c.clientId || "en1oxy7wnw8j9n",
     AuthCode: authCode,
     CodeVerifier: codeVerifier,
+    DeviceInfo: deviceInfo,
     IDEVersion: c.authAppVersion || "3.5.66",
   });
+
+  const origins = Array.isArray(c.accountOrigins) && c.accountOrigins.length ? c.accountOrigins : ["https://api.trae.cn", "https://api.trae.com.cn"];
+  const o = cbOrigin(cbHost);
+  const candidates = [...(o ? [o] : []), ...origins.filter((x) => String(x).replace(/\/+$/, "") !== o)];
+
   let lastMsg = "";
+  const paths = ["/trae/api/v3/oauth/ExchangeToken", "/cloudide/api/v3/trae/oauth/ExchangeToken"];
   for (const origin of candidates) {
-    const r = await adapters
-      .httpJson(`${String(origin).replace(/\/$/, "")}/trae/api/v3/oauth/ExchangeToken`, {
-        method: "POST",
-        headers: { "content-type": "application/json", "user-agent": c.userAgent || "TraeClient/TTNet", "x-cloudide-token": "" },
-        body,
-      })
-      .catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
-    const d = r.data && (r.data.data || r.data);
-    const token = d && (d.access_token || d.accessToken);
-    if (r.ok && token) {
-      return { ok: true, token: String(token).replace(/^Cloud-IDE-JWT\s+/i, ""), refreshToken: String((d.refresh_token || d.refreshToken) || "") };
+    for (const p of paths) {
+      const r = await adapters
+        .httpJson(`${String(origin).replace(/\/$/, "")}${p}`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "user-agent": c.userAgent || "TraeClient/TTNet",
+            "x-cloudide-token": "",
+          },
+          body,
+        })
+        .catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
+
+      const res = (r.data && (r.data.Result || r.data.result || r.data.data)) || r.data;
+      const token = res && (res.AccessToken || res.accessToken || res.Token || res.token || res.access_token);
+      const refreshToken = res && (res.RefreshToken || res.refreshToken || res.refresh_token);
+      if (r.ok && token) {
+        return {
+          ok: true,
+          token: String(token).replace(/^Cloud-IDE-JWT\s+/i, ""),
+          refreshToken: String(refreshToken || ""),
+        };
+      }
+      const errObj = r.data && r.data.ResponseMetadata && r.data.ResponseMetadata.Error;
+      const rawMsg = (errObj && (errObj.Message || errObj.message)) || (r.data && (r.data.message || r.data.msg)) || r.message || `HTTP ${r.status}`;
+      lastMsg = (rawMsg && rawMsg.includes("{__Message.field}"))
+        ? "授权码已失效或已被消费（一次性），请回到官方授权页重新登录获取新码"
+        : rawMsg;
     }
-    lastMsg = (r.data && (r.data.message || r.data.msg)) || r.message || `HTTP ${r.status}`;
   }
   return { ok: false, message: lastMsg };
 }
@@ -1217,6 +1373,173 @@ function zcodeInterstitial(c) {
   u.searchParams.set("redirect", "zcode://oauth/callback");
   u.searchParams.set("app_version", c.appVersion || "4.1.10");
   return u.toString();
+}
+
+/**
+ * Qoder 登录（PKCE 设备码轮询）—— 逆向自客户端 startDeviceFlow()，已实测端点。
+ *
+ * 与其它渠道的形态差异：
+ *   · 不需要回环端口，也不靠 state 轮询换 accessToken——它**直接轮询出完整凭据对**
+ *     { token, refresh_token }（即 dt-/drt-），一步到位，比 WB/ZCode 都简单。
+ *   · 授权页是 Qoder 官方登录页，用 oauth_callback 参数携带 PKCE 回调地址。
+ *
+ * 流程（客户端同款）：
+ *   ① verifier = 64 位随机；challenge = base64url(sha256(verifier))
+ *   ② 打开 {authBase}/users/sign-in?biz_variant=qoder&oauth_callback=<selectAccounts URL>
+ *      selectAccounts URL = {authBase}/device/selectAccounts?challenge=&challenge_method=S256
+ *                           &nonce=&machine_id=&client_id=
+ *   ③ 轮询 GET {openApi}/api/v1/deviceToken/poll?nonce=&verifier=&challenge_method=S256
+ *      · 404 = 用户还没完成登录（客户端同款分支）→ 继续等
+ *      · 200 且含 { token, refresh_token } → 成功
+ *
+ * machine_id 是签名与续期都要用的，必须在此时就取到并落库：
+ * 客户端用 native 模块生成；这里复用 qoderAuth 的读取/生成逻辑（同源同口径）。
+ */
+async function beginQoderOAuth(channel, onDone) {
+  const c = qoderAuth.PRODUCTS[channel] || qoderAuth.PRODUCTS.qoder;
+  const authBase = String(c.authBase || "https://qoder.cn").replace(/\/+$/, "");
+  const openApi = String(c.openApi || "").replace(/\/+$/, "");
+  const clientId = c.clientId || "732aef47-9cf2-46a2-95fe-4cebb5d0d1fa";
+  const bizVariant = c.authBizVariant || "qoder";
+
+  const { verifier, challenge } = pkcePair();
+  const nonce = util.uuid();
+  const machineId = qoderAuth.ensureMachineId(channel);
+
+  const selectUrl = new URL("/device/selectAccounts", authBase);
+  selectUrl.searchParams.set("challenge", challenge);
+  selectUrl.searchParams.set("challenge_method", "S256");
+  selectUrl.searchParams.set("nonce", nonce);
+  selectUrl.searchParams.set("machine_id", machineId);
+  selectUrl.searchParams.set("client_id", clientId);
+
+  const loginUrl = new URL("/users/sign-in", authBase);
+  loginUrl.searchParams.set("biz_variant", bizVariant);
+  loginUrl.searchParams.set("oauth_callback", selectUrl.toString());
+
+  const pollUrl = new URL("/api/v1/deviceToken/poll", openApi);
+  pollUrl.searchParams.set("nonce", nonce);
+  pollUrl.searchParams.set("verifier", verifier);
+  pollUrl.searchParams.set("challenge_method", "S256");
+
+  oauthSession = {
+    mode: "poll",
+    channel,
+    state: nonce,
+    onDone,
+    server: null,
+    timer: null,
+    intervalMs: 1000, // 客户端常量 V6 = 1000ms
+    deadline: Date.now() + OAUTH_TIMEOUT_MS,
+  };
+
+  const tick = async () => {
+    const session = oauthSession;
+    if (!session || session.state !== nonce) return;
+    if (Date.now() > session.deadline) {
+      finishOAuth({ ok: false, message: "登录超时（3 分钟），请重新发起" });
+      return;
+    }
+    const r = await adapters
+      .httpJson(pollUrl.toString(), { method: "GET", headers: { Accept: "application/json" } })
+      .catch(() => null);
+
+    // 404 = 尚未完成登录（客户端同款：继续轮询）。网络错误/5xx 也继续等，由 deadline 兜底。
+    if (r && r.ok && r.data && typeof r.data.token === "string" && typeof r.data.refresh_token === "string") {
+      try {
+        const saved = await saveQoderAccount(channel, {
+          token: r.data.token,
+          refreshToken: r.data.refresh_token,
+          machineId,
+        });
+        finishOAuth({ ok: true, id: saved.id, uid: saved.uid });
+      } catch (e) {
+        finishOAuth({ ok: false, message: String((e && e.message) || e) });
+      }
+      return;
+    }
+    // 明确的终局错误（非 404/408/429 的 4xx）才中止，其余继续等
+    if (r && r.status >= 400 && r.status < 500 && r.status !== 404 && r.status !== 408 && r.status !== 429) {
+      finishOAuth({ ok: false, message: `登录轮询失败（HTTP ${r.status}）` });
+      return;
+    }
+    if (oauthSession && oauthSession.state === nonce) session.timer = setTimeout(tick, session.intervalMs);
+  };
+  oauthSession.timer = setTimeout(tick, 1000);
+
+  return { ok: true, url: loginUrl.toString(), mode: "poll" };
+}
+
+/**
+ * Qoder OAuth 结果落库。
+ * 与扫描导入共用同一套字段口径（meta.machineId 必需；expires_at 落 token 到期）。
+ *
+ * 两处必须做对（实测踩出来的）：
+ *   · uid/name 需拉一次 /api/v1/userinfo——OAuth 轮询只回凭据，不含用户资料；
+ *   · 轮询响应**不含到期时间**，故紧接着调一次 refresh 换取 expires_at /
+ *     refresh_token_expires_at（顺便验证这对凭据当场可用；refresh 是轮换制，
+ *     返回的即最新一代，直接落库）。
+ */
+async function saveQoderAccount(channel, cred) {
+  const c = qoderAuth.PRODUCTS[channel] || qoderAuth.PRODUCTS.qoder;
+  let user = {};
+  try {
+    const r = await adapters.httpJson(new URL("/api/v1/userinfo", c.openApi).toString(), {
+      method: "GET",
+      headers: { Authorization: `Bearer ${cred.token}`, Accept: "application/json", "User-Agent": "Qoder" },
+    });
+    if (r && r.ok && r.data) user = r.data.user || r.data.data || r.data;
+  } catch { /* userinfo 拿不到不阻断登录：uid 缺失时下面兜底 */ }
+  const uid = String(user.id || user.user_id || user.uid || "").trim();
+  if (!uid) throw new Error("登录成功但取不到账号 uid（userinfo 不可用），请改用「从本机软件导入」");
+  const name = String(user.name || user.nickname || user.email || "").trim();
+  // userinfo 实测字段：{id, name, username, avatar, source}——**没有独立的 email 字段**，
+  // 邮箱是塞在 name 里的（如 "user@example.com"）。故 name 含 @ 时同时当作邮箱记录，
+  // 与其它渠道的 meta.email 口径保持一致（UI 会优先显示邮箱）。
+  const email = String(user.email || (name.includes("@") ? name : ""));
+
+  // 用 refresh 换取到期时间（轮询响应没有这两个字段）。
+  // 失败不阻断登录：没有到期时间的账号仍可用，只是临期预刷新与 PoolSync 仲裁少了依据。
+  let token = cred.token;
+  let refreshToken = cred.refreshToken;
+  let expiresAt = 0;
+  let refreshTokenExpiresAt = 0;
+  try {
+    const rr = await qoderAuth.refreshDeviceToken(channel, refreshToken, cred.machineId);
+    if (rr && rr.ok) {
+      token = rr.token || token;
+      refreshToken = rr.refreshToken || refreshToken;
+      expiresAt = rr.expiresAt || 0;
+      refreshTokenExpiresAt = rr.refreshTokenExpiresAt || 0;
+    }
+  } catch { /* 拿不到到期时间不影响入池 */ }
+
+  const existing = store.listAccounts(channel).find((a) => a.uid === uid);
+  const meta = { machineId: cred.machineId, product: channel, email, avatar: String(user.avatar || "") };
+  if (existing) {
+    const oldMeta = readAccountMeta(existing.id);
+    store.updateAccount(existing.id, {
+      token,
+      refreshToken,
+      expiresAt: expiresAt || undefined,
+      meta: { ...oldMeta, ...meta },
+      status: "online",
+      coolUntil: 0,
+      coolReason: "",
+    });
+    return { id: existing.id, uid, updated: true };
+  }
+  const id = store.addAccount({
+    channel,
+    uid,
+    name,
+    token,
+    refreshToken,
+    source: "oauth",
+    expiresAt: expiresAt || undefined,
+    meta,
+  });
+  return { id, uid, updated: false };
 }
 
 async function beginZcodeOAuth(channel, onDone) {
@@ -1551,6 +1874,7 @@ async function beginTraeOAuth(channel, onDone) {
   const fp = deviceFingerprint(`${channel}:${state}`);
 
   const server = http.createServer((req, res) => {
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
     const u = new URL(req.url || "/", "http://127.0.0.1");
     if (u.pathname !== "/authorize") {
       res.statusCode = 404;
@@ -1571,28 +1895,21 @@ async function beginTraeOAuth(channel, onDone) {
     if (errParam) {
       const desc = q.get("error_description") || q.get("error_desc") || q.get("errorDescription") || q.get("message") || "";
       const msg = desc ? `授权失败：${errParam}（${desc}）` : `授权失败：${errParam}`;
-      if (res) {
-        res.statusCode = 400;
-        res.end(ERR_PAGE(msg));
-      }
-      finishOAuth({ ok: false, message: msg });
-      return;
+      endPageThenFinish(res, 400, ERR_PAGE(msg), { ok: false, message: msg });
+      return { ok: false, message: msg };
     }
     if (q.get("isRedirect") === "false" || q.get("is_redirect") === "false") {
-      if (res) {
-        res.statusCode = 400;
-        res.end(ERR_PAGE("回调参数 isRedirect=false：授权未完成，请回到官方页完成登录"));
-      }
-      finishOAuth({ ok: false, message: "回调参数 isRedirect=false，授权未完成" });
-      return;
+      const msg = "回调参数 isRedirect=false：授权未完成，请回到官方页完成登录";
+      endPageThenFinish(res, 400, ERR_PAGE(msg), { ok: false, message: msg });
+      return { ok: false, message: msg };
     }
-    const hasCred = ["accessToken", "access_token", "refreshToken", "refresh_token", "authCode", "auth_code", "authCodeInfo", "auth_code_info", "code", "token"].some((k) => q.get(k));
+    const hasCred = ["accessToken", "access_token", "refreshToken", "refresh_token", "userJwt", "user_jwt", "UserJwt", "userInfo", "user_info", "authCode", "auth_code", "authCodeInfo", "auth_code_info", "code", "token"].some((k) => q.get(k));
     if (!hasCred) {
       // 官方授权页在用户登录前会先空参探测回调地址可达性（参考项目实证）：
       // 回 200 挂起页继续等待，绝不能按失败处理——老实现在这里报错并结束会话，
       // 登录完成后真正的回调打进来时服务器已经关了，「登录后无法回调」就是这么来的
       if (res) res.end(PENDING_PAGE);
-      return;
+      return { ok: true, pending: true };
     }
     // 校验只挡明确的外来请求；不通过只拒绝本次请求、不结束会话
     const v = validateTraeCallback(q, session);
@@ -1601,17 +1918,17 @@ async function beginTraeOAuth(channel, onDone) {
         res.statusCode = 400;
         res.end(ERR_PAGE(`登录失败：${v.message}`));
       }
-      return;
+      return { ok: false, message: v.message };
     }
     try {
       const cred = await resolveTraeCredentials(q, session);
       const r = await saveTraeAccount(cred.accessToken, cred.refreshToken, session.channel, cred.extra);
-      if (res) res.end(OK_PAGE("登录成功，已加入 Trae 号池，可关闭本页"));
-      finishOAuth({ ok: true, id: r.id, uid: r.uid });
+      endPageThenFinish(res, 200, OK_PAGE("登录成功，已加入 Trae 号池，可关闭本页"), { ok: true, id: r.id, uid: r.uid });
+      return { ok: true, id: r.id, uid: r.uid };
     } catch (e) {
       const msg = String((e && e.message) || e);
-      if (res) res.end(ERR_PAGE(`登录失败：${msg}`));
-      finishOAuth({ ok: false, message: msg });
+      endPageThenFinish(res, 200, ERR_PAGE(`登录失败：${msg}`), { ok: false, message: msg });
+      return { ok: false, message: msg };
     }
   };
 
@@ -1638,6 +1955,8 @@ async function beginTraeOAuth(channel, onDone) {
     state,
     traceId,
     verifier,
+    deviceId: fp.deviceId,
+    machineId: fp.machineId,
     server,
     host,
     callbackUrl,
@@ -1650,8 +1969,7 @@ async function beginTraeOAuth(channel, onDone) {
       if (!q) return { ok: false, message: "无法解析回调地址：请整段复制浏览器地址栏内容（需包含 refreshToken / authCode 等参数）" };
       const v = validateTraeCallback(q, oauthSession);
       if (!v.ok) return { ok: false, message: v.message };
-      await handleTraeCallback(q, null);
-      return { ok: true };
+      return await handleTraeCallback(q, null);
     },
   };
   return { ok: true, url, mode: "loopback", port, host };
@@ -1662,7 +1980,7 @@ async function beginTraeOAuth(channel, onDone) {
 function parseCallbackInput(raw) {
   const text = String(raw || "").trim();
   if (!text) return null;
-  const CRED_KEYS = ["accessToken", "access_token", "refreshToken", "refresh_token", "authCode", "auth_code", "authCodeInfo", "code", "token"];
+  const CRED_KEYS = ["accessToken", "access_token", "refreshToken", "refresh_token", "userJwt", "user_jwt", "UserJwt", "userInfo", "user_info", "authCode", "auth_code", "authCodeInfo", "code", "token"];
   const fromQuery = (qs) => {
     const q = new URLSearchParams(qs);
     return CRED_KEYS.some((k) => q.get(k)) ? q : null;
@@ -2172,6 +2490,656 @@ function finishOAuth(result) {
   } catch { /* 回调里的异常不吞掉登录结果 */ }
 }
 
+// ===== LobsterAI（网易有道龙虾）：官方回环 OAuth（无需安装客户端） =====
+// 官方登录页形态：{portal}/portal#/login?source=electron&redirect_uri=http://127.0.0.1:<port>/auth/callback&state=<state>
+// 登录成功 → 前端导航到 redirect_uri 并带 ?code=…&state=… → 本进程用 code 调
+// POST /api/auth/exchange 换 accessToken/refreshToken（实测协议，参考实现 login 工具同款）。
+// 因为回调地址就是本机回环、授权码由 AgentHub 自己消费，所以不依赖官方客户端在场。
+
+/** LobsterAI 配置（headers.json.lobster） */
+function lobsterCfg() {
+  return rules.get("headers.json").lobster || {};
+}
+
+/**
+ * 解析 LobsterAI 账号 uid（按优先级，**绝不使用 yid**）。
+ *
+ * 实测字段形态（2026-10-05）：
+ *   user.userId = "100001"（数字 uid，权威）
+ *   user.yid    = "urs-phoneyd.<hash>@163.com"（邮箱标识，**不是 uid**）
+ *   JWT payload = { sub: "100001", ... }（兜底来源）
+ *
+ * 为什么单独抽函数：uid 是号池去重（同 uid 复用行）与 credit_first 排序的依据。
+ * 早期实现把 yid 也列进候选，userId 缺失时会退化成邮箱字符串——同一账号被判成
+ * 不同号、反复登录生成重复行，且排序把邮箱当余额主体。宁可为空（上层拒绝落库），
+ * 也不能拿语义错误的字段顶替。
+ */
+function resolveLobsterUid(user, token) {
+  const u = user || {};
+  const cand = [u.userId, u.id, u.uid];
+  for (const v of cand) {
+    const s = v == null ? "" : String(v).trim();
+    if (s && /^\d+$/.test(s)) return s; // uid 实测恒为纯数字
+  }
+  // 非数字候选（个别形态可能给非数字 id）也接受，但排除邮箱形态的 yid
+  for (const v of cand) {
+    const s = v == null ? "" : String(v).trim();
+    if (s && !s.includes("@")) return s;
+  }
+  const dec = util.jwtDecode(String(token || ""));
+  const fromJwt = String(dec.uid || (dec.payload && (dec.payload.sub || dec.payload.uid)) || "").trim();
+  return fromJwt && !fromJwt.includes("@") ? fromJwt : "";
+}
+
+/**
+ * 已签发 state 宽限表：state → { sess, at }
+ *
+ * 为什么需要：回环 OAuth 的会话有超时（3 分钟），但**用户在浏览器里完成登录的时间不可控**。
+ * 会话超时关闭后，浏览器才带着 ?code=…&state=… 回调回来 —— 旧实现因「当前无会话」或
+ * 「state 与当前会话不符」直接丢弃，而那个授权码其实**仍然有效**（实测：回调晚到数分钟后
+ * 仍能成功 exchange），于是用户看到「登录失败」却白跑一趟，只能重来。
+ *
+ * 安全边界不变：只接受**本进程生成过的** state（128 位随机，不可猜），故 CSRF 防护仍然成立；
+ * 宽限表只是把「必须正在进行的会话」放宽为「近期由我们发起过的会话」。
+ * 成功兑换后立即删除该 state（配合授权码本身的一次性语义，双重防重放）。
+ */
+const lobsterIssuedStates = new Map();
+const LOBSTER_STATE_TTL_MS = 30 * 60 * 1000;
+
+/** 记录本次签发的 state（带 TTL 清理，防长期运行后 Map 无限增长） */
+function rememberLobsterState(state, sess) {
+  const now = Date.now();
+  for (const [k, v] of lobsterIssuedStates) {
+    if (now - v.at > LOBSTER_STATE_TTL_MS) lobsterIssuedStates.delete(k);
+  }
+  lobsterIssuedStates.set(String(state), { sess, at: now });
+}
+
+/** 按 state 取回会话上下文（当前活动会话优先，其次宽限表） */
+function resolveLobsterSession(state) {
+  const s = String(state || "");
+  if (!s) return null;
+  if (oauthSession && oauthSession.channel === "lobster" && oauthSession.state === s) {
+    return { sess: oauthSession.sess, live: true };
+  }
+  const hit = lobsterIssuedStates.get(s);
+  if (!hit) return null;
+  if (Date.now() - hit.at > LOBSTER_STATE_TTL_MS) {
+    lobsterIssuedStates.delete(s);
+    return null;
+  }
+  return { sess: hit.sess, live: false };
+}
+
+/**
+ * 授权码换令牌：POST /api/auth/exchange（body 带 keyfrom 载荷，无需 Bearer） */
+async function exchangeLobsterAuthCode(code, sess) {
+  const c = lobsterCfg();
+  const body = JSON.stringify({
+    authCode: String(code || ""),
+    firstKeyfrom: sess.firstKeyfrom,
+    latestKeyfrom: String(Date.now()),
+    uuid: sess.uuid,
+    version: "0.1.0",
+  });
+  const r = await adapters
+    .httpJson(c.exchangeUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json",
+        "user-agent": `${c.clientName || "LobsterAI"}/${c.clientVersion || "0.1.0"}`,
+      },
+      body,
+    })
+    .catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
+  const code0 = Number((r.data && r.data.code) ?? (r.ok ? 0 : -1));
+  const d = (r.data && (r.data.data || r.data)) || null;
+  const token = d && (d.accessToken || d.access_token);
+  // token 必须是**非空字符串**：String(undefined) 会得到字面量 "undefined"（truthy），
+  // 能穿过 `&& token` 判定并被当作有效凭据落库（实测踩到：空凭据入池、uid 全空）
+  if (r.ok && code0 === 0 && typeof token === "string" && token.trim()) {
+    const user = (d && d.user) || {};
+    const expiresIn = Number(d.expiresIn || d.expires_in) || 0;
+    // uid 口径（按优先级，**绝不用 yid**）：user.userId（数字 uid）> user.id > JWT sub/uid。
+    // yid 实测是 "urs-phoneyd.<hash>@163.com" 形态的**邮箱标识**，不是 uid——
+    // 拿它当 uid 会污染号池去重与排序（同一账号被判成不同号、反复登录生成重复行）。
+    const uid = resolveLobsterUid(user, token);
+    return {
+      ok: true,
+      token: String(token),
+      refreshToken: String((d.refreshToken || d.refresh_token) || ""),
+      expiresAt: expiresIn > 0 ? Date.now() + expiresIn * 1000 : (util.jwtDecode(String(token)).exp || 0) * 1000,
+      uid,
+      name: String(user.nickname || user.name || ""),
+      youdaoUserId: String(user.userId || ""),
+      // exchange 响应自带 quota（实测含 freeCreditsRemaining / freeCreditsUsed）——顺手带回，
+      // 调用方可选用于首屏余额，省一次查询
+      quota: (d && d.quota) || null,
+    };
+  }
+  return {
+    ok: false,
+    message: (r.data && (r.data.message || r.data.msg)) || r.message || `授权码换取令牌失败（HTTP ${r.status || 0}）`,
+  };
+}
+
+/** 落库：同渠道同 uid 已存在则更新凭据（重复登录/回调重放不产生重复行）。
+ *  meta 存 uuid/keyfrom（刷新令牌时服务端要求回传），缺失会导致 refresh 被拒 */
+function saveLobsterAccount(ex, sess) {
+  const uid = String(ex.uid || "").trim();
+  // uid 缺失一律拒绝落库：空 uid 会让去重查找（find(a => a.uid === uid)）恒不命中，
+  // 同一账号反复登录生成重复行；credit_first 排序也会把空 uid 当独立号参与调度。
+  // 实测踩到过：授权码被重复消费时 exchange 返回 200 但 user 为空，脏记录就这样进了号池。
+  if (!uid) return { ok: false, message: "授权码换取成功但未能解析账号 uid，已拒绝入池（请重新登录）" };
+  const existing = store.listAccounts("lobster").find((a) => a.uid === uid);
+  const meta = {
+    uuid: sess.uuid,
+    firstKeyfrom: sess.firstKeyfrom,
+    latestKeyfrom: String(Date.now()),
+    ...(ex.youdaoUserId ? { youdaoUserId: ex.youdaoUserId } : {}),
+  };
+  if (existing) {
+    store.updateAccount(existing.id, {
+      token: ex.token,
+      refreshToken: ex.refreshToken,
+      expiresAt: ex.expiresAt || 0,
+      status: "online",
+      coolUntil: 0,
+      coolReason: "",
+      meta: { ...(existing.meta || {}), ...meta },
+    });
+    return { ok: true, id: existing.id, uid };
+  }
+  const id = store.addAccount({
+    channel: "lobster",
+    uid,
+    name: ex.name || `龙虾 ${String(uid).slice(-6)}`,
+    token: ex.token,
+    refreshToken: ex.refreshToken,
+    source: "oauth",
+    expiresAt: ex.expiresAt || 0,
+    meta,
+  });
+  return { ok: true, id, uid };
+}
+
+/**
+ * LobsterAI 回环 OAuth：起本地回调服务器，把官方登录页交给系统浏览器打开，
+ * 登录完成后回调 http://127.0.0.1:<port>/auth/callback?code=…&state=…，就地换令牌入池。
+ * 与 Trae 流程同构（都走 listenLoopback + 回环 HTTP 回调），差别只在换令牌的端点与 body。
+ */
+async function beginLobsterOAuth(channel, onDone) {
+  const c = lobsterCfg();
+  const state = crypto.randomBytes(16).toString("hex");
+  const sess = {
+    uuid: crypto.randomUUID(),
+    firstKeyfrom: String(Date.now()),
+  };
+
+  const server = http.createServer((req, res) => {
+    const u = new URL(req.url || "/", "http://127.0.0.1");
+    if (u.pathname !== "/auth/callback") {
+      res.statusCode = 404;
+      res.end("not found");
+      return;
+    }
+    handleLobsterCallback(u.searchParams, res);
+  });
+
+  const handleLobsterCallback = async (q, res) => {
+    const session = oauthSession;
+    // 官方页主动报错（优先判定，与会话是否还在无关）
+    const errParam = q.get("error") || q.get("error_code") || q.get("errorCode");
+    if (errParam) {
+      const desc = q.get("error_description") || q.get("message") || "";
+      const msg = desc ? `授权失败：${errParam}（${desc}）` : `授权失败：${errParam}`;
+      if (res) {
+        res.statusCode = 400;
+        res.end(ERR_PAGE(msg));
+      }
+      finishOAuth({ ok: false, message: msg });
+      return;
+    }
+    // state 解析：**当前活动会话优先，其次已签发宽限表**。
+    // 放宽的原因见 lobsterIssuedStates 注释（会话超时后回调才到，授权码仍然有效）。
+    const gotState = q.get("state");
+    const resolved = resolveLobsterSession(gotState);
+    if (!resolved) {
+      // state 缺失或不认识：既非本次活动、也不在宽限表内 → 按外来请求拒绝（CSRF 防护）
+      const msg = gotState
+        ? "state 校验不通过（非本应用发起的授权回调，或已超过 30 分钟宽限期）"
+        : "回调缺少 state 参数，拒绝处理（无法确认是本应用发起的授权）";
+      if (res) {
+        res.statusCode = 400;
+        res.end(ERR_PAGE(msg));
+      }
+      return;
+    }
+    const sess = resolved.sess;
+    const code = q.get("code") || q.get("authCode") || q.get("auth_code");
+    if (!code) {
+      // 登录前官方可能先空参探测回调可达性：挂起等待，绝不能按失败处理
+      if (res) res.end(PENDING_PAGE);
+      return;
+    }
+    try {
+      const ex = await exchangeLobsterAuthCode(code, sess);
+      if (!ex.ok) throw new Error(ex.message);
+      const r = saveLobsterAccount(ex, sess);
+      // saveLobsterAccount 在 uid 解析失败时返回 ok:false（不落脏记录）——如实回报，
+      // 不能当成成功（否则用户看到「登录成功」而号池里什么都没有）
+      if (!r.ok) throw new Error(r.message);
+      // 兑换成功即作废该 state（配合授权码一次性语义，双重防重放）
+      if (gotState) lobsterIssuedStates.delete(String(gotState));
+      if (res) res.end(OK_PAGE("登录成功，已加入 LobsterAI 号池，可关闭本页"));
+      // 晚到的回调（会话已关）不再有 onDone 消费者，直接落库即可
+      if (resolved.live) finishOAuth({ ok: true, id: r.id, uid: r.uid });
+      else if (session && session.onDone) session.onDone({ ok: true, id: r.id, uid: r.uid });
+    } catch (e) {
+      const msg = String((e && e.message) || e);
+      if (res) res.end(ERR_PAGE(`登录失败：${msg}`));
+      if (resolved.live) finishOAuth({ ok: false, message: msg });
+    }
+  };
+
+  let port;
+  try {
+    port = await listenLoopback(server);
+  } catch (e) {
+    return { ok: false, message: `回环端口监听失败：${(e && e.message) || e}` };
+  }
+  const callbackUrl = `http://127.0.0.1:${port}/auth/callback`;
+  const portal = String(c.loginPortal || "https://lobsterai.youdao.com").replace(/\/+$/, "");
+  // 官方门户登录页：redirect_uri 必须是本机回环地址，否则官方拒绝
+  const url = `${portal}/portal#/login?source=electron&redirect_uri=${encodeURIComponent(callbackUrl)}&state=${state}`;
+
+  // 登记本次签发的 state：会话超时后回调才到时，仍能凭此认出「这是我们发起的授权」
+  // 并完成兑换（否则授权码白费、用户得重来）。安全边界见 lobsterIssuedStates 注释。
+  rememberLobsterState(state, sess);
+
+  oauthSession = {
+    mode: "loopback",
+    channel,
+    state,
+    sess,
+    server,
+    callbackUrl,
+    onDone,
+    timer: setTimeout(() => finishOAuth({ ok: false, message: "登录超时（3 分钟）" }), OAUTH_TIMEOUT_MS),
+    // 手动粘贴回调地址兜底（浏览器没跳回回环地址、或会话已超时后想补交回调时用）。
+    // 不再要求「必须有进行中的会话」——state 若在宽限表内，晚到的回调同样能兑换。
+    submit: async (rawInput) => {
+      const q = parseCallbackInput(rawInput);
+      if (!q) return { ok: false, message: "无法解析回调地址：请整段复制浏览器地址栏内容（需包含 code 与 state）" };
+      const hasState = q.get("state");
+      if (!hasState) return { ok: false, message: "回调地址缺少 state 参数，无法确认是本应用发起的授权" };
+      if (!resolveLobsterSession(hasState)) {
+        return { ok: false, message: "该回调不属于本应用发起的登录（state 不认识或已超过 30 分钟宽限期）" };
+      }
+      await handleLobsterCallback(q, null);
+      return { ok: true };
+    },
+  };
+  return { ok: true, url, mode: "loopback", port, host: portal };
+}
+
+/**
+ * ===== ModelScope（魔搭）OAuth 2.0 + OIDC =====
+ *
+ * 与其它渠道的本质差异：**没有客户端**，且官方提供完整的 OAuth 2.0 + OIDC
+ * （元数据 /.well-known/openid-configuration 实测 200）。凭据链设计为双轨：
+ *
+ *   主路径 OAuth：动态注册（RFC 7591）拿 client_id/secret → 回环回调换 access/refresh
+ *   兜底路径   ：用户自建 ms- 访问令牌（粘贴入池，见 saveModelScopeAccount）
+ *
+ * 实测关键约束（2026-10-06，全部真实调用验证）：
+ *   ① POST /oauth/register 只需 {client_name, redirect_uris} 即返回 client_id/client_secret，
+ *      **无需鉴权** → 可全自动注册，用户零操作（只需在授权页点一次「授权」）
+ *   ② access_token 前缀 `ms_oauth`、475 字符、expires_in=2592000（30 天）
+ *   ③ refresh_token **一次性轮换**：续期成功返回新 refresh，旧的再用得 invalid_grant
+ *      → 续期后必须立即持久化新 refresh（否则下次续期失败）
+ *   ④ OAuth 错误以 **HTTP 200 + body.error** 返回（invalid_grant / invalid_client 等）
+ *      → 判成败必须查 body.error，绝不能只看 HTTP 状态码
+ *   ⑤ scope 含 api-inference 时，OAuth token 可直接调 api-inference 与 magicubes（实测均 200）
+ */
+function modelscopeCfg() {
+  return rules.get("headers.json").modelscope || {};
+}
+
+/** 动态注册互联应用（RFC 7591）。返回 {ok, clientId, clientSecret, message} */
+async function registerModelScopeApp(redirectUri, name) {
+  const c = modelscopeCfg();
+  const body = JSON.stringify({
+    client_name: String(name || "AgentHub").slice(0, 60),
+    redirect_uris: [redirectUri],
+    grant_types: ["authorization_code", "refresh_token"],
+    response_types: ["code"],
+    token_endpoint_auth_method: "client_secret_post",
+    scope: c.oauthScopes || "openid profile api-inference",
+  });
+  const r = await adapters.httpJson(c.oauthRegisterUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json", "user-agent": c.userAgent || "AgentHub" },
+    body,
+  }).catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
+  if (!r.ok || !r.data || !r.data.client_id || !r.data.client_secret) {
+    return { ok: false, message: `互联应用动态注册失败：HTTP ${r.status || 0}${r.data && r.data.error ? " " + r.data.error : ""}${r.message ? " " + r.message : ""}` };
+  }
+  return { ok: true, clientId: String(r.data.client_id), clientSecret: String(r.data.client_secret) };
+}
+
+/**
+ * 授权码换令牌（POST /oauth/token，client_secret_post）。
+ * ⚠ 上游 OAuth 错误以 **HTTP 200 + body.error** 返回——必须查 body.error，
+ *   只看状态码会把 invalid_grant 误判为成功（本实现初版即踩此坑）。
+ */
+async function exchangeModelScopeCode(code, sess) {
+  const c = modelscopeCfg();
+  const form = new URLSearchParams({
+    grant_type: "authorization_code",
+    code: String(code),
+    redirect_uri: String(sess.redirectUri),
+    client_id: String(sess.clientId),
+    client_secret: String(sess.clientSecret),
+  }).toString();
+  const r = await adapters.httpJson(c.oauthTokenUrl, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json", "user-agent": c.userAgent || "AgentHub" },
+    body: form,
+  }).catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
+  const d = r.data || {};
+  // 先查 body.error（OAuth 规范：错误体带 error / error_description）
+  if (d.error) {
+    return { ok: false, message: `换取令牌被拒：${d.error}${d.error_description ? "（" + d.error_description + "）" : ""}` };
+  }
+  if (!r.ok || !d.access_token) {
+    return { ok: false, message: `换取令牌失败：HTTP ${r.status || 0}${r.message ? " " + r.message : ""}` };
+  }
+  // 取身份：OAuth 场景用 userinfo.sub（最稳）；username 作展示名
+  const ui = await adapters.httpJson(c.oauthUserinfoUrl, {
+    method: "GET",
+    headers: { authorization: `Bearer ${d.access_token}`, accept: "application/json", "user-agent": c.userAgent || "AgentHub" },
+  }).catch(() => ({ ok: false, data: null }));
+  const info = (ui && ui.data) || {};
+  const uid = String(info.sub || "").trim();
+  return {
+    ok: true,
+    token: String(d.access_token),
+    refreshToken: String(d.refresh_token || ""),
+    expiresAt: d.expires_in ? Date.now() + Number(d.expires_in) * 1000 : 0,
+    uid,
+    name: String(info.nickname || info.username || "").trim() || (uid ? `魔搭 ${uid.slice(-6)}` : ""),
+    scope: String(d.scope || ""),
+  };
+}
+
+/** 令牌续期（refresh_token grant）。⚠ 一次性轮换：成功后必须把新 refresh 落库 */
+async function refreshModelScopeToken(clientId, clientSecret, refreshToken) {
+  const c = modelscopeCfg();
+  const form = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: String(refreshToken),
+    client_id: String(clientId),
+    client_secret: String(clientSecret),
+  }).toString();
+  const r = await adapters.httpJson(c.oauthTokenUrl, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json", "user-agent": c.userAgent || "AgentHub" },
+    body: form,
+  }).catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
+  const d = r.data || {};
+  if (d.error) return { ok: false, message: `续期被拒：${d.error}${d.error_description ? "（" + d.error_description + "）" : ""}` };
+  if (!r.ok || !d.access_token) return { ok: false, message: `续期失败：HTTP ${r.status || 0}${r.message ? " " + r.message : ""}` };
+  return {
+    ok: true,
+    token: String(d.access_token),
+    // 轮换：新 refresh 可能缺省（部分实现复用旧的）——缺省时保留原值
+    refreshToken: String(d.refresh_token || refreshToken),
+    rotated: !!(d.refresh_token && d.refresh_token !== refreshToken),
+    expiresAt: d.expires_in ? Date.now() + Number(d.expires_in) * 1000 : 0,
+  };
+}
+
+/**
+ * ModelScope 账号落库（双轨：OAuth 与粘贴令牌共用）。
+ * @param {object} ex  {uid, token, refreshToken, expiresAt, name, scope, cookie}
+ * @param {object} sess 会话信息（OAuth 时带 clientId/clientSecret；粘贴时为 null）
+ * @param {string} source "oauth" | "paste"
+ *
+ * Cookie 落库说明：点赞与 daily_active 只在 Web 会话(Cookie)下生效，
+ * 故 Cookie 与 OAuth 令牌**并存**（不是替代）。值经 config.encryptSecret（DPAPI）加密后
+ * 存在 meta.msCookie，读取时由 store.accountSecrets 解密透传。
+ * 更新已有账号时，若本次未采到 Cookie 则**保留原值**，不把已有的会话抹掉。
+ */
+function saveModelScopeAccount(ex, sess, source) {
+  const uid = String((ex && ex.uid) || "").trim();
+  // uid 缺失一律拒绝落库（与 LobsterAI 同款防线）：空 uid 会让去重查找恒不命中，
+  // 同账号反复登录生成重复行，credit_first 排序也会把它当独立号
+  if (!uid) return { ok: false, message: "未能解析账号身份（uid），已拒绝入池" };
+  const token = String((ex && ex.token) || "").trim();
+  if (!token) return { ok: false, message: "凭据为空，已拒绝入池" };
+  const cookie = String((ex && ex.cookie) || "").trim();
+  const meta = {
+    ...(sess && sess.clientId ? { oauthClientId: sess.clientId, oauthClientSecret: sess.clientSecret } : {}),
+    tokenKind: token.startsWith("ms_oauth") ? "oauth" : "token",
+    scope: String((ex && ex.scope) || ""),
+    savedAt: Date.now(),
+  };
+  if (cookie) meta.msCookie = config.encryptSecret(cookie);
+  const existing = store.listAccounts("modelscope").find((a) => a.uid === uid);
+  if (existing) {
+    // 未采到新 Cookie 时保留旧的（避免一次失败的采集把可用会话清空）
+    const nextMeta = { ...(existing.meta || {}), ...meta };
+    if (!cookie && existing.meta && existing.meta.msCookie) nextMeta.msCookie = existing.meta.msCookie;
+    if (cookie) nextMeta.cookieAt = Date.now();
+    store.updateAccount(existing.id, {
+      token,
+      refreshToken: (ex && ex.refreshToken) || "",
+      expiresAt: (ex && ex.expiresAt) || 0,
+      status: "online",
+      coolUntil: 0,
+      coolReason: "",
+      meta: nextMeta,
+    });
+    return { ok: true, id: existing.id, uid, updated: true, hasCookie: !!nextMeta.msCookie };
+  }
+  if (cookie) meta.cookieAt = Date.now();
+  const id = store.addAccount({
+    channel: "modelscope",
+    uid,
+    name: (ex && ex.name) || `魔搭 ${String(uid).slice(-6)}`,
+    token,
+    refreshToken: (ex && ex.refreshToken) || "",
+    source: source || "paste",
+    expiresAt: (ex && ex.expiresAt) || 0,
+    meta,
+  });
+  return { ok: true, id, uid, updated: false, hasCookie: !!cookie };
+}
+
+/** 粘贴 ms- 访问令牌入池：先校验令牌有效（users/me），再取 uid（username）落库 */
+async function importModelScopeToken(token) {
+  const c = modelscopeCfg();
+  const tk = String(token || "").trim();
+  if (!tk) return { ok: false, message: "令牌为空" };
+  // 令牌形态校验：OAuth 令牌（ms_oauth…）不应走粘贴路径（缺 client 信息无法续期）
+  if (tk.startsWith(String(c.oauthTokenPrefix || "ms_oauth"))) {
+    return { ok: false, message: "这是 OAuth 访问令牌，请改用「OAuth 登录」（粘贴路径需 ms- 开头的访问令牌）" };
+  }
+  const base = String(c.apiBase || "https://www.modelscope.cn").replace(/\/+$/, "");
+  const r = await adapters.httpJson(`${base}${c.userInfoPath || "/openapi/v1/users/me"}`, {
+    method: "GET",
+    headers: {
+      authorization: `Bearer ${tk}`,
+      "OpenAPI-Token": tk,
+      "X-Modelfun-Token": tk,
+      accept: "application/json",
+      "user-agent": c.userAgent || "AgentHub",
+      origin: base,
+      referer: `${base}${c.refererPath || "/my/overview"}`,
+    },
+  }).catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
+  if (r.status === 401 || r.status === 403) return { ok: false, message: "令牌无效或已被吊销（请到魔搭「访问令牌」页重新生成）" };
+  if (!r.ok || !r.data) return { ok: false, message: `令牌校验失败：HTTP ${r.status || 0}${r.message ? " " + r.message : ""}` };
+  const d = r.data.data || r.data;
+  const uid = String(d.username || d.userName || "").trim();
+  if (!uid) return { ok: false, message: "令牌有效但未能取到用户名，无法作为号池标识（已拒绝入池）" };
+  // 余额探针：顺带发现「未绑定阿里云」这一推理前置门槛（如实提示，不阻断入池）
+  let warn = "";
+  const bal = await adapters.httpJson(`${base}${c.balancePath}`, {
+    method: "GET",
+    headers: {
+      authorization: `Bearer ${tk}`, "OpenAPI-Token": tk, "X-Modelfun-Token": tk,
+      accept: "application/json", "user-agent": c.userAgent || "AgentHub", origin: base, referer: `${base}${c.refererPath}`,
+    },
+  }).catch(() => ({ ok: false, status: 0, data: null }));
+  if (bal.status === 401 || bal.status === 403) {
+    warn = "（注意：调用推理前需先在魔搭绑定阿里云账号）";
+  }
+  const saved = saveModelScopeAccount({ uid, token: tk, name: String(d.nickname || uid), expiresAt: 0, scope: "token" }, null, "paste");
+  if (!saved.ok) return saved;
+  return { ok: true, id: saved.id, uid, updated: saved.updated, message: warn ? "令牌有效，已入池" + warn : "令牌有效，已入池" };
+}
+
+/**
+ * ModelScope OAuth：动态注册互联应用 → 回环服务器 → **应用内授权窗**（顺带采集 Web 会话 Cookie）
+ * → 回调换 OAuth 令牌 → 落库（OAuth 令牌 + Cookie 双凭据）。
+ *
+ * 为什么用应用内窗口而不是系统浏览器（与其它渠道的关键差异）：
+ *   魔搭把端点分成两族且**严格互斥**（实测穷尽四条路径）：
+ *     「OAuth 可用族」推理 /v1/chat + 魔粒 /openapi/v1/*
+ *     「仅 Cookie/ms- 可用族」点赞 /api/v1/mcpServers/* + 令牌管理 /api/v1/users/tokens*
+ *   且 ms- 令牌能点赞但不触发 daily_active（参考项目实测注释：只有 Web 会话才触发日活）。
+ *   ⇒ **Cookie 是唯一同时覆盖「点赞」与「日活」的凭据**。
+ *   授权窗用独立 partition，登录后 Cookie 就在该 partition 的 jar 里——直接读走即可，
+ *   用户仍然只需点一次「授权」，体验与其它渠道一致。
+ *
+ * 无窗口能力时（helpers.openAuthWindow 缺失）自动降级为系统浏览器 + 回环回调：
+ * 仍能拿到 OAuth 令牌（推理可用），只是缺 Cookie（点赞/日活不可用，签到会如实提示）。
+ */
+async function beginModelScopeOAuth(channel, onDone, helpers) {
+  const c = modelscopeCfg();
+  const state = crypto.randomBytes(16).toString("hex");
+  const openWindow = helpers && helpers.openAuthWindow;
+  // 采到的 Cookie（授权窗回调后填入；无窗口时为 ""）
+  let capturedCookie = "";
+  let authWin = null;
+  const server = http.createServer((req, res) => {
+    // 回调页是完整 HTML（含中文）：显式带 charset 响应头，与页面内 <meta charset> 双保险，
+    // 防中文环境浏览器按 GBK 解码 UTF-8 字节出乱码（Trae 回环同款修复）
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    const u = new URL(req.url || "/", "http://127.0.0.1");
+    if (u.pathname !== "/oauth/callback" && u.pathname !== "/auth/callback") {
+      res.statusCode = 404;
+      res.end("not found");
+      return;
+    }
+    handleCallback(u.searchParams, res);
+  });
+
+  const handleCallback = async (q, res) => {
+    // 官方页主动报错（优先判定）
+    const errParam = q.get("error") || q.get("error_code");
+    if (errParam) {
+      const desc = q.get("error_description") || q.get("message") || "";
+      const msg = desc ? `授权失败：${errParam}（${desc}）` : `授权失败：${errParam}`;
+      endPageThenFinish(res, 400, ERR_PAGE(msg), { ok: false, message: msg });
+      return;
+    }
+    // CSRF：state 必须与本次会话一致
+    const gotState = q.get("state");
+    const session = oauthSession;
+    if (!session || !gotState || String(gotState) !== String(session.state)) {
+      const msg = gotState ? "state 校验不通过（非本应用发起的授权回调）" : "回调缺少 state 参数，拒绝处理";
+      endPageThenFinish(res, 400, ERR_PAGE(msg), { ok: false, message: msg });
+      return;
+    }
+    const code = q.get("code");
+    if (!code) {
+      // 登录前官方可能先空参探测回调可达性：挂起等待，不能按失败处理
+      if (res) res.end(PENDING_PAGE);
+      return;
+    }
+    try {
+      const ex = await exchangeModelScopeCode(code, session.sess);
+      if (!ex.ok) throw new Error(ex.message);
+      // 采 Cookie（此刻授权窗会话已建立）：失败不阻断入池——OAuth 令牌已足以推理，
+      // 只是点赞/日活不可用；checkin 会据此如实提示用户重新授权
+      if (!capturedCookie && authWin && typeof authWin.collectCookie === "function") {
+        capturedCookie = await authWin.collectCookie(c.cookieDomains || ["modelscope.cn"]).catch(() => "");
+      }
+      const r = saveModelScopeAccount({ ...ex, cookie: capturedCookie }, session.sess, "oauth");
+      if (!r.ok) throw new Error(r.message);
+      const note = capturedCookie ? "（已同时获取 Web 会话，每日登录奖励与点赞可用）" : "（未取得 Web 会话：点赞与每日登录奖励不可用，建议重试一次）";
+      endPageThenFinish(res, 200, OK_PAGE(`登录成功，已加入 ModelScope（魔搭）号池，可关闭本页<br>${note}`), { ok: true, id: r.id, uid: r.uid, hasCookie: !!capturedCookie });
+    } catch (e) {
+      const msg = String((e && e.message) || e);
+      endPageThenFinish(res, 200, ERR_PAGE(`登录失败：${msg}`), { ok: false, message: msg });
+    }
+  };
+
+  let port;
+  try {
+    port = await listenLoopback(server);
+  } catch (e) {
+    return { ok: false, message: `回环端口监听失败：${(e && e.message) || e}` };
+  }
+  const callbackUrl = `http://127.0.0.1:${port}/oauth/callback`;
+  // 动态注册（RFC 7591）：只需 client_name + redirect_uris
+  const reg = await registerModelScopeApp(callbackUrl, "AgentHub");
+  if (!reg.ok) {
+    try { server.close(); } catch { /* */ }
+    return { ok: false, message: reg.message };
+  }
+  const url = `${c.oauthAuthorizeUrl}?response_type=code&client_id=${encodeURIComponent(reg.clientId)}` +
+    `&redirect_uri=${encodeURIComponent(callbackUrl)}&scope=${encodeURIComponent(c.oauthScopes || "openid profile api-inference")}` +
+    `&state=${encodeURIComponent(state)}`;
+  oauthSession = {
+    mode: "loopback",
+    channel,
+    state,
+    sess: { clientId: reg.clientId, clientSecret: reg.clientSecret, redirectUri: callbackUrl },
+    server,
+    callbackUrl,
+    onDone,
+    timer: setTimeout(() => finishOAuth({ ok: false, message: "登录超时（3 分钟）" }), OAUTH_TIMEOUT_MS),
+    submit: async (rawInput) => {
+      const q = parseCallbackInput(rawInput);
+      if (!q) return { ok: false, message: "无法解析回调地址（需包含 code 与 state）" };
+      await handleCallback(q, null);
+      return { ok: true };
+    },
+  };
+
+  // 优先应用内窗口（能采 Cookie）；无该能力则回退系统浏览器
+  if (typeof openWindow === "function") {
+    const opened = openWindow({
+      title: "ModelScope（魔搭）· 官方授权登录",
+      url,
+      // ModelScope 走回环回调，不需要深链捕获；onCaptured 仅为接口一致性
+      onCaptured: () => {},
+      onClosed: () => {
+        if (oauthSession && oauthSession.channel === channel) finishOAuth({ ok: false, message: "已关闭授权窗口，登录未完成" });
+      },
+    });
+    if (!opened || opened.ok === false) {
+      try { server.close(); } catch { /* */ }
+      const msg = (opened && opened.message) || "授权窗口创建失败";
+      return { ok: false, message: msg };
+    }
+    authWin = opened;
+    oauthSession.closeWindow = opened.close || null;
+    oauthSession.attachCancel = () => {
+      try { if (opened.close) opened.close(); } catch { /* 已关 */ }
+      try { server.close(); } catch { /* 已关 */ }
+    };
+    return { ok: true, mode: "window", host: "www.modelscope.cn" };
+  }
+
+  return { ok: true, url, mode: "loopback", port, host: "www.modelscope.cn" };
+}
+
 /**
  * 开始 OAuth：按渠道选流程
  * @param {string} channel 内置渠道 id
@@ -2191,6 +3159,10 @@ async function beginOAuth(channel, opts, onDone, helpers) {
   // 小浣熊：上游 v1.18.0 已支持应用内登录（打开官方授权页 → 用户粘回 office-raccoon:// 深链换码），
   // 本分支基点（b476f52）时还只有「不支持」的抛错，合并时按上游实现放行（不再抛错）。
   if (ch === "raccoon") return beginRaccoonOAuth(ch, cb, helpers); // helpers.openAuthWindow 可选（上游内嵌窗；子进程场景缺省走系统浏览器）
+  // 上游 v1.47/v1.48 的两个新渠道：lobster 纯回环 OAuth；modelscope 需要授权窗采 Cookie，
+  // 子进程场景 helpers 恒缺省 → 上游自带降级（系统浏览器 + 回环回调），推理可用、魔粒任务不可用
+  if (ch === "modelscope") return beginModelScopeOAuth(ch, cb, helpers);
+  if (ch === "lobster") return beginLobsterOAuth(ch, cb);
   if (ch === "autoclaw") {
     // 国内版官方只有客户端登录（手机号+验证码）+ auth.json 落盘，没有可代收的网页授权
     throw new Error("AutoClaw（国内）官方没有网页登录：请用「从本机软件导入」（自动读取 %APPDATA%/AutoClaw/auth.json）或粘贴 token");
@@ -2202,13 +3174,49 @@ async function beginOAuth(channel, opts, onDone, helpers) {
   if (ch === "autoclaw_intl") return beginAutoClawIntlOAuth(ch, o, cb);
   if (ch === "trae") return beginTraeOAuth(ch, cb);
   return beginWorkBuddyOAuth(ch, cb);
+}
 
+/**
+ * LobsterAI 回调补交（**不要求存在活动会话**）。
+ *
+ * 与 beginLobsterOAuth 内的 submit 的区别：那条路径绑定在活动会话上，会话超时即失效；
+ * 本函数只依赖 state 宽限表，供「用户登录很慢、回调在会话关闭后才拿到」的场景补交。
+ * 安全边界相同：state 必须是本进程生成过的（128 位随机 + 30 分钟 TTL）。
+ *
+ * 注意：本路径**不经过 beginOAuth 的 onDone**，故编排层（index.cjs）需要在拿到 ok:true
+ * 后自行补跑「刷新余额 + 自动签到」，否则新入池账号会停在 credits=0 / creditsAt=0，
+ * 被 credit_first 策略误判为最末位（实测踩到）。
+ *
+ * @returns {Promise<{ok:boolean,message?:string,uid?:string,id?:string}>}
+ */
+async function submitLobsterCallback(input) {
+  const q = parseCallbackInput(input);
+  if (!q) return { ok: false, message: "无法解析回调地址：请整段复制浏览器地址栏内容（需包含 code 与 state）" };
+  const state = q.get("state");
+  if (!state) return { ok: false, message: "回调地址缺少 state 参数，无法确认是本应用发起的授权" };
+  const resolved = resolveLobsterSession(state);
+  if (!resolved) {
+    return { ok: false, message: "该回调不属于本应用发起的登录（state 不认识或已超过 30 分钟宽限期）" };
+  }
+  const code = q.get("code") || q.get("authCode") || q.get("auth_code");
+  if (!code) return { ok: false, message: "回调地址缺少 code 参数（授权码）" };
+  const ex = await exchangeLobsterAuthCode(code, resolved.sess);
+  if (!ex.ok) return { ok: false, message: ex.message };
+  const r = saveLobsterAccount(ex, resolved.sess);
+  if (!r.ok) return { ok: false, message: r.message };
+  // 兑换成功即作废该 state（配合授权码一次性语义，双重防重放）
+  lobsterIssuedStates.delete(String(state));
+  return { ok: true, uid: r.uid, id: r.id, message: "已补交回调，账号已入池" };
 }
 
 /** 手动提交回调地址（浏览器没跳回回环地址时的兜底路径） */
 async function submitCallbackUrl(input, channel) {
   const session = oauthSession;
-  if (!session) return { ok: false, message: "当前没有进行中的登录" };
+  // LobsterAI 特例：允许无活动会话时凭 state 宽限表补交（会话超时后回调才到的场景）
+  if (!session) {
+    if (String(channel || "") === "lobster") return submitLobsterCallback(input);
+    return { ok: false, message: "当前没有进行中的登录" };
+  }
   if (channel && session.channel !== channel) return { ok: false, message: "进行中的登录属于其他渠道" };
   if (typeof session.submit !== "function") return { ok: false, message: "该渠道不支持手动提交回调地址" };
   return session.submit(input);
@@ -2241,6 +3249,15 @@ module.exports = {
   importCandidate,
   beginOAuth,
   submitCallbackUrl,
+  submitLobsterCallback,
+  resolveLobsterUid,
+  // ModelScope（魔搭）：OAuth 主路径 + 粘贴令牌兜底 + 续期
+  beginModelScopeOAuth,
+  registerModelScopeApp,
+  exchangeModelScopeCode,
+  refreshModelScopeToken,
+  saveModelScopeAccount,
+  importModelScopeToken,
   cancelOAuth,
   bindRaccoonDevice,
   byteCryptoDecrypt,

@@ -2,15 +2,16 @@
      （时间/状态/渠道/模型/KEY 筛选 + 列设置 + 清理 + 详情弹窗；方案 §7 stats.html）
      口径：不设日聚合冗余表，全部由 usage_requests 流水直查；保留期在设置页可调 -->
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import * as api from "../../api/ipc";
 import type { ProxyStatsOverview, ProxyUsageDetail, ProxyUsageRow } from "../../types";
 import { useAppStore } from "../../stores/app";
-import { fmtInt, fmtK, fmtMs, channelName } from "./format";
+import { fmtInt, fmtK, fmtMs, fmtTime, fmtDate, channelName, statusCls } from "./format";
 import RequestLogTable from "./RequestLogTable.vue";
 import RequestDetailDialog from "./RequestDetailDialog.vue";
 import ColSettingsMenu from "./ColSettingsMenu.vue";
 import { LOG_COLS } from "./logCols";
+import { coalesceAsync } from "../../utils/timing";
 
 const app = useAppStore();
 
@@ -177,12 +178,39 @@ function goPage(p: number) {
   loadDetail();
 }
 
+/** 本页是否处于前台：页面经 v-show 保活，事件刷新只在激活时跑，切走即停 */
+const active = computed(() => app.activeModule === "proxy" && app.activePage === "stats");
+
+// 事件合流：概览 + 明细一起拉，1s 窗口合并防重入；明细保持当前页码（最新记录在最前）
+const scheduleRefresh = coalesceAsync(() => Promise.all([refresh(), loadDetail()]), 1000);
+
+watch(active, (on) => {
+  if (on) scheduleRefresh();
+  else scheduleRefresh.cancel();
+});
+
+let offEvent: (() => void) | undefined;
+
+// async：Key 下拉选项要等一次 proxyKeysList，拉不到就只留渠道/模型筛选（见下方 try/catch）
 onMounted(async () => {
   refresh();
   loadDetail();
   try {
     keyOptions.value = (await api.proxyKeysList()).map((k) => ({ id: k.id, name: k.name }));
   } catch { /* Key 列表拉不到就只有渠道/模型筛选可用 */ }
+  // 请求流水变化（后端已节流为每 2s 至多一条）驱动本页刷新，无需轮询；
+  // 明细/趋势/TOP 全部实时直查 usage_requests 流水，事件即变更信号
+  offEvent = api.onUpdateEvent((e) => {
+    const p = e as { event?: string; type?: string };
+    if (p.event !== "proxy" || p.type !== "request") return;
+    if (!active.value) return;
+    scheduleRefresh();
+  });
+});
+
+onUnmounted(() => {
+  scheduleRefresh.cancel();
+  if (offEvent) offEvent();
 });
 </script>
 

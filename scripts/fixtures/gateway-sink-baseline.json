@@ -234,11 +234,11 @@
     "id": "waf-channel-block",
     "desc": "WAF Block Page 是渠道级故障：短退避整个渠道，不逐个冷却账号（followup 验退避真的生效）",
     "status": 200,
-    "body": "data: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: {\"error\":{\"message\":\"渠道 trae 被上游边缘拦截（WAF Block Page）：与账号无关，已跳备选渠道\",\"type\":\"upstream_error\",\"param\":null,\"code\":null}}\n\ndata: [DONE]\n\n",
+    "body": "data: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: {\"error\":{\"message\":\"渠道 trae(一号) 不可用：渠道 trae 被上游边缘拦截（WAF Block Page）：与账号无关，已跳备选渠道\",\"type\":\"upstream_error\",\"param\":null,\"code\":null}}\n\ndata: [DONE]\n\n",
     "followups": [
       {
         "status": 200,
-        "body": "data: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: {\"error\":{\"message\":\"渠道 trae 降级中（WAF Block），120s 后回切重试\",\"type\":\"upstream_error\",\"param\":null,\"code\":null}}\n\ndata: [DONE]\n\n",
+        "body": "data: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: {\"error\":{\"message\":\"未发起任何上游请求（候选渠道号池为空或降级中）：渠道 trae(渠道降级中) 不可用：渠道 trae 降级中（WAF Block），120s 后回切重试\",\"type\":\"upstream_error\",\"param\":null,\"code\":null}}\n\ndata: [DONE]\n\n",
         "picks": []
       }
     ],
@@ -256,14 +256,14 @@
         "accountName": "一号",
         "model": "glm-4.6",
         "status": 503,
-        "error": "渠道 trae 被上游边缘拦截（WAF Block Page）：与账号无关，已跳备选渠道"
+        "error": "渠道 trae(一号) 不可用：渠道 trae 被上游边缘拦截（WAF Block Page）：与账号无关，已跳备选渠道"
       },
       {
         "channel": "",
         "accountName": "",
         "model": "glm-4.6",
         "status": 503,
-        "error": "渠道 trae 降级中（WAF Block），120s 后回切重试"
+        "error": "未发起任何上游请求（候选渠道号池为空或降级中）：渠道 trae(渠道降级中) 不可用：渠道 trae 降级中（WAF Block），120s 后回切重试"
       }
     ]
   },
@@ -392,7 +392,7 @@
     "id": "unknown-model",
     "desc": "模型无人拥有且没配有回退 → 400 并在提示里列出可用模型",
     "status": 400,
-    "body": "{\"error\":{\"message\":\"模型 \\\"no-such-model\\\" 不在任何渠道目录中。可用模型：Doubao-Seed-Evolving, Doubao-Seed-2.1-Pro, seed-code-pro-0430, Doubao-Seed-2.1-Turbo, computer_use_subagent, Doubao-Seed-2.0-Code, browser_use_subagent, glm-5.3, glm-5.2, glm-5-turbo, glm-5, DeepSeek-V4-Flash-Official, DeepSeek-V4-Flash, DeepSeek-V4-Pro-Official, DeepSeek-V4-Pro, kimi-k3, kimi-k2.7-code, kimi-k2.6, minimax-m3, qwen3.8-max, qwen-3.7-plus, sagitta, aquila, custom_model_gemini, custom_model_placeholder, custom_model_1M_text, custom_model_1M, custom_model_doubao_1M, custom_model_doubao_256k, custom_model_kimi, custom_model_claude, custom_model_gpt-5, custom_model_no-fc, custom_model_deepseek_chat, custom_model_deepseek_reasoner, custom_model_deepseek_v4, file_search_agent, explore_sub_agent_v2, summary, deepseek-v4, glm-4.6, kimi-k2, doubao-seed-1.6, qwen3-coder, minimax-m2, claude-sonnet-4.5, claude-opus-4.1, gpt-5, gpt-5-codex, hy3-preview, deepseek-v3.2, default-model, fast-model, balanced-model, primary-model, deep-model, kimi-k2.8-preview, deepseek-v4.1-flash, deepseek-v4.1-flash-sg, gpt-6-astra, hy4-preview-f, hy4-preview, hy3, gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, gpt-5.4, gemini-3.5-flash, raccoon-chat-ml-5-5, cline-free/deepseek-v4.1-flash, cline-free/muse-spark-1.3-contributor, cline-free/solar-pro4, z-ai/glm-5.3-flash, poolside/laguna-s-2.1:free, cline-pass/glm-5.3, cline-pass/kimi-k3, cline-pass/deepseek-v4.1-flash, cline-pass/deepseek-v4-pro, cline-pass/qwen3.8-max, glm-5.3-flash, Qwen3.8-Flash, Auto, Ultimate, Performance, Efficient, Sonus, Cantus, Qwen3.7-Max, Qwen3.7-Plus, DeepSeek-Flash, GLM-5.1, GLM-4.7, GLM-4.5-Air\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"model_not_found\"}}",
+    "body": "{\"error\":{\"message\":\"模型 \\\"no-such-model\\\" 不在任何渠道目录中。可用模型：Doubao-Seed-Evolving, Doubao-Seed-2.1-Pro, seed-code-pro-0430, Doubao-Seed-2.1-Turbo, computer_use_subagent, Doubao-Seed-2.0-Code, browser_use_subagent, glm-5.3, glm-5.2, glm-5-turbo, glm-5, DeepSeek-V4-Flash-Official, DeepSeek-V4-Flash, DeepSeek-V4-Pro-Official, DeepSeek-V4-Pro, kimi-k3, kimi-k2.7-code, kimi-k2.6, minimax-m3, qwen3.8-max, qwen-3.7-plus, sagitta, aquila, custom_model_gemini, custom_model_placeholder, custom_model_1M_text, custom_model_1M, custom_model_doubao_1M, custom_model_doubao_256k, custom_model_kimi, custom_model_claude, custom_model_gpt-5, custom_model_no-fc, custom_model_deepseek_chat, custom_model_deepseek_reasoner, custom_model_deepseek_v4, file_search_agent, explore_sub_agent_v2, summary, deepseek-v4, glm-4.6, kimi-k2, doubao-seed-1.6, qwen3-coder, minimax-m2, claude-sonnet-4.5, claude-opus-4.1, gpt-5, gpt-5-codex, hy3-preview, deepseek-v3.2, default-model, fast-model, balanced-model, primary-model, deep-model, kimi-k2.8-preview, deepseek-v4.1-flash, deepseek-v4.1-flash-sg, gpt-6-astra, hy4-preview-f, hy4-preview, hy3, gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, gpt-5.4, gemini-3.5-flash, raccoon-chat-ml-5-5, cline-free/deepseek-v4.1-flash, cline-free/muse-spark-1.3-contributor, cline-free/solar-pro4, z-ai/glm-5.3-flash, poolside/laguna-s-2.1:free, cline-pass/glm-5.3, cline-pass/kimi-k3, cline-pass/deepseek-v4.1-flash, cline-pass/deepseek-v4-pro, cline-pass/qwen3.8-max, glm-5.3-flash, deepseek-ai/DeepSeek-V4.1-Flash, deepseek-ai/DeepSeek-V4-Flash-0731, deepseek-ai/DeepSeek-V4-Pro, deepseek-ai/DeepSeek-V4-Pro-0813, ZhipuAI/GLM-5.3-Flash, ZhipuAI/GLM-5.2, ZhipuAI/GLM-4.7-Flash, Qwen/Qwen3.8-Flash-Next, Qwen/Qwen3.8-27B, Qwen/Qwen3.5-397B-A17B, Qwen/Qwen3.5-122B-A10B, Qwen/Qwen3.5-35B-A3B, Qwen/Qwen3.5-27B, MiniMax/MiniMax-M3, MiniMax/MiniMax-M1-80k, meituan-longcat/LongCat-Flash-Lite, stepfun-ai/Step-3.5-Flash, stepfun-ai/Step-3.7-Flash, Shanghai_AI_Laboratory/Intern-S1, Shanghai_AI_Laboratory/Intern-S2-Preview, mistralai/Mistral-Large-Instruct-2407, nex-agi/Nex-N2.5-Pro, nex-agi/Nex-N2.5-mini, deepseek-flash, deepseek-v4-flash-vision-exp, glm-5.3-flashx, MiniMax-M3.1-Flash-Preview, MiniMax-M2.7, qwen3.5-plus-2026-04-20, qwen3.6-plus, doubao-seed-2-1-turbo-260628, kimi-k2.5, qwen3.7-plus, doubao-seed-2-0-code-preview-260215, doubao-seed-2-1-pro-260915, qwen3.8-flash, qwen3.8-omni-flash, glm-5v-turbo, glm-5.1, qwen3.7-max, kimi-k2.7-code-highspeed, Auto, Ultimate, Performance, Efficient, Sonus, Cantus, GLM-4.7, GLM-4.5-Air\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"model_not_found\"}}",
     "followups": [],
     "coolLog": [],
     "pickLog": [],

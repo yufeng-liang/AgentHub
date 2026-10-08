@@ -3,6 +3,58 @@
 "use strict";
 const path = require("node:path");
 const { app, BrowserWindow, Tray, Menu, nativeImage, shell, ipcMain, nativeTheme, Notification } = require("electron");
+
+// ===== 闪退取证（本地补丁 __agenthubCrashTrace）=====
+// 1.42.0 出现静默退出：Windows 无 Application Error 事件、无 minidump、应用自身零日志，
+// 只能靠重启时间戳反推。这里把 JS 异常 / 子进程死亡 / 退出原因全部落到 userData/logs/crash.log，
+// 并启用本地 crashpad（只落盘不上传）——原生崩溃会留下 minidump，debug.log 的 "not connected" 噪音随之消失。
+const { crashReporter } = require("electron");
+// 行写入与截断逻辑抽到 backend/crashlog.cjs：backend 模块（如会话流水 worker 的父进程侧）
+// 也要写同一份取证日志——child-process-gone 不覆盖 node 子进程，那边必须自行落痕
+const __crashlog = require("./backend/crashlog.cjs");
+let __crashCount = 0;
+function __crashLog(kind, detail) {
+  if (__crashCount > 50) return;
+  __crashCount++;
+  __crashlog.write(kind, detail);
+}
+function __describe(e) {
+  if (e instanceof Error) return `${e.name}: ${e.message} :: ${String(e.stack || "").replace(/\s+/g, " ").slice(0, 1200)}`;
+  try { return JSON.stringify(e); } catch { return String(e); }
+}
+try { crashReporter.start({ uploadToServer: false, submitURL: "" }); } catch { /* 无 crashReporter 则仅失去 dump 能力 */ }
+// 启动留痕：放在 whenReady 里，确保 app.setName 之后再取 userData（否则会落到错误目录）
+app.whenReady().then(() => {
+  try { __crashLog("boot", `v${app.getVersion()} electron=${process.versions.electron} node=${process.versions.node}`); } catch { /* 忽略 */ }
+  // 休眠唤醒守卫：注册 powerMonitor 的 suspend/resume，供各周期任务判断「是否刚唤醒」
+  // （避免唤醒瞬间签到 + 额度刷新 + 记忆中枢任务集中爆发，见 backend/wakeGuard.cjs）。
+  // 事件同时写入 crash.log——Windows Modern Standby 是否派发 resume 尚无定论，
+  // 留痕后下次实际睡眠即可在日志里核实该守卫是否真的生效。
+  try {
+    const wk = require("./backend/wakeGuard.cjs");
+    wk.start({ powerMonitor: require("electron").powerMonitor, log: __crashLog });
+  } catch (e) { __crashLog("wake-guard-failed", __describe(e)); }
+});
+// 捕获而非退出：托盘常驻的反代网关被别的工具依赖，宁可降级活着也要把根因留痕（每次运行最多记 50 条）
+process.on("uncaughtException", (e) => __crashLog("uncaughtException", __describe(e)));
+process.on("unhandledRejection", (r) => __crashLog("unhandledRejection", __describe(r)));
+process.on("exit", (code) => __crashLog("exit", `code=${code} uptime=${Math.round(process.uptime())}s`));
+app.on("child-process-gone", (_e, d) => __crashLog("child-process-gone", __describe(d)));
+app.on("render-process-gone", (_e, _wc, d) => __crashLog("render-process-gone", __describe(d)));
+app.on("gpu-process-gone", (_e, d) => __crashLog("gpu-process-gone", __describe(d)));
+app.on("before-quit", () => { let p = "n/a"; try { p = String(updater.pendingInstall()); } catch { /* updater 尚未就绪 */ } __crashLog("before-quit", `pendingInstall=${p}`); });
+app.on("quit", (_e, code) => __crashLog("quit", `exitCode=${code}`));
+// 渲染进程无响应取证：界面「卡死/未响应」不崩溃、不退出，此前零痕迹（2026-10-05 卡死排查实证——
+// crashpad 25 个 dump 全来自 node 子进程，渲染进程冻结无一字留痕）。unresponsive/responsive 成对
+// 落盘，与同期的 worker/同步日志对齐即可定位因果；Chromium 的挂起检测有去重，不会刷屏。
+app.on("browser-window-created", (_e, win) => {
+  const wc = win && win.webContents;
+  if (!wc) return;
+  wc.on("unresponsive", () => { let u = ""; try { u = String(wc.getURL()).slice(0, 200); } catch { /* 已销毁 */ } __crashLog("render-unresponsive", `url=${u}`); });
+  wc.on("responsive", () => __crashLog("render-responsive", ""));
+});
+// ===== 闪退取证结束 =====
+
 const config = require("./backend/config.cjs");
 const ipc = require("./backend/ipc.cjs");
 const updater = require("./backend/updater.cjs");
@@ -412,14 +464,23 @@ watch.setOnEvent(({ kind, summary, count }) => {
 // 必须在 requestSingleInstanceLock 之前生效——锁就落在 userData 里；且 Windows 上 Electron 的
 // appData 取自 Known Folder API 而非 APPDATA 环境变量，光重定向 APPDATA 骗不过锁。不设即无感。
 if (process.env.AGENTHUB_USER_DATA_DIR) app.setPath("userData", process.env.AGENTHUB_USER_DATA_DIR);
-const gotLock = app.requestSingleInstanceLock();
+// 开发旁路（上游 v1.4x）：AGENTHUB_ALLOW_MULTI=1 跳过单实例锁并把 userData 隔离到 AgentHub-dev，
+// 让 `npm run dev` 能与安装版并存（否则新实例拿不到锁干净退出，concurrently -k 连带关掉 vite）。
+// 两者同时给出时以 AGENTHUB_USER_DATA_DIR 为准——探针要的是自己指定的那个目录，不是固定后缀。
+const ALLOW_MULTI = process.env.AGENTHUB_ALLOW_MULTI === "1";
+if (ALLOW_MULTI && !process.env.AGENTHUB_USER_DATA_DIR) {
+  app.setPath("userData", path.join(app.getPath("appData"), "AgentHub-dev"));
+}
+const gotLock = ALLOW_MULTI ? true : app.requestSingleInstanceLock();
 if (!gotLock) {
+  __crashLog("single-instance-lock-lost", "已有实例持有单实例锁，本次启动即退出（第二次启动的正常行为，不是崩溃）");
   app.quit();
 } else {
   // 规格二期认领（Task 9 项 2）：second-instance 此前忽略 argv——「--gateway-start 这类从托盘/
   // 命令行拉起网关的入口」需要它。决定：本期只补 argv 解析与一条留痕日志，不加新入口——现在的
   // 网关认领不需要 argv，而新入口涉及命令行 → 网关生命周期的编排，归后续产品决策（简报原文）。
-  app.on("second-instance", (_event, argv) => {
+  // ALLOW_MULTI 下本次就是独立实例，不存在「第二个实例唤第一个窗口」这件事，故不登记。
+  if (!ALLOW_MULTI) app.on("second-instance", (_event, argv) => {
     const { flags, hasStart } = gatewayClient.parseGatewayArgv(argv);
     if (flags.length) {
       console.log(`[second-instance] 网关相关参数 ${flags.join(" ")}`
@@ -493,6 +554,10 @@ if (!gotLock) {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
       else showWindow();
     });
+  }).catch((e) => {
+    // 初始化链（建库 / 注册 IPC / 建窗建托盘 / 起各调度器）任何一步抛错都记下来；
+    // 原先这里没有 catch，抛错 = unhandledRejection = 主进程静默退出
+    __crashLog("whenReady-failed", __describe(e));
   });
 
   app.on("before-quit", (e) => {

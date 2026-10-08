@@ -139,6 +139,10 @@ const extraUserCmds = [
   { name: "proxy_zcode_device_repair", why: "ZCode 设备指纹修复：给撞车/被烧账号重派随机指纹（上游 v1.34，写号池）" },
   { name: "proxy_zcode_claim_mode", why: "ZCode 领取模式：live 指纹临时借出给单账号 + 重启客户端（上游 v1.36，写本机登录态）" },
   { name: "proxy_zcode_restore_mid", why: "ZCode 恢复锚定指纹：anchor.remoteMid 写回 live 恢复手机远程（上游 v1.36，写本机登录态）" },
+  // 上游 v1.50 的渠道成本档：读/写号池 agents.cost_tier（cost-first 路由的档位种子与手改值），
+  // 实现体在子进程 index.cjs、主进程只转发。preload 白名单与转发名单已由合并带入，
+  // 这里补上登记，否则本闸会把「三处已对齐」报成「白名单外多出的键」。
+  { name: "proxy_pool_tier", why: "渠道成本档：读/写 agents.cost_tier（上游 v1.50 cost-first 路由，写号池）" },
 ];
 const upstreamUserNames = extraUserCmds.map((c) => c.name);
 check("④ 子进程表含 proxy_account_import_blob（import_file 拆两段的子进程半段）",

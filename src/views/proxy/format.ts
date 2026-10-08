@@ -44,8 +44,25 @@ export function fmtAgo(ts: number): string {
 }
 
 /**
+ * 大数中文数量级：万 / 百万 / 千万 / 亿 / 百亿，换算档固定保留两位小数。
+ * 渠道额度共用一套换算（积分与 Token 同规）；不足 1 万保持千分位整数。
+ */
+export function fmtCnAmount(n: number): string {
+  const v = Number(n) || 0;
+  if (v <= 0) return "0";
+  if (v >= 1e10) return (v / 1e10).toFixed(2) + " 百亿";
+  if (v >= 1e8) return (v / 1e8).toFixed(2) + " 亿";
+  if (v >= 1e7) return (v / 1e7).toFixed(2) + " 千万";
+  if (v >= 1e6) return (v / 1e6).toFixed(2) + " 百万";
+  if (v >= 1e4) return (v / 1e4).toFixed(2) + " 万";
+  return fmtInt(v);
+}
+
+/**
  * 格式化 Token 数量：
  * 智谱不是积分，是 Token，支持换算单位百万、千万、亿，保留合理小数位并去除末尾零。
+ * （上游 v1.4x 把本函数删了、统一走 fmtCnAmount；本分支的智谱 Token 口径仍需要它，
+ *  单位表 balanceUnit()==="Token" 就是靠 fmtToken 换算的，不能跟着退。）
  */
 export function fmtToken(n: number): string {
   const v = Number(n) || 0;
@@ -71,9 +88,11 @@ export function fmtToken(n: number): string {
 
 /** 各渠道计费单位（逐渠道适配：有的渠道叫积分，有的渠道是 Token 包）。
  *  真相源在后端 store.cjs BUILTIN_CHANNELS[].unit（402 文案用），此处是展示镜像——两边加渠道必须同步。
- *  · trae / workbuddy 家 / raccoon：上游按积分计（Trae 积分包、CodeBuddy 加油包、小浣熊 points）；
+ *  · trae / workbuddy 家 / raccoon / lobster：上游按积分计（Trae 积分包、CodeBuddy 加油包、小浣熊 points、
+ *    龙虾每日签到积分）；
  *  · zcode 家：智谱编码套餐不是积分，是 Token 包（billing/balance 的 remaining_units）；
- *  · cline / autoclaw / qoder：订阅/加速池，官方无余额接口、消耗也从不实报，单位落不到界面上，
+ *  · qoder 家：官方是浮点 Credits（实测 0.0066 级精度，整数化会抹掉小额消耗）；
+ *  · cline / autoclaw / modelscope：订阅/加速池，官方无余额接口、消耗也从不实报，单位落不到界面上，
  *    兜底用中性「额度」；自建提供商同此。 */
 export const CHANNEL_UNITS: Record<string, string> = {
   trae: "积分",
@@ -84,7 +103,10 @@ export const CHANNEL_UNITS: Record<string, string> = {
   cline_pass: "额度",
   autoclaw: "额度",
   autoclaw_intl: "额度",
-  qoder: "额度",
+  modelscope: "额度",
+  lobster: "积分",
+  qoder: "Credits",
+  qoder_intl: "Credits",
   zcode: "Token",
   zcode_intl: "Token",
 };
@@ -92,11 +114,28 @@ export const balanceUnit = (channel?: string): string => (channel && CHANNEL_UNI
 /** Token 计价渠道（智谱家）：余额展示要过 fmtToken 换算（亿/万），浮层给原值 */
 export const isTokenChannel = (channel?: string): boolean => balanceUnit(channel) === "Token";
 
-/** 渠道余额格式化：Token 渠道输出换算后的 Token（智谱 150000000 → 1.5 亿），其余渠道输出积分原值 */
-export function fmtBalance(val: number, channel?: string): string {
-  if (val === -1) return "不限";
-  return isTokenChannel(channel) ? fmtToken(val) : fmtInt(val);
+/**
+ * 格式化 Qoder Credits（浮点计量，实测精度到 1e-16）：
+ * 整数部分正常显示，小数最多保留 2 位并去尾零——整数化会丢掉小额消耗的真实计量。
+ */
+export function fmtCredits(n: number): string {
+  const v = Number(n) || 0;
+  if (!Number.isFinite(v)) return "0";
+  if (Number.isInteger(v)) return fmtInt(v);
+  const s = v.toFixed(2).replace(/\.?0+$/, "");
+  return s === "" || s === "-" ? "0" : s;
 }
+
+/** Qoder 双区共用一套展示口径（Credits 浮点 + 领 Credits 动作），判断收敛到一处 */
+export const isQoderChannel = (id?: string): boolean => id === "qoder" || id === "qoder_intl";
+
+/** 渠道成本档 → 展示文案（cost-first 路由排序的标注；'' = 未标注按普通） */
+export const COST_TIER_NAMES: Record<string, string> = {
+  free: "免费",
+  low: "低成本",
+  normal: "普通",
+};
+export const costTierName = (tier?: string) => COST_TIER_NAMES[tier || "normal"] || "普通";
 
 /** 积分包明细的包名兜底：各渠道上游叫法不同（Trae 积分包 / WorkBuddy 加油包 / zcode 套餐额度），
  *  上游没给名字时按渠道口径兜，而不是一律「积分包」 */
@@ -105,7 +144,14 @@ export function pkgFallbackName(channel?: string): string {
   return u === "Token" ? "套餐额度" : u === "积分" ? "积分包" : "额度包";
 }
 
-/** 渠道显示名（usage 流水里的 channel id → 中文名；与 store.cjs BUILTIN_CHANNELS.display 对齐） */
+/** 渠道余额格式化：Token 渠道输出换算后的 Token（智谱 150000000 → 1.5 亿），
+ *  Qoder 双区输出浮点 Credits，其余渠道按中文数量级 */
+export function fmtBalance(val: number, channel?: string): string {
+  if (val === -1) return "不限";
+  if (isQoderChannel(channel)) return fmtCredits(val);
+  if (isTokenChannel(channel)) return fmtToken(val);
+  return fmtCnAmount(val);
+}
 export const CHANNEL_NAMES: Record<string, string> = {
   trae: "Trae SOLO CN",
   workbuddy: "WorkBuddy CN",
@@ -115,10 +161,12 @@ export const CHANNEL_NAMES: Record<string, string> = {
   cline_pass: "Cline 订阅池",
   autoclaw: "智谱 AutoClaw（国内）",
   autoclaw_intl: "智谱 AutoClaw（国际）",
-  qoder: "Qoder",
+  modelscope: "ModelScope（魔搭）",
+  lobster: "LobsterAI（有道）",
   zcode: "ZCode（智谱）",
   zcode_intl: "ZCode 智谱（国际）",
-
+  qoder: "Qoder CN",
+  qoder_intl: "Qoder International",
 };
 export const channelName = (id: string) => CHANNEL_NAMES[id] || id || "-";
 

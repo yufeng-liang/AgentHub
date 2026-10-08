@@ -246,10 +246,19 @@ function section(name, fn) {
       "③ main.cjs 仍有 proxy.shutdown() 残留 —— 主进程不许再持有网关停机实现");
 
     // 入口一 + 入口二（before-quit 的装更分支与非托盘退出分支）都必须调 quitForInstall()
-    const hIdx = mainSrc.indexOf('app.on("before-quit"');
-    assert.ok(hIdx >= 0, "③ main.cjs 找不到 before-quit 注册");
-    const hEnd = mainSrc.indexOf("\n  });", hIdx);
-    const handler = hEnd > hIdx ? mainSrc.slice(hIdx, hEnd) : mainSrc.slice(hIdx, hIdx + 4000);
+    // main.cjs 里可能有多条 before-quit 注册（上游 v1.4x 加了一条纯崩溃留痕的日志钩子），
+    // 判据必须落到「真正负责停机互锁的那一条」——按 quitForInstall( 出现的位置认领，
+    // 而不是取第一条：取第一条会让上游新加的日志钩子把这条断言静默换成空判据。
+    const hIdxs = [];
+    for (let k = mainSrc.indexOf('app.on("before-quit"'); k >= 0; k = mainSrc.indexOf('app.on("before-quit"', k + 1)) hIdxs.push(k);
+    assert.ok(hIdxs.length >= 1, "③ main.cjs 找不到 before-quit 注册");
+    let handler = "";
+    for (const k of hIdxs) {
+      const hEnd = mainSrc.indexOf("\n  });", k);
+      const slice = hEnd > k ? mainSrc.slice(k, hEnd) : mainSrc.slice(k, k + 4000);
+      if (/quitForInstall\(/.test(slice)) handler = slice;
+    }
+    assert.ok(handler !== "", "③ 没有任何一条 before-quit 调 quitForInstall() —— 装更/退出互锁丢失");
     assert.ok(/updater\.pendingInstall\(\)/.test(handler) && /updater\.pendingInstallRequested\(\)/.test(handler),
       "③ before-quit 的装更意愿必须同时看 pendingInstall() 与 pendingInstallRequested() —— "
       + "后者堵 triggerInstall 的洞（先置 installTriggered 再 quitAndInstall，第二次 before-quit 时前者已 false）");

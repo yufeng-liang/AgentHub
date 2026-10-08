@@ -20,8 +20,9 @@ import LlmUsagePanel from "../../components/memory/LlmUsagePanel.vue";
 import MemHelp from "../../components/memory/MemHelp.vue";
 import MemFirstRun from "../../components/memory/MemFirstRun.vue";
 import MemMorePanel from "../../components/memory/MemMorePanel.vue";
-import { agentLabel } from "../../components/memory/labels";
+import { agentLabel, projectLabel } from "../../components/memory/labels";
 import { coalesceAsync } from "../../utils/timing";
+import { sortAgentCards } from "../../utils/agent-card-sort";
 
 // 本页是首屏落点候选（moduleOrder 可把「记忆仓库」排到首位）、整体保持静态，唯独图表按需加载：
 // MemoryTrendChart -> echarts+zrender 会把约 473 KiB 拽进 entry，与用量统计的 TrendChart 同一口径
@@ -36,11 +37,11 @@ const trendRaw = ref<{ day: string; count: number }[]>([]);
 const trendRange = ref(30);
 const recent = ref<MemoryRow[]>([]);
 const agents = ref<MemoryAgentCard[]>([]);
+/** 列表排序与「Agent 接入」页同一套：已接入在前、其余默认序、「通用（~/.agents）」垫底 */
+const sortedAgents = computed(() => sortAgentCards(agents.value));
 const healthOpen = ref(false);
 const lastSyncAt = ref(0);
 const busy = ref("");
-const drawerId = ref("");
-const drawerOpen = ref(false);
 
 /* 健康数据源统一收口到 store.diagnose（仪表盘/索引页/事件回流共用同一口径，不再各自 RPC） */
 const healthy = computed(() => mem.diagnose);
@@ -181,6 +182,8 @@ onMounted(async () => {
   offEvent = api.onUpdateEvent((e) => {
     const p = e as { event?: string; type?: string; running?: boolean };
     if (p.event !== "memory") return;
+    // 页面 v-show 保活：隐藏时事件照收，但不做全量刷新（切回时 watch(active) 会补一次）
+    if (!active.value) return;
     if (REFRESH_TYPES.has(p.type || "")) scheduleRefresh();
     // index 完成事件的诊断快照已由 store.onEvent 落进 mem.diagnose，本页 computed 自动跟随，无需再处理
   });
@@ -222,7 +225,7 @@ watch(active, (v) => {
       ⚠️ 索引与记忆文件不一致（孤儿行 {{ healthy.orphan }} · 未索引 {{ healthy.unindexed }} · 断链 {{ healthy.broken }}）
       <span class="b-grow"></span>
       <button class="btn btn-ghost" :disabled="busy === 'repair'" @click="repairIndex">{{ busy === "repair" ? "修复中…" : "一键修复" }}</button>
-      <button class="btn-outline" @click="app.activePage = 'index'">诊断详情</button>
+      <button class="btn-outline" @click="app.setPage('index')">诊断详情</button>
     </div>
 
     <div v-if="mem.indexEvent?.running" class="mem-card">
@@ -256,7 +259,7 @@ watch(active, (v) => {
         </div>
         <!-- 定高滚动：后续接入的 Agent 变多时列表自己滚，不把卡片越撑越高 -->
         <div v-if="agents.length" class="mem-scroll mem-scroll-sm">
-          <div v-for="a in agents" :key="a.id" class="mem-chain-node" style="cursor: pointer" @click="goto('agents')">
+          <div v-for="a in sortedAgents" :key="a.id" class="mem-chain-node" style="cursor: pointer" @click="goto('agents')">
             <span class="mem-dot" :class="a.beat ? 'ok' : a.injected ? 'warn' : 'bad'"></span>
             <span class="n-title">{{ a.name }}</span>
             <span style="margin-left: auto" class="mem-chip" :class="a.beat ? 'accent' : a.injected ? 'warn' : ''">
@@ -293,7 +296,7 @@ watch(active, (v) => {
             <div class="mi-meta">
               <span>{{ agentLabel(r.agent) }}</span>
               <span>·</span>
-              <span>{{ r.project || "通用（general）" }}</span>
+              <span>{{ r.project ? projectLabel(r.project, mem.projects, r.projectName) : "通用（general）" }}</span>
             </div>
           </div>
         </div>
@@ -355,14 +358,7 @@ watch(active, (v) => {
 
     <!-- 更多扩展功能（深层画像/Agent接入/检索索引/自动化/导入/WebDAV） -->
     <MemMorePanel />
-
-    <MemoryDetailDrawer
-      :show="drawerOpen"
-      :id="drawerId"
-      @close="drawerOpen = false"
-      @open="openDrawer"
-      @changed="refresh"
-    />
+    <!-- 记忆详情抽屉由 App.vue 全局常驻挂载（绑 store.detailDrawerOpen），这里不再重复挂一个死实例 -->
     </template>
   </div>
 </template>

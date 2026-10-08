@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS keys (
   key_prefix TEXT NOT NULL DEFAULT '',
   key_suffix TEXT NOT NULL DEFAULT '',
   route TEXT NOT NULL DEFAULT 'auto',
+  route_order TEXT NOT NULL DEFAULT '',
   daily_quota INTEGER NOT NULL DEFAULT 0,
   rate_limit INTEGER NOT NULL DEFAULT 0,
   enabled INTEGER NOT NULL DEFAULT 1,
@@ -48,6 +49,7 @@ CREATE TABLE IF NOT EXISTS agents (
   display TEXT NOT NULL DEFAULT '',
   domain TEXT NOT NULL DEFAULT '',
   pool_strategy TEXT NOT NULL DEFAULT 'expire_first',
+  cost_tier TEXT NOT NULL DEFAULT '',
   updated_at INTEGER NOT NULL DEFAULT 0,
   kind TEXT NOT NULL DEFAULT 'builtin',
   base_url TEXT NOT NULL DEFAULT '',
@@ -138,7 +140,21 @@ CREATE INDEX IF NOT EXISTS idx_usage_model ON usage_requests(model, ts);
  *  用户自建提供商不在这张表里，走 agents 表的 kind != 'builtin' 行；两者合并视图见 channelList()。
  *  unit = 该渠道余额/套餐的计费口径（有的渠道叫积分，有的渠道是 Token 包）：402 耗尽文案
  *  （server.cjs）据此组词；前端展示的镜像真相源在 src/views/proxy/format.ts CHANNEL_UNITS，
- *  两边加渠道必须同步。 */
+ *  两边加渠道必须同步。
+ *  costTier = 成本档种子默认（上游 v1.50 的 cost-first 路由排序用）：free=免费额度渠道 /
+ *  low=签到白送类 / 不带=未标注（运行时按 normal 解释）。仅收有把握的两条，宁缺勿滥——
+ *  错标 free 会把付费渠道排前面烧钱。
+ *  Qoder 双区（上游 v1.43 起）：CN 与 INTL 账号与额度池互不相通，各自独立号池；两处签名都
+ *  依赖本机安装的对应客户端（wasm 提取），凭据可导入但未装客户端时不可调用。
+ *  INTL 免费额度不含 DeepSeek-Flash / GLM-5.3-Flash 等（需充值或额度覆盖才有可用模型），
+ *  界面上要按渠道给出该提示，别让用户以为国际版和 CN 版模型集等价。
+ *  ⚠ 本次合并（上游 v1.41–v1.50）先把该开关关掉：本分支此时仍用内联的 qoder 适配器
+ *  （单渠道 + meta.mode 切区），ADAPTERS 里没有 qoder_intl 这个键。开着它会让
+ *  上游 discovery.scanQoder 交出 channel=qoder_intl 的候选，而 adapters.get() 回 undefined，
+ *  导入直接报「未知渠道」。下一个提交（Qoder 归一：改用上游 qoderAdapter/qoderAuth/qoderSigner
+ *  双区工厂 + 移植本分支独有的四项能力）把它打开。 */
+const QODER_INTL_ENABLED = false;
+
 const BUILTIN_CHANNELS = [
   { id: "trae", display: "Trae SOLO CN", domain: "api.trae.cn", unit: "积分" },
   { id: "workbuddy", display: "WorkBuddy CN", domain: "copilot.tencent.com", unit: "积分" },
@@ -149,12 +165,16 @@ const BUILTIN_CHANNELS = [
   { id: "cline_pass", display: "Cline 订阅池", domain: "api.cline.bot", unit: "额度" },
   { id: "autoclaw", display: "智谱 AutoClaw（国内）", domain: "autoglm-acceleration-api.zhipuai.cn", unit: "额度" },
   { id: "autoclaw_intl", display: "智谱 AutoClaw（国际）", domain: "autoglm-api.autoglm.ai", unit: "额度" },
-  { id: "qoder", display: "Qoder", domain: "api3.qoder.sh", unit: "额度" },
+  // ModelScope（魔搭 · 阿里）：官方 OpenAI 兼容网关 + 魔粒每日任务，无客户端、无签名、无逆向
+  { id: "modelscope", display: "ModelScope（魔搭）", domain: "api-inference.modelscope.cn", unit: "额度", costTier: "free" },
+  // LobsterAI（网易有道龙虾）：原生 OpenAI 兼容 + 每日签到 100 积分，登录走应用内回环 OAuth
+  { id: "lobster", display: "LobsterAI（有道）", domain: "lobsterai-server.youdao.com", unit: "积分", costTier: "low" },
   // ZCode（智谱编码套餐；上游 v1.30 起单渠道双 provider：meta.provider=zai|bigmodel，见 adapters.makeZcode）
   // 智谱套餐不是积分，是 Token 包：billing/balance 返回 remaining_units/total_units
   { id: "zcode", display: "ZCode（智谱）", domain: "zcode.z.ai", unit: "Token" },
   { id: "zcode_intl", display: "ZCode 智谱（国际）", domain: "api.z.ai", unit: "Token" },
-
+  { id: "qoder", display: "Qoder CN", domain: "gateway.qoder.com.cn", unit: "Credits" },
+  ...(QODER_INTL_ENABLED ? [{ id: "qoder_intl", display: "Qoder International", domain: "api2.qoder.sh", unit: "Credits" }] : []),
 ];
 const BUILTIN_IDS = new Set(BUILTIN_CHANNELS.map((c) => c.id));
 
@@ -190,9 +210,11 @@ function open() {
   try {
     db.exec("ALTER TABLE keys ADD COLUMN key_enc TEXT NOT NULL DEFAULT ''");
   } catch { /* 已存在 */ }
-  // 在线迁移：usage_requests 五列（请求日志流增强，2026-09-27）。
+  // 在线迁移：usage_requests 六列（请求日志流增强，2026-09-27）。
   // cached/cache_write 用 -1 做「上游未上报」哨兵（与 agent2api 的「-」口径一致）：
   // 0 = 上报了但确实为 0，-1 = 这个渠道根本不给缓存字段——两者在界面上必须区分开
+  // 上游 v1.44 给同一张表另加了 cache_read_tokens/cache_creation_tokens（默认 0）：那是同一概念
+  // 的第二个名字 + 更弱的哨兵语义，整段拒收，读写口径统一留在 cached_tokens/cache_write_tokens。
   for (const c of [
     "cached_tokens INTEGER NOT NULL DEFAULT -1",
     "cache_write_tokens INTEGER NOT NULL DEFAULT -1",
@@ -203,11 +225,21 @@ function open() {
   ]) {
     try { db.exec(`ALTER TABLE usage_requests ADD COLUMN ${c}`); } catch { /* 已存在 */ }
   }
+  // 在线迁移（上游 v1.45/v1.50 新增）：keys.route_order = per-key 路由策略覆盖（''=跟随全局）；
+  // agents.cost_tier = 渠道成本档（''=未标注，运行时按 normal 解释）
+  try { db.exec("ALTER TABLE keys ADD COLUMN route_order TEXT NOT NULL DEFAULT ''"); } catch { /* 已存在 */ }
+  try { db.exec("ALTER TABLE agents ADD COLUMN cost_tier TEXT NOT NULL DEFAULT ''"); } catch { /* 已存在 */ }
   migrateProviders(db);
-  const ins = db.prepare("INSERT OR IGNORE INTO agents (id, display, domain, pool_strategy, updated_at, kind) VALUES (?,?,?,?,?,?)");
-  for (const c of BUILTIN_CHANNELS) ins.run(c.id, c.display, c.domain, "expire_first", Date.now(), "builtin");
+  const ins = db.prepare("INSERT OR IGNORE INTO agents (id, display, domain, pool_strategy, cost_tier, updated_at, kind) VALUES (?,?,?,?,?,?,?)");
+  for (const c of BUILTIN_CHANNELS) ins.run(c.id, c.display, c.domain, "expire_first", c.costTier || "", Date.now(), "builtin");
   const updDisplay = db.prepare("UPDATE agents SET display = ? WHERE id = ?");
-  for (const c of BUILTIN_CHANNELS) updDisplay.run(c.display, c.id);
+  // 存量行成本档回填：INSERT OR IGNORE 不触碰已存在的行，这里只给「从未标注过」的行补种子默认
+  // （守卫 cost_tier=''，用户手动改过的档位永不覆盖）
+  const updTier = db.prepare("UPDATE agents SET cost_tier=? WHERE id=? AND cost_tier=''");
+  for (const c of BUILTIN_CHANNELS) {
+    updDisplay.run(c.display, c.id);
+    if (c.costTier) updTier.run(c.costTier, c.id);
+  }
 
   gc();
   return db;
@@ -264,12 +296,17 @@ function routeOk(route) {
   return route === "auto" || channelList().some((c) => c.id === route);
 }
 
-function createKey({ name, route, dailyQuota, rateLimit }) {
+/** per-key 路由策略白名单：''=跟随全局；非法值一律按跟随全局处理 */
+function routeOrderOk(order) {
+  return order === "" || order === "score" || order === "cost-first";
+}
+
+function createKey({ name, route, routeOrder, dailyQuota, rateLimit }) {
   open();
   const secret = "sk-" + crypto.randomBytes(24).toString("hex"); // 48 hex
   const id = crypto.randomUUID();
   db.prepare(
-    "INSERT INTO keys (id, name, key_hash, key_enc, key_prefix, key_suffix, route, daily_quota, rate_limit, enabled, created_at) VALUES (?,?,?,?,?,?,?,?,?,1,?)"
+    "INSERT INTO keys (id, name, key_hash, key_enc, key_prefix, key_suffix, route, route_order, daily_quota, rate_limit, enabled, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,1,?)"
   ).run(
     id,
     String(name || "").slice(0, 64) || "未命名 Key",
@@ -278,6 +315,7 @@ function createKey({ name, route, dailyQuota, rateLimit }) {
     secret.slice(0, 7),
     secret.slice(-4),
     routeOk(route) ? route : "auto",
+    routeOrderOk(routeOrder) ? routeOrder : "",
     Math.max(0, Number(dailyQuota) || 0),
     Math.max(0, Number(rateLimit) || 0),
     Date.now()
@@ -299,6 +337,7 @@ function listKeys() {
     mask: `${r.key_prefix}····${r.key_suffix}`,
     secret: decryptForRead(r.key_enc),
     route: r.route,
+    routeOrder: r.route_order || "",
     dailyQuota: r.daily_quota,
     rateLimit: r.rate_limit,
     enabled: !!r.enabled,
@@ -306,6 +345,42 @@ function listKeys() {
     todayReq: (umap.get(r.id) || {}).req || 0,
     todayTokens: (umap.get(r.id) || {}).tokens || 0,
   }));
+}
+
+/**
+ * 从别的设备导入一把 API Key（号池 WebDAV 同步用）。
+ *
+ * 与 createKey 的区别：createKey 自己生成密钥，这里用**给定的明文密钥**入库——
+ * 跨设备同步要求同一个 sk- 在各设备都能用，所以只能沿用原密钥。
+ * 落库时按本机能力重新加密（Windows 走 DPAPI、无 safeStorage 的环境走明文降级），
+ * 所以不直接搬运对端的 key_enc（跨平台解不开）。
+ *
+ * 幂等：同 id 或同 key_hash 已存在则跳过，返回 {ok:false, reason}。
+ */
+function importKey({ id, name, secret, route, routeOrder, dailyQuota, rateLimit, enabled, createdAt }) {
+  open();
+  const s = String(secret || "").trim();
+  if (!s) return { ok: false, reason: "empty-secret" };
+  const hash = hashKey(s);
+  const dup = db.prepare("SELECT id FROM keys WHERE key_hash = ? OR id = ?").get(hash, String(id || ""));
+  if (dup) return { ok: false, reason: "exists" };
+  db.prepare(
+    "INSERT INTO keys (id, name, key_hash, key_enc, key_prefix, key_suffix, route, route_order, daily_quota, rate_limit, enabled, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
+  ).run(
+    String(id || crypto.randomUUID()),
+    String(name || "").slice(0, 64) || "未命名 Key",
+    hash,
+    config.encryptSecret(s),
+    s.slice(0, 7),
+    s.slice(-4),
+    routeOk(route) ? route : "auto",
+    routeOrderOk(routeOrder) ? routeOrder : "",
+    Math.max(0, Number(dailyQuota) || 0),
+    Math.max(0, Number(rateLimit) || 0),
+    enabled === false ? 0 : 1,
+    Number(createdAt) || Date.now()
+  );
+  return { ok: true };
 }
 
 function dayStartMs(day) {
@@ -320,7 +395,7 @@ function findKeyBySecret(secret) {
   const r = db.prepare("SELECT * FROM keys WHERE key_hash = ?").get(hashKey(secret));
   if (!r) return null;
   return {
-    id: r.id, name: r.name, route: r.route, dailyQuota: r.daily_quota,
+    id: r.id, name: r.name, route: r.route, routeOrder: r.route_order || "", dailyQuota: r.daily_quota,
     rateLimit: r.rate_limit, enabled: !!r.enabled,
   };
 }
@@ -331,11 +406,12 @@ function updateKey(id, patch) {
   if (!cur) return false;
   const name = patch.name != null ? String(patch.name).slice(0, 64) : cur.name;
   const route = patch.route != null && routeOk(patch.route) ? patch.route : cur.route;
+  const routeOrder = patch.routeOrder != null && routeOrderOk(patch.routeOrder) ? patch.routeOrder : cur.route_order;
   const quota = patch.dailyQuota != null ? Math.max(0, Number(patch.dailyQuota) || 0) : cur.daily_quota;
   const rate = patch.rateLimit != null ? Math.max(0, Number(patch.rateLimit) || 0) : cur.rate_limit;
   const enabled = patch.enabled != null ? (patch.enabled ? 1 : 0) : cur.enabled;
-  db.prepare("UPDATE keys SET name=?, route=?, daily_quota=?, rate_limit=?, enabled=? WHERE id=?")
-    .run(name, route, quota, rate, enabled, cur.id);
+  db.prepare("UPDATE keys SET name=?, route=?, route_order=?, daily_quota=?, rate_limit=?, enabled=? WHERE id=?")
+    .run(name, route, routeOrder, quota, rate, enabled, cur.id);
   return true;
 }
 
@@ -432,6 +508,7 @@ function listAgents() {
   open();
   return db.prepare("SELECT * FROM agents ORDER BY rowid").all().map((r) => ({
     id: r.id, display: r.display, domain: r.domain, poolStrategy: r.pool_strategy,
+    costTier: r.cost_tier || "",
     kind: BUILTIN_IDS.has(r.id) ? "builtin" : r.kind,
     enabled: !!r.enabled,
   }));
@@ -506,6 +583,14 @@ function deleteProvider(id) {
   const n = db.prepare("DELETE FROM agents WHERE id = ?").run(String(id)).changes;
   invalidateChannels();
   return n > 0;
+}
+
+/** 渠道成本档（cost-first 路由排序用）：free=免费额度 / low=签到白送 / normal=普通（''也是 normal） */
+function setAgentCostTier(channel, tier) {
+  open();
+  if (!["free", "low", "normal"].includes(tier)) return false;
+  db.prepare("UPDATE agents SET cost_tier=?, updated_at=? WHERE id=?").run(tier, Date.now(), String(channel));
+  return true;
 }
 
 // ===== 号池账号 =====
@@ -592,19 +677,39 @@ function tokenUsable(r) {
 
 function accountView(r) {
   const meta = parseMeta(r.meta);
+  // 冷却到期在**读时**派生回 online 并落库。不能只在 poolAccounts 被调用时复活：
+  // 调度只挑 online 账号，若"复活"依赖该渠道被访问，就会出现
+  // 「冷却 → 不被任何请求选中 → 永不复活」的死结（实测 workbuddy_ai 因一次 54 万 token
+  // 请求顶穿首字节预算被熔断 30 分钟，之后 12.5 小时没有任何调用方唤醒它，
+  // 渠道一直显示报错、模型目录也不再刷新）。
+  // 顺带清掉过期的"最近错误"：它属于那次冷却，冷却结束就不再是当前状态
+  // （完整历史仍保留在 usage_requests，不会丢）。
+  let status = r.status;
+  let coolUntil = r.cool_until;
+  let coolReason = r.cool_reason || "";
+  let lastError = meta.lastError || null;
+  if (status === "cooling" && coolUntil && coolUntil <= Date.now()) {
+    status = "online";
+    coolUntil = 0;
+    coolReason = "";
+    lastError = null;
+    const nextMeta = { ...meta };
+    delete nextMeta.lastError;
+    updateAccount(r.id, { status, coolUntil, coolReason, meta: nextMeta });
+  }
   return {
     id: r.id,
     channel: r.channel,
     uid: r.uid,
     name: r.name,
-    status: r.status,
+    status,
     credits: r.credits,
     creditsAt: r.credits_at,
     expiresAt: r.expires_at,
-    coolUntil: r.cool_until,
-    coolReason: r.cool_reason || "",
+    coolUntil,
+    coolReason,
     /** 最近一次上游错误（气泡展示用；只留最新一条） */
-    lastError: meta.lastError || null,
+    lastError,
     source: r.source,
     lastUsed: r.last_used,
     todayReq: r.today_day === dayStr() ? r.today_req : 0,
@@ -657,11 +762,17 @@ function getAccount(id) {
 
 /** 取解密后的凭据（仅主进程内部使用，绝不外传渲染层）。
  *  热路径每请求走到这里一次：解不开时回空串 + 计数，不把抛错打到请求链路上——
- *  选号阶段 tokenUsable 已经过滤过，这里抛穿的后果是整条请求 500，而不是换下一个号。 */
+ *  选号阶段 tokenUsable 已经过滤过，这里抛穿的后果是整条请求 500，而不是换下一个号。
+ *  meta：一并带出账号元数据（Cookie 等会话凭据存在 meta 里，值本身已由 encryptSecret 加密）。
+ *  适配器需要 meta 才能按账号取 Cookie（/api/v1 族专用），故在此统一解密并透传。 */
 function accountSecrets(r) {
+  const meta = parseMeta(r && r.meta);
+  // Cookie 值以 meta.msCookie 存放，落库前经 config.encryptSecret（DPAPI），此处解回明文
+  if (meta && meta.msCookie) meta.msCookie = config.decryptSecret(meta.msCookie);
   return {
     token: decryptForRead(r.token_enc),
     refreshToken: decryptForRead(r.refresh_enc),
+    meta,
   };
 }
 
@@ -711,8 +822,10 @@ function updateAccount(id, patch) {
     }
   }
   if (patch.status != null) put("status", String(patch.status));
-  // credits 允许 -1（企业版无限额度哨兵）；其余负值一律归 0
-  if (patch.credits != null) put("credits", Number(patch.credits) < -1 ? 0 : Math.round(Number(patch.credits) || 0));
+  // credits 允许 -1（企业版无限额度哨兵）；其余负值一律归 0。
+  // 保留两位小数：Qoder 的 Credits 是浮点计量（实测 0.0066 级），取整会抹掉小额消耗；
+  // 既有渠道传整数，不受影响（浮点列在 SQLite 中按 REAL 存）
+  if (patch.credits != null) put("credits", Number(patch.credits) < -1 ? 0 : Math.round((Number(patch.credits) || 0) * 100) / 100);
   if (patch.creditsAt != null) put("credits_at", Number(patch.creditsAt) || 0);
   if (patch.expiresAt != null) put("expires_at", Math.max(0, Number(patch.expiresAt) || 0));
   if (patch.coolUntil != null) put("cool_until", Math.max(0, Number(patch.coolUntil) || 0));
@@ -830,7 +943,8 @@ function snapshotCredits(channel, accountId, credits, expiresAt) {
   db.prepare(
     `INSERT INTO credits_history (channel, account_id, day, credits, expires_at) VALUES (?,?,?,?,?)
      ON CONFLICT(channel, account_id, day) DO UPDATE SET credits=excluded.credits, expires_at=excluded.expires_at`
-  ).run(String(channel), String(accountId), dayStr(), Math.max(0, Math.round(credits || 0)), Math.max(0, Number(expiresAt) || 0));
+    // 两位小数口径与 updateAccount 一致（Qoder 浮点 Credits；整数渠道不受影响）
+  ).run(String(channel), String(accountId), dayStr(), Math.max(0, Math.round((Number(credits) || 0) * 100) / 100), Math.max(0, Number(expiresAt) || 0));
 }
 
 // ===== 积分包明细（Q2 持久化：按账号整体替换该账号包集，单一事实源供派生/展示/同步） =====
@@ -1037,6 +1151,11 @@ function usageView(r) {
     id: r.id, ts: r.ts, reqId: r.req_id, keyId: r.key_id, keyName: r.key_name,
     channel: r.channel, accountId: r.account_id, accountName: r.account_name, model: r.model,
     promptTokens: r.prompt_tokens, completionTokens: r.completion_tokens,
+    // 上游 v1.50 的统计明细按 cacheReadTokens / cacheCreationTokens 取名，口径仍走本分支的
+    // cached_tokens / cache_write_tokens 那一列（-1 = 上游未上报，对 UI 的 v-if 等价于「不显示」，
+    // 所以这里把哨兵折成 0 而不是原样透出，避免界面把「没回报」画成「命中 0%」）
+    cacheReadTokens: r.cached_tokens > 0 ? r.cached_tokens : 0,
+    cacheCreationTokens: r.cache_write_tokens > 0 ? r.cache_write_tokens : 0,
     ttftMs: r.ttft_ms, latencyMs: r.latency_ms, status: r.status, error: r.error,
     cachedTokens: r.cached_tokens, cacheWriteTokens: r.cache_write_tokens,
     creditsUsed: r.credits_used,
@@ -1183,6 +1302,11 @@ module.exports = {
   open, close, proxyDir, dayStr, dayStartMs,
   driver: () => driver,
   BUILTIN_CHANNELS,
+  // 别名导出：上游 v1.43–v1.50 的后端与 4 个自带自检（proxy-lobster / proxy-modelscope /
+  // proxy-qoder-discovery / proxy-smoke）都按 store.CHANNELS 取渠道注册表。指向同一个数组引用，
+  // 不是第二份真相源；本分支的新代码一律用 BUILTIN_CHANNELS / channelList()。
+  CHANNELS: BUILTIN_CHANNELS,
+  QODER_INTL_ENABLED,
   isBuiltinChannel,
   channelList, invalidateChannels,
   channelDisplay, channelUnit,
@@ -1193,12 +1317,10 @@ module.exports = {
   // checkpointMsSource 是缝的自证面（评审 Concern 3）：让闸能对「默认值一字的惰性」与「被覆盖时如实标 env」
   // 两极都下断言，而不是只信注释。纯函数、无副作用（只读 env，不开库、不碰 WAL）。
   checkpoint, startCheckpointTimer, walBytes, lastCheckpoint, checkpointMsSource,
-  // 注：不再导出 CHANNELS 常量（本分支把渠道真相源收进 channelList()，内置 4 家 + 自建提供商）。
-  createKey, listKeys, findKeyBySecret, updateKey, deleteKey, keyTodayReq,
-  listAgents, setPoolStrategy,
+  createKey, importKey, listKeys, findKeyBySecret, updateKey, deleteKey, keyTodayReq,
+  listAgents, setPoolStrategy, setAgentCostTier,
   listProviders, getProvider, saveProvider, deleteProvider,
   listAccounts, accountRows, getAccount, accountMeta, mergeAccountMeta, accountSecrets, addAccount, updateAccount, bumpAccountUsage, setCreditsToday, removeAccount, noteError, clearError,
-
   listModelCooldowns, upsertModelCooldown, deleteModelCooldowns,
   snapshotCredits,
   setCreditPackages, listCreditPackages,
