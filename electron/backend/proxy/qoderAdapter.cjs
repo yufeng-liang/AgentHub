@@ -124,6 +124,8 @@ function makeQoder(product, deps) {
   // util 为必填：用于 hasConsumableDelta（流中断时的本地出线判定）。
   // 缺省时退回 require（生产环境由 adapters.cjs 注入；单测可直接传 util）
   const U = util || require("./util.cjs");
+  // fork-port：纯函数分类/标签剥离工具（与 product 无关，整模块传入）。缺省即退回上游原语义。
+  const SU = deps.selfSignUtil || null;
   const cfg = () => (rules.get("headers.json") || {})[product] || {};
 
   // ===== 签名会话池 =====
@@ -398,6 +400,7 @@ function makeQoder(product, deps) {
       const result = { status: 200, planLimit: false };
       let settled = false;
       let sentDelta = false;
+      const splitter = SU ? new SU.TagSplitter() : null;
       try {
         const r = await fetchStream(signed.url, {
           method: "POST",
@@ -436,8 +439,19 @@ function makeQoder(product, deps) {
               emit({ type: "error", status: 402, code: 116, message: msg });
               return;
             }
-            const st = code === "UNAUTHORIZED" || /token|unauthor/i.test(String(msg)) ? 401 : 502;
-            emit({ type: "error", status: st, code: innerCode || code, message: String(msg) });
+            // fork-port：403 在这里有两种含义——带 pricing/额度特征的是套餐不足（402 → 换号），
+            // 裸 403 才是登录态（401 → 刷新）；只看状态码会把「该充值」误报成「登录失效」，
+            // 换号与刷新两条自救路径同时走错。状态码先经 statusCodeOf 归一（本路给 statusCode
+            // 字符串，自签路给 statusCodeValue 数字），否则 403 双语义判据整体失效。
+            let st = code === "UNAUTHORIZED" || /token|unauthor/i.test(String(msg)) ? 401 : 502;
+            let outMsg = String(msg);
+            if (SU) {
+              const cls = SU.classify({ httpStatus: SU.statusCodeOf(env) || st, text: `${code} ${msg}` });
+              st = cls.status;
+              outMsg = cls.message;
+              if (st === 402) result.planLimit = true;
+            }
+            emit({ type: "error", status: st, code: innerCode || code, message: outMsg });
             return;
           }
           const text = env.body;
@@ -457,6 +471,13 @@ function makeQoder(product, deps) {
               // 本适配器内的 sentDelta 仅用于「流中断时能否如实上报」的本地决策（见下方 catch），
               // 判据用 util.hasConsumableDelta（正文/思考/工具调用三类真实可消费字段），
               // 避免只带 role 或私有扩展字段的噪声帧误判为"已出内容"而封死换号自救。
+              // fork-port：Qoder 把 reasoning 以 <thinking>/<think>/<reasoning>/<thought> 混在
+              // content 里下发，标签还会切在任意分片边界；不剥离会把思考链当正文计费并透给下游客户端。
+              // 顺序必须是「先剥离、再判出线」：被吞掉的 thinking 段用户一个字符都没看到，
+              // 按剥离前的 content 记 sentDelta 会让流中断误判成「已出内容」，封死换号自救。
+              if (splitter && typeof choice.delta.content === "string" && choice.delta.content) {
+                choice.delta.content = splitter.feed(choice.delta.content);
+              }
               if (U.hasConsumableDelta(choice.delta)) sentDelta = true;
               emit({ type: "delta", delta: choice.delta });
             }
@@ -474,6 +495,10 @@ function makeQoder(product, deps) {
             });
           }
         });
+        if (splitter) {
+          const tail = splitter.flush();
+          if (tail) emit({ type: "delta", delta: { content: tail } }); // 不 flush 会把末尾文字整段吞掉
+        }
       } catch (e) {
         // 流中断：已出内容则如实上报，未出内容交给外层换号
         if (sentDelta) {

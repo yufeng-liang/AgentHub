@@ -517,6 +517,39 @@ async function main() {
     assert(threw && threw.status === 503 && threw.qoderSignerDown === true, "未注入 selfSign 时保持上游 503 语义（不静默降级）");
   }
 
+  // ===== 10. fork-port：403 双语义 / 429→402 / <thinking> 跨片剥离 =====
+  // 上游只看 statusCode 字符串：403 一律当登录态。fork 实测 403 有两种含义——带 pricing/额度特征
+  // 的是套餐不足（402 → 换号），裸 403 才是登录态（401 → 刷新）；只看状态码把「该充值」误报成
+  // 「登录失效」，换号与刷新两条自救路径都会走错。thinking 标签同理：Qoder 把 reasoning 混在
+  // content 里下发且会切在分片边界。
+  console.log("\n[10] 信封分类与 thinking 剥离");
+  {
+    const SU = require("../electron/backend/proxy/qoderSelfSign.cjs");
+    const mk = (text) => makeQoder("qoder", {
+      ...deps,
+      selfSignUtil: SU,
+      signer: { createSession: async () => ({ prepareInferRequest: () => ({ url: "http://x/y", headers: {}, body: Buffer.from("{}") }), modelCacheDecrypt: () => "{}", free() {} }) },
+      fetchStream: async () => ({ resp: { body: sseStream(text), ok: true, status: 200 }, cancelTimer: () => {} }),
+    });
+    const run = async (text) => { const emits = []; const res = await mk(text).chat({ account: { uid: "u", meta: {} }, secrets: { token: "t" }, model: "dfmodel", body: { messages: [] }, emit: (x) => emits.push(x), meta: {} }); return { emits, res }; };
+
+    const a = await run(frame({ message: "please see https://qoder.com/pricing to upgrade your plan" }, "FORBIDDEN"));
+    assert(a.emits.some((x) => x.type === "error" && x.status === 402), "403 带 pricing 判成 402");
+    assert(a.res.planLimit === true, "402 同时置 planLimit（换号触发口径）");
+
+    const b = await run(frame({ message: "permission denied" }, "FORBIDDEN"));
+    assert(b.emits.some((x) => x.type === "error" && x.status === 401), "裸 403 判成 401 登录态");
+    assert(b.res.planLimit === false, "裸 403 不得置 planLimit（不是额度问题）");
+
+    const c = await run(frame({ message: "too many requests" }, "TOO_MANY_REQUESTS"));
+    assert(c.emits.some((x) => x.type === "error" && x.status === 402), "429 转 402（限流交交换号，不算硬故障）");
+
+    const d = await run(frame({ choices: [{ delta: { content: "A<thin" } }] }, "OK") + frame({ choices: [{ delta: { content: "king>B秘密</thinking>C" } }] }, "OK"));
+    const text = d.emits.filter((x) => x.type === "delta").map((x) => (x.delta && x.delta.content) || "").join("");
+    assert(text === "AC", "跨片 thinking 剥离干净且 flush 补回尾段（实得 " + JSON.stringify(text) + "）");
+    assert(!/think/.test(text), "正文不残留标签碎片");
+  }
+
   console.log("\n[done] Qoder 适配器单元自测全部通过");
 }
 
