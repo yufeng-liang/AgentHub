@@ -382,7 +382,7 @@ const PROXY_POOL = [
 
 /** 提供商列表的预览态：与 PROXY_POOL 里那条 myrelay 是同一个对象，
  *  这样「自定义提供商」页与「号池」页在 npm run dev:web 里对得上 */
-const MOCK_PROVIDERS: {
+const MOCK_PROXY_PROVIDERS: {
   id: string; display: string; domain: string; kind: string; enabled: boolean; baseUrl: string;
   models: unknown[]; extraHeaders: Record<string, string>; extraBody: Record<string, unknown>;
   updatedAt: number; keyCount: number; onlineCount: number;
@@ -1302,29 +1302,29 @@ export const mock = {
         return { encrypted: true, driver: "node:sqlite", dataDir: "(浏览器预览)" };
       // ===== 自定义提供商：浏览器预览的内存实现（只演界面，校验与号池都在主进程） =====
       case "proxy_provider_list":
-        return { ok: true, providers: MOCK_PROVIDERS.map((p) => ({ ...p, models: [...p.models] })) };
+        return { ok: true, providers: MOCK_PROXY_PROVIDERS.map((p) => ({ ...p, models: [...p.models] })) };
       case "proxy_provider_create": {
         const id = String(args?.id || "");
-        if (MOCK_PROVIDERS.some((p) => p.id === id)) return { ok: false, message: `标识 "${id}" 已存在` };
+        if (MOCK_PROXY_PROVIDERS.some((p) => p.id === id)) return { ok: false, message: `标识 "${id}" 已存在` };
         const p = {
           id, display: String(args?.display || id), domain: "", kind: "openai_compat", enabled: args?.enabled !== false,
           baseUrl: String(args?.baseUrl || ""), models: (args?.models as unknown[]) || [],
           extraHeaders: (args?.extraHeaders as Record<string, string>) || {}, extraBody: (args?.extraBody as Record<string, unknown>) || {},
           updatedAt: Date.now(), keyCount: ((args?.keys as unknown[]) || []).length, onlineCount: ((args?.keys as unknown[]) || []).length,
         };
-        MOCK_PROVIDERS.push(p);
+        MOCK_PROXY_PROVIDERS.push(p);
         return { ok: true, provider: p, keyIds: [] };
       }
       case "proxy_provider_update": {
-        const p = MOCK_PROVIDERS.find((x) => x.id === args?.id);
+        const p = MOCK_PROXY_PROVIDERS.find((x) => x.id === args?.id);
         if (!p) return { ok: false, message: "提供商不存在" };
         Object.assign(p, args, { updatedAt: Date.now() });
         return { ok: true, provider: p };
       }
       case "proxy_provider_delete": {
-        const i = MOCK_PROVIDERS.findIndex((x) => x.id === args?.id);
+        const i = MOCK_PROXY_PROVIDERS.findIndex((x) => x.id === args?.id);
         if (i < 0) return { ok: false, message: "提供商不存在" };
-        MOCK_PROVIDERS.splice(i, 1);
+        MOCK_PROXY_PROVIDERS.splice(i, 1);
         return { ok: true };
       }
       case "proxy_provider_add_key":
@@ -1335,7 +1335,7 @@ export const mock = {
         // 浏览器预览不代打上游，但要能演出两种结果态：清单里有的模型算"可用"，其余回失败文案，
         // 否则逐行测试这条 UI 在 dev:web 里永远只能看到一种样子
         const m = String(args?.model || "");
-        const known = MOCK_PROVIDERS.find((p) => p.id === args?.id);
+        const known = MOCK_PROXY_PROVIDERS.find((p) => p.id === args?.id);
         const inList = (known?.models || []).some((x) => (typeof x === "string" ? x : (x as { model: string }).model) === m);
         return inList
           ? { ok: true, ms: 640 + m.length * 7, model: m, sample: "（预览态假响应）收到", finishReason: "stop", usage: { prompt_tokens: 12, completion_tokens: 3, total_tokens: 15 } }
