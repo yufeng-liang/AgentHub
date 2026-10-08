@@ -840,9 +840,9 @@ async function main() {
     "api.cline.bot": "cline", // chat/auth/refresh 同域，路径原样保留
     "autoglm-acceleration-api.zhipuai.cn": "autoclaw",
     "autoglm-api.autoglm.ai": "autoclaw_intl",
-    // qoder 两区的**全部**域都要在册：改写表按 hostname 精确匹配，漏一个就是 realFetch
-    // ——fork 期只写 global 区（api3.qoder.sh）就够，归一移植后 qoder=CN，
-    // 自签与 PAT/签到都打在 .com.cn 域上，漏映射等于拿假凭据往真上游发请求。
+    // 这张表是「上游域 → 假上游段」的改写映射，不是出网白名单：
+    // 归一移植后 qoder 从 global 区换成 CN 域，漏登记 api3/gateway/openapi 中任何一个，
+    // 后果都不是「测试覆盖不到」而是拿假凭据往真上游发请求。故未登记域一律不放行（见下方守卫）。
     "api3.qoder.sh": "qoder",
     "gateway.qoder.com.cn": "qoder",
     "openapi.qoder.com.cn": "qoder",
@@ -850,10 +850,11 @@ async function main() {
   globalThis.fetch = (url, opts) => {
     const u = new URL(String(url));
     const seg = FAKE_HOSTS[u.hostname];
-    // 守卫：qoder 的域必须逐个登记。漏一个不是「测试覆盖不到」，而是拿假凭据往真上游发请求
-    // （归一移植后 qoder 从 global 区换成 CN 域，就差点踩中这一条）。宁可当场红，不静默出网。
-    if (!seg && /(^|\.)qoder\.(sh|com\.cn)$/.test(u.hostname)) {
-      throw new Error(`smoke 守卫：qoder 域 ${u.hostname} 未登记进 FAKE_HOSTS，拒绝出网`);
+    // 守卫：默认拒绝。本段只该碰 127.0.0.1 的假上游与表内登记的域，其余当场红。
+    // 早先只按 qoder 域名做正则，等于承认「漏一个渠道就静默出网一次」——这一类对 cline/autoclaw
+    // 以及将来接入的 qoder_intl（api2/openapi.qoder.sh）同样成立，所以判据换成「非 loopback 即拒」。
+    if (!seg && !/^(127\.0\.0\.1|localhost|\[::1\])$/.test(u.hostname)) {
+      throw new Error(`smoke 守卫：域名 ${u.hostname} 未登记进 FAKE_HOSTS，拒绝出网`);
     }
     if (!seg) return realFetch(url, opts);
     // 取末两级路径做假上游端点名（cline: chat/completions 与 auth/refresh；其余上游单端点）
@@ -965,6 +966,13 @@ async function main() {
   // 集成回归（T14 发现的 _key/key 错位 bug）：chat 必须把目录条目的上游 key 带进信封与头，而不是 "undefined"
   assert(qEnv.model_config.key === "qfmodel", "信封 model_config.key 是上游 key 而非 undefined: " + qEnv.model_config.key);
   assert(seenHeaders.qd["x-model-key"] === "qfmodel", "x-model-key 是上游 key 而非 undefined: " + seenHeaders.qd["x-model-key"]);
+
+  // 守卫自证：未登记域必须**被守卫抛掉**，而不是静默放行。只补表不加永久断言的话，
+  // 下一次改写这张表的人（或把判据改回按域名挑的改动）不会发现守卫已经不生效。
+  // 探针域名用 RFC 2606 保留的 .invalid——即便守卫真失效也打不到任何真上游，只是让断言变红。
+  let guardErr = "";
+  try { await globalThis.fetch("https://smoke-guard-probe.invalid/ping"); } catch (e) { guardErr = String((e && e.message) || e); }
+  assert(/smoke 守卫/.test(guardErr), "出网守卫拦下未登记域（空/其它错＝守卫已失效）: " + (guardErr.slice(0, 90) || "未抛错"));
 
   // 收尾：还原 fetch、清理新渠道数据
   globalThis.fetch = realFetch;
