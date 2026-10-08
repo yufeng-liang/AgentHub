@@ -176,7 +176,13 @@ async function main() {
   const prov = await invoke("memory_provider_list");
   check("供应商列表初始为空数组", Array.isArray(prov.providers), JSON.stringify(prov.providers.length));
   const auto = await invoke("memory_auto_status");
-  check("自动化状态含 9 个任务", auto.tasks.length === 9, String(auto.tasks.length));
+  // 断言核心任务齐全而非写死总数（与下面「导入来源」同一口径）：上游 v1.51.0 加了第 10 个任务
+  // cleanup（五类异常记忆自动清理），写死 9 会在每次上游扩表时误报，而漏掉真正的任务表缺失
+  const autoIds = auto.tasks.map((t) => t.id);
+  check("自动化状态含核心任务（含 v1.51.0 的 cleanup）",
+    ["extract", "summarize", "tag", "classify", "supersede", "distill", "consolidate", "profile", "index-scan", "cleanup"]
+      .every((id) => autoIds.includes(id)), String(auto.tasks.length));
+  check("自动化任务不重复", new Set(autoIds).size === autoIds.length, autoIds.join(","));
   const sourcesRes = await invoke("memory_import_sources");
   // 断言核心来源齐全而非写死总数：来源清单随版本增补（当前 8 个），写死个数会在每次扩充后误报
   const srcIds = sourcesRes.sources.map((s) => s.id);
