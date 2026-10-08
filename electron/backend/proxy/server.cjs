@@ -103,7 +103,11 @@ function resolveChannel(key, model, settings) {
   // （auto/ultimate 这类）一旦被别家目录收走，钉着 trae 的客户端会被静默改投且无从察觉。
 
   if (key.route !== "auto") return { channel: key.route };
-  const owners = adapters.modelOwners(model);
+  // 必须传 settings：modelOwners 读的是「本请求生效配置」里的排除集，
+  // 少传一个参数就退回磁盘默认值 ⇒ 用户在目录页点掉的渠道根本不参与路由（A11 会红）。
+  const owners = adapters.modelOwners(model, settings);
+  // 排除到空是用户显式意图的结果，不是「模型未知」：绝不能落到下面的未知透传或 fixed 渠道兜底
+  if (!owners.length && (settings.modelChannelExcludes || {})[model]) return { channel: null, allExcluded: true };
   if (owners.length === 1) return { channel: owners[0] }; // auto 模式下模型仅存在于单渠道目录 → 直达
   if (owners.length > 1) {
     const ov = (settings.modelOverrides || {})[model];
@@ -565,6 +569,14 @@ async function handleChat(req, res, settings, surface) {
     record({ status: 400, error: "model disabled" });
     return sink.endErr(400, `模型 "${actualModel}" 已被禁用（模型目录页可恢复）`, "invalid_request_error", "model_disabled");
   }
+  // 渠道被点到全排除：与「已被禁用」同形处理（明确 400，且在回退链之前），但文案必须说清是渠道被排掉了——
+  // 报成「不在任何渠道目录中」会让人去翻模型目录，而该翻的是那一列渠道。
+  // 只解析一次：resolveChannel → modelOwners 要遍历全部适配器目录，下面那道「未知模型」判据共用同一个结果。
+  const primaryRoute = resolveChannel(key, actualModel, settings);
+  if (primaryRoute.allExcluded) {
+    record({ status: 400, error: "all channels excluded" });
+    return sink.endErr(400, `模型 "${actualModel}" 的所有渠道已被你排除（模型目录页点回该渠道即可恢复）`, "invalid_request_error", "model_all_channels_excluded");
+  }
   // 模型回退链（多模型自动切换）：请求模型 → 回退模型（单跳防循环）。
   // 触发时机：① 模型不在任何渠道目录（unknown）；② 渠道号池全部不可用（耗尽/冷却）。
   // per-model 覆盖（旧配置兼容）优先，否则用全局统一回退模型（autoFallbackEnabled !== false 且已配置）。
@@ -578,7 +590,7 @@ async function handleChat(req, res, settings, surface) {
     modelChain.push(fallback);
   }
 
-  if (!resolveChannel(key, actualModel, settings).channel && !fallback) {
+  if (!primaryRoute.channel && !fallback) {
     const hint = adapters.listableModels(settings).map((m) => m.id).join(", ");
     record({ status: 400, error: "unknown model" });
     return sink.endErr(400, `模型 "${actualModel}" 不在任何渠道目录中。可用模型：${hint}`, "invalid_request_error", "model_not_found");

@@ -292,6 +292,10 @@ export interface ProxyConfig {
   debugStatus: boolean;
   /** 模型 → 渠道 id 的 per-model 覆盖（渠道可扩充，故为字符串值） */
   modelOverrides: Record<string, string>;
+  /** 模型 → 已排除的渠道 id 列表（模型目录页「点掉=排除」）：自动路由时把这些渠道从归属候选里裁掉。
+   *  与 modelOverrides 同为 canonical 模型 id 精确键、同样只在本地生效——刻意**不进**跨设备同步
+   *  （poolsync 的 SHARED_CONFIG_KEYS 不含它）：排除表达的是这台设备上此刻的取舍，同步过去会盖掉另一台的选择。 */
+  modelChannelExcludes: Record<string, string[]>;
   /** 拟人抖动：每次上游请求前随机停 40~220ms，模拟真实客户端节奏 */
   humanizeJitter: boolean;
   /** 禁用的模型（请求直接 400） */

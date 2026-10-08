@@ -4950,7 +4950,15 @@ function modelOwners(model, cfg) {
       out.push(channel);
     }
   }
-  return out;
+  // 模型级渠道排除：只在**这一处**裁（而不是在 server 的两个调用点各裁一遍），
+  // 这样主渠道选择（server.cjs:106）与故障转移候选队列（:701）拿到的归属口径天然一致。
+  // 键口径与 modelOverrides 完全相同：canonical 模型 id 精确匹配、不做大小写兜底——
+  // 多一套口径就多一类「目录改名后静默失效」的暗坑，而 modelOverrides 已是这个形状，可对照。
+  const ex = (c.modelChannelExcludes || {})[model];
+  if (!ex || !ex.length) return out;
+  const off = new Set(ex.map(String));
+  // 排除到空是用户的显式意图，不是「模型未知」：返回空数组即可，调用点据此判 400（见 server.cjs allExcluded）
+  return out.filter((ch) => !off.has(ch));
 }
 
 /** /v1/models 对外可列模型：合并视图减去 disabledModels（口径与请求路径 400 拦截一致）。

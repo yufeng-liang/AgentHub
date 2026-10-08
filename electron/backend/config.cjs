@@ -165,6 +165,7 @@ function defaultConfig() {
       usageRetentionDays: 90,   // 请求流水保留期（天）：启动 GC 与统计页「清理」共用（7~3650）
       debugStatus: false,       // /status 调试端点（默认关，仅回环地址）
       modelOverrides: {},       // 模型 → 渠道 的 per-model 覆盖（多源重叠时优先）
+      modelChannelExcludes: {}, // 模型 → 已排除渠道（模型目录页「点掉=排除」；不进跨设备同步）
       humanizeJitter: true,     // 拟人抖动：每次上游请求前随机停 40~220ms（防风控识别为反代）
       disabledModels: [],       // 禁用的模型（请求直接 400 model_disabled，且不出现在 /v1/models）
       modelFallback: {},        // 模型 → 回退模型（旧版 per-model 配置，优先于全局回退）

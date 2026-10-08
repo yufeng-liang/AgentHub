@@ -54,6 +54,7 @@ function defaultConfig(): AppConfig {
       usageRetentionDays: 90,
       debugStatus: false,
       modelOverrides: {},
+      modelChannelExcludes: {},
       humanizeJitter: true,
       disabledModels: [],
       modelFallback: {},
