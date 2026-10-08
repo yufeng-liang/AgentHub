@@ -53,7 +53,7 @@ const fmtReal = loadTsModule("src/views/proxy/format.ts");
 const { fmtCtx, capabilityTags } = fmtReal;
 // 合并列的摘要/态别算法同样取**同一份实现**：闸自己拼一遍「自动路由 · N 渠道」，
 // 组件写成别的文案也不会红——这与 colCountFor / fmtCtx 是一个口径。
-const { chanSummary, chanTone, chanRows, staleExcluded, liveCount } = loadTsModule("src/views/proxy/channelCell.ts");
+const { chanSummary, chanTone, chanRows, staleExcluded, liveCount, capTagsFor, CAP_COMPACT_BELOW } = loadTsModule("src/views/proxy/channelCell.ts");
 
 let pass = 0;
 const failures = [];
@@ -170,7 +170,7 @@ async function render({ rows, firstVisible, viewRows, activeTab = "" }) {
     app: { config: { proxy: { modelCustom: { "model-001": { contextLength: 999 } } } } },
     REASONING_EFFORT_ALL: [{ value: "", label: "默认" }, { value: "low", label: "低 (low)" }],
     // 能力标签取**真实现**：桩（此前是 () => ["工具"]）会让「五枚全显」这条判据只能测到桩自己。
-    capabilityTags, channelName: () => "Trae", fmtRate: () => "—",
+    channelName: () => "Trae", fmtRate: () => "—",
     // 合并列的两个可见函数也取真的（同上：注入假的等于门禁替被测代码答题）
     chanSummary, chanTone,
     // 探针实测：未解析组件（el-popover / el-select）的**插槽内容在 SSR 里会被渲染**
@@ -180,6 +180,10 @@ async function render({ rows, firstVisible, viewRows, activeTab = "" }) {
     chanRowsOf: (m) => chanRows(m, ["trae", "workbuddy"]),
     staleExcluded: (m) => staleExcluded(m), liveCount: (m) => liveCount(m),
     toggleExclude: noop, togglePin: noop, clearStale: noop, gotoKey: noop,
+    // 能力格走 capTagsFor（真档位规则），这里只给「量到的宽度」这个输入——
+    // 组件平时从 ResizeObserver 拿它，SSR 里没有 DOM 可量。阈值本身由 ㉘ 单独判，
+    // 所以这里不是在替被测代码决定档，是在喂夹具输入（与给 scrollTop 同性质）。
+    capTags: (m) => capTagsFor(m, 1400),
     // 上下文列「非编辑态 K/M 缩写 + 聚焦草稿」引入的绑定点。
     // 这段只保证模板渲染得出来，本闸的判据是行结构（⑬ 已单独钉输入框还在），
     // 所以 ctxValue 只取目录值、不复制组件里「自定义优先」那条链路。
@@ -317,6 +321,31 @@ async function main() {
   check("㉕ 排除行有 chan-excluded、钉定行有 chan-pinned（两种态不同类名）",
     /chan-excluded/.test(one) && /chan-pinned/.test(row3),
     `首行 ${JSON.stringify((/class="(chan-sum[^"]*)"/.exec(one) || [])[1])} / 第4行 ${JSON.stringify((/class="(chan-sum[^"]*)"/.exec(row3) || [])[1])}`);
+
+  // ===== E++. 能力列的窄宽度降级（定案 Q13 的降级顺序只能这样判，见下面注释）=====
+  // 组件按滚动容器实测宽度选档，SSR 里没有宽度可量（tableW=0 ⇒ 恒非 compact），
+  // 所以这两条判**纯函数**、真机 860 档判**渲染结果**。想用闸一次覆盖两档就得给组件注入
+  // 一个假宽度，那等于门禁替被测代码决定档位——不做。
+  const fullTags = capabilityTags(models[0]);
+  const compactTags = capabilityTags(models[0], { compact: true });
+  check(`㉖ compact 只比 full 少「视」一项（${fullTags.join("")} → ${compactTags.join("")}）`,
+    fullTags.includes("视") && !compactTags.includes("视") && compactTags.length === fullTags.length - 1,
+    JSON.stringify({ fullTags, compactTags }));
+  // ↑ 那枚是「去掉 K/M 后缀、留整数千位」，不是整枚删掉：输出上限是这一列最有用的一个数
+  check(`㉖b compact 档的↑仍在且去掉缩写后缀（full ${fullTags[fullTags.length - 1]} → compact ${compactTags[compactTags.length - 1]}）`,
+    compactTags.some((t) => /^↑\d+$/.test(t)) && !compactTags.some((t) => /[KM]$/.test(t)),
+    JSON.stringify(compactTags));
+  // ㉗ 未知输出上限要显式给 ↑—：静默不显会让人以为这模型没有上限，而不是「不知道」
+  const noOut = { ...models[0], maxOutputTokens: 0 };
+  check("㉗ maxOutputTokens 未知时能力列含 ↑—", capabilityTags(noOut).includes("↑—") && capabilityTags(noOut, { compact: true }).includes("↑—"),
+    JSON.stringify(capabilityTags(noOut)));
+  // ㉘ 阈值只写一次这件事：capTagsFor 的边界必须是「宽度>0 且 < CAP_COMPACT_BELOW」。
+  //    0（还没量到 / SSR 首帧）按全显档，否则首屏会先闪一版砍掉「视」的标签。
+  check(`㉘ capTagsFor 边界（${CAP_COMPACT_BELOW - 1} 降档、${CAP_COMPACT_BELOW} 全显、0 全显）`,
+    capTagsFor(models[0], CAP_COMPACT_BELOW - 1).length === compactTags.length &&
+      capTagsFor(models[0], CAP_COMPACT_BELOW).length === fullTags.length &&
+      capTagsFor(models[0], 0).length === fullTags.length,
+    `${capTagsFor(models[0], CAP_COMPACT_BELOW - 1).join("")} / ${capTagsFor(models[0], CAP_COMPACT_BELOW).join("")} / ${capTagsFor(models[0], 0).join("")}`);
 
   // ===== F. 只虚拟化了目录这一张表 =====
   // 数 class="v-spacer" 而不是 v-spacer：后者在 CSS 选择器里也出现（tr.v-spacer），

@@ -1,5 +1,5 @@
 import type { ProxyModel } from "../../types";
-import { channelName } from "./format";
+import { capabilityTags, channelName } from "./format";
 
 /** 模型目录「渠道」列的纯算法：摘要文案、态别类名、Popover 行序、窄宽度阈值。
  *
@@ -10,6 +10,14 @@ import { channelName } from "./format";
 /** 窄宽度降级阈值：滚动容器 clientWidth 低于它，能力列先去掉 K/M 后缀、再砍「视」（定案 Q13）。
  *  860/888 是本页实测的窄端（列宽按百分比摊，能力列 22.5% ≈ 193px），五枚全显放不下。 */
 export const CAP_COMPACT_BELOW = 1000;
+
+/** 按容器实测宽度取能力标签（阈值判断只写在这里一次）。
+ *  组件只负责量宽度、闸只负责量这条规则——把 `width < 1000` 抄进模板表达式，
+ *  闸就得在测试里再抄一遍同一个比较，那才是真的自证。
+ *  @param width 滚动容器 clientWidth；0 = 还没量到（首帧 / SSR），按全显档。 */
+export function capTagsFor(m: ProxyModel, width: number): string[] {
+  return capabilityTags(m, { compact: width > 0 && width < CAP_COMPACT_BELOW });
+}
 
 const srcOf = (m: ProxyModel) => (m.sources || []) as string[];
 const exOf = (m: ProxyModel) => (m.excluded || []) as string[];

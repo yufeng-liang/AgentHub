@@ -6,8 +6,8 @@ import type { ComponentPublicInstance } from "vue";
 import * as api from "../../api/ipc";
 import type { ModelCustomEntry, ProxyChannelId, ProxyChannelView, ProxyModel } from "../../types";
 import { useAppStore } from "../../stores/app";
-import { capabilityTags, channelName, fmtCtx, fmtInt, fmtRate, parseCtxInput } from "./format";
-import { chanRows, chanSummary, chanTone, staleExcluded } from "./channelCell";
+import { channelName, fmtCtx, fmtInt, fmtRate, parseCtxInput } from "./format";
+import { capTagsFor, chanRows, chanSummary, chanTone, staleExcluded } from "./channelCell";
 import { ROW_H, colCountFor, winRange } from "./virtualWindow";
 import ModelMetaEditor from "../../components/proxy/ModelMetaEditor.vue";
 
@@ -83,9 +83,14 @@ const vPadBottom = computed(() => range.value.padBottom);
 
 let scrollerEl: Element | null = null;
 let scrollerRo: ResizeObserver | null = null;
+/** 滚动容器实测宽度（能力列按它选 compact 档）；0 = 还没量到，按全显档处理 */
+const tableW = ref(0);
 function measureView() {
   viewRows.value = scrollerEl ? Math.ceil(scrollerEl.clientHeight / ROW_H) : 0;
+  tableW.value = scrollerEl ? scrollerEl.clientWidth : 0;
 }
+/** 档位规则在 channelCell.capTagsFor 里（阈值只写一次，结构闸判的是同一条） */
+const capTags = (m: ProxyModel) => capTagsFor(m, tableW.value);
 /** 函数式 ref：滚动容器在 v-if 里，切子 Tab 会重建，元素到手/消失各回调一次。
  *  形参类型必须与 Vue 的 VNodeRef 一致（含 ComponentPublicInstance），
  *  写窄了 strictFunctionTypes 下会因参数逆变直接报 TS2322。 */
@@ -666,13 +671,15 @@ onMounted(refresh);
                   <td class="cell-chips cap-cell" role="button" tabindex="0" :aria-label="`编辑 ${m.id} 的能力与档位`" @click="openMetaEditor(m)" @keydown.enter.prevent="openMetaEditor(m)">
                     <!-- 2026-09-30 重组：原「元数据」列并进能力格 —— chips 一眼看能力，整格可点开编辑器，
                          悬停露出铅笔提示可编辑；有用户覆盖时「覆盖」徽标跟过来（信息不丢，列数 -1）。
-                         role=button + 键盘 Enter，可访问性与原按钮打平。 -->
+                         role=button + 键盘 Enter，可访问性与原按钮打平。
+                         2026-10-08：改回五枚全显（合并列把宽度还回来了）。窄容器由 capCompact
+                         降档，而不是靠 CSS 截断——「图 视 …」这种被省略号切掉的样子最没用。 -->
                     <span class="cap-chips">
-                      <el-tooltip v-if="capabilityTags(m).length > 1" :content="`能力：${capabilityTags(m).join(' / ')}（点击编辑）`" placement="top">
-                        <span class="chip-sum"><span class="tag tag-dim">{{ capabilityTags(m)[0] }}</span><span class="tag tag-dim chip-more">+{{ capabilityTags(m).length - 1 }}</span></span>
+                      <el-tooltip :content="`能力：${capTags(m).join(' / ')}（点击编辑）`" placement="top">
+                        <span class="cap-list">
+                          <span v-for="t in capTags(m)" :key="t" class="tag tag-dim">{{ t }}</span>
+                        </span>
                       </el-tooltip>
-                      <span v-else-if="capabilityTags(m).length" class="tag tag-dim">{{ capabilityTags(m)[0] }}</span>
-                      <span v-else class="cap-none">—</span>
                     </span>
                     <i class="ph ph-pencil-simple cap-edit-ic" aria-hidden="true"></i>
                     <el-tooltip v-if="m.metaOverridden && m.metaOverridden.length" content="含用户覆盖" placement="top">
@@ -1291,26 +1298,22 @@ onMounted(refresh);
   padding-right: 8px;
   overflow: hidden;
 }
-/* 能力 / 来源渠道两列：多枚标签在 920 下曾被省略号切成 "图 …"、"WorkBuddy CN …"，
-   而这两列的宽度是上面按 888 容器倒推的，加宽就要动模型列。改成只显首枚 + 计数角标，
-   全量清单交给 tooltip —— 单行，不碰 ROW_H=60 的虚拟滚动垫高数学。 */
+/* 能力列：2026-09-30 曾因宽度不够改成「只显首枚 + 计数角标」，那时代价是五枚能力只能看见一枚。
+   2026-10-08 合并列把这列加宽到 22.5%，改回全显；宽度仍然不够时降 compact 档
+   （先去掉↑的缩写后缀、再砍「视」），**不靠省略号截断**——"图 视 …" 这种切法既看不出少了什么，
+   也读不出↑后面本来是 131K 还是 1310。单行是硬约束：换行就破 ROW_H=60 的垫高数学。 */
 .cell-chips .tag {
   font-size: 10px;
   padding: 1px 4px;
 }
-.chip-sum {
+.cap-list {
   display: inline-flex;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 3px;
-  max-width: 100%;
   min-width: 0;
 }
-.chip-sum .tag:first-child {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.chip-more {
+.cap-list .tag {
   flex-shrink: 0;
 }
 /* ===== 合并后的「渠道」列（2026-10-08）=====
@@ -1622,9 +1625,6 @@ onMounted(refresh);
   gap: 3px;
   min-width: 0;
   overflow: hidden;
-}
-.cap-none {
-  color: var(--text-3);
 }
 .cap-edit-ic {
   flex: 0 0 auto;
