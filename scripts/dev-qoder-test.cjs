@@ -242,13 +242,16 @@ const realFetch = globalThis.fetch;
   const row2 = store.accountRows("qoder").find((r0) => r0.uid === "uid-q-2");
   ok("userinfo 失败仍落库（uid 用 poll 的 user_id、名兜底、到期缺省 now+30 天）", !!acc2 && acc2.name === "Qoder 账号" && acc2.meta.mode === "cn" && seen.some((s) => s.url.startsWith("https://openapi.qoder.com.cn/api/v1/deviceToken/poll")) && row2.expires_at > Date.now() + 29 * 86400 * 1000, acc2 && { name: acc2.name, meta: acc2.meta, exp: row2.expires_at });
 
-  // 归一移植后 qoder=CN（地区由渠道 id 定），而 qoder_intl 尚未注册（store.QODER_INTL_ENABLED=false）。
-  // 继续放 intl 过去会落一个 meta.mode=global 的 qoder 账号并被静默打到 CN 网关——「答非所问」比
-  // 「明确说不支持」难排查得多，所以这里必须当场拒绝，且不得留下任何 global 账号。
-  const timersBefore = timers.length;
+  // 区服由**渠道 id** 决定（qoder=CN / qoder_intl=global），edition 这个登录参数不再被读。
+  // 旧契约是「edition=intl 且开关未开 ⇒ 当场拒绝」；现在 qoder_intl 按开关条件注册，
+  // 开关关时它连渠道都不存在（下面第二条钉的就是这件事），开关开时它是合法渠道。
   const ri = await discovery.beginOAuth("qoder", { edition: "intl" }, () => {});
-  ok("intl 区在服务尚未接入时被明确拒绝", ri.ok === false && /国际版/.test(String(ri.message || "")), ri);
-  ok("拒绝时不排轮询、不落任何 global 账号", timers.length === timersBefore && !store.listAccounts("qoder").some((a) => a.meta && a.meta.mode === "global"), { timersBefore, now: timers.length });
+  ok("qoder 渠道即使带 edition=intl 也落 CN 授权页（区服跟随渠道 id）", ri.ok === true && /^https:\/\/qoder\.com\.cn\/device\/selectAccounts\?/.test(ri.url), ri.url || ri);
+  await drain();
+  // beginOAuth 是 async：同步 try 抓不到它的 throw（会变成 rejected promise），必须 await 收错误。
+  let intlErr = "";
+  try { await discovery.beginOAuth("qoder_intl", {}, () => {}); } catch (e) { intlErr = String((e && e.message) || e); }
+  ok("国际版渠道在开关关闭时根本不存在（不会半接入）", /未知渠道 qoder_intl/.test(intlErr), intlErr || "没抛错");
 
   // refresh_token 含 | 判无效（§2.3）→ 不落库、继续轮；取消后不再排期
   resetClock(); seen = []; polls = 0; done = null;

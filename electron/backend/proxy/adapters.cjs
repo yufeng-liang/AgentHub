@@ -4326,7 +4326,9 @@ const autoclaw_intl = makeAutoClaw("intl");
 // （index.cjs:33 与本文件历史注释都记过同一教训：Node 下取到半初始化模块 → undefined）。
 // selfSign/selfSignUtil 是 fork 独有：上游把「客户端未装」判成 503 渠道级故障，
 // fork 还要第二条签名路（纯 JS COSY 自签，零安装可用）与一套信封分类/标签剥离工具。
-// qoder_intl 暂不注册——store.QODER_INTL_ENABLED=false，与登录归一在同批翻（归一移植计划二）。
+// qoder_intl 与 qoder 共用同一个工厂，只差 product 键（域名由 qoderEndpoints 按渠道分派）。
+// 注册必须与 store.QODER_INTL_ENABLED 同进同退：ADAPTERS 参与 modelOwners，
+// 悄悄注册会让「渠道被隐藏但仍在路由」变成静默回归——proxy-smoke 的 intlOn 断言就是钉这一点的。
 const qoder = makeUpstreamQoder("qoder", {
   fetchStream, pumpSse, httpJson, rules, store, util,
   auth: qoderAuth,
@@ -4334,6 +4336,17 @@ const qoder = makeUpstreamQoder("qoder", {
   selfSign: qoderSelfSign.makeSelfSign("qoder", { fetchStream, pumpSse, httpJson }),
   selfSignUtil: qoderSelfSign,
 });
+const qoderIntl = store.QODER_INTL_ENABLED
+  ? makeUpstreamQoder("qoder_intl", {
+      fetchStream, pumpSse, httpJson, rules, store, util,
+      auth: qoderAuth,
+      signer: qoderSigner,
+      selfSign: qoderSelfSign.makeSelfSign("qoder_intl", { fetchStream, pumpSse, httpJson }),
+      selfSignUtil: qoderSelfSign,
+    })
+  : null;
+// 注：qoderIntl 只能靠下面的 ADAPTERS 字面量条件展开进表，不能在这里写
+// `ADAPTERS.qoder_intl = qoderIntl` —— 那张表在本行之后才声明，赋值会踩 TDZ 直接崩在模块加载。
 
 
 // ===== 自定义提供商：通用 OpenAI 兼容适配器（按 agents 行动态实例化，一张表行 = 一个上游端点） =====
@@ -4730,7 +4743,7 @@ zcode_intl.id = "zcode_intl";
 
 // zcode / zcode_intl 追加在**末尾**：modelOwners 按此顺序返回，glm-5.3 等既有 owner（autoclaw/qoder）
 // 的默认归属不变——新家只是多一个来源，不抢既有裸名路由。
-const ADAPTERS = { trae, workbuddy, workbuddy_ai, raccoon, cline_free, cline_pass, autoclaw, autoclaw_intl, modelscope, lobster, qoder, zcode, zcode_intl };
+const ADAPTERS = { trae, workbuddy, workbuddy_ai, raccoon, cline_free, cline_pass, autoclaw, autoclaw_intl, modelscope, lobster, qoder, zcode, zcode_intl, ...(qoderIntl ? { qoder_intl: qoderIntl } : {}) };
 
 /** 渠道 → 适配器：内置 8 家查静态表，未命中再试动态提供商。
  *  ADAPTERS 本身保持只含内置 —— mergedModels()/modelOwners() 靠这个前提把裸模型名

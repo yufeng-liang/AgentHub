@@ -2278,18 +2278,17 @@ function qoderOauthMeta(machineId, region, email, userId) {
 }
 
 async function beginQoderOAuth(channel, edition, onDone) {
-  const region = qoderRegionOfMode(edition);
-  // 归一移植后地区由**渠道 id** 决定（qoder=CN），Global 区要靠 qoder_intl 承载，而它尚未注册
-  // （store.QODER_INTL_ENABLED=false）。放过去会落一个 meta.mode=global 的 qoder 账号并被静默
-  // 打到 CN 网关——「答非所问」比「明确说不支持」难排查得多，故当场拒绝、且不留任何 global 号。
-  // 计划二注册 qoder_intl 并同批翻开开关后，本分支自然失效（region=global 命中已注册渠道）。
-  if (region === "global" && !store.QODER_INTL_ENABLED) {
-    return { ok: false, message: "Qoder 国际版渠道尚未接入：当前仅支持中国版（CN）" };
-  }
+  // 区服由**渠道 id** 决定（与 qoderAdapter / qoderAuth / qoderSelfSign 同一口径）：
+  // qoder=CN、qoder_intl=global。edition 是「单渠道 + meta.mode 切区」时代的遗留登录参数，
+  // 这里不再读它——一个渠道对应一个区服，要登国际版就加 qoder_intl 那一行，不靠弹窗里的 radio。
+  const region = EP.regionOf(channel);
+  // 原先这里有一条「region===global 且开关未开 ⇒ 明确拒绝」：qoder_intl 现在按开关条件注册，
+  // 开关关时 beginOAuth 在 `if (!adapters.get(ch))` 就报「未知渠道」，开关开时它是合法渠道，
+  // 两头都到不了这条判断，故删除。
   const cfg = EP.REGIONS[region]; // 域名读真相源（此前这里是第四份手抄表）
   const verifier = crypto.randomBytes(32).toString("base64url");
   const challenge = crypto.createHash("sha256").update(verifier).digest("base64url"); // S256 无填充
-  const machineId = qoderMachineIdOf();
+  const machineId = qoderMachineIdOf(channel);
   const nonce = util.uuid().replace(/-/g, "");
   const url = `${cfg.webOrigin}/device/selectAccounts?challenge=${encodeURIComponent(challenge)}&challenge_method=S256&machine_id=${encodeURIComponent(machineId)}&nonce=${nonce}`;
   oauthSession = {
@@ -2352,9 +2351,10 @@ async function saveDiscoveredAccount(channel, { uid, name, token, refreshToken, 
 }
 
 /** qoder 机器标识：与对话侧共用 adapters 的单一实现（同一批候选文件、同一份落盘位置、同一进程内缓存），
- *  避免两处各写一份读文件逻辑导致机器码漂移。 */
-function qoderMachineIdOf() {
-  return adapters._qoderMachineId();
+ *  避免两处各写一份读文件逻辑导致机器码漂移。按渠道分取——CN 与国际版各自的客户端目录不同
+ *  （~/.qoder-cn vs ~/.qoder），混用会让登录 URL 送出的 id 与签名用的 id 不是同一个。 */
+function qoderMachineIdOf(product = "qoder") {
+  return adapters._qoderMachineId(product);
 }
 
 // ===== AutoClaw 国际版 OAuth（协议参考 第四章 §3.2）：三步——
@@ -3184,7 +3184,9 @@ async function beginOAuth(channel, opts, onDone, helpers) {
     throw new Error("AutoClaw（国内）官方没有网页登录：请用「从本机软件导入」（自动读取 %APPDATA%/AutoClaw/auth.json）或粘贴 token");
   }
   if (ch === "cline_free" || ch === "cline_pass") return beginClineOAuth(ch, cb);
-  if (ch === "qoder") return beginQoderOAuth(ch, o.edition, cb);
+  // qoder 双区共用同一条设备码链路。漏掉 qoder_intl 会掉到本函数末尾的 WorkBuddy 兜底——
+  // 用 WorkBuddy 的回环 OAuth 去打 Qoder 登录，表现为「授权页打开了、但永远等不到号」。
+  if (ch === "qoder" || ch === "qoder_intl") return beginQoderOAuth(ch, o.edition, cb);
   if (ch === "zcode" || ch === "zcode_intl") return beginZcodeOAuth(ch, cb);
   // autoclaw 国际版只有网页 OAuth（阿里云滑块前置 + 回环回调换码）；滑块参数由 renderer 两次调用透传
   if (ch === "autoclaw_intl") return beginAutoClawIntlOAuth(ch, o, cb);
