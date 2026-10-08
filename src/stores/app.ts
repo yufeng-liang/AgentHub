@@ -7,8 +7,12 @@ import * as api from "../api/ipc";
 // 浏览器 mock / 后端加载失败时的兜底默认值；后端权威默认值见 electron/backend/config.cjs
 const defaultConfig: AppConfig = {
   theme: "dark",
-  // 动效默认关闭（低配置电脑友好），用户在设置里开启后本机记住
-  fx: false,
+  // 动效默认开启（装饰层默认体验）；粒子尘场 / 光池追随默认关闭（背景层最吃性能的两项），
+  // 个性化鼠标样式默认开启（轻量；保持老用户升级后液滴光标不断档）
+  fx: true,
+  fxParticles: false,
+  fxPools: false,
+  fxCursor: true,
   moduleOrder: MODULES.map((m) => m.key),
   tools: {},
   customDirs: [],
@@ -62,6 +66,16 @@ export type SkillsPageId = "dashboard" | "library" | "skill-detail" | "sync" | "
 // 保存串行链：save_config 在主进程并发执行，「后写完者赢」——快速连续保存时旧快照可能
 // 最后落盘，磁盘落后于 UI。链条保证写入顺序 = 发起顺序；快照在 save() 发起瞬间取
 let saveChain: Promise<unknown> = Promise.resolve();
+
+/** 动效开关的 localStorage 镜像：main.ts 在配置异步加载前靠它同步判定首帧状态
+    （写不进只影响下次冷启动首帧，不碍事） */
+function mirrorFx(key: string, on: boolean) {
+  try {
+    localStorage.setItem(key, on ? "1" : "0");
+  } catch {
+    /* 私隐模式等场景写不进：忽略 */
+  }
+}
 
 export const useAppStore = defineStore("app", {
   state: () => ({
@@ -133,8 +147,12 @@ export const useAppStore = defineStore("app", {
         this.activePage = first.pages[0].id;
       }
       this.applyTheme(this.config.theme);
-      // 只有显式 true 才开（默认关闭）：旧配置无此字段时回落默认关
-      this.applyFx(this.config.fx === true);
+      // 界面动效默认开启：只有显式存的 false 才关（旧配置无此字段时跟随新默认）；
+      // 粒子 / 光池默认关、显式 true 才开；鼠标样式默认开、显式 false 才关
+      this.applyFx(this.config.fx !== false);
+      this.applyFxParticles(this.config.fxParticles === true);
+      this.applyFxPools(this.config.fxPools === true);
+      this.applyFxCursor(this.config.fxCursor !== false);
       this.loaded = true;
       // 工具显示名全局一份；启动即拉取，设置保存后 refreshTools 刷新
       this.toolMeta = (await api.listTools().catch(() => null)) || [];
@@ -169,22 +187,53 @@ export const useAppStore = defineStore("app", {
       this.applyTheme(theme);
       this.save();
     },
-    /** 界面动效开关（仅展示层）的即时应用：html.fx-off 供 CSS 压停装饰动画；
+    /** 界面动效总开关（仅展示层）的即时应用：html.fx-off 供 CSS 压停装饰动画；
         localStorage 镜像供 main.ts 在配置异步加载前同步判定是否安装液滴光标，
         关闭动效的用户冷启动不闪系统箭头 */
     applyFx(on: boolean) {
       this.config.fx = on;
       document.documentElement.classList.toggle("fx-off", !on);
-      try {
-        localStorage.setItem("agenthub.fx", on ? "1" : "0");
-      } catch {
-        /* 镜像写不进只影响下次冷启动首帧，不碍事 */
-      }
+      mirrorFx("agenthub.fx", on);
     },
     /** 设置弹窗里的动效切换：即时生效并落盘 */
     setFx(on: boolean) {
       if (this.config.fx === on) return;
       this.applyFx(on);
+      this.save();
+    },
+    /** 粒子尘场子开关（与光池互相独立）：html.fx-particles-off 隐藏画布层，
+        防止关闭后最后一帧尘粒定格在屏上 */
+    applyFxParticles(on: boolean) {
+      this.config.fxParticles = on;
+      document.documentElement.classList.toggle("fx-particles-off", !on);
+      mirrorFx("agenthub.fxParticles", on);
+    },
+    setFxParticles(on: boolean) {
+      if (this.config.fxParticles === on) return;
+      this.applyFxParticles(on);
+      this.save();
+    },
+    /** 光池追随子开关（与粒子、鼠标样式互相独立）：一类是鼠标互动光影——
+        光池、玻璃反光、卡片聚光、背景光标视差；html.fx-pools-off 隐藏相关图层 */
+    applyFxPools(on: boolean) {
+      this.config.fxPools = on;
+      document.documentElement.classList.toggle("fx-pools-off", !on);
+      mirrorFx("agenthub.fxPools", on);
+    },
+    setFxPools(on: boolean) {
+      if (this.config.fxPools === on) return;
+      this.applyFxPools(on);
+      this.save();
+    },
+    /** 个性化鼠标样式子开关（液滴光标 + 点击涟漪，默认开启）：只写配置与镜像，
+        DOM 侧由 App.vue 的 watch 调 setCursorFX 装卸（与总开关联动） */
+    applyFxCursor(on: boolean) {
+      this.config.fxCursor = on;
+      mirrorFx("agenthub.fxCursor", on);
+    },
+    setFxCursor(on: boolean) {
+      if (this.config.fxCursor === on) return;
+      this.applyFxCursor(on);
       this.save();
     },
     /** 打开全局设置弹窗：tab 缺省保持当前模块；左下角齿轮给 general，跨模块入口给 webdav 等 */

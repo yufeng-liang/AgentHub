@@ -11,7 +11,10 @@ const ago = (minutes: number) => new Date(NOW - minutes * 60000).toISOString();
 function defaultConfig(): AppConfig {
   return {
     theme: "dark",
-    fx: false,
+    fx: true,
+    fxParticles: false,
+    fxPools: false,
+    fxCursor: true,
     moduleOrder: MODULES.map((m) => m.key),
     tools: {
       zcode: { enabled: true, paths: [".zcode/skills"] },
