@@ -219,12 +219,20 @@ const realFetch = globalThis.fetch;
     if (url.includes("/api/v1/userinfo")) return resp(500, { message: "boom" });
     return resp(500, {});
   };
-  const rg = await discovery.beginOAuth("qoder", { edition: "intl" }, (x) => { done = x; });
-  ok("edition=intl → global 区授权页", rg.ok === true && /^https:\/\/qoder\.com\/device\/selectAccounts\?/.test(rg.url), rg.url);
+  const rg = await discovery.beginOAuth("qoder", { edition: "cn" }, (x) => { done = x; });
+  ok("edition=cn 授权页落 cn 域", rg.ok === true && /^https:\/\/qoder\.com\.cn\/device\/selectAccounts\?/.test(rg.url), rg.url);
   await drain();
   const acc2 = store.listAccounts("qoder").find((a) => a.uid === "uid-q-2");
   const row2 = store.accountRows("qoder").find((r0) => r0.uid === "uid-q-2");
-  ok("userinfo 失败仍落库（uid 用 poll 的 user_id、名兜底、到期缺省 now+30 天）", !!acc2 && acc2.name === "Qoder 账号" && acc2.meta.mode === "global" && seen.some((s) => s.url.startsWith("https://openapi.qoder.sh/api/v1/deviceToken/poll")) && row2.expires_at > Date.now() + 29 * 86400 * 1000, acc2 && { name: acc2.name, meta: acc2.meta, exp: row2.expires_at });
+  ok("userinfo 失败仍落库（uid 用 poll 的 user_id、名兜底、到期缺省 now+30 天）", !!acc2 && acc2.name === "Qoder 账号" && acc2.meta.mode === "cn" && seen.some((s) => s.url.startsWith("https://openapi.qoder.com.cn/api/v1/deviceToken/poll")) && row2.expires_at > Date.now() + 29 * 86400 * 1000, acc2 && { name: acc2.name, meta: acc2.meta, exp: row2.expires_at });
+
+  // 归一移植后 qoder=CN（地区由渠道 id 定），而 qoder_intl 尚未注册（store.QODER_INTL_ENABLED=false）。
+  // 继续放 intl 过去会落一个 meta.mode=global 的 qoder 账号并被静默打到 CN 网关——「答非所问」比
+  // 「明确说不支持」难排查得多，所以这里必须当场拒绝，且不得留下任何 global 账号。
+  const timersBefore = timers.length;
+  const ri = await discovery.beginOAuth("qoder", { edition: "intl" }, () => {});
+  ok("intl 区在服务尚未接入时被明确拒绝", ri.ok === false && /国际版/.test(String(ri.message || "")), ri);
+  ok("拒绝时不排轮询、不落任何 global 账号", timers.length === timersBefore && !store.listAccounts("qoder").some((a) => a.meta && a.meta.mode === "global"), { timersBefore, now: timers.length });
 
   // refresh_token 含 | 判无效（§2.3）→ 不落库、继续轮；取消后不再排期
   resetClock(); seen = []; polls = 0; done = null;
@@ -232,7 +240,7 @@ const realFetch = globalThis.fetch;
     seen.push({ url, opts });
     return url.includes("/api/v1/deviceToken/poll") ? resp(200, { token: "t", refresh_token: "pat|a|b", user_id: "uid-q-3" }) : resp(500, {});
   };
-  await discovery.beginOAuth("qoder", {}, (x) => { done = x; });
+  await discovery.beginOAuth("qoder", { edition: "cn" }, (x) => { done = x; });
   await drain(4);
   ok("refresh_token 含 | 判无效 → 不落库并继续轮", done === null && pollArms.length === 4 && pollArms.every((ms) => ms === 2000) && !store.listAccounts("qoder").some((a) => a.uid === "uid-q-3"), { done, pollArms });
   ok("取消登录撤销轮询", discovery.cancelOAuth() === true && timers.length === 0);
@@ -243,7 +251,7 @@ const realFetch = globalThis.fetch;
     seen.push({ url, opts });
     return url.includes("/api/v1/deviceToken/poll") ? resp(200, { token: "t", refresh_token: "rt-no-uid" }) : resp(500, {});
   };
-  await discovery.beginOAuth("qoder", {}, (x) => { done = x; });
+  await discovery.beginOAuth("qoder", { edition: "cn" }, (x) => { done = x; });
   await drain();
   ok("poll 缺 user_id 且 userinfo 失败 → 报错且不落空 uid 账号", !!done && done.ok === false && /user_id/.test(done.message) && !store.listAccounts("qoder").some((a) => !a.uid), done);
 
@@ -253,7 +261,7 @@ const realFetch = globalThis.fetch;
     seen.push({ url, opts });
     return url.includes("/api/v1/deviceToken/poll") ? resp(200, { token: "q-access4", refresh_token: "q-rt4", user_id: "uid-q-4", expires_at: 1893456000 }) : resp(500, {});
   };
-  await discovery.beginOAuth("qoder", {}, (x) => { done = x; });
+  await discovery.beginOAuth("qoder", { edition: "cn" }, (x) => { done = x; });
   await drain();
   const row4 = store.accountRows("qoder").find((r0) => r0.uid === "uid-q-4");
   ok("expires_at 秒形态识别为毫秒且容忍 userinfo 失败", !!done && done.ok === true && !!row4 && row4.expires_at === 1893456000000, { done, exp: row4 && row4.expires_at });

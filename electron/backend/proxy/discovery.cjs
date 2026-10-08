@@ -2267,6 +2267,13 @@ async function beginClineOAuth(channel, onDone) {
 // qoder：无起始请求，本地拼授权页；2s 轮询 poll（202/404 = 继续）→ userinfo 补资料 → 落库 meta.mode
 async function beginQoderOAuth(channel, edition, onDone) {
   const region = qoderRegionOfMode(edition);
+  // 归一移植后地区由**渠道 id** 决定（qoder=CN），Global 区要靠 qoder_intl 承载，而它尚未注册
+  // （store.QODER_INTL_ENABLED=false）。放过去会落一个 meta.mode=global 的 qoder 账号并被静默
+  // 打到 CN 网关——「答非所问」比「明确说不支持」难排查得多，故当场拒绝、且不留任何 global 号。
+  // 计划二注册 qoder_intl 并同批翻开开关后，本分支自然失效（region=global 命中已注册渠道）。
+  if (region === "global" && !store.QODER_INTL_ENABLED) {
+    return { ok: false, message: "Qoder 国际版渠道尚未接入：当前仅支持中国版（CN）" };
+  }
   const cfg = {
     global: { webOrigin: "https://qoder.com", openApi: "https://openapi.qoder.sh" },
     cn: { webOrigin: "https://qoder.com.cn", openApi: "https://openapi.qoder.com.cn" },
