@@ -142,12 +142,25 @@ function mkModels(n) {
   }));
 }
 
+/** el-popover 这类组件在闸里没注册。未解析组件的**默认槽**会被渲染（探针实测旧模板一行里
+ *  <el-option 开标签 = 2），但**具名槽**（`#reference`）整个丢掉——于是触发器那颗 chip
+ *  在 HTML 里根本不存在，㉓/㉓b/㉓c/㉕ 就看不见被测内容。
+ *  这个桩只负责「把所有槽都吐出来给判据看」：它不产出任何被测语义
+ *  （文案、类名、行序仍来自组件与 channelCell 的真实现），所以不构成门禁替被测代码答题。 */
+const AllSlotsStub = {
+  name: "el-popover",
+  setup(_props, { slots }) {
+    return () => Vue.h("el-popover", null, [slots.reference ? slots.reference() : null, slots.default ? slots.default() : null]);
+  },
+};
+
 async function render({ rows, firstVisible, viewRows, activeTab = "" }) {
   const { render, source, thSource } = catalogTbodyRender();
   const r = winRange(rows.length, firstVisible, viewRows);
   const win = rows.slice(r.start, r.end);
   const noop = () => {};
   const app = Vue.createSSRApp({ render });
+  app.component("el-popover", AllSlotsStub);
   Object.assign(app.config.globalProperties, {
     rows, win, activeTab,
     vPadTop: r.padTop, vPadBottom: r.padBottom,
@@ -156,7 +169,6 @@ async function render({ rows, firstVisible, viewRows, activeTab = "" }) {
     colCountFor,
     app: { config: { proxy: { modelCustom: { "model-001": { contextLength: 999 } } } } },
     REASONING_EFFORT_ALL: [{ value: "", label: "默认" }, { value: "low", label: "低 (low)" }],
-    CHANNEL_OPTIONS: [{ value: "", label: "自动" }, { value: "trae", label: "Trae" }],
     // 能力标签取**真实现**：桩（此前是 () => ["工具"]）会让「五枚全显」这条判据只能测到桩自己。
     capabilityTags, channelName: () => "Trae", fmtRate: () => "—",
     // 合并列的两个可见函数也取真的（同上：注入假的等于门禁替被测代码答题）
@@ -258,11 +270,19 @@ async function main() {
   // ㉓ 渠道格摘要文本必须等于**真函数**对该行算出的值：模板里手拼「自动路由」也能让
   //    「看起来对」的截图通过，但两处口径迟早分叉（定案 Q10 的文案规则就没人守了）。
   const want0 = chanSummary(models[0]);
-  check(`㉓ 首行渠道格摘要渲染出「${want0}」（来自 channelCell.chanSummary）`, one.includes(want0),
-    `实得片段 ${JSON.stringify((/<span class="chan-sum[^>]*>([^<]*)</.exec(one) || [])[1] || "（没有 chan-sum）")}`);
+  // 只比**触发器自己的可见文本**，不用 one.includes(want0)：整格可点开的 aria-label 里也含同一串，
+  // 用 includes 时把模板改成手拼字面量仍会绿（变异对照 C 实测到过这个空转）。
+  const chanText = (/<span class="chan-sum[^"]*"[^>]*>([^<]*)</.exec(one) || [])[1];
+  check(`㉓ 首行渠道格摘要文本 == chanSummary 算出的「${want0}」（实得「${chanText}」）`, chanText === want0,
+    `片段 ${JSON.stringify(chanText)}`);
   check("㉓b 渠道格触发器带 role=button（可点开的键盘可达入口）", /class="chan-sum[^"]*"[^>]*role="button"/.test(one), "合并列必须是按钮，不是一个只读 chip");
   check(`㉓c 首行渠道格的 tone 类名 == chanTone 算出的「${chanTone(models[0])}」`, new RegExp(`class="chan-sum[^"]*${chanTone(models[0])}`).test(one),
     `实得 ${JSON.stringify((/class="(chan-sum[^"]*)"/.exec(one) || [])[1])}`);
+
+  // ㉓h 「已排除 N」角标：摘要只报还剩几个（Q10a），被排除的数量得另有可见处，
+  //     否则用户点了两颗渠道，格子上看不出这是刚改的还是本来就剩一个。
+  check(`㉓h 有排除时格子里显出「已排除 ${models[0].excluded.length}」角标`, new RegExp(`已排除\\s*${models[0].excluded.length}`).test(one),
+    `片段 ${JSON.stringify((/class="tag tag-warn chan-badge">([^<]*)</.exec(one) || [])[1])}`);
 
   // ㉓d 格子里每颗来源渠道都得有一个开关：状态列 1 颗 + 本行 sources.length 颗。
   //    少一颗就是「某条渠道在 popover 里根本没有可点的行」——静态检查与截图都看不见（要点开才知道）。
