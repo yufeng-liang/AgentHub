@@ -858,7 +858,9 @@ function register(ipcMain) {
     }
     const file = path.join(rules.rulesDir(), "catalog.json");
     const cur = JSON.parse(JSON.stringify(rules.get("catalog.json") || {}));
-    cur[ch] = { syncedAt: Date.now(), models: r.models };
+    // keyIdSchema:1 = 本条目的 id 是上游真实 model key。qoderAdapter.catalogIndex 只认带标记的条目
+    // （fork 期那份展示名口径的历史条目据此失效）；其余渠道的读取方不看此字段，属加法。
+    cur[ch] = { syncedAt: Date.now(), keyIdSchema: 1, models: r.models };
     fs.writeFileSync(file, JSON.stringify(cur, null, 2), "utf8");
     rules.reload("catalog.json");
     const withRate = r.models.filter((m) => m && m.rate != null).length;

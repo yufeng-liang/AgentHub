@@ -130,6 +130,9 @@ const rules = require("../electron/backend/proxy/rules.cjs");
 const catPath = path.join(rules.rulesDir(), "catalog.json");
 rules.init(); // dev 环境无人调 init，ensureFiles 不会落盘——先落 DEFAULTS 再改夹具
 const cat0 = JSON.parse(fs.readFileSync(catPath, "utf8"));
+// qoder 已不在 rules DEFAULTS 里放兜底目录（见 proxy-qoder-adapter-selftest [3d]），
+// 全新沙箱的 catalog 没有 qoder 键——此处自建空条目再继续测 fork 的 _key 保留判据。
+cat0.qoder = cat0.qoder || { syncedAt: 0, models: [] };
 cat0.qoder.models.push(
   { id: "SyncedModel", name: "SyncedModel", rate: 1, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0, _key: "synced-upstream-key", _efforts: ["low", "xhigh"] },
   { id: "DefaultsOnly", name: "DefaultsOnly", rate: 1, capabilities: { images: false, reasoning: false, tools: true }, contextLength: 200000, maxOutputTokens: 0 }

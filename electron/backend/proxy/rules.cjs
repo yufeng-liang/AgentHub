@@ -112,28 +112,12 @@ const DEFAULTS = {
     },
     // Qoder 静态兜底（协议参考 §3.8 global 区 17 条快照，rate=price_factor，0 是合法值）；
     // 拉取 model/list 成功后整段覆盖对应渠道。cn 区清单在适配器 QODER_FALLBACK 内置
-    qoder: {
-      syncedAt: 0,
-      models: [
-        { id: "Qwen3.8-Flash", name: "Qwen3.8-Flash", rate: 0.1, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
-        { id: "Qwen3.8-Max", name: "Qwen3.8-Max", rate: 0.5, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
-        { id: "Auto", name: "Auto", rate: 1, capabilities: { images: true, reasoning: false, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
-        { id: "Ultimate", name: "Ultimate", rate: 1.6, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
-        { id: "Performance", name: "Performance", rate: 1.1, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
-        { id: "Efficient", name: "Efficient", rate: 0.3, capabilities: { images: true, reasoning: false, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
-        { id: "Sonus", name: "Sonus", rate: 3.2, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
-        { id: "Cantus", name: "Cantus", rate: 3.2, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
-        { id: "Qwen3.7-Max", name: "Qwen3.7-Max", rate: 0.5, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
-        { id: "Qwen3.7-Plus", name: "Qwen3.7-Plus", rate: 0.1, capabilities: { images: true, reasoning: false, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
-        { id: "Kimi-K3", name: "Kimi-K3", rate: 0.8, capabilities: { images: true, reasoning: false, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
-        { id: "Kimi-K2.8-Preview", name: "Kimi-K2.8-Preview", rate: 0.3, capabilities: { images: true, reasoning: false, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
-        { id: "GLM-5.3", name: "GLM-5.3", rate: 0.6, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
-        { id: "GLM-5.3-Flash", name: "GLM-5.3-Flash", rate: 0.1, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
-        { id: "DeepSeek-V4-Pro", name: "DeepSeek-V4-Pro", rate: 0.8, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
-        { id: "DeepSeek-Flash", name: "DeepSeek-Flash", rate: 0.2, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
-        { id: "MiniMax-M3", name: "MiniMax-M3", rate: 0.2, capabilities: { images: true, reasoning: false, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
-      ],
-    },
+    // qoder：**不在这里放默认目录**。兜底模型的唯一真相源是 qoderAdapter.cjs 的
+    // STATIC_MODELS_BY_PRODUCT（按 product 隔离，且明确不给 qoder_intl 兜底——issue #74）。
+    // 归一移植前此处曾有一份 17 行的 fork 表，id 用的是 display_name（Auto/Ultimate/…）：
+    // 上游 catalogIndex 读到它就把展示名当 model_config.key 上行 ⇒ 400。
+    // 补一份 key 口径的表等于放第二份会漂移的硬编码，且未实测的档位/能力只能靠编，故删除。
+    // 真实倍率/能力由「同步模型目录」写回（带 keyIdSchema:1）。
     // ModelScope（魔搭 · 阿里）：静态兜底 = 实测 GET /v1/models 的 35 个模型
     // （2026-10-06 拉取，需 Bearer）。⚠ 清单按社区热度精选，**不是全集**：
     //   GLM-5.3-Flash 不在清单内但直调 200（已实测）——故清单仅供开箱展示，

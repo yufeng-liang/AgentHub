@@ -196,7 +196,11 @@ function makeQoder(product, deps) {
     const all = (() => {
       try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return {}; }
     })();
-    const entry = all[product];
+    let entry = all[product];
+    // fork-port：无 keyIdSchema 标记的历史条目（fork 期展示名口径）一律忽略，等价「未拉取过目录」
+    // → models() 回落本产品静态兜底。用户文件里的旧条目不删（非破坏、可回退），
+    // 但绝不能让它参与路由——展示名当 model_config.key 上行必 400。
+    if (entry && entry.keyIdSchema !== 1) entry = null;
     const byKey = new Map();
     for (const m of (entry && Array.isArray(entry.models) ? entry.models : [])) {
       if (m && m.id) byKey.set(String(m.id).toLowerCase(), m);

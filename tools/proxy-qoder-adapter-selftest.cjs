@@ -134,6 +134,7 @@ async function main() {
       JSON.stringify({
         qoder: {
           syncedAt: Date.now(),
+          keyIdSchema: 1, // 与 rules DEFAULTS 同判据：无标记的条目会被 catalogIndex 忽略（见 [3d]）
           models: [
             { id: "dfmodel", name: "DeepSeek-Flash", scene: "assistant" },
             { id: "qfmodel", name: "Qwen3.8-Flash", scene: "assistant" },
@@ -148,6 +149,28 @@ async function main() {
     assert(ms.length === 2, "有目录时 models() 只返回目录内容，实际 " + ms.length + "：" + ms.join(","));
     assert(ms.includes("dfmodel") && ms.includes("qfmodel"), "目录内模型保留");
     assert(!ms.includes("kmodel") && !ms.includes("mmodel"), "目录外的静态兜底模型不得复活（幽灵模型）");
+  }
+
+  // ===== 3d. qoder 兜底表只许有一份；历史展示名条目必须运行时忽略 =====
+  // rules.init() 会把 DEFAULTS 写进 rules 目录。fork 期那份 qoder 用的是展示名 id
+  // （Auto/Ultimate/…），上游 catalogIndex 读同一文件 ⇒ rewriteBody 把 model_config.key
+  // 填成 "ultimate" 打给上游 ⇒ 400。用户文件里的历史条目不删（非破坏、可回退），但必须忽略。
+  console.log("\n[3d] DEFAULTS 不再带 qoder 目录条目 + 无 keyIdSchema 的历史条目被忽略");
+  {
+    const defaults = require("../electron/backend/proxy/rules.cjs").DEFAULTS;
+    assert(!defaults["catalog.json"].qoder, "DEFAULTS catalog.json 不含 qoder 条目（兜底唯一真相源是 STATIC_MODELS_BY_PRODUCT）");
+    assert(ad.models().includes("dfmodel") && ad.models().length === STATIC_MODELS.length, "无目录条目时 models() 恰为本产品静态兜底（不借别区、不翻倍）");
+    const staleDir = fs.mkdtempSync(path.join(os.tmpdir(), "agenthub-qoder-stale-"));
+    fs.writeFileSync(
+      path.join(staleDir, "catalog.json"),
+      JSON.stringify({ qoder: { syncedAt: 0, models: [{ id: "Ultimate", name: "Ultimate" }] } }),
+      "utf8",
+    );
+    // 同 [3c]：只覆盖 rulesDir，不 {...rules} 展开（模块方法会丢 this 绑定）
+    const staleRules = { get: (n) => rules.get(n), rulesDir: () => staleDir };
+    const adStale = makeQoder("qoder", { ...deps, rules: staleRules });
+    assert(adStale.models().includes("dfmodel"), "无 keyIdSchema 标记的历史 qoder 目录被忽略 → 回落静态兜底");
+    assert(!adStale.models().includes("Ultimate") && !adStale.models().includes("ultimate"), "被忽略的历史条目不得泄漏成模型 id");
   }
 
   // ===== 4. fetchModels（stub 签名器）=====
