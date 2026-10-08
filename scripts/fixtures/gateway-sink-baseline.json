@@ -234,11 +234,11 @@
     "id": "waf-channel-block",
     "desc": "WAF Block Page 是渠道级故障：短退避整个渠道，不逐个冷却账号（followup 验退避真的生效）",
     "status": 200,
-    "body": "data: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: {\"error\":{\"message\":\"渠道 trae(一号) 不可用：渠道 trae 被上游边缘拦截（WAF Block Page）：与账号无关，已跳备选渠道\",\"type\":\"upstream_error\",\"param\":null,\"code\":null}}\n\ndata: [DONE]\n\n",
+    "body": "data: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: {\"error\":{\"message\":\"[ah:REQID] 渠道 trae(一号) 不可用：渠道 trae 被上游边缘拦截（WAF Block Page）：与账号无关，已跳备选渠道\",\"type\":\"upstream_error\",\"param\":null,\"code\":null}}\n\ndata: [DONE]\n\n",
     "followups": [
       {
         "status": 200,
-        "body": "data: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: {\"error\":{\"message\":\"未发起任何上游请求（候选渠道号池为空或降级中）：渠道 trae(渠道降级中) 不可用：渠道 trae 降级中（WAF Block），120s 后回切重试\",\"type\":\"upstream_error\",\"param\":null,\"code\":null}}\n\ndata: [DONE]\n\n",
+        "body": "data: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: {\"error\":{\"message\":\"[ah:REQID] 未发起任何上游请求（候选渠道号池为空或降级中）：渠道 trae(渠道降级中) 不可用：渠道 trae 降级中（WAF Block），120s 后回切重试\",\"type\":\"upstream_error\",\"param\":null,\"code\":null}}\n\ndata: [DONE]\n\n",
         "picks": []
       }
     ],
@@ -256,14 +256,14 @@
         "accountName": "一号",
         "model": "glm-4.6",
         "status": 503,
-        "error": "渠道 trae(一号) 不可用：渠道 trae 被上游边缘拦截（WAF Block Page）：与账号无关，已跳备选渠道"
+        "error": "[ah:REQID] 渠道 trae(一号) 不可用：渠道 trae 被上游边缘拦截（WAF Block Page）：与账号无关，已跳备选渠道"
       },
       {
         "channel": "",
         "accountName": "",
         "model": "glm-4.6",
         "status": 503,
-        "error": "未发起任何上游请求（候选渠道号池为空或降级中）：渠道 trae(渠道降级中) 不可用：渠道 trae 降级中（WAF Block），120s 后回切重试"
+        "error": "[ah:REQID] 未发起任何上游请求（候选渠道号池为空或降级中）：渠道 trae(渠道降级中) 不可用：渠道 trae 降级中（WAF Block），120s 后回切重试"
       }
     ]
   },

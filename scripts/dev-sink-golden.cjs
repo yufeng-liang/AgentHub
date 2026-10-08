@@ -231,6 +231,9 @@ function normalize(text) {
     .replace(/chatcmpl-[0-9a-f]{24}/g, "chatcmpl-REQID")
     .replace(/"created":\d+/g, '"created":CREATED')
     .replace(/"id":"[0-9a-f-]{36}"/g, '"id":"UUID"')
+    // 上游 v1.50.2 给失败响应加了 [ah:xxxxxxxx] 请求 id 前缀（= 每次请求随机的 24 位 id 取前 8 位）。
+    // 不抹掉的话基线会把一次运行的随机值钉死，下必红——它承载的是取证信息，不是调度语义。
+    .replace(/\[ah:[0-9a-f]{8}\]/g, "[ah:REQID]")
     // 渠道退避倒计时按墙钟算秒数，逐次运行会跳一两个字：抹成常数，
     // 但保留「有没有这句话」——那才是"走了渠道级退避而不是罚账号"的判据
     .replace(/，\s*\d+\s*s?\s*后重试/g, "，Ns 后重试");
