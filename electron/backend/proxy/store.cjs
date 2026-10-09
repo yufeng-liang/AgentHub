@@ -9,6 +9,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const config = require("../config.cjs");
+const redact = require("./redact.cjs");
 
 let Database = null;
 let driver = "none";
@@ -135,6 +136,17 @@ CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_requests(ts);
 CREATE INDEX IF NOT EXISTS idx_usage_key ON usage_requests(key_id, ts);
 CREATE INDEX IF NOT EXISTS idx_usage_channel ON usage_requests(channel, ts);
 CREATE INDEX IF NOT EXISTS idx_usage_model ON usage_requests(model, ts);
+CREATE TABLE IF NOT EXISTS op_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,
+  level TEXT NOT NULL DEFAULT 'info',
+  op TEXT NOT NULL DEFAULT '',
+  message TEXT NOT NULL DEFAULT '',
+  channel TEXT NOT NULL DEFAULT '',
+  target TEXT NOT NULL DEFAULT '',
+  detail TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_oplog_ts ON op_logs(ts);
 `;
 /** 内置渠道：代码常量是它们 display/domain 的唯一真相源（agents 表里的内置行只承载调度策略）。
  *  用户自建提供商不在这张表里，走 agents 表的 kind != 'builtin' 行；两者合并视图见 channelList()。
@@ -272,12 +284,16 @@ function setUsageRetention(days) {
   if (n >= 1 && n <= 3650) usageRetentionDays = n;
 }
 
-/** 流水按保留期 GC，启动时执行；余额历史同步清理 */
+/** 流水按保留期 GC，启动时执行；余额历史同步清理；操作日志 30 天 + 5 万行上限 */
 function gc() {
   const cutoff = Date.now() - Math.max(1, usageRetentionDays) * 86400000;
   db.prepare("DELETE FROM usage_requests WHERE ts < ?").run(cutoff);
   const dayCut = dayStr(cutoff);
   db.prepare("DELETE FROM credits_history WHERE day < ?").run(dayCut);
+  // 操作日志：30 天 + 行数上限（每条代理请求一条，量级同 usage_requests；超限删最老）
+  const logCut = Date.now() - 30 * 86400000;
+  db.prepare("DELETE FROM op_logs WHERE ts < ?").run(logCut);
+  db.prepare("DELETE FROM op_logs WHERE id NOT IN (SELECT id FROM op_logs ORDER BY id DESC LIMIT 50000)").run();
 }
 
 function dayStr(ts) {
@@ -713,6 +729,8 @@ function accountView(r) {
     lastError,
     /** 今日签到结果（号池行内按钮三态与详情弹窗数据源；只留当天一条，跨天由前端按 day 判为过期） */
     checkin: meta.checkin && typeof meta.checkin === "object" ? meta.checkin : null,
+    /** 首登奖励结算台账（小浣熊一次性新手福利；key → 结算时刻，落了即「已领取」） */
+    onboardingGrants: meta.onboardingGrants && typeof meta.onboardingGrants === "object" ? meta.onboardingGrants : null,
     source: r.source,
     lastUsed: r.last_used,
     todayReq: r.today_day === dayStr() ? r.today_req : 0,
@@ -803,6 +821,29 @@ function addAccount({ channel, uid, name, token, refreshToken, source, expiresAt
   return id;
 }
 
+/** meta 白名单（凭据不走 meta 明文）：token/refreshToken 等凭据一律走独立加密列
+ *  （token_enc/refresh_enc），msCookie 在写入前已过 encryptSecret 加密。
+ *  这里剥离敏感形态的键（历史版本或外部同步可能带进明文凭据），正常业务键
+ *  （lastError/checkin/onboardingGrants/domain/enterpriseId/provider/email 等）不受影响 */
+const META_SENSITIVE_RE = /token|secret|password|apikey|api[-_]key|jwt|credential/i;
+/** 上游按「键名子串」判敏感，会误杀本分支里名字撞上的**业务键**（都是既有实现，不是本批引入）：
+ *  · tokenType —— WorkBuddy/CodeBuddy 的令牌类型，ideswitch.cjs:877 经 metaOf(acc).tokenType 读它拼
+ *    本地配置；剥掉即切号时丢类型。
+ *  · tokenKind —— ModelScope 凭据是 oauth 还是裸 token（discovery.cjs:2774 写，目前无人读，
+ *    留着当排障线索）。
+ *  · oauthClientSecret —— ModelScope OAuth 续期的客户端密钥，discovery.cjs:2773 写、adapters.cjs:2915 读；
+ *    剥掉即每次续期报「缺少 OAuth 客户端信息」，号在池里但永久不可用。它确实是一把密钥躺在明文
+ *    meta 里，那是入池方案落地时就有的取舍（改成走加密列要连着改采集与续期两处），不属于合并批次顺手改的范围。 */
+const META_SENSITIVE_KEEP = new Set(["tokenType", "tokenKind", "oauthClientSecret"]);
+function stripSensitiveMeta(meta) {
+  const out = {};
+  for (const [k, v] of Object.entries(meta)) {
+    if (!META_SENSITIVE_KEEP.has(k) && META_SENSITIVE_RE.test(k)) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
 function updateAccount(id, patch) {
   open();
   const cur = getAccount(id);
@@ -836,7 +877,7 @@ function updateAccount(id, patch) {
   if (patch.lastUsed != null) put("last_used", Number(patch.lastUsed) || 0);
   if (patch.token != null) put("token_enc", config.encryptSecret(patch.token));
   if (patch.refreshToken != null) put("refresh_enc", config.encryptSecret(patch.refreshToken));
-  if (patch.meta != null && typeof patch.meta === "object") put("meta", JSON.stringify(patch.meta));
+  if (patch.meta != null && typeof patch.meta === "object") put("meta", JSON.stringify(stripSensitiveMeta(patch.meta)));
   // 维护 updated_at：明确传入或当修改了重要字段时自动刷新
   const nextUpdatedAt = patch.updatedAt != null ? Number(patch.updatedAt) : Date.now();
   put("updated_at", nextUpdatedAt);
@@ -847,9 +888,10 @@ function updateAccount(id, patch) {
 }
 
 /** 记录账号最近一次上游错误（号池状态气泡展示用；只留最新一条，message 截 400 字）。
- *  渠道级拦截（11128/WAF）不冷却账号，这类错误只有落在这里才看得见 */
+ *  渠道级拦截（11128/WAF）不冷却账号，这类错误只有落在这里才看得见。
+ *  落库前过脱敏（redact.cjs）：上游报错回显的 Bearer/JWT 不进 meta 与日志页气泡 */
 function noteError(id, message) {
-  const msg = String(message || "").trim();
+  const msg = redact(String(message || "").trim());
   if (!id || !msg) return;
   mergeAccountMeta(id, { lastError: { at: Date.now(), message: msg.slice(0, 400) } });
 }
@@ -904,6 +946,74 @@ function noteCheckin(id, result, action) {
       message: String(r.message || "").slice(0, 400),
     },
   });
+}
+
+/**
+ * 记录小浣熊账号一次首登奖励（onboarding）的结算时刻（meta.onboardingGrants，key → 结算时刻）。
+ * settled 只含本轮探测成功的增量（granted true/false 都算落定）；合并进已有台账，永不覆盖旧键。
+ * 落了台账的 key 后续签到恒跳过（「后续不再领取」）；失败不落，下轮自然重试（「直到领取成功」）。
+ */
+function noteOnboardingGrant(id, settled) {
+  if (!id || !settled || typeof settled !== "object") return;
+  // 走 mergeAccountMeta 而不是上游原文的 getAccount→spread→updateAccount：那是本文件
+  // mergeAccountMeta 注释明确禁止的形态（与额度刷新/池同步并发时整份盖掉别人的 meta）。
+  // 台账仍要先读旧键再并，语义与上游一致：落了台账的 key 恒跳过，失败不落、下轮重试。
+  const cur = accountMeta(id);
+  const ledger = cur.onboardingGrants && typeof cur.onboardingGrants === "object" ? cur.onboardingGrants : {};
+  return mergeAccountMeta(id, { onboardingGrants: { ...ledger, ...settled } });
+}
+
+// ===== 操作日志（op_logs：反代网关各项操作一条一条落库；写入永不抛错由 oplog.cjs 兜） =====
+
+/** 记一条操作日志（字段截断防脏数据撑爆行；ts 用当前时刻） */
+function insertOpLog(row) {
+  open();
+  db.prepare("INSERT INTO op_logs (ts, level, op, message, channel, target, detail) VALUES (?,?,?,?,?,?,?)").run(
+    Date.now(),
+    String(row.level || "info"),
+    String(row.op || "").slice(0, 32),
+    String(row.message || "").slice(0, 500),
+    String(row.channel || "").slice(0, 32),
+    String(row.target || "").slice(0, 120),
+    String(row.detail || "").slice(0, 1000)
+  );
+}
+
+/** 操作日志筛选（与列表同一套 where）：from/to 毫秒区间、level、op */
+function opLogWhere(filter) {
+  const where = [];
+  const vals = [];
+  if (Number(filter.from) > 0) { where.push("ts >= ?"); vals.push(Number(filter.from)); }
+  if (Number(filter.to) > 0) { where.push("ts <= ?"); vals.push(Number(filter.to)); }
+  if (filter.level) { where.push("level = ?"); vals.push(String(filter.level)); }
+  if (filter.op) { where.push("op = ?"); vals.push(String(filter.op)); }
+  return { clause: where.length ? ` WHERE ${where.join(" AND ")}` : "", vals };
+}
+
+/** 分页列表（时间倒序；limit 1~200 封顶） */
+function listOpLogs(filter) {
+  open();
+  const { clause, vals } = opLogWhere(filter || {});
+  const total = db.prepare(`SELECT COUNT(*) AS n FROM op_logs${clause}`).get(...vals).n;
+  const rows = db.prepare(`SELECT * FROM op_logs${clause} ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?`).all(
+    ...vals,
+    Math.max(1, Math.min(200, Number(filter.limit) || 50)),
+    Math.max(0, Number(filter.offset) || 0)
+  );
+  return { rows, total };
+}
+
+/** 操作类型下拉（去重后按字母序；空表返回空数组） */
+function listOpLogOps() {
+  open();
+  return db.prepare("SELECT DISTINCT op FROM op_logs ORDER BY op").all().map((r) => r.op).filter(Boolean);
+}
+
+/** 导出全集（与列表同一套筛选，无分页；2 万行上限防一次性拉爆） */
+function exportOpLogRows(filter) {
+  open();
+  const { clause, vals } = opLogWhere(filter || {});
+  return db.prepare(`SELECT * FROM op_logs${clause} ORDER BY ts DESC, id DESC LIMIT 20000`).all(...vals);
 }
 
 /** 记录账号一次消耗的滚动计数（跨天自动清零）；credits 为上游实报积分（缺省/-1 = 未上报，
@@ -1346,7 +1456,8 @@ module.exports = {
   createKey, importKey, listKeys, findKeyBySecret, updateKey, deleteKey, keyTodayReq,
   listAgents, setPoolStrategy, setAgentCostTier,
   listProviders, getProvider, saveProvider, deleteProvider,
-  listAccounts, accountRows, getAccount, accountMeta, mergeAccountMeta, accountSecrets, addAccount, updateAccount, bumpAccountUsage, setCreditsToday, removeAccount, noteError, clearError, noteCheckin,
+  listAccounts, accountRows, getAccount, accountMeta, mergeAccountMeta, accountSecrets, addAccount, updateAccount, bumpAccountUsage, setCreditsToday, removeAccount, noteError, clearError, noteCheckin, noteOnboardingGrant,
+  insertOpLog, listOpLogs, listOpLogOps, exportOpLogRows,
   listModelCooldowns, upsertModelCooldown, deleteModelCooldowns,
   snapshotCredits,
   setCreditPackages, listCreditPackages,

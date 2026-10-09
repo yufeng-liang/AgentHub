@@ -52,6 +52,7 @@ const defaultConfig: AppConfig = {
     channelFailoverMax: 3,
     channelCooldownMs: 120000,
     channelCooldownCapMs: 900000,
+    channelEnabled: {},
     ccSwitchModel: "",
     promptMode: "passthrough",
     promptText: "",

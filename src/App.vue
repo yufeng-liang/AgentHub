@@ -21,6 +21,9 @@ import SyncDialog from "./components/sync/SyncDialog.vue";
 import SkillsDashboardView from "./views/skills/SkillsDashboardView.vue";
 import SyncOverviewView from "./views/sync/OverviewView.vue";
 import ProxyHomeView from "./views/proxy/ProxyHomeView.vue";
+// 上游这批改的静态 import 一律不收：本分支把首屏留点收窄到四选一（上面那 4 条），
+// 其余 proxy 页全在下面的 defineAsyncComponent 块里按需切包。照抄会把 Keys/Agents/
+// Models/Stats/PoolSync/CcSwitch 一起拖回 entry，还会把 Providers/Expiry 的拆包前提打破。
 // 记忆中枢模块：9 个页面 + 隐藏配置页（模块级 .memory-scope 样式作用域，可整体剥离）
 // 「待确认」收件箱不再是独立页签，已并入记忆浏览的第三个视图（components/memory/MemReviewPanel）
 import MemoryDashboardView from "./views/memory/DashboardView.vue";
@@ -46,6 +49,8 @@ const ProxyModelsView = defineAsyncComponent(() => import("./views/proxy/ProxyMo
 const ProxyStatsView = defineAsyncComponent(() => import("./views/proxy/ProxyStatsView.vue"));
 const ProxyPoolSyncView = defineAsyncComponent(() => import("./views/proxy/ProxyPoolSyncView.vue"));
 const ProxyCcSwitchView = defineAsyncComponent(() => import("./views/proxy/ProxyCcSwitchView.vue"));
+// 上游 v1.57.0 的反代网关「日志」页：与其余 proxy 页同样按需加载（它带 el-date-picker，静态进 entry 不划算）
+const ProxyLogView = defineAsyncComponent(() => import("./views/proxy/ProxyLogView.vue"));
 const ConfigSkillsSection = defineAsyncComponent(() => import("./components/config/ConfigSkillsSection.vue"));
 const ConfigUsageSection = defineAsyncComponent(() => import("./components/config/ConfigUsageSection.vue"));
 const ConfigProxySection = defineAsyncComponent(() => import("./components/config/ConfigProxySection.vue"));
@@ -675,6 +680,7 @@ const seen = (mod: string, page: string) => !!visited.value[`${mod}/${page}`];
         <ProxyStatsView v-if="seen('proxy', 'stats')" v-show="on('proxy', 'stats')" :class="{ 'page-anim': on('proxy', 'stats') }" />
         <ProxyPoolSyncView v-if="seen('proxy', 'poolsync')" v-show="on('proxy', 'poolsync')" :class="{ 'page-anim': on('proxy', 'poolsync') }" />
         <ProxyCcSwitchView v-if="seen('proxy', 'ccswitch')" v-show="on('proxy', 'ccswitch')" :class="{ 'page-anim': on('proxy', 'ccswitch') }" />
+        <ProxyLogView v-if="seen('proxy', 'proxylog')" v-show="on('proxy', 'proxylog')" :class="{ 'page-anim': on('proxy', 'proxylog') }" />
         <!-- 记忆中枢九页：各页自带 .memory-scope 容器（样式作用域见 styles/memory.css）；
              模型与网关已并入配置页子板块，调用统计并入仪表盘；待确认并入记忆浏览 -->
         <MemoryDashboardView v-if="seen('memory', 'dashboard')" v-show="on('memory', 'dashboard')" class="page" :class="{ 'page-anim': on('memory', 'dashboard') }" />

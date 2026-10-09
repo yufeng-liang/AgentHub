@@ -399,7 +399,8 @@ async function refresh() {
   if (!pool.value.length) loading.value = true;
   try {
     pool.value = await api.proxyPool();
-    // 选中渠道被删除/下线后不悬空：回退到第一个渠道，否则整个号池面板区消失、下半屏空白
+    // 选中渠道被删除/下线/被关闭后不悬空：回退到第一个渠道，否则整个号池面板区消失、下半屏空白
+    // （关闭那条走的是同一分支——proxyPool 已按 channelOn 过滤，被关闭的渠道不在响应里）
     if (pool.value.length && !pool.value.some((ch) => ch.id === activeChannel.value)) {
       activeChannel.value = pool.value[0].id as ProxyChannelId;
     }

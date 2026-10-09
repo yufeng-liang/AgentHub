@@ -16,6 +16,7 @@ const responsesOut = require("./protocols/responses-out.cjs");
 const util = require("./util.cjs");
 const promptPolicy = require("./promptPolicy.cjs");
 const events = require("./events.cjs");
+const oplog = require("./oplog.cjs");
 
 let runtime = null; // { server, startedAt, port, bind, active }
 
@@ -93,7 +94,9 @@ function emitRequestThrottled() {
   }, 2000);
 }
 
-/** 渠道选择（方案 §6.2）：提供商显式前缀 → 钉渠道 → 单源强制 → per-model 覆盖 → 打分（健康度×余额） */
+/** 渠道选择（方案 §6.2）：提供商显式前缀 → 钉渠道 → 单源强制 → per-model 覆盖 → 打分（健康度×余额）。
+ *  关闭的渠道（上游启闭）不参与：modelOwners 已过滤（单源 → 空 → 400），
+ *  key.route 指到关闭渠道按 auto 走（钉死的渠道被关后不能把请求带进死胡同） */
 function resolveChannel(key, model, settings) {
   // `slug/model` 前缀直达提供商。这里只交出渠道，不改模型名——上游真名由适配器的 upstreamFor 剥前缀
   // 再映射，与内置适配器「收到客户端模型名、自己改写」的契约保持一致，调度层不需要知道第二套命名口径。
@@ -101,8 +104,8 @@ function resolveChannel(key, model, settings) {
   if (slug) return { channel: slug };
   // 钉渠道排在单归属之前：key.route 是用户显式意图。排在后面的话，某个通用模型名
   // （auto/ultimate 这类）一旦被别家目录收走，钉着 trae 的客户端会被静默改投且无从察觉。
-
-  if (key.route !== "auto") return { channel: key.route };
+  // 但排到关闭渠道之前也不行（上游启闭）：被关掉就不参与，按 auto 继续往下选。
+  if (key.route !== "auto" && adapters.channelOn(key.route, settings)) return { channel: key.route };
   // 必须传 settings：modelOwners 读的是「本请求生效配置」里的排除集，
   // 少传一个参数就退回磁盘默认值 ⇒ 用户在目录页点掉的渠道根本不参与路由（A11 会红）。
   const owners = adapters.modelOwners(model, settings);
@@ -124,9 +127,10 @@ function resolveChannel(key, model, settings) {
 }
 
 /** 渠道综合分：可用账号数 × 号池总余额（方案 §6.2 auto）；降级中的渠道记 0 分——
- *  熔断让位备选，到期半开自动恢复资格（成功一次清零，见 noteChannelSuccess） */
+ *  熔断让位备选，到期半开自动恢复资格（成功一次清零，见 noteChannelSuccess）。
+ *  关闭的渠道同样记 0 分（上游启闭：打分排不上去，路由不落） */
 function channelScore(channel) {
-  if (channelCooling(channel)) return 0;
+  if (channelCooling(channel) || !adapters.channelOn(channel)) return 0;
   const s = pool.poolSummary(channel);
   return (s.onlineCount > 0 ? 1 : 0) * (1 + s.totalCredits);
 }
@@ -149,7 +153,7 @@ function tierGroups() {
  *  totalCredits 不含 -1 哨兵，现状按 1+0 计分会把全无限账号的渠道垫到最底 */
 function costFirstScore(channel) {
   const s = pool.poolSummary(channel);
-  if (channelCooling(channel)) return 0;
+  if (channelCooling(channel) || !adapters.channelOn(channel)) return 0;
   const base = (s.onlineCount > 0 ? 1 : 0) * (1 + s.totalCredits);
   return s.unlimited ? base + 1e12 : base;
 }
@@ -158,7 +162,7 @@ function costFirstScore(channel) {
  *  后两条必须一起算——「已知余额为 0」「余额已到期」的号在池视图里仍是 online
  *  （把号标 exhausted 的是 pickAccount 自己），只看 onlineCount 会把它们当可用渠道继续占预算。 */
 function routeUsable(channel) {
-  if (channelCooling(channel)) return false;
+  if (channelCooling(channel) || !adapters.channelOn(channel)) return false;
   const now = Date.now();
   return pool.poolAccounts(channel).some((a) =>
     a.status === "online" && a.hasToken &&
@@ -208,14 +212,21 @@ function pickByOrder(order, candidates, groups) {
 async function attemptChat(channel, acc, model, body, emit, meta) {
   const adapter = adapters.get(channel);
   let secrets = store.accountSecrets(store.getAccount(acc.id));
+  // 会话式转发扩展点（契约见 adapters.cjs 顶部注释块）：适配器声明 stateful() 时改走
+  // chatSession——装得下「一次客户端请求 = 多个上游请求 + 协议翻译」的上游；
+  // 现有 9 家都不声明 stateful，一律走单发 chat，行为零变化
+  const send = (secrets) =>
+    typeof adapter.stateful === "function" && adapter.stateful() && typeof adapter.chatSession === "function"
+      ? adapter.chatSession({ account: acc, secrets, model, body, emit, meta })
+      : adapter.chat({ account: acc, secrets, model, body, emit, meta });
   try {
-    return await adapter.chat({ account: acc, secrets, model, body, emit, meta });
+    return await send(secrets);
   } catch (e) {
     if (e && e.status === 401) {
       const r = await adapters.refreshTokenLocked(channel, acc, secrets).catch(() => ({ ok: false }));
       if (r.ok) {
         store.updateAccount(acc.id, { token: r.token, refreshToken: r.refreshToken, status: "online", coolUntil: 0, coolReason: "" });
-        return await adapter.chat({ account: acc, secrets: { token: r.token, refreshToken: r.refreshToken }, model, body, emit, meta });
+        return await send({ token: r.token, refreshToken: r.refreshToken });
       }
       // 触发计数与冷却交给 catch 侧的 applyCool 统一处理（classifyUpstream → relogin），
       // 这里只如实抛出：是短冷却重试还是判废由计数决定
@@ -255,10 +266,22 @@ function classifyGeneric(e, planLimit) {
 /** 错误分类（对齐参考项目 handler.applyErrorPolicy 全表 + 参考项目 SOLO 专项）：
  *  决定冷却档位与是否换号。6004 = 模型级限流（罚账号×模型，切模型豁免）；
  *  11102 = 该账号不支持此模型（6h 指数负缓存）；4008 = 模型/账号级限流；4001 = 模型配置问题
- * （不罚号）；11115 prompt 过长（零动作透传）；11101 参数错误（换号不罚号——不同账号模型权限不同）
- *  channel 非内置渠道时改走 classifyGeneric：这套码表对任意中转站不成立，见其注释。 */
+ * （不罚号）；11115 prompt 过长（零动作透传）；11101 参数错误（换号不罚号——不同账号模型权限不同）。
+ *  channel 非内置渠道时改走 classifyGeneric：这套码表对任意中转站不成立，见其注释。
+ *  内置渠道的私有业务码走扩展点 classifyError（契约见 adapters.cjs）：入参 channel 优先问适配器，
+ *  返回非空即走渠道级分类。通用层保留的 4008/6004/11102/11115/11101 等码是**跨渠道共用**的
+ * （trae/workbuddy/qoder 都会回同一族码），不能搬进单个渠道——搬走即改变其它渠道的分类结果 */
 function classifyUpstream(e, planLimit, channel) {
+  // 分流在前、扩展点在後：提供商没有「适配器私有码表」这回事，若先问扩展点，
+  // adapters.get(提供商 id) 拿到的是 makeOpenaiCompat 实例，它会替任意中转站作答。
   if (channel && !store.isBuiltinChannel(channel)) return classifyGeneric(e, planLimit);
+  if (channel) {
+    const ad = adapters.get(channel);
+    if (ad && typeof ad.classifyError === "function") {
+      const r = ad.classifyError(e);
+      if (r) return r;
+    }
+  }
   if (planLimit || (e && e.status === 402)) return { kind: "credit", switchable: true, status: 402 };
   const msg = String((e && e.message) || "");
   const code = Number(e && e.code) || 0;
@@ -514,6 +537,12 @@ async function handleChat(req, res, settings, surface) {
     store.insertUsage(usageRow);
     if (usageRow.accountId) store.bumpAccountUsage(usageRow.accountId, (usageRow.promptTokens || 0) + (usageRow.completionTokens || 0), usageRow.creditsUsed);
     emitRequestThrottled();
+    // 操作日志：每条代理请求一条（成功 info / 4xx warn / 5xx+网络 error）；
+    // detail 带上游错误轨迹，message 带模型与耗时——日志页直接看，不必翻 usage_requests
+    const st = Number(usageRow.status) || 0;
+    oplog.log(st >= 500 || st === 0 ? "error" : st >= 400 ? "warn" : "info", "代理请求",
+      `${usageRow.model || "-"} · HTTP ${st || "-"} · ${usageRow.latencyMs}ms${usageRow.error ? " · " + String(usageRow.error).slice(0, 120) : ""}`,
+      { channel: usageRow.channel, target: [usageRow.keyName, usageRow.accountName].filter(Boolean).join(" / "), detail: usageRow.error || "" });
   };
 
   // ===== 鉴权：库中只存哈希，实时查表（启停/删除即时生效）。Key 从哪个头读由协议面定 =====
@@ -1188,10 +1217,14 @@ function buildApp(settings) {
   //  另外别拿 decryptFailureCount()（进程内只增不减的累计次数）当判据：那样 ok 都能 true 而
   //  credFail 永久 true，两个字段互相矛盾，用户删掉坏号也洗不掉。四个渠道都要算，不能用 some() 短路。）
   app.get("/readyz", (_req, res) => {
-    // channelList() 而非 store.CHANNELS：本分支把渠道的真相源收进 channelList()（内置 4 家 +
+    // channelList() 而非 store.CHANNELS：本分支把渠道的真相源收进 channelList()（全部内置渠道 +
     // 启用中的自建提供商），提供商与内置渠道**用同一套号池凭据**，就绪判定必须一起算，
     // 否则「只配了提供商」的用户会被 /readyz 误报成没号。
-    const summaries = store.channelList().map((c) => pool.poolSummary(c.id));
+    // channelOn（上游启闭）只作用在就绪判定上，绝不动上面的 /healthz：全渠道关闭是用户意图，
+    // 不是进程失能——监督器据 /healthz 决定重启，若这里改成 503 会打出重启循环。
+    // 提供商不受启闭弹窗管辖（channelEnabled 里没有它的键），channelOn 对它恒 true。
+    const cfg = settings();
+    const summaries = store.channelList().filter((c) => adapters.channelOn(c.id, cfg)).map((c) => pool.poolSummary(c.id));
     const credFail = store.decryptFailureActive() > 0;
     const healthy = summaries.some((s) => s.onlineCount > 0);
     // detail 与 status 必须自相洽：healthy 时（HTTP 200）不许再写「号池无可用账号」，

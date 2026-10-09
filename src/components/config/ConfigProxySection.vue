@@ -8,8 +8,11 @@ import * as api from "../../api/ipc";
 import type { ProxyModel, ProxyRuleFile } from "../../types";
 import { useAppStore } from "../../stores/app";
 import { fmtAgo, fmtK } from "../../views/proxy/format";
+import ProxyUpstreamDialog from "../ProxyUpstreamDialog.vue";
 
 const app = useAppStore();
+// 上游启闭弹窗（渠道级开关：关闭的渠道在反代网关全部页面动态隐藏，重新打开立即恢复）
+const upOpen = ref(false);
 // 页面内的二级子板块：服务与路由 / 监控与安全 / 规则文件
 const tab = ref<"service" | "monitor" | "rules">("service");
 const rules = ref<ProxyRuleFile[]>([]);
@@ -133,6 +136,7 @@ function openDataDir() {
       </div>
       <div class="cfg-sec-actions">
         <span v-if="msg" class="tag" :class="msgErr ? 'tag-err' : 'tag-ok'">{{ msg }}</span>
+        <button class="btn btn-ghost" @click="upOpen = true"><i class="ph ph-plugs-connected"></i>上游启闭</button>
         <button class="btn btn-cta" :disabled="saving" @click="save">{{ saving ? "保存中…" : "保存并重启服务" }}</button>
       </div>
     </div>
@@ -370,5 +374,8 @@ function openDataDir() {
         </table>
       </div>
     </div>
+
+    <!-- 上游启闭弹窗（渠道级开关）：关闭的渠道在反代网关全部页面动态隐藏，重新打开立即恢复 -->
+    <ProxyUpstreamDialog :open="upOpen" @close="upOpen = false" />
   </div>
 </template>

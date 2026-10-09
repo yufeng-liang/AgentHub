@@ -32,6 +32,13 @@ function proxyConfig() {
   }
 }
 
+/** 渠道启闭（「上游启闭」弹窗）：配置里显式 false = 关闭，其余（缺省/非布尔）= 启用。
+ *  cfg 已在调用方就绪时直接传入，避免循环内重复读盘 */
+function channelOn(channel, cfg) {
+  const c = cfg || proxyConfig();
+  const v = (c.channelEnabled || {})[channel];
+  return v !== false;
+}
 
 const FIRST_BYTE_MS = 30000; // 首 token 30s 超时判失败。实测成功请求 TTFT P99≈8.7s、最大 20.2s，
 // 10s 会误杀慢模型/thinking 首包（参考项目无首字节总超时，读空闲容忍 300s，这里取全覆盖+余量的折中）
@@ -1794,6 +1801,23 @@ function raccoonRefreshHeaders(c, account) {
   return h;
 }
 
+/** 手机端身份头（仅首次手机端登录奖励 mobileGrantUrl 用）：官方手机 App 壳的请求形态
+ *  （示例项目 agent2api 从安卓包逆向实测）：platform 报 app-android、版本报 App 侧 v1.0.3。
+ *  手机端端点认的也是桌面端登录签发的同一把 Bearer token（token 无平台绑定），
+ *  报哪端只影响走哪条端点，不影响凭证 —— 每个号两条一次性奖励各领一次。 */
+function raccoonMobileHeaders(c, account, secrets) {
+  const idn = raccoonIdentity(account);
+  const h = {
+    "content-type": "application/json",
+    accept: "application/json",
+    authorization: `Bearer ${secrets.token}`,
+    "X-Client-Platform": "app-android",
+    "X-Client-Version": "v1.0.3",
+  };
+  if (idn.officeIdentity && idn.officeIdentity !== "personal") h["X-Org-Code"] = idn.officeIdentity;
+  return h;
+}
+
 /** GLM 系（glm-5-3 / glm-5.3 等）的思考参数归一（issue #78）：上游这条链路只认 low/high/max，
  *  发 "off" 会被 LiteLLM 直接 400——真实流水实证：「该模型始终思考，不支持关闭思考；请使用 low、
  *  high 或 max」。这里把「关思考」译成官方语义 low（仍是关，只是强度最低），并摘掉 thinking /
@@ -2082,6 +2106,54 @@ const raccoon = {
     }
     const granted = !!(r.data.data && r.data.data.granted);
     return { ok: true, already: !granted, claimed: granted, message: granted ? "已领取每日积分" : "今日已领取过" };
+  },
+
+  /**
+   * 首次登录奖励（一次性新手福利，桌面端与手机端各一条端点，同一把 Bearer token、各领一次）。
+   * 契约与 raccoon.checkin 的每日 grant 同形：`{code:0,data:{granted,popup?:{points}}}`；
+   * granted=false = 此前已发放（幂等成功，不重复加分）。两条端点互不共享额度：
+   * 桌面端早已领过的账号，手机端那条照样能拿满。
+   *
+   * 台账（已领取标记）存账号 meta.onboardingGrants（key → 结算时刻）：
+   *   · 台账已结算的任务不发请求 —— 落了标记后续恒跳过（「后续不再领取」）；
+   *   · 探测成功（无论 granted 真假）都算落定，返回 settled 增量由编排层写台账 ——
+   *     两种结果都代表奖励已落定，这一步就是「已领取」标记的写入口径；
+   *   · 探测失败（网络/5xx）不落台账，下次签到/自动签到自然重试（「直到领取成功」）；
+   *   · 401 = 凭证失效，整体失败（不落台账，也不对每条任务各撞一次 401）。
+   * 串行探测（与签到同一条防风控口径）。实际入账分值以响应 popup.points 为准，
+   * 取不到按名义值 3000 兜底（仅用于界面展示与流水摘要）。
+   */
+  async claimOnboarding(account, secrets) {
+    const c = this.cfg();
+    const meta = (account && account.meta) || {};
+    const ledger = meta.onboardingGrants && typeof meta.onboardingGrants === "object" ? meta.onboardingGrants : {};
+    const tasks = [
+      { key: "desktop_login_grant", title: "首次电脑端登录奖励", path: c.grantUrl, headers: raccoonWebHeaders(c, account, secrets) },
+      { key: "mobile_login_grant", title: "首次手机端登录奖励", path: c.mobileGrantUrl, headers: raccoonMobileHeaders(c, account, secrets) },
+    ];
+    const now = Date.now();
+    const settled = {};
+    const results = [];
+    let claimed = 0, already = 0, failed = 0, claimedPoints = 0;
+    for (const t of tasks) {
+      if (Number(ledger[t.key]) > 0) continue;
+      const r = await httpJson(t.path, { method: "POST", headers: t.headers, body: "{}" }).catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
+      if (r.status === 401) return { ok: false, message: "凭证失效，请重新登录" };
+      const code = Number((r.data && r.data.code) ?? (r.ok ? 0 : -1));
+      if (!r.ok || !r.data || (code !== 0 && code !== 200)) {
+        failed++;
+        results.push({ key: t.key, title: t.title, ok: false, error: (r.data && r.data.message) || r.message || `HTTP ${r.status}` });
+        continue;
+      }
+      const granted = !!(r.data.data && r.data.data.granted);
+      const points = granted ? Number(r.data.data.popup && r.data.data.popup.points) || 3000 : 0;
+      settled[t.key] = now;
+      claimed++;
+      claimedPoints += points;
+      if (!granted) already++; // granted=false = 此前已发放，本轮幂等落定（不再入账）
+      results.push({ key: t.key, title: t.title, ok: true, already: !granted, points });
+    }
+    return { ok: failed === 0, settled, results, claimed, already, failed, claimedPoints };
   },
 
   /** 加油包领取：raccoon 加油包为付费购买（无免费"领取"动作），不支持 → 返回不可用提示 */
@@ -3968,6 +4040,41 @@ const zcode = {
 
 };
 
+// ===== 适配器契约（新增/维护渠道必读）=====
+// 必需方法（缺失在启动期就报错，绝不留到运行期 "ad.chat is not a function"）：
+//   models()        静态兜底模型清单（string[]，可为空数组——清单来自拉取目录时）
+//   chat(ctx)       对话转发：{ account, secrets, model, body, emit, meta }，事件经 emit 回流
+// 可选方法（调用点均有 typeof 守卫或降级分支）：
+//   cfg / queryCredits / trial / userInfo / mapModel / rewriteBody / solveCaptcha /
+//   claimOnboarding / fetchModelsPublic / fetchModelsOnce / chatOnce …
+//   —— cfg() 在本分支不是必需：ADAPTERS 只有内置渠道共用它，而 modelOwners 之外无人跨适配器调；
+//   —— queryCredits() 更不是：自定义提供商是 API Key 直连、刻意不定义它（makeOpenaiCompat），
+//      Cline/AutoClaw 是官方订阅额度、上游没有对外余额接口，两条都由 credits.cjs 的
+//      creditsCapable() 先判能力再刷（把这两者列进必需集 = 网关 require 阶段即崩）。
+// 推荐方法（缺省时调用点各自守卫/降级）：
+//   fetchModels / checkin / checkinStatus / refreshToken
+// 可选扩展点：
+//   stateful() + chatSession(ctx)  会话式转发：一次客户端请求 = 多个上游请求 + 协议翻译时声明
+//     stateful() 返回 true，server 改走 chatSession（ctx 同 chat，不再走单发 chat）；缺省单发。
+//   classifyError(e)  渠道私有业务码分类：返回 { kind, switchable, status } 走渠道级分类，
+//     返回 null/undefined 走通用 classifyUpstream。注意 4008/11102 等码**跨渠道共用**
+//     （trae/workbuddy/qoder 都会回），不要把它们搬进单个渠道的 classifyError。
+// 命名约定：请求头方法统一 headers()。新增渠道步骤：
+//   ① store.cjs 的 CHANNELS 加一行（含 display/domain/costTier）
+//   ② 本文件实现适配器并挂到 ADAPTERS（必需方法缺失启动期即抛错）
+//   ③ rules/headers.json 等规则文件加渠道配置
+//   ④ 前端 format.ts 补 CHANNEL_NAMES / checkinLabels / balanceUnit 等展示文案
+//   ⑤ tools/ 自测补注册断言（双表一致性由 consistencyReport 兜底，漏挂即自测失败）
+const REQUIRED_ADAPTER_METHODS = ["models", "chat"];
+
+/** 契约断言：必需方法缺失即抛错（启动期 fail-fast，而非运行期 TypeError） */
+function assertAdapterContract(channel, ad) {
+  for (const m of REQUIRED_ADAPTER_METHODS) {
+    if (typeof (ad && ad[m]) !== "function") {
+      throw new Error(`渠道 ${channel} 缺少必需的适配器方法 ${m}()（契约见 adapters.cjs 顶部注释块）`);
+    }
+  }
+}
 
 
 /** cline 错误 → AgentHub 语义。403 刻意不当限额：ENTITLEMENT/API_REQUEST 是「账号×模型」
@@ -4745,7 +4852,11 @@ zcode_intl.id = "zcode_intl";
 // 的默认归属不变——新家只是多一个来源，不抢既有裸名路由。
 const ADAPTERS = { trae, workbuddy, workbuddy_ai, raccoon, cline_free, cline_pass, autoclaw, autoclaw_intl, modelscope, lobster, qoder, zcode, zcode_intl, ...(qoderIntl ? { qoder_intl: qoderIntl } : {}) };
 
-/** 渠道 → 适配器：内置 8 家查静态表，未命中再试动态提供商。
+// 启动期契约校验：全员必需方法缺失在 require 阶段即抛错（fail-fast），
+// 人为删掉某个适配器的 chat() 后应用启动即崩在明面上，而不是运行期才 404/TypeError
+for (const [channel, ad] of Object.entries(ADAPTERS)) assertAdapterContract(channel, ad);
+
+/** 渠道 → 适配器：内置渠道查静态表，未命中再试动态提供商。
  *  ADAPTERS 本身保持只含内置 —— mergedModels()/modelOwners() 靠这个前提把裸模型名
  *  的归属判定完全留给内置渠道（提供商的模型只以 slug/model 出现），见那里的注释。 */
 function get(channel) {
@@ -4939,12 +5050,15 @@ function modelOwners(model, cfg) {
   const lower = String(model || "").toLowerCase();
   const mapped = [];
   const directRev = rev[model];
+  // 别名支路同样要过启闭（上游只给了下面的主循环）：别名命中是 owners 的唯一来源时，
+  // 漏判会让关闭渠道经 resolveChannel 的「单源 → 直达」重新拿到请求，等于启闭形同虚设。
+  const aliasOn = (ch) => ADAPTERS[ch] && channelOn(ch, c);
   if (directRev && typeof directRev === "object") {
-    mapped.push(...Object.keys(directRev).filter((ch) => ADAPTERS[ch]));
+    mapped.push(...Object.keys(directRev).filter(aliasOn));
   } else {
     for (const [k, map] of Object.entries(rev)) {
       if (k.toLowerCase() === lower && map && typeof map === "object") {
-        mapped.push(...Object.keys(map).filter((ch) => ADAPTERS[ch]));
+        mapped.push(...Object.keys(map).filter(aliasOn));
         break;
       }
     }
@@ -4958,6 +5072,9 @@ function modelOwners(model, cfg) {
   }
   for (const [channel, ad] of Object.entries(ADAPTERS)) {
     if (seen.has(channel)) continue;
+    // 关闭的渠道不算归属：单源模型也判「不可用」（resolveChannel 拿到空列表 → 400 给可用模型提示），
+    // 多源模型自动收窄到启用渠道（故障转移备选同步收窄，路由打分与备选队列全走这里）
+    if (!channelOn(channel, c)) continue;
     if (ad.models().some((m) => String(m).toLowerCase() === lower)) {
       seen.add(channel);
       out.push(channel);
@@ -4979,9 +5096,23 @@ function modelOwners(model, cfg) {
 function listableModels(cfg) {
   const c = cfg || proxyConfig();
   const disabled = c.disabledModels || [];
-  if (!disabled.length) return mergedModels(c);
-  const off = new Set(disabled.map((s) => String(s).toLowerCase()));
-  return mergedModels(c).filter((m) => !off.has(m.id.toLowerCase()));
+  const off = new Set((disabled || []).map((s) => String(s).toLowerCase()));
+  const on = (ch) => channelOn(ch, c);
+  return mergedModels(c)
+    .filter((m) => (m.sources || []).some(on)) // 全源渠道都被关闭的模型不对外暴露（客户端不再看到）
+    .filter((m) => !off.has(m.id.toLowerCase()));
+}
+
+/** 双表一致性报告（CHANNELS ↔ ADAPTERS）：两向差集非空即自测失败（tools/proxy-smoke.cjs 断言）。
+ *  只从 CHANNELS 移除而留 ADAPTERS，会让模型被判「双区共有」并路由到无账号的渠道；
+ *  只加 ADAPTERS 不加 CHANNELS，会让渠道有适配器却不出现在任何 UI/健康检查/池同步校验里 */
+function consistencyReport() {
+  const chanIds = new Set(store.CHANNELS.map((c) => c.id));
+  const adIds = new Set(Object.keys(ADAPTERS));
+  return {
+    channelsWithoutAdapter: [...chanIds].filter((id) => !adIds.has(id)),
+    adaptersWithoutChannel: [...adIds].filter((id) => !chanIds.has(id)),
+  };
 }
 
 module.exports = {
@@ -4990,9 +5121,14 @@ module.exports = {
   mergedModels,
   listableModels,
   modelOwners,
+  channelOn,
   httpJson,
   refreshTokenLocked,
   setModelMetaSource,
+  // 适配器契约（启动期校验 + 自测复验用）；必需集在本分支只钉 models/chat，理由见上方契约注释块
+  REQUIRED_ADAPTER_METHODS,
+  assertAdapterContract,
+  consistencyReport,
   // ModelScope 续期实现注入（避免 adapters ↔ discovery 循环依赖；由 index.cjs 启动时注入）
   setModelScopeRefresh,
   // ModelMeta 统一层窥视口（dev-effort-catalog-test 直测）：三源合并 / seed 解析容错 / 覆盖标记

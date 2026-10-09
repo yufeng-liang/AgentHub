@@ -16,6 +16,7 @@ import type { DeviceMeta } from "../types/sync";
 import type { ModuleKey } from "../types";
 import * as api from "../api/ipc";
 import { coalesceAsync } from "../utils/timing";
+import ProxyUpstreamDialog from "./ProxyUpstreamDialog.vue";
 import logoUrl from "../assets/logo.png";
 
 const app = useAppStore();
@@ -156,10 +157,10 @@ const billingOn = computed(() => !!usageApp.config.billing?.enabled);
 const currency = computed(() => usageApp.config.billing?.displayCurrency || "CNY");
 
 // ===== 模块卡片的运行状态与统计（全部真实数据，无 mock） =====
-const MODULE_META = computed<Record<ModuleKey, { state: string; level: "ok" | "warn"; stats: { v: string; label: string }[] }>>(() => {
+const MODULE_META = computed<Record<ModuleKey, { state: string; level: "ok" | "warn"; stats: { v: string; label: string; unit?: string }[] }>>(() => {
   const sk = skillsStats.value;
-  const syncStats: { v: string; label: string }[] = [
-    { v: String(usage.devices.length), label: "机器" },
+  const syncStats: { v: string; label: string; unit?: string }[] = [
+    { v: String(usage.devices.length), label: "机器", unit: "台" },
   ];
   if (billingOn.value && syncTodayCost.value !== null) {
     syncStats.push({ v: formatCost(syncTodayCost.value, 2, currency.value), label: "今日费用" });
@@ -170,9 +171,9 @@ const MODULE_META = computed<Record<ModuleKey, { state: string; level: "ok" | "w
       state: sk && sk.pendingConflicts > 0 ? `${sk.pendingConflicts} 冲突待裁决` : "运行中",
       level: sk && sk.pendingConflicts > 0 ? "warn" : "ok",
       stats: [
-        { v: sk ? String(sk.skillCount) : "-", label: "已收纳" },
-        { v: sk ? String(sk.pendingConflicts) : "-", label: "待裁决" },
-        { v: sk ? String(sk.toolCount) : "-", label: "接入工具" },
+        { v: sk ? String(sk.skillCount) : "-", label: "已收纳", unit: "个" },
+        { v: sk ? String(sk.pendingConflicts) : "-", label: "待裁决", unit: "个" },
+        { v: sk ? String(sk.toolCount) : "-", label: "接入工具", unit: "个" },
       ],
     },
     sync: {
@@ -184,9 +185,9 @@ const MODULE_META = computed<Record<ModuleKey, { state: string; level: "ok" | "w
       state: proxyRunning.value ? "网关运行中" : "网关未启动",
       level: proxyRunning.value ? "ok" : "warn",
       stats: [
-        { v: `:${app.config.proxy.port}`, label: "端口" },
-        { v: String(proxyKeyCount.value), label: "Key" },
-        { v: channels.value.length ? String(channels.value.length) : "-", label: "上游" },
+        { v: String(app.config.proxy.port), label: "端口" },
+        { v: String(proxyKeyCount.value), label: "Key", unit: "个" },
+        { v: enabledUpstreamCount.value ? String(enabledUpstreamCount.value) : "-", label: "已启用上游", unit: "个" },
       ],
     },
     memory: {
@@ -199,8 +200,9 @@ const MODULE_META = computed<Record<ModuleKey, { state: string; level: "ok" | "w
             : "等待 Agent 调用",
       level: memoryOverview.value && memoryOverview.value.pending === 0 && memoryOverview.value.verifiedAgents > 0 ? "ok" : "warn",
       stats: [
-        { v: memoryOverview.value ? String(memoryOverview.value.total) : "-", label: "条记忆" },
-        { v: memoryOverview.value ? `${memoryOverview.value.verifiedAgents}/${memoryOverview.value.agents}` : "-", label: "已连通" },
+        // 普通 = 总量 − 深层 L2；「N 个 Agent 已连通」已在右上状态，这里只报记忆条数
+        { v: memoryOverview.value ? String(Math.max(0, memoryOverview.value.total - memoryOverview.value.l2)) : "-", label: "普通记忆", unit: "条" },
+        { v: memoryOverview.value ? String(memoryOverview.value.l2) : "-", label: "深层记忆", unit: "条" },
       ],
     },
   };
@@ -210,6 +212,8 @@ const MODULE_META = computed<Record<ModuleKey, { state: string; level: "ok" | "w
 type ProxyChannelRow = {
   id: string;
   display: string;
+  /** 这一行当前能不能用：内置渠道 = 上游启闭，自建提供商 = 提供商页的停用位（口径见 types 里那条注释） */
+  enabled?: boolean;
   summary: { totalCredits: number; accountCount: number; onlineCount: number; earliestExpire: number; expired: boolean; expiringSoon: boolean };
 };
 const channels = ref<ProxyChannelRow[]>([]);
@@ -220,12 +224,18 @@ async function refreshChannels() {
 // 注意渠道级 expired 是 some 语义（任一账号过期即置位），所以只按标签过滤会连带藏掉
 // 仍有可用账号的渠道 —— 必须再要求余额也为 0。
 const visibleChannels = computed(() => channels.value.filter((c) => !(c.summary.expired && c.summary.totalCredits === 0)));
+// 「已启用上游」只数当前真能用的行：号池视图里被关闭的内置渠道已经不在列表里（后端 poolView 按
+// channelOn 过滤），停用的自定义提供商仍在列表里（号池页要看它的账号），故由 enabled 标记裁掉。
+const enabledUpstreamCount = computed(() => channels.value.filter((c) => c.enabled !== false).length);
 const fmtDay = (ts: number) => {
   if (!ts) return "-";
   const d = new Date(ts);
   const p = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 };
+
+// 上游启闭弹窗（渠道级开关：关闭的渠道在反代网关全部页面动态隐藏）
+const upOpen = ref(false);
 
 // 模块图标（线稿 path，复刻 design.html）
 const MODULE_ICONS: Record<ModuleKey, string> = {
@@ -376,8 +386,14 @@ const TOOLS = computed<{ name: string; meta: string; label: string; ok: boolean 
           </div>
           <div class="mc-stats">
             <div v-for="s in MODULE_META[mod.key].stats" :key="s.label" class="mc-stat">
-              <b>{{ s.v }}</b><span>{{ s.label }}</span>
+              <b>{{ s.v }}<span v-if="s.unit" class="mc-unit">{{ s.unit }}</span></b><span>{{ s.label }}</span>
             </div>
+            <!-- 上游启闭（仅反代网关卡）：渠道级开关入口，弹窗内各渠道图标 + 名称 + 开关 -->
+            <el-tooltip v-if="mod.key === 'proxy'" content="上游启闭：控制各渠道在反代网关中的启用与可见" placement="top">
+              <button class="mc-up-btn" @click.stop="upOpen = true">
+                <i class="ph ph-plugs-connected"></i>上游启闭
+              </button>
+            </el-tooltip>
           </div>
         </div>
       </nav>
@@ -570,6 +586,9 @@ const TOOLS = computed<{ name: string; meta: string; label: string; ok: boolean 
         </span>
       </div>
     </div>
+
+    <!-- 上游启闭弹窗（渠道级开关）：关闭的渠道在反代网关全部页面动态隐藏，重新打开立即恢复 -->
+    <ProxyUpstreamDialog :open="upOpen" @close="upOpen = false" />
   </aside>
 </template>
 
@@ -765,6 +784,8 @@ const TOOLS = computed<{ name: string; meta: string; label: string; ok: boolean 
 }
 .mc-stats {
   display: flex;
+  flex-wrap: wrap; /* 挤不下时「上游启闭」按钮换行右对齐，数字不被压缩 */
+  align-items: flex-end;
   gap: 12px;
   margin-top: 8px;
 }
@@ -774,9 +795,42 @@ const TOOLS = computed<{ name: string; meta: string; label: string; ok: boolean 
   font-weight: 600;
   display: block;
 }
+/* 数字后的弱化单位（台/个/条）：与下卡片 .ov-unit 同构的两段式 */
+.mc-unit {
+  font-size: 9px;
+  font-weight: 500;
+  color: var(--text-3);
+  margin-left: 2px;
+  font-family: var(--font-ui);
+}
 .mc-stat span {
   font-size: 9px;
   color: var(--text-3);
+}
+/* 上游启闭小按钮（仅反代网关卡）：弱化 ghost 态，悬停点亮，与免责问号同色系 */
+.mc-up-btn {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 7px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--text-3);
+  font-size: 9px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.mc-up-btn .ph {
+  font-size: 10px;
+}
+.mc-up-btn:hover {
+  color: var(--accent-strong);
+  border-color: var(--accent-line);
+  background: var(--accent-dim);
 }
 .mc-state {
   position: absolute;

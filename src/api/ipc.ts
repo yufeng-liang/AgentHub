@@ -9,6 +9,7 @@ import type {
   ProxyBuiltinChannelId, ProxyPoolStrategy, ProxyCostTier,
   ProxyCheckinRow, ProxyProvider, ProxyProviderKind, ProxyProviderModel, ProxyProviderTestResult,
   CcSwitchStatus, CcSwitchRegisterResult, CcSwitchAppType, ZcodeDeviceStatusResult, ZcodeClaimModeResult,
+  ProxyOpLogList,
   MemoryRow, MemoryDetail, MemoryStats, MemoryIndexStatus, MemoryTimelineNode, MemoryProjectCard,
   MemoryAgentCard, MemoryAgentVerify, MemoryBridgeStatus, MemoryConfigEnvelope, MemoryStatusEnvelope,
   MemoryToolRow,
@@ -24,6 +25,7 @@ export type {
   ProxyAccountStatus, ProxyEvent, ProxyCheckinRow,
   ProxyProvider, ProxyProviderKind, ProxyProviderModel, ProxyProviderTestResult,
   CcSwitchStatus, CcSwitchRegisterResult,
+  ProxyOpLogList, ProxyOpLogRow,
   MemoryRow, MemoryDetail, MemoryStats, MemoryIndexStatus, MemoryTimelineNode, MemoryProjectCard,
   MemoryAgentCard, MemoryAgentVerify, MemoryBridgeStatus, MemoryConfigEnvelope, MemoryStatusEnvelope,
   MemoryToolRow, MemoryEvent,
@@ -232,6 +234,10 @@ export const proxyKeyDelete = (id: string) => call<{ ok: boolean; message?: stri
 
 // ===== 反代网关：号池 / 凭据接入 =====
 export const proxyPool = () => call<ProxyChannelView[]>("proxy_pool");
+/** 渠道启闭（「上游启闭」弹窗）：list = 全量含已关闭渠道（带 enabled）；toggle = 写配置 + 广播事件即时生效 */
+export const proxyChannelList = () => call<ProxyChannelView[]>("proxy_channel_list");
+export const proxyChannelToggle = (channel: ProxyChannelId | string, enabled: boolean) =>
+  call<{ ok: boolean; channel?: string; enabled?: boolean; message?: string }>("proxy_channel_toggle", { channel, enabled });
 export const proxyPoolStrategy = (channel: ProxyChannelId, strategy: ProxyPoolStrategy) =>
   call<{ ok: boolean; message?: string }>("proxy_pool_strategy", { channel, strategy });
 /** 渠道成本档（cost-first 路由排序的标注来源） */
@@ -359,6 +365,22 @@ export const proxyStatsDetail = (opts: { page?: number; pageSize?: number; chann
 export const proxyStatsRequest = (id: number) => call<ProxyUsageDetail | null>("proxy_stats_request", { id });
 export const proxyStatsCleanup = (days?: number, all?: boolean) => call<{ deleted: number }>("proxy_stats_cleanup", { days, all });
 export const proxyRecent = (limit?: number) => call<ProxyUsageRow[]>("proxy_recent", { limit });
+
+// ===== 反代网关：操作日志（「日志」页签） =====
+export interface ProxyOpLogFilter {
+  /** 毫秒时间戳区间（视图层由日期串换算），空/0 = 不限 */
+  from?: number | null;
+  to?: number | null;
+  level?: string;
+  op?: string;
+  limit?: number;
+  offset?: number;
+}
+export const proxyOpLogList = (filter: ProxyOpLogFilter) => call<ProxyOpLogList>("proxy_oplog_list", filter as Record<string, unknown>);
+export const proxyOpLogOps = () => call<string[]>("proxy_oplog_ops");
+/** 导出 Excel（.xlsx 落 downloads，文件名含毫秒时间戳）；导出当前筛选全集（无分页） */
+export const proxyOpLogExport = (filter: Omit<ProxyOpLogFilter, "limit" | "offset">) =>
+  call<{ ok: boolean; path?: string; count?: number; message?: string }>("proxy_oplog_export", filter as Record<string, unknown>);
 export const proxyRulesList = () => call<ProxyRuleFile[]>("proxy_rules_list");
 export const proxyOpenRulesDir = () => call<{ ok: boolean }>("proxy_open_rules_dir");
 export const proxyOpenDataDir = () => call<{ ok: boolean }>("proxy_open_data_dir");
