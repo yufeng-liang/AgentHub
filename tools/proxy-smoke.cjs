@@ -18,6 +18,7 @@ async function main() {
     if (!cond) throw new Error("断言失败: " + msg);
   };
   const store = require("../electron/backend/proxy/store.cjs");
+  const EP = require("../electron/backend/proxy/qoderEndpoints.cjs"); // 网关域名按真相源比，不写字面量（写死就是下一个漂移点）
   const rules = require("../electron/backend/proxy/rules.cjs");
   const util = require("../electron/backend/proxy/util.cjs");
   const pool = require("../electron/backend/proxy/pool.cjs");
@@ -260,8 +261,8 @@ async function main() {
   const intlOn = !!store.QODER_INTL_ENABLED;
   assert(!!adapters.get("qoder_intl") === intlOn, `qoder_intl 适配器注册状态与开关(${intlOn}) 一致`);
   assert(store.CHANNELS.some((c) => c.id === "qoder_intl") === intlOn, `CHANNELS 中 qoder_intl 与开关一致`);
-  const qoderList = [["qoder", qd, "https://gateway.qoder.com.cn"]];
-  if (intlOn) qoderList.push(["qoder_intl", adapters.get("qoder_intl"), "https://api2.qoder.sh"]);
+  const qoderList = [["qoder", qd, EP.inferGateway("qoder")]];
+  if (intlOn) qoderList.push(["qoder_intl", adapters.get("qoder_intl"), EP.inferGateway("qoder_intl")]);
   for (const [id, ad, gw] of qoderList) {
     const need = ["cfg", "models", "fetchModels", "headers", "rewriteBody", "chat", "queryCredits", "refreshToken"];
     assert(need.every((k) => typeof ad[k] === "function"), `${id} 适配器十件套齐备`);

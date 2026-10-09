@@ -48,8 +48,12 @@ function loadTsModule(rel) {
   return mod.exports;
 }
 const { ROW_H, OVERSCAN, MIN_ROWS, winRange, colCountFor } = loadTsModule("src/views/proxy/virtualWindow.ts");
-// fmtCtx 取真的，不在这里手抄一遍缩写规则（抄了就变成门禁替被测代码答题）
-const { fmtCtx } = loadTsModule("src/views/proxy/format.ts");
+// fmtCtx / capabilityTags 取真的，不在这里手抄一遍缩写与标签规则（抄了就变成门禁替被测代码答题）
+const fmtReal = loadTsModule("src/views/proxy/format.ts");
+const { fmtCtx, capabilityTags } = fmtReal;
+// 合并列的摘要/态别算法同样取**同一份实现**：闸自己拼一遍「自动路由 · N 渠道」，
+// 组件写成别的文案也不会红——这与 colCountFor / fmtCtx 是一个口径。
+const { chanSummary, chanTone, chanRows, staleExcluded, liveCount } = loadTsModule("src/views/proxy/channelCell.ts");
 
 let pass = 0;
 const failures = [];
@@ -125,10 +129,30 @@ function mkModels(n) {
   return Array.from({ length: n }, (_, i) => ({
     id: `model-${String(i + 1).padStart(3, "0")}`, object: "model", created: 0, owned_by: "trae",
     sources: i % 3 === 0 ? ["trae", "workbuddy"] : ["trae"],
-    name: `Model ${i + 1}`, rate: null, capabilities: { tools: true }, contextLength: 131072,
-    reasoning: {}, enabled: true, override: "", fallback: "",
+    name: `Model ${i + 1}`, rate: null,
+    // 能力五枚齐备（图/视/思/工 + 输出上限），这样「全显」的判据数得到 5 而不是一
+    capabilities: { images: true, video: true, reasoning: true, tools: true },
+    maxOutputTokens: 131072,
+    contextLength: 131072,
+    reasoning: {}, enabled: true, fallback: "",
+    // 三态各留一格：0=双源且排除了一个、3=钉定、其余=纯自动单源
+    override: i === 3 ? "trae" : "",
+    excluded: i % 3 === 0 ? ["workbuddy"] : [],
+    pinnedKeys: i % 3 === 0 ? [{ id: "k1", name: "CLI 用 Key", route: "trae" }] : [],
   }));
 }
+
+/** el-popover 这类组件在闸里没注册。未解析组件的**默认槽**会被渲染（探针实测旧模板一行里
+ *  <el-option 开标签 = 2），但**具名槽**（`#reference`）整个丢掉——于是触发器那颗 chip
+ *  在 HTML 里根本不存在，㉓/㉓b/㉓c/㉕ 就看不见被测内容。
+ *  这个桩只负责「把所有槽都吐出来给判据看」：它不产出任何被测语义
+ *  （文案、类名、行序仍来自组件与 channelCell 的真实现），所以不构成门禁替被测代码答题。 */
+const AllSlotsStub = {
+  name: "el-popover",
+  setup(_props, { slots }) {
+    return () => Vue.h("el-popover", null, [slots.reference ? slots.reference() : null, slots.default ? slots.default() : null]);
+  },
+};
 
 async function render({ rows, firstVisible, viewRows, activeTab = "" }) {
   const { render, source, thSource } = catalogTbodyRender();
@@ -136,6 +160,7 @@ async function render({ rows, firstVisible, viewRows, activeTab = "" }) {
   const win = rows.slice(r.start, r.end);
   const noop = () => {};
   const app = Vue.createSSRApp({ render });
+  app.component("el-popover", AllSlotsStub);
   Object.assign(app.config.globalProperties, {
     rows, win, activeTab,
     vPadTop: r.padTop, vPadBottom: r.padBottom,
@@ -144,8 +169,17 @@ async function render({ rows, firstVisible, viewRows, activeTab = "" }) {
     colCountFor,
     app: { config: { proxy: { modelCustom: { "model-001": { contextLength: 999 } } } } },
     REASONING_EFFORT_ALL: [{ value: "", label: "默认" }, { value: "low", label: "低 (low)" }],
-    CHANNEL_OPTIONS: [{ value: "", label: "自动" }, { value: "trae", label: "Trae" }],
-    capabilityTags: () => ["工具"], channelName: () => "Trae", fmtRate: () => "—",
+    // 能力标签取**真实现**：桩（此前是 () => ["工具"]）会让「五枚全显」这条判据只能测到桩自己。
+    capabilityTags, channelName: () => "Trae", fmtRate: () => "—",
+    // 合并列的两个可见函数也取真的（同上：注入假的等于门禁替被测代码答题）
+    chanSummary, chanTone,
+    // 探针实测：未解析组件（el-popover / el-select）的**插槽内容在 SSR 里会被渲染**
+    // （旧模板一行里 <el-option 开标签数 = 2）。所以 popover 里的行数与开关数能当判据，
+    // 不必退化成「只能真机核验」。chanRowsOf 用真的 chanRows 现算，order 由闸给定；
+    // 顺序策略本身另用 ㉓e 直接判纯函数，不依赖这里给的 order。
+    chanRowsOf: (m) => chanRows(m, ["trae", "workbuddy"]),
+    staleExcluded: (m) => staleExcluded(m), liveCount: (m) => liveCount(m),
+    toggleExclude: noop, togglePin: noop, clearStale: noop, gotoKey: noop,
     // 上下文列「非编辑态 K/M 缩写 + 聚焦草稿」引入的绑定点。
     // 这段只保证模板渲染得出来，本闸的判据是行结构（⑬ 已单独钉输入框还在），
     // 所以 ctxValue 只取目录值、不复制组件里「自定义优先」那条链路。
@@ -211,16 +245,88 @@ async function main() {
   const ch = await render({ rows: models, firstVisible: 0, viewRows: 7, activeTab: "trae" });
   const chHead = headColCount(ch.thSource, "trae");
   const chCols = [...new Set(dataRows(ch.rowsOut).map((t) => t.tds))];
-  check(`⑩ 单渠道视图（少一列「来源渠道」）表头 ${chHead} 列 ⇒ 数据行也 ${chHead} 列（实得 ${chCols.join("/")}）`,
-    chHead === headCols - 1 && chCols.length === 1 && chCols[0] === chHead, "activeTab 下列宽/colspan 没跟着改会错位");
+  // ⑩ 合并列改造后「渠道」列常驻：两个视图的列数必须**相同**。
+  //    此前是 headCols - 1（少一列「来源渠道」），改成相等就是把「合并」这件事钉进判据：
+  //    实现若还给渠道列挂 v-if，activeTab 下表头少一列而 colspan 仍是老数 ⇒ 整表错位，这里必红。
+  check(`⑩ 单渠道视图与合并视图列数相同（实得 ${chHead}/${headCols}）`,
+    chHead === headCols && chCols.length === 1 && chCols[0] === chHead, "合并列若还挂 v-if，activeTab 下会少一列而 colspan 仍是老数 ⇒ 整表错位");
 
   // ===== E. 防「为了性能砍功能」：每行该有的控件还得在 =====
   const one = dataRows(a.rowsOut)[0].inner;
-  check("⑪ 数据行仍有 2 个下拉（思考强度 + 渠道覆盖）", (one.match(/el-select/g) || []).length >= 2);
+  // ⑪ 合并列改造后每行的 el-select 只剩「思考强度」一个（渠道覆盖那张并进 popover）。
+  //    必须钉成恰好 1 而不是 >=1：下界判据对「多挂一份 select」全盲，而白挂一份就是
+  //    本页最初测出来的那个代价（133 行 × 2 个 select = 冷挂载 +10131 个事件监听器）。
+  //    计数按开标签 `<el-select` 而不是子串 `el-select`：后者在一行里出现 8 次（class 名也含它），
+  //    拿子串当「下拉个数」是判据自身写错（实测旧模板 2 个下拉 → 子串 8 次）。
+  const selN = (one.match(/<el-select/g) || []).length;
+  check(`⑪ 每行 el-select 恰好 1 个（思考强度；渠道覆盖已并入 popover）（实得 ${selN}）`, selN === 1,
+    selN === 2 ? "渠道覆盖那张 select 还在 ⇒ 合并没落地" : `实得 ${selN}`);
   // 2026-09-30 重组：编辑入口从独立按钮并入能力格（.cap-cell 整格可点开编辑器），
   // 闸跟着钉新形状：能力格可点击（role=button）+ 状态开关仍在。
   check("⑫ 数据行仍有「能力格编辑入口」（cap-cell role=button）与状态开关", /cap-cell/.test(one) && /role="button"/.test(one) && /role="switch"/.test(one));
   check("⑬ 数据行仍渲染上下文输入框", /custom-input/.test(one));
+
+  // ===== E+. 合并列与能力列的新形状（2026-10-08，先于实现写下，让它红在旧实现上）=====
+  // ㉓ 渠道格摘要文本必须等于**真函数**对该行算出的值：模板里手拼「自动路由」也能让
+  //    「看起来对」的截图通过，但两处口径迟早分叉（定案 Q10 的文案规则就没人守了）。
+  const want0 = chanSummary(models[0]);
+  // 只比**触发器自己的可见文本**，不用 one.includes(want0)：整格可点开的 aria-label 里也含同一串，
+  // 用 includes 时把模板改成手拼字面量仍会绿（变异对照 C 实测到过这个空转）。
+  const chanText = (/<span class="chan-sum[^"]*"[^>]*>([^<]*)</.exec(one) || [])[1];
+  check(`㉓ 首行渠道格摘要文本 == chanSummary 算出的「${want0}」（实得「${chanText}」）`, chanText === want0,
+    `片段 ${JSON.stringify(chanText)}`);
+  check("㉓b 渠道格触发器带 role=button（可点开的键盘可达入口）", /class="chan-sum[^"]*"[^>]*role="button"/.test(one), "合并列必须是按钮，不是一个只读 chip");
+  check(`㉓c 首行渠道格的 tone 类名 == chanTone 算出的「${chanTone(models[0])}」`, new RegExp(`class="chan-sum[^"]*${chanTone(models[0])}`).test(one),
+    `实得 ${JSON.stringify((/class="(chan-sum[^"]*)"/.exec(one) || [])[1])}`);
+
+  // ㉓h 「已排除 N」角标：摘要只报还剩几个（Q10a），被排除的数量得另有可见处，
+  //     否则用户点了两颗渠道，格子上看不出这是刚改的还是本来就剩一个。
+  check(`㉓h 有排除时格子里显出「已排除 ${models[0].excluded.length}」角标`, new RegExp(`已排除\\s*${models[0].excluded.length}`).test(one),
+    `片段 ${JSON.stringify((/class="tag tag-warn chan-badge">([^<]*)</.exec(one) || [])[1])}`);
+
+  // ㉓d 格子里每颗来源渠道都得有一个开关：状态列 1 颗 + 本行 sources.length 颗。
+  //    少一颗就是「某条渠道在 popover 里根本没有可点的行」——静态检查与截图都看不见（要点开才知道）。
+  const swN = (one.match(/role="switch"/g) || []).length;
+  const wantSw = 1 + models[0].sources.length;
+  check(`㉓d 一行内 role=switch 共 ${wantSw} 颗（状态 1 + 来源渠道 ${models[0].sources.length}）（实得 ${swN}）`, swN === wantSw,
+    swN === 1 ? "popover 里的渠道开关不存在 ⇒ 排除态没有可点的控件" : `实得 ${swN}`);
+
+  // ㉓e 行序策略直接判纯函数（SSR 只数得出行数，顺序对不对只能这样判）
+  const ordRows = chanRows({ id: "x", sources: ["workbuddy", "trae"], override: "", excluded: ["workbuddy"] }, ["trae", "workbuddy"]);
+  check("㉓e 行序=可用的在前、被排除的沉底", ordRows.map((r) => r.id).join(",") === "trae,workbuddy" && ordRows[1].on === false,
+    ordRows.map((r) => `${r.id}:${r.on ? "on" : "off"}`).join(","));
+  const mapRows = chanRows({ id: "y", sources: ["lobster", "trae"], override: "", excluded: [] }, ["trae", "lobster"], ["lobster"]);
+  check("㉓e2 反向映射命中的渠道置顶并标「映射」", mapRows[0].id === "lobster" && mapRows[0].mapped === true,
+    mapRows.map((r) => `${r.id}${r.mapped ? "(映射)" : ""}`).join(","));
+  // ㉓f 陈旧排除（渠道已不在 sources 里）要作为灰行出现在末尾，而不是被静默丢掉——
+  //     丢掉就没有「一键清除」的入口，配置里那个幽灵 id 永远留着还没人知道。
+  const staleRows = chanRows({ id: "z", sources: ["trae"], override: "", excluded: ["gone_chan"] }, ["trae", "workbuddy"]);
+  check("㉓f 陈旧排除出现在行尾且标 stale", staleRows.length === 2 && staleRows[1].id === "gone_chan" && staleRows[1].stale === true,
+    JSON.stringify(staleRows.map((r) => [r.id, r.stale])));
+
+  // ㉔ 能力列全显：渲染出的 tag 数 == capabilityTags 的长度（旧实现是「首枚 + 计数角标」恒 2）
+  const wantTags = capabilityTags(models[0]);
+  const capCell = (/<td class="cell-chips cap-cell[\s\S]*?<\/td>/.exec(one) || [""])[0];
+  const capTagN = (capCell.match(/class="tag /g) || []).length;
+  check(`㉔ 能力格渲染 ${wantTags.length} 枚标签（图/视/思/工/↑）（实得 ${capTagN}）`, capTagN === wantTags.length,
+    capTagN === 2 ? "仍是「首枚 + 计数角标」的旧实现" : `期望 ${wantTags.join("/")}，实得单元格 ${capCell.slice(0, 160)}`);
+  check(`㉔b 能力格逐枚文案与真函数一致：${wantTags.join(" ")}`, wantTags.every((t) => capCell.includes(`>${t}<`)), capCell.slice(0, 200));
+
+  // ㉕ 两态并存要能从可见类名区分（定案 Q2=B 的全部内容就是「用户看得出这是排除还是钉定」）
+  const row3 = dataRows(a.rowsOut)[3] ? dataRows(a.rowsOut)[3].inner : "";
+  check("㉕ 排除行有 chan-excluded、钉定行有 chan-pinned（两种态不同类名）",
+    /chan-excluded/.test(one) && /chan-pinned/.test(row3),
+    `首行 ${JSON.stringify((/class="(chan-sum[^"]*)"/.exec(one) || [])[1])} / 第4行 ${JSON.stringify((/class="(chan-sum[^"]*)"/.exec(row3) || [])[1])}`);
+
+  // ===== E++. 能力列全显的两条补充判据 =====
+  // ㉗ 未知输出上限要显式给 ↑—：静默不显会让人以为这模型没有上限，而不是「不知道」
+  const noOut = { ...models[0], maxOutputTokens: 0 };
+  check("㉗ maxOutputTokens 未知时能力列含 ↑—", capabilityTags(noOut).includes("↑—"), JSON.stringify(capabilityTags(noOut)));
+  // ㉘ 能力标签只接一个入参 —— 钉住「没有窄宽度降档」这个实测结论：
+  //     表挂 min-width:860 + table-layout:fixed ⇒ 能力格最窄也有 ~204px，五枚加铅笔约 120px
+  //     （真机实测余 102px）。谁要重新引入 compact 档，得先证明格子会窄过 204，
+  //     而不是像最初那版一样在默认窗口就把「视」白白砍掉。
+  check("㉘ capabilityTags 只接一个入参（降档机制已按实测删除）", capabilityTags.length === 1, `形参数 ${capabilityTags.length}`);
 
   // ===== F. 只虚拟化了目录这一张表 =====
   // 数 class="v-spacer" 而不是 v-spacer：后者在 CSS 选择器里也出现（tr.v-spacer），

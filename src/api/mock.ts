@@ -7,6 +7,12 @@ const KEY = "agenthub-config";
 const PREVIEW_NOTE = "（浏览器预览 mock 数据，桌面端才真实生效）";
 const NOW = Date.now();
 const ago = (minutes: number) => new Date(NOW - minutes * 60000).toISOString();
+/** 本地时区的今天（YYYY-MM-DD）：与后端 store.dayStr 同口径，签到记录的跨天判定用 */
+const TODAY = (() => {
+  const d = new Date(NOW);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+})();
 
 function defaultConfig(): AppConfig {
   return {
@@ -54,6 +60,7 @@ function defaultConfig(): AppConfig {
       usageRetentionDays: 90,
       debugStatus: false,
       modelOverrides: {},
+      modelChannelExcludes: {},
       humanizeJitter: true,
       disabledModels: [],
       modelFallback: {},
@@ -67,8 +74,7 @@ function defaultConfig(): AppConfig {
       channelCooldownMs: 120000,
       channelCooldownCapMs: 900000,
       ccSwitchModel: "",
-      checkinAuto: false,
-      checkinAutoTime: "09:00",
+      checkinAutoRules: {},
       promptMode: "passthrough",
       promptText: "",
     },
@@ -247,40 +253,53 @@ const PROXY_POOL = [
   {
     id: "trae", display: "Trae SOLO CN", domain: "api.trae.cn", costTier: "", poolStrategy: "expire_first",
     health: null as { until: number; reason: string; streak: number } | null,
+    checkinAuto: { enabled: true, time: "08:30", jitterMin: 15 },
     summary: { channel: "trae", totalCredits: 72480, accountCount: 2, onlineCount: 2, earliestExpire: NOW + 48 * 86400000, expired: false, expiringSoon: false, todayReq: 412, todayTokens: 96400, lastCreditsAt: NOW - 25 * 60000 },
     accounts: [
+      // 今日已签到（行内按钮"已签到"态；点开看今日详情）
       { id: "a1", channel: "trae", uid: "88213476", name: "主账号 · 沐", status: "online", credits: 51230, creditsAt: NOW - 25 * 60000, expiresAt: NOW + 48 * 86400000, coolUntil: 0, coolReason: "", source: "oauth", lastUsed: NOW - 3 * 60000, todayReq: 301, todayTokens: 70200, creditsToday: 21, createdAt: NOW - 20 * 86400000, hasToken: true,
+        checkin: { day: TODAY, at: NOW - 3600000, action: "checkin", ok: true, credit: 100, streakDays: 5, message: "签到成功" },
         packages: [{ code: "trae-solo", name: "SOLO 基础包", total: 100, used: 0, remaining: 100, expiresAt: NOW + 48 * 86400000 }] },
+      // 今日签到失败（行内按钮"签到失败"态；点开看失败原因）
       { id: "a2", channel: "trae", uid: "90247811", name: "备用号", status: "online", credits: 21250, creditsAt: NOW - 25 * 60000, expiresAt: NOW + 21 * 86400000, coolUntil: 0, coolReason: "", source: "paste", lastUsed: NOW - 40 * 60000, todayReq: 111, todayTokens: 26200, creditsToday: 21, createdAt: NOW - 6 * 86400000, hasToken: true,
+        checkin: { day: TODAY, at: NOW - 3000000, action: "checkin", ok: false, message: "上游 429：签到请求过于频繁，请稍后重试" },
         // 已用完：默认档「有余额」应当把它藏起来
         packages: [{ code: "trae-boost", name: "SOLO 加油包", total: 5, used: 5, remaining: 0, expiresAt: NOW + 21 * 86400000 }] },
     ],
   },
   {
-    id: "workbuddy", display: "WorkBuddy（中国区）", domain: "copilot.tencent.com", costTier: "", poolStrategy: "credit_first",
+    id: "workbuddy", display: "WorkBuddy CN", domain: "copilot.tencent.com", costTier: "", poolStrategy: "credit_first",
     health: null as { until: number; reason: string; streak: number } | null,
+    checkinAuto: { enabled: false, time: "09:00", jitterMin: 0 },
     summary: { channel: "workbuddy", totalCredits: 34120, accountCount: 2, onlineCount: 1, earliestExpire: NOW + 12 * 86400000, expired: false, expiringSoon: false, todayReq: 203, todayTokens: 41200, lastCreditsAt: NOW - 40 * 60000 },
 
     accounts: [
+      // 该渠道今日已全部签完（工具栏按钮应显示"签到成功"完成态）
       { id: "a3", channel: "workbuddy", uid: "wb_7c21", name: "工作号", status: "online", credits: 34120, creditsAt: NOW - 40 * 60000, expiresAt: NOW + 12 * 86400000, coolUntil: 0, coolReason: "", source: "scan", lastUsed: NOW - 8 * 60000, todayReq: 203, todayTokens: 41200, creditsToday: 21, createdAt: NOW - 15 * 86400000, hasToken: true,
+        checkin: { day: TODAY, at: NOW - 4000000, action: "checkin", ok: true, already: true, streakDays: 12, message: "今日已签到" },
         packages: [{ code: "wb-fission", name: "CodeBuddy 个人版国内运营裂变包", total: 500, used: 401, remaining: 99, expiresAt: NOW + 12 * 86400000 }] },
       { id: "a4", channel: "workbuddy", uid: "wb_9e05", name: "历史快照", status: "cooling", credits: 0, creditsAt: NOW - 300 * 60000, expiresAt: 0, coolUntil: NOW + 42000, coolReason: "上游限流", source: "scan", lastUsed: NOW - 55 * 60000, todayReq: 0, todayTokens: 0, creditsToday: -1, createdAt: NOW - 15 * 86400000, hasToken: true,
+        checkin: { day: TODAY, at: NOW - 4000000, action: "checkin", ok: true, credit: 50, streakDays: 3, message: "签到成功" },
         packages: [{ code: "wb-legacy", name: "CodeBuddy 个人版国内运营裂变包", total: 100, used: 100, remaining: 0, expiresAt: NOW + 9 * 86400000 }] },
     ],
   },
   {
-    id: "workbuddy_ai", display: "WorkBuddy AI（国际版）", domain: "www.workbuddy.ai", costTier: "", poolStrategy: "expire_first",
+    id: "workbuddy_ai", display: "WorkBuddy AI", domain: "www.workbuddy.ai", costTier: "", poolStrategy: "expire_first",
     health: null as { until: number; reason: string; streak: number } | null,
+    checkinAuto: { enabled: false, time: "09:00", jitterMin: 0 },
     summary: { channel: "workbuddy_ai", totalCredits: 8120, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 33 * 86400000, expired: false, expiringSoon: false, todayReq: 66, todayTokens: 14800, lastCreditsAt: NOW - 70 * 60000 },
 
     accounts: [
+      // 一次性加油包已领（行内按钮应显示"已领取"）
       { id: "a5", channel: "workbuddy_ai", uid: "wba_3d88", name: "Trial 加油包", status: "online", credits: 8120, creditsAt: NOW - 70 * 60000, expiresAt: NOW + 33 * 86400000, coolUntil: 0, coolReason: "", source: "paste", lastUsed: NOW - 30 * 60000, todayReq: 66, todayTokens: 14800, creditsToday: 21, createdAt: NOW - 4 * 86400000, hasToken: true,
+        checkin: { day: TODAY, at: NOW - 5000000, action: "trial", ok: true, already: true, credit: 500, message: "加油包已领取" },
         packages: [{ code: "wba-bonus", name: "Bonus Pack", total: 100, used: 0, remaining: 100, expiresAt: NOW + 33 * 86400000 }] },
     ],
   },
   {
     id: "raccoon", display: "商汤小浣熊", domain: "xiaohuanxiong.com", costTier: "", poolStrategy: "expire_first",
     health: null as { until: number; reason: string; streak: number } | null,
+    checkinAuto: { enabled: false, time: "09:00", jitterMin: 0 },
     summary: { channel: "raccoon", totalCredits: 9800, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 29 * 86400000, expired: false, expiringSoon: true, todayReq: 18, todayTokens: 5200, lastCreditsAt: NOW - 12 * 60000 },
     accounts: [
       { id: "a6", channel: "raccoon", uid: "rc_88213", name: "小浣熊 1 号", status: "online", credits: 9800, creditsAt: NOW - 12 * 60000, expiresAt: NOW + 29 * 86400000, coolUntil: 0, coolReason: "", source: "json", lastUsed: NOW - 9 * 60000, todayReq: 18, todayTokens: 5200, creditsToday: 21, createdAt: NOW - 3 * 86400000, hasToken: true,
@@ -339,6 +358,7 @@ const PROXY_POOL = [
   {
     id: "modelscope", display: "ModelScope（魔搭）", domain: "api-inference.modelscope.cn", costTier: "free", poolStrategy: "credit_first",
     health: null as { until: number; reason: string; streak: number } | null,
+    checkinAuto: { enabled: false, time: "09:00", jitterMin: 0 },
     summary: { channel: "modelscope", totalCredits: 341, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 86400000, expiringSoon: true, todayReq: 5, todayTokens: 1200, lastCreditsAt: NOW - 2 * 60000 },
     accounts: [
       { id: "a9", channel: "modelscope", uid: "demo-user", name: "魔搭主号", status: "online", credits: 341, creditsAt: NOW - 2 * 60000, expiresAt: NOW + 86400000, coolUntil: 0, coolReason: "", source: "token", lastUsed: NOW - 1 * 60000, todayReq: 5, todayTokens: 1200, creditsToday: -1, createdAt: NOW - 86400000, hasToken: true },
@@ -347,6 +367,7 @@ const PROXY_POOL = [
   {
     id: "lobster", display: "LobsterAI（有道）", domain: "lobsterai-server.youdao.com", costTier: "low", poolStrategy: "credit_first",
     health: null as { until: number; reason: string; streak: number } | null,
+    checkinAuto: { enabled: false, time: "09:00", jitterMin: 0 },
     summary: { channel: "lobster", totalCredits: 300, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 14 * 86400000, expiringSoon: true, todayReq: 6, todayTokens: 1800, lastCreditsAt: NOW - 4 * 60000 },
     accounts: [
       { id: "a8", channel: "lobster", uid: "lb_20481", name: "龙虾主号", status: "online", credits: 300, creditsAt: NOW - 4 * 60000, expiresAt: NOW + 14 * 86400000, coolUntil: 0, coolReason: "", source: "oauth", lastUsed: NOW - 3 * 60000, todayReq: 6, todayTokens: 1800, creditsToday: -1, createdAt: NOW - 2 * 86400000, hasToken: true },
@@ -356,6 +377,7 @@ const PROXY_POOL = [
     id: "zcode", display: "ZCode（智谱）", domain: "zcode.z.ai", costTier: "", poolStrategy: "expire_first",
     // 演示降级态：浏览器预览里能看到渠道卡降级徽标与回切倒计时的样式
     health: { until: NOW + 95_000, reason: "上游 5xx，流量已走其他渠道", streak: 1 } as { until: number; reason: string; streak: number } | null,
+    checkinAuto: { enabled: false, time: "09:00", jitterMin: 0 },
     summary: { channel: "zcode", totalCredits: 150000000, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 90 * 86400000, expired: false, expiringSoon: false, todayReq: 12, todayTokens: 250000, lastCreditsAt: NOW - 10 * 60000 },
     accounts: [
       { id: "a7", channel: "zcode", uid: "zc_1001", name: "智谱主号", status: "online", credits: 150000000, creditsAt: NOW - 10 * 60000, expiresAt: NOW + 90 * 86400000, coolUntil: 0, coolReason: "", source: "json", lastUsed: NOW - 5 * 60000, todayReq: 12, todayTokens: 250000, creditsToday: 62000, createdAt: NOW - 5 * 86400000, hasToken: true },
@@ -363,19 +385,23 @@ const PROXY_POOL = [
   },
   {
     // Qoder 双区：credits 用浮点演示（整数化会丢计量，见 format.ts fmtCredits）
-    id: "qoder", display: "Qoder CN", domain: "gateway.qoder.com.cn", costTier: "", poolStrategy: "expire_first",
+    id: "qoder", display: "Qoder", domain: "gateway.qoder.com.cn", costTier: "", poolStrategy: "expire_first",
     health: null as { until: number; reason: string; streak: number } | null,
+    checkinAuto: { enabled: false, time: "09:00", jitterMin: 0 },
     summary: { channel: "qoder", totalCredits: 199.9934, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 30 * 86400000, expiringSoon: false, todayReq: 9, todayTokens: 48200, lastCreditsAt: NOW - 6 * 60000 },
     accounts: [
       { id: "a8", channel: "qoder", uid: "qd_3001", name: "Qoder 主号", status: "online", credits: 199.9934, creditsAt: NOW - 6 * 60000, expiresAt: NOW + 30 * 86400000, coolUntil: 0, coolReason: "", source: "scan", lastUsed: NOW - 4 * 60000, todayReq: 9, todayTokens: 48200, creditsToday: -1, createdAt: NOW - 2 * 86400000, hasToken: true },
     ],
   },
   {
-    id: "qoder_intl", display: "Qoder International", domain: "api2.qoder.sh", costTier: "", poolStrategy: "expire_first",
+    id: "qoder_intl", display: "Qoder 国际", domain: "api2.qoder.sh", costTier: "", poolStrategy: "expire_first",
     health: null as { until: number; reason: string; streak: number } | null,
+    checkinAuto: { enabled: false, time: "09:00", jitterMin: 0 },
     summary: { channel: "qoder_intl", totalCredits: 0.0066, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 30 * 86400000, expiringSoon: false, todayReq: 1, todayTokens: 2100, lastCreditsAt: NOW - 30 * 60000 },
     accounts: [
-      { id: "a9", channel: "qoder_intl", uid: "qd_2001", name: "Qoder INTL", status: "online", credits: 0.0066, creditsAt: NOW - 30 * 60000, expiresAt: NOW + 30 * 86400000, coolUntil: 0, coolReason: "", source: "oauth", lastUsed: NOW - 30 * 60000, todayReq: 1, todayTokens: 2100, creditsToday: -1, createdAt: NOW - 86400000, hasToken: true },
+      // 上游夹具原样保留：qoder_intl 带回一条 unavailable 记录。本仓按 CHECKIN_CAPABLE 不给国际版
+      // 摆任何签到入口（工具栏 / 行内 / 自动签到三处同闸），所以这条记录只该被忽略、不该冒出按钮
+      { id: "a9", channel: "qoder_intl", uid: "qd_2001", name: "Qoder INTL", status: "online", credits: 0.0066, creditsAt: NOW - 30 * 60000, expiresAt: NOW + 30 * 86400000, coolUntil: 0, coolReason: "", source: "oauth", lastUsed: NOW - 30 * 60000, todayReq: 1, todayTokens: 2100, creditsToday: -1, createdAt: NOW - 86400000, hasToken: true, checkin: { day: TODAY, at: NOW - 6000000, action: "checkin", ok: true, unavailable: true, message: "该账号的服务未开放" } },
     ],
   },
 ];
@@ -1001,6 +1027,8 @@ export const mock = {
           { id: "claude", name: "Claude Code 会话", kind: "jsonl", path: "C:\\Users\\demo\\.claude\\projects", enabled: true, exists: true, items: 38, sizeBytes: 40960, note: "", estimate: "首次导入，将全量扫描", cursor: null },
           { id: "codex", name: "Codex 会话", kind: "jsonl", path: "C:\\Users\\demo\\.codex\\sessions", enabled: true, exists: true, items: 12, sizeBytes: 20480, note: "", estimate: "首次导入，将全量扫描", cursor: null },
           { id: "workbuddy", name: "WorkBuddy 会话", kind: "jsonl", path: "C:\\Users\\demo\\.workbuddy-ai", enabled: true, exists: true, items: 5, sizeBytes: 10240, note: "", estimate: "首次导入，将全量扫描", cursor: null },
+          { id: "trae", name: "Trae 系会话（Trae / CN / SOLO）", kind: "trae", path: "C:\\Users\\demo\\AppData\\Roaming", enabled: true, exists: true, items: 2, sizeBytes: 424673280, note: "已识别 Trae / Trae CN 的加密会话库", estimate: "Trae 已读到 id=1798 · Trae CN 已读到 id=920，本次按增量续读", cursor: { files: { Trae: { lastId: 1798 }, "Trae CN": { lastId: 920 } } } },
+          { id: "antigravity", name: "Antigravity 会话（Antigravity / IDE）", kind: "antigravity", path: "C:\\Users\\demo\\.gemini", enabled: true, exists: true, items: 322, sizeBytes: 24117248, note: "已识别 antigravity / antigravity-ide 的 322 份会话日志", estimate: "已记录 89 份会话日志的读取水位，本次只读新增内容", cursor: { files: {} } },
           { id: "notes-md", name: "Markdown 笔记目录", kind: "md", path: "", enabled: false, exists: false, items: 0, sizeBytes: 0, note: "未配置路径", estimate: "", cursor: null },
         ], importDir: "C:\\Users\\demo\\AgentHub\\memory\\_import" };
       case "memory_import_source_save":
@@ -1172,18 +1200,25 @@ export const mock = {
             { accountId: "a3", channel: "workbuddy_ai", name: "国际版号", uid: "wb_9e05", ok: true, unavailable: true, message: "国际版无签到体系" },
           ],
         };
-      case "proxy_checkin_run":
-        return {
-          ok: true,
-          action: args?.action || "checkin",
-          total: 3,
-          okCount: 2,
-          rows: [
-            { accountId: "a1", channel: "trae", name: "主账号 · 沐", uid: "88213476", ok: true, message: "签到成功", credit: 100 },
-            { accountId: "a2", channel: "workbuddy", name: "工作号", uid: "wb_7c21", ok: true, already: true, message: "今天已签到" },
-            { accountId: "a3", channel: "workbuddy_ai", name: "国际版号", uid: "wb_9e05", ok: true, unavailable: true, message: "国际版无签到体系" },
-          ],
-        };
+      case "proxy_checkin_run": {
+        // 按渠道返回该渠道账号的签到结果，并把结果写回池视图（模拟主进程 meta.checkin 落库）：
+        // 预览里点完「一键签到」行内按钮随即变「已签到/已领取」，工具栏进完成态
+        type MockAcct = { id: string; channel: string; name: string; uid: string; checkin?: unknown };
+        const pools = PROXY_POOL as unknown as { id: string; accounts: MockAcct[] }[];
+        const ch = pools.find((c) => c.id === String(args?.channel || "trae")) || pools[0];
+        const action = args?.action === "trial" ? "trial" : "checkin";
+        const rows = ch.accounts.map((a) => ({ accountId: a.id, channel: a.channel, name: a.name, uid: a.uid, ok: true, message: action === "trial" ? "加油包已领取" : "签到成功", credit: 100 }));
+        for (const a of ch.accounts) a.checkin = { day: TODAY, at: Date.now(), action, ok: true, credit: 100, streakDays: 1, message: action === "trial" ? "加油包已领取" : "签到成功" };
+        return { ok: true, action, total: rows.length, okCount: rows.length, rows };
+      }
+      case "proxy_checkin_auto_set": {
+        const chId = String(args?.channel || "");
+        const pools = PROXY_POOL as unknown as { id: string; checkinAuto?: { enabled: boolean; time: string; jitterMin: number } }[];
+        const ch = pools.find((c) => c.id === chId);
+        const rule = { enabled: !!args?.enabled, time: String(args?.time || "09:00"), jitterMin: Number(args?.jitterMin || 0) };
+        if (ch) ch.checkinAuto = rule;
+        return { ok: true, channel: chId, ...rule };
+      }
       case "proxy_scan":
         return [
           { channel: "workbuddy", uid: "wb_7c21", name: "工作号", source: "scan", file: "workbuddy-desktop.info", imported: true },
@@ -1222,7 +1257,9 @@ export const mock = {
       case "proxy_account_import_file":
         return { ok: true, canceled: true };
       case "proxy_models":
-        return JSON.parse(JSON.stringify(PROXY_MODELS));
+        // 与真实后端同形状下发管理态字段：预览面没有 Key 表与排除集的回路，两条恒空
+        // （和 override/fallback 在 mock 里也一样不随配置变化，不是新造的失真）
+        return JSON.parse(JSON.stringify(PROXY_MODELS)).map((m: Record<string, unknown>) => ({ ...m, excluded: [], pinnedKeys: [] }));
       case "proxy_models_sync":
         return { ok: true, channel: args?.channel || "workbuddy", count: 6, withRate: 4 };
       // 切号：首调只做预检（对应真实后端 —— 一律回 needConfirm + probe，由前端弹确认框），

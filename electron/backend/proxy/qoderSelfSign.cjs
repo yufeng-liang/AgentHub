@@ -17,18 +17,19 @@ const os = require("node:os");
 const qcosy = require("./qoderCosy.cjs");
 const U = require("./util.cjs");
 const store = require("./store.cjs");
+const EP = require("./qoderEndpoints.cjs");
 
 /** 四组域名按 region 内置切换（地区不接受任意 URL）；模型目录/凭证两地区不通用。
- *  ⚠ gateway 值带尾斜杠：自签链路按 `${gateway}${PATH}` 拼接（PATH 不带前导斜杠）。 */
-const REGIONS = {
-  global: { openApi: "https://openapi.qoder.sh", center: "https://center.qoder.sh", webOrigin: "https://qoder.com", gateway: "https://api3.qoder.sh/" },
-  cn: { openApi: "https://openapi.qoder.com.cn", center: "https://gateway.qoder.com.cn", webOrigin: "https://qoder.com.cn", gateway: "https://gateway.qoder.com.cn/" },
-};
+ *  表搬到 qoderEndpoints.cjs：wasm 路（rules 种子 + qoderAuth 兜底）与本模块此前给国际版
+ *  写了两个不同的推理网关（api2 vs api3），CN 恰好同值所以从没暴露。
+ *  ⚠ EP 的 gateway **不带尾斜杠**（与 rules/auth 口径一致）；本模块按 `${chatBase}${PATH}`
+ *     拼接（PATH 不带前导斜杠），所以用 makeSelfSign 里的 chatBase 而不是直接拼 gateway。
+ *  再导出同名 REGIONS / PRODUCT_REGION：dev-qoder-test.cjs:23 与本目录的端点闸都按这两个名字取。 */
+const REGIONS = EP.REGIONS;
+// 渠道 id → 地区：真相源在 qoderEndpoints（上游主干同口径），这里只再导出同名符号。
+const PRODUCT_REGION = EP.PRODUCT_REGION;
 
-/** 渠道 id → 地区。上游主干用 product 分双区，本模块必须与它同一套真相源。 */
-const PRODUCT_REGION = { qoder: "cn", qoder_intl: "global" };
-
-const CHAT_PATH = "algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1"; // gateway 基址带尾斜杠
+const CHAT_PATH = "algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1"; // 拼在 chatBase（带尾斜杠）之后
 const MODEL_LIST_PATH = "algo/api/v2/model/list?Encode=1";
 const REFRESH_PATH = "/algo/api/v3/user/refresh_token"; // center 域
 
@@ -237,22 +238,32 @@ class TagSplitter {
 }
 
 /** 自签机器标识（协议参考 §3.7）：按序找候选文件，第一个存在的非空（≤256 字符、无控制字符）用之；
- *  都没有则生成 UUID v4 写入 <config_dir>/qoder-machine-id，进程内缓存。只碰文件，不碰网络与注册表。 */
-let _mid = null;
-function machineId() {
-  if (_mid) return _mid;
+ *  都没有则生成 UUID v4 写入 <config_dir>/qoder-machine-id[-<product>]，按渠道分别缓存。
+ *
+ *  为什么按渠道分：候选表此前只列了 ~/.qoder —— 那是**国际版**客户端的目录，而 CN 客户端写
+ *  ~/.qoder-cn（见 qoderAuth.PRODUCTS.homeDir）。于是 CN 号拿到的是国际版客户端的 id 或一个
+ *  随机 uuid，与登录 URL 里送出去的 machine_id 不同源。现在按产品各取自己目录、各存各的文件。
+ *  CN 仍用历史文件名 qoder-machine-id，避免老用户已生成的那份作废。
+ *  形参带默认值 ⇒ Function.length 仍是 0，adapters._qoderMachineId 的历史调用形状不破。 */
+const _midByProduct = new Map();
+function machineId(product = "qoder") {
+  if (_midByProduct.has(product)) return _midByProduct.get(product);
   const fs = require("node:fs");
   const configDir = store.proxyDir();
-  const candidates = [path.join(configDir, "qoder-machine-id"), path.join(os.homedir(), ".qoder-proxy", "machine_id"), path.join(os.homedir(), ".qoder", ".auth", "machine_id"), path.join(os.homedir(), ".qoder", "machine_id")];
+  const ownFile = path.join(configDir, product === "qoder" ? "qoder-machine-id" : `qoder-machine-id-${product}`);
+  const home = os.homedir();
+  const ph = EP.PRODUCT_HOME[product] || ".qoder";
+  const candidates = [ownFile, path.join(home, ".qoder-proxy", "machine_id"), EP.machineIdFileOf(product), path.join(home, ph, "machine_id")];
   for (const f of candidates) {
     try {
       const v = fs.readFileSync(f, "utf8").trim();
-      if (v && v.length <= 256 && !/[\x00-\x1f\x7f]/.test(v)) { _mid = v; return _mid; }
+      if (v && v.length <= 256 && !/[\x00-\x1f\x7f]/.test(v)) { _midByProduct.set(product, v); return v; }
     } catch { /* 下一个候选 */ }
   }
-  _mid = U.uuid();
-  try { fs.mkdirSync(configDir, { recursive: true }); fs.writeFileSync(path.join(configDir, "qoder-machine-id"), _mid); } catch { /* 只读环境用内存值 */ }
-  return _mid;
+  const id = U.uuid();
+  try { fs.mkdirSync(configDir, { recursive: true }); fs.writeFileSync(ownFile, id); } catch { /* 只读环境用内存值 */ }
+  _midByProduct.set(product, id);
+  return id;
 }
 
 /** 身份解析（协议参考 §3.7）：自签账号的 token 是 JWT，身份直接读 payload。
@@ -290,7 +301,10 @@ function prepareBody(body) {
  *  deps = { fetchStream, pumpSse, httpJson }——util/store 已在本模块顶层 require，不再注入。 */
 function makeSelfSign(product, deps) {
   const { fetchStream, pumpSse, httpJson } = deps;
-  const region = PRODUCT_REGION[product] || "global";
+  const region = EP.regionOf(product);
+  // 自签按 `${chatBase}${PATH}` 拼（PATH 不带前导斜杠），所以这里取带尾斜杠的形态；
+  // 真相源本身存的是无尾斜杠口径，与 rules 种子和 qoderAuth 一致。
+  const chatBase = EP.chatBase(product);
 
   /** 对话主流程（协议参考 §3.4/§3.5）：自签 → SSE 双层信封解包 → thinking 标签跨片剥离 */
   async function chat({ account, secrets, modelKey, entry, body, emit }) {
@@ -301,7 +315,7 @@ function makeSelfSign(product, deps) {
     const prepared = prepareBody(body);
     const requestId = U.uuid();
     const userId = (account && ((account.meta && account.meta.user_id) || account.uid)) || "";
-    const machineIdStr = machineId();
+    const machineIdStr = machineId(product);
     const idz = ids({ userId, upstreamKey: e.key, maxTokens: prepared.max_tokens, seed: (prepared.session_id || "") || undefined });
     const envBody = envelope({ internal: prepared, modelEntry: e, ids: idz, requestId, lastUserText });
     // 思考档位（协议参考 §3.4）：reasoning_effort → reasoning → thinking 命中即停；off/none/disabled/false 不发；
@@ -320,7 +334,7 @@ function makeSelfSign(product, deps) {
       }
     }
     const encoded = qcosy.encodeBody(Buffer.from(JSON.stringify(envBody), "utf8")); // 必须先编码后签名
-    const url = `${cfg.gateway}${CHAT_PATH}`;
+    const url = `${chatBase}${CHAT_PATH}`;
     const headers = {
       ...qcosy.buildCosyHeaders({ url, body: encoded, uid: userId, token: (secrets && secrets.token) || "", name: (account && account.name) || "", email: (account && account.meta && account.meta.email) || "", machineId: machineIdStr, requestId }),
       "content-type": "application/json",
@@ -403,10 +417,10 @@ function makeSelfSign(product, deps) {
    *  展示名落 name、档位落 reasoning.supportedEfforts，形状与上游 fetchModels 逐字对齐。 */
   async function fetchModelsRemote({ account, secrets }) {
     const cfg = REGIONS[region];
-    const url = `${cfg.gateway}${MODEL_LIST_PATH}`;
+    const url = `${chatBase}${MODEL_LIST_PATH}`;
     const requestId = U.uuid();
     const encoded = qcosy.encodeBody(Buffer.from(JSON.stringify({ region }), "utf8"));
-    const headers = qcosy.buildCosyHeaders({ url, body: encoded, uid: (account && account.uid) || "", token: (secrets && secrets.token) || "", name: "", email: "", machineId: machineId(), requestId });
+    const headers = qcosy.buildCosyHeaders({ url, body: encoded, uid: (account && account.uid) || "", token: (secrets && secrets.token) || "", name: "", email: "", machineId: machineId(product), requestId });
     const r = await httpJson(url, { method: "GET", headers }).catch((e) => ({ ok: false, status: 0, data: null, message: String(e) }));
     const chat = r.data && (r.data.chat || (r.data.data && r.data.data.chat));
     if (!r.ok || !Array.isArray(chat)) return { ok: false, message: `目录拉取失败（HTTP ${r.status || 0}）` };

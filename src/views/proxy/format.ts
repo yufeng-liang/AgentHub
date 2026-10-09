@@ -129,6 +129,48 @@ export function fmtCredits(n: number): string {
 /** Qoder 双区共用一套展示口径（Credits 浮点 + 领 Credits 动作），判断收敛到一处 */
 export const isQoderChannel = (id?: string): boolean => id === "qoder" || id === "qoder_intl";
 
+// 上游 v1.55.0 同批还带了它自己那套 fmtBalance / balanceUnit（硬编码三档），与上面 fork 的
+// CHANNEL_UNITS 表驱动版本重名。两份真相源里取表驱动那份：它覆盖 zcode_intl / qoder_intl，
+// 且 isTokenChannel 依赖 balanceUnit() === "Token" 这个单数口径，改成上游的 "Tokens" 会静默断掉换算。
+/** 本地时区的今天（YYYY-MM-DD）：与主进程 store.dayStr 同口径，签到记录的跨天判定用 */
+export function todayStr(): string {
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/**
+ * 签到动作的渠道化文案：各渠道"领取"形态不同（加油包/Credits 一次性领取、zcode 领奖励、
+ * 其余每日签到），按钮/完成态/详情标题统一吃这一份，避免把"领加油包"写成"签到"
+ */
+export function checkinLabels(channel?: string): {
+  /** 设置按钮：自动签到 / 自动领加油包 / 自动领 Credits / 自动领取 */
+  auto: string;
+  /** 工具栏动作按钮：一键签到 / 领加油包 / 领 Credits / 一键领取 */
+  run: string;
+  /** 行内动作按钮（窄）：签到 / 领加油包 / 领 Credits / 领取 */
+  shortRun: string;
+  /** 全部完成后的工具栏按钮：签到成功 / 领取成功 */
+  done: string;
+  /** 行内完成态：已签到 / 已领取 */
+  shortDone: string;
+  /** 行内失败态：签到失败 / 领取失败 */
+  shortFail: string;
+  /** 详情弹窗标题词：签到详情 / 领取详情 */
+  detail: string;
+} {
+  if (channel === "workbuddy_ai") {
+    return { auto: "自动领加油包", run: "领加油包", shortRun: "领加油包", done: "领取成功", shortDone: "已领取", shortFail: "领取失败", detail: "领取详情" };
+  }
+  if (isQoderChannel(channel)) {
+    return { auto: "自动领 Credits", run: "领 Credits", shortRun: "领 Credits", done: "领取成功", shortDone: "已领取", shortFail: "领取失败", detail: "领取详情" };
+  }
+  if (channel === "zcode") {
+    return { auto: "自动领取", run: "一键领取", shortRun: "领取", done: "领取成功", shortDone: "已领取", shortFail: "领取失败", detail: "领取详情" };
+  }
+  return { auto: "自动签到", run: "一键签到", shortRun: "签到", done: "签到成功", shortDone: "已签到", shortFail: "签到失败", detail: "签到详情" };
+}
+
 /** 渠道成本档 → 展示文案（cost-first 路由排序的标注；'' = 未标注按普通） */
 export const COST_TIER_NAMES: Record<string, string> = {
   free: "免费",
@@ -165,8 +207,8 @@ export const CHANNEL_NAMES: Record<string, string> = {
   lobster: "LobsterAI（有道）",
   zcode: "ZCode（智谱）",
   zcode_intl: "ZCode 智谱（国际）",
-  qoder: "Qoder CN",
-  qoder_intl: "Qoder International",
+  qoder: "Qoder",
+  qoder_intl: "Qoder 国际",
 };
 export const channelName = (id: string) => CHANNEL_NAMES[id] || id || "-";
 
@@ -193,9 +235,11 @@ export const statusCls = (s: number) => (s >= 200 && s < 300 ? "tag-ok" : s >= 5
 /** 模型倍率 → 展示文案（null/undefined = 未知） */
 export const fmtRate = (r: number | null | undefined) => (r == null || Number.isNaN(Number(r)) ? "—" : `×${Number(r)}`);
 
- /** 模型能力 → 紧凑标签列表：图=图片输入 / 视=视频输入 / 思=思考链 / 工=工具调用；↑ 输出上限。
-  *  2026-09-30 去重：上下文长度不再进这列 —— 表格有独立的「上下文」列（且可编辑），
-  *  同一个数在两列各显示一遍是纯重复，还挤占能力 chips 的宽度。 */
+ /** 模型能力 → 紧凑标签列表：图=图片输入 / 视=视频输入 / 思=思考链 / 工=工具调用 / ↑=输出上限。
+  *  2026-10-08：合并列腾出的宽度还给这列，改回全显（此前是「首枚 + 计数角标」）。
+  *  实测不需要窄宽度降档：表挂 min-width:860 + table-layout:fixed，能力格最窄也有 ~204px，
+  *  而五枚加铅笔图标约 120px —— 降档只会在默认窗口下把「视」白白藏掉。
+  *  2026-09-30 去重：上下文长度不进这列（表里有独立且可编辑的「上下文」列）。 */
  export function capabilityTags(m: {
    capabilities?: { images?: boolean; video?: boolean; reasoning?: boolean; tools?: boolean };
    maxOutputTokens?: number;
@@ -206,7 +250,9 @@ export const fmtRate = (r: number | null | undefined) => (r == null || Number.is
    if (c.video) out.push("视");
    if (c.reasoning) out.push("思");
    if (c.tools) out.push("工");
-   if (m.maxOutputTokens) out.push("↑" + fmtK(m.maxOutputTokens));
+   const n = Number(m.maxOutputTokens) || 0;
+   // 未知也要出一枚：静默不显等于替用户宣布「这模型没有输出上限」，而真实含义是目录里没给
+   out.push("↑" + (n ? fmtK(n) : "—"));
    return out;
  }
 

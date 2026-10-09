@@ -4,9 +4,9 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import * as api from "../../api/ipc";
-import type { ProxyBuiltinChannelId } from "../../types";
+import type { ProxyBuiltinChannelId, ProxyChannelView } from "../../types";
 import { useAppStore } from "../../stores/app";
-import { channelName } from "./format";
+import { CHANNEL_NAMES, channelName } from "./format";
 
 const app = useAppStore();
 const st = ref<api.ProxyPoolSyncStatus | null>(null);
@@ -15,24 +15,17 @@ const runMsg = ref("");
 const targetChannel = ref<ProxyBuiltinChannelId | "">("");
 let offEvent: (() => void) | undefined;
 
-const CHANNELS: { id: ProxyBuiltinChannelId | ""; label: string }[] = [
+/** 同步范围渠道：id 取自号池实际渠道（隐藏渠道不出现，新增渠道自动跟进），
+ *  label 取自权威显示名表 CHANNEL_NAMES。
+ *  此前这里手抄了一遍渠道名，已经漂过：zcode_intl 写成「ZCode（智谱·国际）」而权威表是
+ *  「ZCode 智谱（国际）」——scripts/dev-channel-names-test.cjs 的 ⑦⑧ 就是钉这件事的。 */
+const channels = ref<ProxyChannelView[]>([]);
+const CHANNELS = computed<{ id: ProxyBuiltinChannelId | ""; label: string }[]>(() => [
   { id: "", label: "全部渠道" },
-  { id: "trae", label: "Trae SOLO CN" },
-  { id: "workbuddy", label: "WorkBuddy CN" },
-  { id: "workbuddy_ai", label: "WorkBuddy AI" },
-  { id: "raccoon", label: "商汤小浣熊" },
-  // targetChannel 是同步范围而非显示筛选（传给 proxyPoolsyncRun），缺项的渠道无法单独同步
-  { id: "cline_free", label: "Cline 免费池" },
-  { id: "cline_pass", label: "Cline 订阅池" },
-  { id: "autoclaw", label: "智谱 AutoClaw（国内）" },
-  { id: "autoclaw_intl", label: "智谱 AutoClaw（国际）" },
-  { id: "modelscope", label: "ModelScope（魔搭）" },
-  { id: "lobster", label: "LobsterAI（有道）" },
-  { id: "zcode", label: "ZCode（智谱）" },
-  { id: "zcode_intl", label: "ZCode（智谱·国际）" },
-  { id: "qoder", label: "Qoder CN" },
-  { id: "qoder_intl", label: "Qoder International" },
-];
+  ...channels.value
+    .filter((c) => c.kind !== "openai_compat")
+    .map((c) => ({ id: c.id as ProxyBuiltinChannelId, label: CHANNEL_NAMES[c.id] || c.display })),
+]);
 
 const running = computed(() => !!st.value?.running);
 const percent = computed(() => Math.max(0, Math.min(100, st.value?.percent ?? 0)));
@@ -76,6 +69,8 @@ function onEvent(e: unknown) {
 
 onMounted(() => {
   refreshStatus();
+  // 渠道清单是本页唯一的操作范围：取不到就只剩「全部渠道」一档，所以报错写进 err 而不是静默吞掉
+  api.proxyPool().then((v) => (channels.value = v)).catch((e) => (err.value = String((e as Error).message || e)));
   offEvent = api.onUpdateEvent(onEvent);
 });
 onUnmounted(() => {

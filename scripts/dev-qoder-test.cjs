@@ -160,6 +160,22 @@ const discovery = require("../electron/backend/proxy/discovery.cjs");
 const store = require("../electron/backend/proxy/store.cjs");
 ok("region 归一", discovery._qoderRegionOfMode("cn") === "cn" && discovery._qoderRegionOfMode("intl") === "global" && discovery._qoderRegionOfMode("") === "global");
 
+// ===== machineId 键名口径（读侧只认 meta.machineId，写侧历史上只写 machine_id）=====
+// 读侧：qoderAdapter 五处（签名头 Cosy-MachineId、续期、风控身份）全读 account.meta.machineId；
+// 写侧：本机扫描导入写 machineId，而 OAuth 登录只写 machine_id ⇒ 网页登录的 Qoder 号
+// machineId 恒空，签名用的是另一个来源的机器码。双写是零迁移的收口方式。
+ok("OAuth meta 双写 machineId / machine_id（读侧只认前者）", (() => {
+  const f = discovery._qoderOauthMetaForTest;
+  if (typeof f !== "function") return false; // 未导出时报 ✗ 而不是抛穿整个文件（后面还有 40 条断言）
+  const m = f("m-42", "cn", "a@b.c", "u-7");
+  return m.machineId === "m-42" && m.machine_id === "m-42" && m.mode === "cn" && m.user_id === "u-7";
+})(), typeof discovery._qoderOauthMetaForTest === "function" ? JSON.stringify(discovery._qoderOauthMetaForTest("m-42", "cn", "a@b.c", "u-7")) : "没有 _qoderOauthMetaForTest 导出");
+// 这条防的是「把读侧改成二选一」那种假修：读侧保持只认 machineId，双写才有意义。
+ok("读侧仍只认 meta.machineId（不得改成 machine_id 兜底来糊弄双写）", (() => {
+  const src = fs.readFileSync(path.join(__dirname, "..", "electron/backend/proxy/qoderAdapter.cjs"), "utf8");
+  return /meta\.machineId/.test(src) && !/meta\.machine_id/.test(src);
+})());
+
 // 假时钟：setTimeout 只入队，drain() 手动按序触发，2s 间隔一秒都不等；每轮之后新排期的间隔记进
 // pollArms（httpJson 自带的 60s 总超时定时器在同一轮 finally 里就被清掉，不会混进记录）
 const realSetTimeout = global.setTimeout, realClearTimeout = global.clearTimeout;
@@ -226,13 +242,16 @@ const realFetch = globalThis.fetch;
   const row2 = store.accountRows("qoder").find((r0) => r0.uid === "uid-q-2");
   ok("userinfo 失败仍落库（uid 用 poll 的 user_id、名兜底、到期缺省 now+30 天）", !!acc2 && acc2.name === "Qoder 账号" && acc2.meta.mode === "cn" && seen.some((s) => s.url.startsWith("https://openapi.qoder.com.cn/api/v1/deviceToken/poll")) && row2.expires_at > Date.now() + 29 * 86400 * 1000, acc2 && { name: acc2.name, meta: acc2.meta, exp: row2.expires_at });
 
-  // 归一移植后 qoder=CN（地区由渠道 id 定），而 qoder_intl 尚未注册（store.QODER_INTL_ENABLED=false）。
-  // 继续放 intl 过去会落一个 meta.mode=global 的 qoder 账号并被静默打到 CN 网关——「答非所问」比
-  // 「明确说不支持」难排查得多，所以这里必须当场拒绝，且不得留下任何 global 账号。
-  const timersBefore = timers.length;
+  // 区服由**渠道 id** 决定（qoder=CN / qoder_intl=global），edition 这个登录参数不再被读。
+  // 旧契约是「edition=intl 且开关未开 ⇒ 当场拒绝」；现在 qoder_intl 按开关条件注册，
+  // 开关关时它连渠道都不存在（下面第二条钉的就是这件事），开关开时它是合法渠道。
   const ri = await discovery.beginOAuth("qoder", { edition: "intl" }, () => {});
-  ok("intl 区在服务尚未接入时被明确拒绝", ri.ok === false && /国际版/.test(String(ri.message || "")), ri);
-  ok("拒绝时不排轮询、不落任何 global 账号", timers.length === timersBefore && !store.listAccounts("qoder").some((a) => a.meta && a.meta.mode === "global"), { timersBefore, now: timers.length });
+  ok("qoder 渠道即使带 edition=intl 也落 CN 授权页（区服跟随渠道 id）", ri.ok === true && /^https:\/\/qoder\.com\.cn\/device\/selectAccounts\?/.test(ri.url), ri.url || ri);
+  await drain();
+  // beginOAuth 是 async：同步 try 抓不到它的 throw（会变成 rejected promise），必须 await 收错误。
+  let intlErr = "";
+  try { await discovery.beginOAuth("qoder_intl", {}, () => {}); } catch (e) { intlErr = String((e && e.message) || e); }
+  ok("国际版渠道在开关关闭时根本不存在（不会半接入）", /未知渠道 qoder_intl/.test(intlErr), intlErr || "没抛错");
 
   // refresh_token 含 | 判无效（§2.3）→ 不落库、继续轮；取消后不再排期
   resetClock(); seen = []; polls = 0; done = null;
@@ -265,6 +284,13 @@ const realFetch = globalThis.fetch;
   await drain();
   const row4 = store.accountRows("qoder").find((r0) => r0.uid === "uid-q-4");
   ok("expires_at 秒形态识别为毫秒且容忍 userinfo 失败", !!done && done.ok === true && !!row4 && row4.expires_at === 1893456000000, { done, exp: row4 && row4.expires_at });
+  // 双写不只活在纯函数里：走完整假 fetch 登录链路后，**落库那一行**的 meta 必须两个键都在且同值
+  // （读侧 qoderAdapter 拿的是这一行，不是 qoderOauthMeta 的返回值）。
+  ok("登录落库的 meta 两个键同值（端到端，不是只测构造函数）", (() => {
+    if (!row4) return false;
+    const m = typeof row4.meta === "string" ? JSON.parse(row4.meta) : row4.meta || {};
+    return !!m.machineId && m.machineId === m.machine_id;
+  })(), row4 && row4.meta);
 
   restoreClock();
   globalThis.fetch = realFetch;

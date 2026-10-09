@@ -64,6 +64,24 @@ function poolTbodyRender() {
   return new Function("Vue", res.code + "\nreturn render")(Vue);
 }
 
+/** 从组件源码里解析真·CHECKIN_CAPABLE 表，供桩复用。
+ *  以前这里手抄一份名单（"这四家有每日签到"），结果组件把 qoder 改成 true 之后桩还在说 false，
+ *  ⑫ 判的是抄的那份而不是组件的那份 —— 结构闸最怕的就是这种「自己与自己一致」的空判据。 */
+function realCheckinCapable() {
+  const src = fs.readFileSync(path.join(ROOT, FILE), "utf8");
+  const block = /const CHECKIN_CAPABLE[^=]*=\s*\{([\s\S]*?)\n\};/.exec(src);
+  if (!block) throw new Error("解析不到组件里的 CHECKIN_CAPABLE 表：形状变了要跟着改这里");
+  const map = {};
+  for (const m of block[1].matchAll(/(\w+)\s*:\s*(true|false)/g)) map[m[1]] = m[2] === "true";
+  const ids = Object.keys(map);
+  // 防空判据下界：这张表漏一个渠道是编译期就红（Record<ProxyBuiltinChannelId>），空表说明解析错位
+  if (ids.length < 10) throw new Error(`CHECKIN_CAPABLE 只解析到 ${ids.length} 个渠道，判据会空转`);
+  return map;
+}
+const CAPABLE = realCheckinCapable();
+const capableIds = Object.keys(CAPABLE).filter((k) => CAPABLE[k]);
+const incapableIds = Object.keys(CAPABLE).filter((k) => !CAPABLE[k]);
+
 function buildCtx({ n, channel, builtin, expanded = [], withPackages = true }) {
   const noop = () => {};
   const acc = (i) => ({
@@ -76,8 +94,11 @@ function buildCtx({ n, channel, builtin, expanded = [], withPackages = true }) {
   return {
     ch: { id: channel, display: "X", kind: builtin ? "builtin" : "openai_compat", accounts: Array.from({ length: n }, (_, i) => acc(i + 1)) },
     isBuiltin: () => builtin,
-    // 与组件里的 CHECKIN_CAPABLE 同口径：这四家有每日签到，qoder / cline / autoclaw 没有
-    checkinCapable: (id) => ["workbuddy", "workbuddy_ai", "raccoon", "trae"].includes(id),
+    // 行内签到的三态绑定（上游 v1.55）：行/列计数与状态无关，桩只求绑定不炸；
+    // 文案统一回"签到"，让 ⑪⑫⑬ 三条门禁判据只看「按钮渲不渲染」，不看渠道化措辞
+    checkinCapable: (id) => CAPABLE[id] === true,
+    checkinRowState: () => "todo", checkinRowTitle: () => "签到", checkinRowText: () => "签到",
+    onRowCheckin: noop,
     ideSupported: () => true, ideTitle: () => "", channelName: () => "X",
     // 余额浮层（el-tooltip 用）：真值只在 zcode 家非空，行/列计数与它无关，给个同名桩让绑定不炸
     creditTip: () => "",
@@ -103,7 +124,10 @@ async function render(opts) {
   const app = Vue.createSSRApp({ render: poolTbodyRender() });
   Object.assign(app.config.globalProperties, buildCtx(opts));
   app.config.warnHandler = () => {};            // 表格用到的其它变量走 undefined 即可，噪声不入库
-  const html = await renderToString(app);
+  // 剥掉 HTML 注释再判：SSR 会把模板里的注释原样输出，而 ⑥⑦⑧⑪⑫⑬ 这几条是按**文字标记**
+  // 找按钮在不在的。本批合并时在行内加了一条「行内签到三态…」的说明注释，直接把 ⑪⑫ 打红——
+  // 判据吃注释文字，等于谁写注释谁改结构。剥掉之后只剩真正渲染出来的内容。
+  const html = (await renderToString(app)).replace(/<!--[\s\S]*?-->/g, "");
   return { html, rows: topLevelRows(html) };
 }
 
@@ -149,8 +173,16 @@ async function main() {
   check(`⑩ 提供商表头 ${pHead} 列 ⇒ 每个 Key 行也 ${pHead} 列（实得 ${pBody.join("/")}）`,
     pBody.length === 1 && pBody[0] === pHead, "自建提供商没有余额/到期概念，多出的列会让整表错位");
   check("⑪ 提供商行不摆「签到」（fork 的 checkinCapable 门禁）", !/签到/.test(p.html));
-  const q = await render({ n: 1, channel: "qoder", builtin: true });
-  check("⑫ 无签到能力的内置渠道（qoder）也不摆「签到」", !/签到/.test(q.html));
+  // ⑫⑬ 双向钉住「组件真表 ↔ 模板门禁」这条接线：只判「不该出现的没出现」是半套判据，
+  // 上游 v1.55 恰好证明了这点——它把行内按钮改成按 acc.channel !== 'zcode' 放行，
+  // 能力表一旦被绕过，cline / autoclaw 会凭空长出注定被主进程拒答的按钮。
+  const incapable = incapableIds.find((id) => id !== "zcode"); // zcode 的行内「领取」走专门分支，不吃这张表
+  const ic = await render({ n: 1, channel: incapable, builtin: true });
+  check(`⑫ 能力表为 false 的内置渠道（${incapable}）不摆签到按钮`, !/签到/.test(ic.html));
+  const capable = capableIds[0];
+  const cp = await render({ n: 1, channel: capable, builtin: true });
+  check(`⑬ 能力表为 true 的内置渠道（${capable}）确实摆出了签到按钮`, /签到/.test(cp.html),
+    "一行都没渲染 ⇒ 门禁或 v-if 被绕过，⑫ 的「没出现」就成了空判据");
 
   console.log(`\n${failures.length ? "FAIL " + failures.length + " 项" : "OK 号池表格结构闸全过"}（共 ${pass + failures.length} 项）`);
   if (failures.length) process.exit(1);

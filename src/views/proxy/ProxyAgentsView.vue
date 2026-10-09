@@ -7,7 +7,7 @@ import { computed, onMounted, onUnmounted, ref, watch, nextTick } from "vue";
 import * as api from "../../api/ipc";
 import type { ProxyChannelView, ProxyAccount, ProxyChannelId, ProxyBuiltinChannelId, ProxyChannelKind, ProxyPoolStrategy, ProxyCostTier, ProxyScanCandidate, ProxyCheckinRow, ZcodeDeviceRow } from "../../types";
 import { useAppStore } from "../../stores/app";
-import { fmtInt, fmtK, fmtDate, fmtAgo, fmtCredits, ACCOUNT_STATUS, SOURCE_NAMES, channelName, fmtBalance, balanceUnit, isTokenChannel, isQoderChannel, costTierName, pkgFallbackName } from "./format";
+import { fmtInt, fmtK, fmtDate, fmtAgo, fmtCredits, ACCOUNT_STATUS, SOURCE_NAMES, channelName, fmtBalance, balanceUnit, isTokenChannel, isQoderChannel, costTierName, pkgFallbackName, checkinLabels, todayStr } from "./format";
 import { coalesceAsync } from "../../utils/timing";
 
 const app = useAppStore();
@@ -85,7 +85,7 @@ const CHANNEL_META: Record<ProxyBuiltinChannelId, { icon: string; hint: string }
 
   // Qoder 无回环 OAuth（登录在官方客户端内完成，凭据落在加密信封里）→ 只走本机导入/文件/粘贴
   qoder: { icon: "ph-compass", hint: "设备授权登录 · 本机导入 · 去客户端领每日 Credits" },
-  qoder_intl: { icon: "ph-globe-hemisphere-west", hint: "国际版 · 本机导入（需充值才有模型）" },
+  qoder_intl: { icon: "ph-globe-hemisphere-west", hint: "国际版 · 无静态模型兜底，添加后点「拉取模型」取官方目录" },
 };
 // 自定义提供商只有 API Key：没有登录态、没有签到、没有余额概念，措辞要与生态渠道明确区分
 const PROVIDER_META = { icon: "ph-plugs-connected", hint: "API Key 轮转 · 无余额概念" };
@@ -93,7 +93,7 @@ const PROVIDER_META = { icon: "ph-plugs-connected", hint: "API Key 轮转 · 无
 // ===== 渠道能力表（与主进程一一对应，缺能力的动作一律不摆按钮）=====
 // 签到：判据是主进程适配器里 checkin/checkinStatus 这两个方法存不存在。
 // 上游 v1.50 起这张表要跟着渠道一起长：modelscope 是「每日任务」（会话触碰 + 点赞）、
-// lobster 是「每日签到 100 积分」、Qoder 双区是「活动 Credits 领取」（每日 100，需装客户端出风控身份），
+// lobster 是「每日签到 100 积分」、Qoder CN 是「活动 Credits 领取」（每日 100，需装客户端出风控身份），
 // 三家都定义了 checkin ⇒ 记 true。Cline 双池 / AutoClaw 双区官方就没有签到体系，
 // 主进程对它们只能回 unavailable，界面上摆个按钮就是骗人点一次、跑一轮空请求。
 // zcode 家记 false 是刻意的：它的「一键领取 / 过码 / 领取模式」在模板里各走专门分支，不吃这张表。
@@ -109,7 +109,7 @@ const CHECKIN_CAPABLE: Record<ProxyBuiltinChannelId, boolean> = {
   modelscope: true,
   lobster: true,
   qoder: true,
-  qoder_intl: true,
+  qoder_intl: false, // 活动 Credits 领取是 CN 侧专属（每日 100 要靠桌面端出风控身份），国际版只有充值额度
   zcode: false,
   zcode_intl: false,
 };
@@ -198,8 +198,6 @@ const oauthErr = ref(false); // 与等待态共用 oauthMsg 一条消息位，�
 let oauthRun = 0;
 // mode=device（cline / qoder）时后端回的验证码：授权页通常已自动带上，留一手给用户手输
 const oauthUserCode = ref("");
-// qoder 国际版 / 中国版是两套域名（登录与调度同源），登录入口就地切换
-const qoderEdition = ref<"intl" | "cn">("intl");
 // AutoClaw 国际版的两个上游：滑块过了之后按这个 vendor 换授权地址
 const aclawVendor = ref<"zai" | "google">("zai");
 // 浏览器没跳回回环地址时的兜底：把地址栏整段粘回来
@@ -293,10 +291,10 @@ const OAUTH_HELP: Record<string, { title: string; desc: string }> = {
     desc: "先完成滑块验证，再跳转 Zai / Google 授权页；登录后自动回到本应用。<br />没有国际版账号也可「粘贴 JSON」导入 token。",
   },
   // Qoder 双区（上游 v1.4x 起 OAuth 走 PKCE 设备码轮询，不再依赖本机客户端）：
-  // 区服切换与「粘贴 JSON」是 fork 侧保留的两条入口，故文案一并写明
+  // 两条渠道各说各的区服（区服由渠道 id 定），不再有「在弹窗里切区服」这一步
   qoder: {
     title: "用 Qoder 官方登录页登录（设备授权）",
-    desc: "跳转 Qoder 官方授权页登录并选择账号，本机每 2 秒轮询自动完成——<b>无需本机安装 Qoder 客户端</b>（PKCE 设备码，轮询直接取回设备凭据对，含刷新令牌）。<br />国际版 / 中国版在下方切换区服；也可「粘贴 JSON」导入。",
+    desc: "跳转 Qoder 官方授权页登录并选择账号，本机每 2 秒轮询自动完成——<b>无需本机安装 Qoder 客户端</b>（PKCE 设备码，轮询直接取回设备凭据对，含刷新令牌）。<br />本渠道是中国版；国际版请用「Qoder 国际」那一行。也可「粘贴 JSON」导入。",
   },
   qoder_intl: {
     title: "用 Qoder 国际版官方登录页登录",
@@ -507,6 +505,128 @@ async function runTrial() {
     toast(String((e as Error).message || e), "err");
   } finally {
     checkinBusy.value = false;
+    await refresh();
+  }
+}
+
+// ===== 今日签到状态（行内按钮三态 + 详情小窗 + 渠道完成态） =====
+// 数据源：账号的 checkin 记录（主进程 meta.checkin 落库，手动/自动签到都会写；跨天按 day 判为过期）
+/** 正在查看的签到详情（点「已签到/已领取」看今日详情；点「签到失败/领取失败」看原因） */
+const checkinDetail = ref<ProxyAccount | null>(null);
+/** 响应式的"今天"：秒级 tick 里跨天即更新，页面常开过午夜时行内三态自动回退到待签到 */
+const today = ref(todayStr());
+
+/** 行内按钮三态：todo 未签到 / done 已完成（含幂等与不开放）/ fail 失败 */
+function checkinRowState(acc: ProxyAccount): "todo" | "done" | "fail" {
+  const c = acc.checkin;
+  if (!c || c.day !== today.value) return "todo";
+  if (c.ok || c.already || c.unavailable) return "done";
+  return "fail";
+}
+
+/** 行内按钮文案：未签到 = 渠道动作（签到/领加油包/领 Credits），已完成/失败 = 结果态 */
+function checkinRowText(acc: ProxyAccount): string {
+  const st = checkinRowState(acc);
+  const L = checkinLabels(acc.channel);
+  // 服务不开放（如国际版无签到体系）不是"已签到"，如实说"不开放"避免误导
+  if (st === "done") return acc.checkin?.unavailable ? "不开放" : L.shortDone;
+  if (st === "fail") return L.shortFail;
+  return L.shortRun;
+}
+
+/** 行内按钮悬浮说明：动作语义随渠道不同；已完成/失败时改为引导点开查看详情 */
+function checkinRowTitle(acc: ProxyAccount): string {
+  const st = checkinRowState(acc);
+  const L = checkinLabels(acc.channel);
+  if (st === "done") return `点开查看今日${L.detail}`;
+  if (st === "fail") return "点开查看本次失败原因";
+  if (acc.channel === "workbuddy_ai") return "国际版无每日签到，点此领一次性加油包";
+  if (acc.channel === "raccoon") return "登录送积分（幂等，锁定当日积分 7 天）";
+  if (acc.channel === "modelscope") return "执行每日任务：会话触碰（登录 200 + 绑云 50）+ 收藏/喜欢至 20 次（+40 魔粒）。点赞是公开星标动作";
+  if (acc.channel === "lobster") return "每日签到领 100 积分（常驻活动，需客户端版本 ≥ 2026.9.4）";
+  if (isQoderChannel(acc.channel)) return "领取当前可领的活动 Credits（每日 100，10:00 UTC+8 刷新）；需完成任务的活动会跳过";
+  return "对该账号执行每日签到";
+}
+
+/** 行内按钮点击：未签到 → 立即执行；已完成/失败 → 弹今日详情 / 失败原因 */
+function onRowCheckin(acc: ProxyAccount) {
+  if (checkinRowState(acc) === "todo") void runCheckinAccount(acc);
+  else checkinDetail.value = acc;
+}
+
+/** 今日详情小窗的结果标签：完成态细分（成功 / 幂等已完成 / 服务不开放）与失败态细分 */
+function checkinDetailTag(acc: ProxyAccount): { text: string; cls: string } {
+  const L = checkinLabels(acc.channel);
+  const c = acc.checkin;
+  if (checkinRowState(acc) === "fail") {
+    if (c?.needCaptcha) return { text: "需人机校验", cls: "tag-warn" };
+    if (c?.deviceBurned) return { text: "指纹被消耗", cls: "tag-warn" };
+    return { text: L.shortFail, cls: "tag-err" };
+  }
+  if (c?.unavailable) return { text: "服务不开放", cls: "tag-dim" };
+  if (c?.already) return { text: "已完成（幂等）", cls: "tag-dim" };
+  return { text: L.shortDone, cls: "tag-ok" };
+}
+
+/** 该渠道今日是否全部完成（参与判定的账号都有完成记录）→ 工具栏动作按钮显示"签到成功/领取成功" */
+function channelCheckinDone(ch: ProxyChannelView): boolean {
+  const list = ch.accounts.filter((a) => a.hasToken && a.status !== "disabled");
+  return list.length > 0 && list.every((a) => checkinRowState(a) === "done");
+}
+
+/** 工具栏动作按钮的悬浮说明：完成态优先说明"可重跑（幂等）"，其余按渠道动作语义 */
+function checkinToolbarTitle(ch: ProxyChannelView): string {
+  const L = checkinLabels(ch.id);
+  if (!checkinBusy.value && channelCheckinDone(ch)) return `今日已全部完成，点击可重新执行（${L.shortRun}幂等，已完成的账号自动跳过）`;
+  if (ch.id === "workbuddy_ai") return "国际版无每日签到，这是一次性 trial 加油包";
+  if (ch.id === "zcode") return "领取当前可领的奖励套餐（周末包等）；需要人机校验时会弹官方验证窗";
+  if (isQoderChannel(ch.id)) return "领取当前可领的活动 Credits（每日 100，10:00 UTC+8 刷新，领取后 30 天有效）。只处理可领取的活动，需完成任务的活动会跳过";
+  return `对渠道内全部账号执行每日${L.shortRun === "签到" ? "签到" : L.shortRun}（幂等，已完成的账号自动跳过）`;
+}
+
+/** 渠道化文案表（签到 / 领加油包 / 领 Credits / 领取） */
+const labelsOf = (channel?: string) => checkinLabels(channel);
+
+// ===== 自动签到设置弹窗（按渠道：每天几点、抖动多久；写整体配置 checkinAutoRules，tick 60s 内生效） =====
+const autoDlg = ref<ProxyChannelView | null>(null);
+const autoBusy = ref(false);
+const autoForm = ref<{ enabled: boolean; time: string; jitterMin: number }>({ enabled: false, time: "09:00", jitterMin: 0 });
+
+function openAutoCheckin(ch: ProxyChannelView) {
+  autoDlg.value = ch;
+  autoForm.value = {
+    enabled: !!ch.checkinAuto?.enabled,
+    time: ch.checkinAuto?.time || "09:00",
+    jitterMin: Number(ch.checkinAuto?.jitterMin || 0),
+  };
+}
+
+async function saveAutoCheckin() {
+  const ch = autoDlg.value;
+  if (!ch || autoBusy.value) return;
+  autoBusy.value = true;
+  try {
+    const r = await api.proxyCheckinAutoSet({
+      channel: ch.id,
+      enabled: autoForm.value.enabled,
+      time: autoForm.value.time || "09:00",
+      jitterMin: Number(autoForm.value.jitterMin) || 0,
+    });
+    if (r.ok === false) {
+      toast(r.message || "保存失败", "err");
+      return;
+    }
+    autoDlg.value = null;
+    const L = checkinLabels(ch.id);
+    toast(
+      r.enabled
+        ? `${ch.display}：自动${L.shortRun}已开启（每天 ${r.time}${r.jitterMin ? ` 起随机 ${r.jitterMin} 分钟内` : ""}执行）`
+        : `${ch.display}：自动${L.shortRun}已关闭`
+    );
+  } catch (e) {
+    toast(String((e as Error).message || e), "err");
+  } finally {
+    autoBusy.value = false;
     await refresh();
   }
 }
@@ -989,9 +1109,9 @@ function switchMethod(m: AddMethod) {
   if (m === "local" && !scanList.value.length) loadScan();
 }
 
-/** 渠道专属登录参数：qoder 要区服（两套域名），AutoClaw 国际版要上游 vendor（滑块两跳同值） */
+/** 渠道专属登录参数。Qoder 双区不再传 edition：区服由渠道 id 决定（主进程 EP.regionOf），
+ *  国际版是独立的一行渠道，不是 CN 渠道上的一个 radio。AutoClaw 国际版仍要上游 vendor（滑块两跳同值）。 */
 function oauthOpts(channel: ProxyBuiltinChannelId): { edition?: "intl" | "cn"; vendor?: "zai" | "google" } {
-  if (channel === "qoder") return { edition: qoderEdition.value };
   if (channel === "autoclaw_intl") return { edition: "intl", vendor: aclawVendor.value };
   return {};
 }
@@ -1326,6 +1446,8 @@ let nowTimer: number | undefined;
  *  非激活渠道的降级倒计时冻结在旧读数、过期后角标也不消失 */
 function tickNow() {
   if (!active.value) return;
+  const t = todayStr();
+  if (t !== today.value) today.value = t; // 跨天：行内签到三态自动回退（模板吃响应式的 today）
   const needs = pool.value.some(
     (c) => (c.health && c.health.until > now.value) || c.accounts.some((a) => a.status === "cooling" && a.coolUntil)
   );
@@ -1507,33 +1629,64 @@ onUnmounted(() => {
             <!-- 签到 / 加油包 / 额度刷新都是生态渠道专属动作：自定义提供商只有一把 API Key，
                  既没有每日签到可领，也没有余额可查（主进程一律明确拒答，不该在界面上摆出来） -->
             <template v-if="isBuiltin(ch)">
-              <el-tooltip v-if="ch.id === 'workbuddy_ai'" content="国际版无每日签到，这是一次性 trial 加油包" placement="top">
-                <button class="btn btn-sm" :disabled="checkinBusy" @click="runTrial">
-                  {{ checkinBusy ? "领取中…" : "领加油包" }}
-                </button>
+              <!-- 工具栏浮层文案统一吃 checkinToolbarTitle（上游 v1.55 把它抽成函数，其中 Qoder / WB AI /
+                   zcode 三条与本仓原文一字不差，另外补了「今日已全部完成」的完成态提示） -->
+              <el-tooltip v-if="ch.id === 'workbuddy_ai'" :content="checkinToolbarTitle(ch)" placement="top">
+                <button
+                  class="btn btn-sm"
+                  :class="{ 'btn-checkin-done': !checkinBusy && channelCheckinDone(ch) }"
+                  :disabled="checkinBusy"
+                  @click="runTrial"
+                >{{ checkinBusy ? "领取中…" : channelCheckinDone(ch) ? labelsOf(ch.id).done : labelsOf(ch.id).run }}</button>
               </el-tooltip>
+              <el-tooltip v-else-if="ch.id === 'zcode' && zcodeHasReward" :content="checkinToolbarTitle(ch)" placement="top">
+                <button
+                  class="btn btn-sm"
+                  :class="{ 'btn-checkin-done': !checkinBusy && channelCheckinDone(ch) }"
+                  :disabled="checkinBusy"
+                  @click="runCheckinChannel"
+                >{{ checkinBusy ? "领取中…" : channelCheckinDone(ch) ? labelsOf(ch.id).done : labelsOf(ch.id).run }}</button>
+              </el-tooltip>
+              <!-- Qoder 双区（上游 v1.50）：官方没有「每日签到」，是活动 Credits 领取，文案与动作名如实区分。
+                   再加一道 checkinCapable：活动领取是 CN 侧专属（要靠桌面端出风控身份），
+                   CHECKIN_CAPABLE.qoder_intl 按 a2e386f 的判定记 false ⇒ 国际版三处入口都不给摆，
+                   否则工具栏承诺得上的事，行内和自动签到两处都拒绝。 -->
+              <el-tooltip v-else-if="isQoderChannel(ch.id) && checkinCapable(ch.id)" :content="checkinToolbarTitle(ch)" placement="top">
+                <button
+                  class="btn btn-sm"
+                  :class="{ 'btn-checkin-done': !checkinBusy && channelCheckinDone(ch) }"
+                  :disabled="checkinBusy"
+                  @click="runCheckinChannel"
+                >{{ checkinBusy ? "领取中…" : channelCheckinDone(ch) ? labelsOf(ch.id).done : labelsOf(ch.id).run }}</button>
+              </el-tooltip>
+              <!-- 每日签到只在主进程真有 checkin 的渠道摆按钮（判据见 CHECKIN_CAPABLE）：
+                   上游这版用 ch.id !== 'zcode' 兜底，会把 cline 双池 / AutoClaw 双区也点亮 -->
+              <el-tooltip v-else-if="checkinCapable(ch.id)" :content="checkinToolbarTitle(ch)" placement="top">
+                <button
+                  class="btn btn-sm"
+                  :class="{ 'btn-checkin-done': !checkinBusy && channelCheckinDone(ch) }"
+                  :disabled="checkinBusy"
+                  @click="runCheckinChannel"
+                >{{ checkinBusy ? "签到中…" : channelCheckinDone(ch) ? labelsOf(ch.id).done : labelsOf(ch.id).run }}</button>
+              </el-tooltip>
+              <!-- 自动签到设置（上游 v1.55，按渠道：每天几点 + 抖动分钟；开启后按钮点亮）。
+                   这道能力闸是本仓加的：给没有签到动作的渠道开自动签到，等于每天白发一次注定被拒的
+                   请求。放行集 = CHECKIN_CAPABLE ∪ zcode（zcode 走「一键领取」那条专门分支，
+                   能力表按设计记 false）；不另加 isQoderChannel——那样 qoder_intl 会出现
+                   「有自动签到设置按钮、行内却没有签到按钮」的自相矛盾（真机核验时抓到的）。 -->
               <el-tooltip
-                v-else-if="ch.id === 'zcode' && zcodeHasReward"
-                content="领取当前可领的奖励套餐（周末包等）；需要人机校验时会弹官方验证窗"
+                v-if="checkinCapable(ch.id) || ch.id === 'zcode'"
+                :content="`${labelsOf(ch.id).auto}设置：自定义每天执行时间与抖动`"
                 placement="top"
               >
-                <button class="btn btn-sm" :disabled="checkinBusy" @click="runCheckinChannel">
-                  {{ checkinBusy ? "领取中…" : "一键领取" }}
+                <button
+                  class="btn btn-sm"
+                  :class="{ 'btn-auto-on': ch.checkinAuto?.enabled }"
+                  @click="openAutoCheckin(ch)"
+                >
+                  <i class="ph ph-clock"></i>{{ labelsOf(ch.id).auto }}
                 </button>
               </el-tooltip>
-              <!-- Qoder 双区（上游 v1.50）：官方没有「每日签到」，是活动 Credits 领取，文案与动作名如实区分 -->
-              <el-tooltip
-                v-else-if="isQoderChannel(ch.id)"
-                content="领取当前可领的活动 Credits（每日 100，10:00 UTC+8 刷新，领取后 30 天有效）。只处理可领取的活动，需完成任务的活动会跳过"
-                placement="top"
-              >
-                <button class="btn btn-sm" :disabled="checkinBusy" @click="runCheckinChannel">
-                  {{ checkinBusy ? "领取中…" : "领 Credits" }}
-                </button>
-              </el-tooltip>
-              <button v-else-if="checkinCapable(ch.id)" class="btn btn-sm" :disabled="checkinBusy" @click="runCheckinChannel">
-                {{ checkinBusy ? "签到中…" : "一键签到" }}
-              </button>
               <el-tooltip
                 v-if="ch.id === 'zcode'"
                 content="设备指纹（deviceMid）诊断与修复：多账号共用同一枚指纹时，一个账号领取周末套餐会把全组账号的当周资格烧掉（服务端提示「不符合领取条件」/1004）。修复即给这些账号重派全新随机指纹"
@@ -1568,12 +1721,18 @@ onUnmounted(() => {
                而这三项对生态渠道是真信息，所以按 kind 隐藏而不是换成假数据 -->
           <div v-if="isBuiltin(ch)" class="agg-item">
             <span>总余额</span>
-            <el-tooltip :content="tokensTip(ch)" :disabled="!tokensTip(ch)" placement="top">
-              <b>{{ fmtBalance(ch.summary.totalCredits, ch.id) }}</b>
-            </el-tooltip>
-            <span v-if="isTokenChannel(ch.id) || isQoderChannel(ch.id)" style="font-size: 11px; font-weight: normal; color: var(--text-3); margin-left: 2px">{{ balanceUnit(ch.id) }}</span>
+            <div class="agg-val">
+              <el-tooltip :content="tokensTip(ch)" :disabled="!tokensTip(ch)" placement="top">
+                <b>{{ fmtBalance(ch.summary.totalCredits, ch.id) }}</b>
+              </el-tooltip>
+              <!-- 单位一直显示（上游 v1.55）：只给数字看不出量纲。取本仓的 balanceUnit 表驱动口径，
+                   不取上游按渠道硬编码的三档（那份漏了 zcode_intl / cline_* 等，且 "Tokens" 单复数与
+                   isTokenChannel 依赖的 "Token" 不一致） -->
+              <em class="agg-unit">{{ balanceUnit(ch.id) }}</em>
+            </div>
             <!-- 本页浮层已整页统一到 el-tooltip（上游 v1.38.0 口径，工具栏 / 聚合行 / 账号行三处一起换），
                  原生 title 不许在本页复活：scripts/dev-proxy-tooltip-uniform-test.cjs 会逐文件查。 -->
+
           </div>
           <div class="agg-item"><span>{{ isBuiltin(ch) ? "账号数" : "Key 数" }}</span><b>{{ ch.summary.accountCount }}</b></div>
 
@@ -1668,14 +1827,29 @@ onUnmounted(() => {
                   <button v-if="isBuiltin(ch)" class="btn-link btn-sm" :disabled="refreshingId === acc.id" @click="refreshOne(acc)">
                     {{ refreshingId === acc.id ? "刷新中…" : "刷新" }}
                   </button>
+                  <!-- 行内签到三态（上游 v1.55）：未执行显示渠道动作名，已完成 / 失败点开看今日详情小窗。
+                       isBuiltin 与能力闸（判据见 CHECKIN_CAPABLE）是本仓加的：上游按 acc.channel !== 'zcode'
+                       放行，会把 cline 双池 / AutoClaw 双区这些主进程注定拒答的渠道也点亮。 -->
                   <el-tooltip
-                    v-if="acc.hasToken && isBuiltin(ch) && (checkinCapable(acc.channel) || acc.channel === 'zcode')"
-                    :content="acc.channel === 'workbuddy_ai' ? '国际版无每日签到，用上方工具栏「领加油包」' : acc.channel === 'raccoon' ? '登录送积分（幂等，锁定当日积分 7 天）' : acc.channel === 'zcode' ? '领取当前可领的奖励套餐（如需人机校验会弹官方验证窗）' : acc.channel === 'modelscope' ? '执行每日任务：会话触碰（登录 200 + 绑云 50）+ 收藏/喜欢至 20 次（+40 魔粒）。点赞是公开星标动作' : acc.channel === 'lobster' ? '每日签到领 100 积分（常驻活动，需客户端版本 ≥ 2026.9.4）' : isQoderChannel(acc.channel) ? '领取该账号当前可领的活动 Credits（每日 100，10:00 UTC+8 刷新，领取后 30 天有效）' : '对该账号执行每日签到'"
+                    v-if="acc.hasToken && isBuiltin(ch) && acc.channel !== 'zcode' && checkinCapable(acc.channel)"
+                    :content="checkinRowTitle(acc)"
                     placement="top"
                   >
-                    <button class="btn-link btn-sm" :disabled="checkinBusy" @click="runCheckinAccount(acc)">
-                      {{ acc.channel === "zcode" || isQoderChannel(acc.channel) ? "领取" : "签到" }}
-                    </button>
+                    <button
+                      class="btn-link btn-sm"
+                      :class="{ 'ck-done': checkinRowState(acc) === 'done', 'ck-fail': checkinRowState(acc) === 'fail' }"
+                      :disabled="checkinBusy && checkinRowState(acc) === 'todo'"
+                      @click="onRowCheckin(acc)"
+                    >{{ checkinRowText(acc) }}</button>
+                  </el-tooltip>
+                  <!-- zcode 的逐账号「领取」不进三态：它下面本来就有过码 / 领取模式两枚专用按钮，
+                       保留本仓原形（单态按钮 + 直接执行） -->
+                  <el-tooltip
+                    v-else-if="acc.hasToken && acc.channel === 'zcode'"
+                    content="领取当前可领的奖励套餐（如需人机校验会弹官方验证窗）"
+                    placement="top"
+                  >
+                    <button class="btn-link btn-sm" :disabled="checkinBusy" @click="runCheckinAccount(acc)">领取</button>
                   </el-tooltip>
                   <el-tooltip
                     v-if="acc.channel === 'zcode'"
@@ -1701,7 +1875,7 @@ onUnmounted(() => {
                     </button>
                   </el-tooltip>
                   <el-tooltip v-if="isBuiltin(ch)" :content="ideTitle(acc)" :disabled="!ideTitle(acc)" placement="top">
-                    <!-- 「切到 IDE」在客户端没装/不支持时是常置 disabled 的，提示正是解释它为什么点不动 ⇒ 同 UID 那格，用 span 承接 hover -->
+                    <!-- 「切到 IDE」在客户端没装/不支持时是常置 disabled 的，提示正是解释它为什么点不动 ⇒ 用 span 承接 hover -->
                     <span>
                       <button
                         class="btn-link btn-sm"
@@ -1836,17 +2010,8 @@ onUnmounted(() => {
               <div class="add-pane-icon"><i class="ph ph-key"></i></div>
               <div class="add-pane-title">{{ OAUTH_HELP[addChannel]?.title || "用官方登录页登录" }}</div>
               <div class="add-pane-desc" v-html="OAUTH_HELP[addChannel]?.desc || ''"></div>
-              <!-- qoder 区服切换：国际版与中国版是两套域名与账号体系，登录参数直接决定回调到哪个 openapi -->
-              <el-radio-group
-                v-if="addChannel === 'qoder'"
-                v-model="qoderEdition"
-                size="small"
-                class="oauth-radio-row"
-                :disabled="oauthWaiting || oauthBusy"
-              >
-                <el-radio-button value="intl">国际版</el-radio-button>
-                <el-radio-button value="cn">中国版</el-radio-button>
-              </el-radio-group>
+              <!-- Qoder 双区不再在这里放区服 radio：国际版是独立的一行渠道（qoder_intl），
+                   区服由渠道 id 决定。radio 留在弹窗里只会造成「渠道说 CN、参数说 intl」的分裂。 -->
               <!-- AutoClaw 国际版的两个上游：滑块通过后按这个 vendor 换授权地址 -->
               <el-radio-group
                 v-if="addChannel === 'autoclaw_intl'"
@@ -2093,6 +2258,77 @@ onUnmounted(() => {
           <div class="set-desc">验证通过后自动继续领取；关闭弹窗即取消本次领取。</div>
           <div id="zcap-captcha-element" class="captcha-mount"></div>
           <button id="zcap-captcha-trigger" class="captcha-trigger" type="button" aria-hidden="true" tabindex="-1"></button>
+        </div>
+      </div>
+
+      <!-- 签到详情小窗：点行内「已签到/已领取」看今日详情、点「签到失败/领取失败」看原因 -->
+      <div v-if="checkinDetail" class="p-mask" @click.self="checkinDetail = null">
+        <div class="p-dlg glass ckd-dlg">
+          <div class="p-title checkin-head">
+            <i class="ph" :class="checkinRowState(checkinDetail) === 'fail' ? 'ph-warning-circle' : 'ph-seal-check'"></i>
+            {{ checkinRowState(checkinDetail) === "fail" ? labelsOf(checkinDetail.channel).shortFail + "原因" : "今日" + labelsOf(checkinDetail.channel).detail }}
+          </div>
+          <div class="set-desc">{{ checkinDetail.name || checkinDetail.uid || checkinDetail.id }} · {{ channelName(checkinDetail.channel) }}</div>
+          <div class="ckd-rows">
+            <div class="ckd-row">
+              <span class="ckd-k">结果</span>
+              <span class="tag" :class="checkinDetailTag(checkinDetail).cls">{{ checkinDetailTag(checkinDetail).text }}</span>
+            </div>
+            <div class="ckd-row">
+              <span class="ckd-k">时间</span>
+              <b class="mono">{{ checkinDetail.checkin ? fmtClock(checkinDetail.checkin.at) : "-" }}</b>
+            </div>
+            <div v-if="checkinDetail.checkin?.credit" class="ckd-row">
+              <span class="ckd-k">本次获得</span>
+              <b class="mono">+{{ checkinDetail.checkin.credit }}</b>
+            </div>
+            <div v-if="checkinDetail.checkin?.streakDays" class="ckd-row">
+              <span class="ckd-k">连续天数</span>
+              <b class="mono">{{ checkinDetail.checkin.streakDays }} 天</b>
+            </div>
+            <div v-if="checkinDetail.checkin?.message" class="ckd-msg mono">{{ checkinDetail.checkin.message }}</div>
+          </div>
+          <div class="p-actions">
+            <button class="btn btn-primary" @click="checkinDetail = null">关闭</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 自动签到设置（按渠道）：每天几点自动执行 + 抖动分钟；保存即生效（后端 60s tick 热读配置） -->
+      <div v-if="autoDlg" class="p-mask" @click.self="autoDlg = null">
+        <div class="p-dlg glass auto-dlg">
+          <div class="p-title checkin-head">
+            <i class="ph ph-clock"></i>
+            {{ labelsOf(autoDlg.id).auto }}设置
+            <span class="add-chip">{{ autoDlg.display }}</span>
+          </div>
+          <div class="set-desc">
+            到点后本机自动执行本渠道{{ labelsOf(autoDlg.id).shortRun === "签到" ? "每日签到" : labelsOf(autoDlg.id).shortRun }}（幂等，已完成的账号自动跳过）；关机 / 休眠错过时间点，开机后补跑。
+          </div>
+          <div class="auto-rows">
+            <div class="auto-row">
+              <span class="auto-label">每天自动执行</span>
+              <div class="switch" :class="{ on: autoForm.enabled }" role="switch" :aria-checked="autoForm.enabled" @click="autoForm.enabled = !autoForm.enabled"></div>
+            </div>
+            <div class="auto-row">
+              <span class="auto-label">执行时间</span>
+              <input v-model="autoForm.time" type="time" class="f-input" style="width: 122px" />
+            </div>
+            <div class="auto-row">
+              <span class="auto-label">抖动时间</span>
+              <span class="auto-jitter">
+                <input v-model.number="autoForm.jitterMin" type="number" class="f-input" style="width: 84px" min="0" max="180" step="1" />
+                <em>分钟内随机</em>
+              </span>
+            </div>
+          </div>
+          <div class="auto-hint">
+            抖动 = 到点后随机延迟 0~N 分钟再执行（避免和其他用户整点同时请求上游）；当天内的延迟值是固定的，0 = 准点执行。
+          </div>
+          <div class="p-actions">
+            <button class="btn" @click="autoDlg = null">取消</button>
+            <button class="btn btn-primary" :disabled="autoBusy" @click="saveAutoCheckin">{{ autoBusy ? "保存中…" : "保存" }}</button>
+          </div>
         </div>
       </div>
 
@@ -2416,11 +2652,6 @@ onUnmounted(() => {
   align-items: center;
   gap: 8px;
 }
-/* 面板标题里的渠道图标：与主按钮同图标，形成"按钮 → 面板"的视觉呼应 */
-.channel-panel .card-title .ph {
-  font-size: 13px;
-  color: var(--accent-strong);
-}
 .danger {
   color: var(--err, #e05555);
 }
@@ -2443,12 +2674,31 @@ onUnmounted(() => {
   font-family: var(--font-mono);
   font-size: 13px;
 }
-/* 策略下拉与工具栏其他按钮同为小控件档（--ctl-h-sm = 24px），严格同高对齐 */
+/* 总余额：数字与单位同行（单位小字灰色；此前只有 zcode/Qoder 显示，且被列布局挤到下一行） */
+.agg-val {
+  display: flex;
+  align-items: baseline;
+  gap: 3px;
+  min-width: 0;
+}
+.agg-unit {
+  font-style: normal;
+  font-size: 11px;
+  color: var(--text-3);
+}
+/* 工具栏控件同高端对齐：左侧下拉的可见框是 el-select__wrapper 的 34px（全局 .f-el-select
+   标准），故外层 .el-select 与右侧各按钮一律 34px——此前后者 24px + 外层 24px 内层 34px
+   的错配会让下拉向下溢出 10px，一排控件高低参差 */
+.panel-tools .btn-sm {
+  height: 34px;
+  padding: 0 12px;
+  font-size: 12px;
+}
 .strategy-select {
   width: 108px;
   margin-right: 8px;
   vertical-align: middle;
-  height: var(--ctl-h-sm);
+  height: 34px;
   font-size: 11px;
 }
 /* ===== 添加账号弹窗：头部 + 分段方式切换 + 等高面板 + 固定底部操作（弹窗外壳版式见 global.css 的 .p-dlg） ===== */
@@ -2938,6 +3188,108 @@ onUnmounted(() => {
   padding: 18px 0;
   text-align: center;
   font-size: 11.5px;
+  color: var(--text-3);
+}
+/* ===== 工具栏动作按钮的完成态（今日全部签完）与自动签到开启态 ===== */
+.btn-checkin-done {
+  border-color: var(--accent-line);
+  background: var(--accent-dim);
+  color: var(--accent-strong);
+}
+.btn-auto-on {
+  border-color: var(--accent-line);
+  color: var(--accent-strong);
+}
+.btn-auto-on .ph {
+  font-size: 13px;
+  color: var(--accent-strong);
+}
+
+/* ===== 行内签到按钮三态：已完成（绿）/ 失败（黄）——颜色压过 .btn-link 的 hover 反馈 ===== */
+.btn-link.ck-done {
+  color: var(--accent-strong) !important;
+  background: var(--accent-dim);
+}
+.btn-link.ck-fail {
+  color: var(--warn, #e5b454) !important;
+  background: color-mix(in srgb, var(--warn, #e5b454) 12%, transparent);
+}
+
+/* ===== 签到详情小窗（今日详情 / 失败原因） ===== */
+.ckd-dlg {
+  width: 420px;
+}
+.ckd-rows {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--bg-soft);
+}
+.ckd-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+}
+.ckd-k {
+  flex-shrink: 0;
+  width: 62px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+.ckd-msg {
+  margin-top: 2px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--line);
+  font-size: 11px;
+  line-height: 1.7;
+  color: var(--text-2);
+  word-break: break-all;
+  white-space: pre-wrap;
+}
+
+/* ===== 自动签到设置弹窗（按渠道：时间 + 抖动） ===== */
+.auto-dlg {
+  width: 440px;
+}
+.auto-rows {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+}
+.auto-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--line);
+}
+.auto-row:last-child {
+  border-bottom: none;
+}
+.auto-label {
+  flex: 1;
+  font-size: 12px;
+  color: var(--text-2);
+}
+.auto-jitter {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.auto-jitter em {
+  font-style: normal;
+  font-size: 11px;
+  color: var(--text-3);
+}
+.auto-hint {
+  margin-top: 4px;
+  font-size: 11px;
+  line-height: 1.7;
   color: var(--text-3);
 }
 /* ===== UID 查看弹窗 ===== */

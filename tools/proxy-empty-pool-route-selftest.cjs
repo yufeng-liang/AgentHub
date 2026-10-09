@@ -168,6 +168,53 @@ async function main() {
     check("A5 轨迹如实记 failover:workbuddy_ai→…", /failover:workbuddy_ai→/.test(lastRow().error || ""), String(lastRow().error));
     store.updateKey(k.id, { route: "auto" });
 
+    // ===== A11~A14：模型级渠道排除（模型目录页「点掉=排除」的数据面）=====
+    // 位置选在 A5 之后：此刻 shared-model 的 owner = modelscope/lobster/trae/workbuddy/workbuddy_ai，
+    // 而**唯一有可用账号的是 workbuddy**（A8 之后 wb 会被候选失败带进冷却，那时判据测的是冷却不是排除）。
+    // 判据必须走真实 HTTP 链路：单测 modelOwners 会漏掉「server.cjs 调它时没传 settings」这半边缺陷。
+    // A11 关掉故障转移把候选截成 1：排除生效就是 503（旧实现必然 200），没有「跳到别的渠道」可以掩盖。
+    cfg.channelFailover = false;
+    cfg.modelChannelExcludes = { "shared-model": ["workbuddy"] };
+    const wbBefore11 = hits.wb;
+    rr = await call({ model: "shared-model", stream: false, messages: bodyMsg });
+    body = await rr.text();
+    check("A11 排除唯一可用渠道后不得再 200（旧实现：排除集根本不参与路由）", rr.status !== 200 && hits.wb === wbBefore11, `${rr.status} ${JSON.stringify(hits)} ${body.slice(0, 160)}`);
+    check("A11b 503 文案列的是没账号的那几个渠道，不含 workbuddy", /modelscope|lobster|trae/.test(body) && !/渠道 workbuddy\(/.test(body), body.slice(0, 240));
+    cfg.channelFailover = true;
+
+    // A12 排除到只剩 workbuddy：幸存者必须正常出线（裁切不能把候选裁空）
+    cfg.modelChannelExcludes = { "shared-model": ["modelscope", "lobster", "trae", "workbuddy_ai"] };
+    const wbBefore12 = hits.wb;
+    rr = await call({ model: "shared-model", stream: false, messages: bodyMsg });
+    body = await rr.text();
+    check("A12 只留 workbuddy 时应 200", rr.status === 200, `${rr.status} ${body.slice(0, 200)}`);
+    check("A12b 落点确实是 workbuddy", hits.wb === wbBefore12 + 1 && lastRow().channel === "workbuddy", `${JSON.stringify(hits)} / ${lastRow().channel}`);
+
+    // A13 点到零个渠道 ⇒ 明确 400 且文案点名原因。
+    //    「不在任何渠道目录」是另一回事（那是模型未知），两者混用会让人去翻模型目录而不是翻渠道列。
+    cfg.modelChannelExcludes = { "shared-model": ["modelscope", "lobster", "trae", "workbuddy", "workbuddy_ai"] };
+    rr = await call({ model: "shared-model", stream: false, messages: bodyMsg });
+    body = await rr.text();
+    check("A13 全排除应 400", rr.status === 400, `${rr.status} ${body.slice(0, 200)}`);
+    check("A13b 400 文案要点名「所有渠道已被你排除」", /所有渠道已被你排除/.test(body), body.slice(0, 240));
+    check("A13c 文案不得说成「不在任何渠道目录中」", !/不在任何渠道目录/.test(body), body.slice(0, 240));
+    // A13d 固定渠道策略下不得把被排除的渠道当透传兜底放出去（此时 fixedChannel=trae 也在排除集里）
+    cfg.routeStrategy = "fixed";
+    const traeBefore13 = hits.trae;
+    rr = await call({ model: "shared-model", stream: false, messages: bodyMsg });
+    body = await rr.text();
+    check("A13d fixed 策略下全排除仍 400（旧实现会透传 fixedChannel 打出请求）", rr.status === 400 && hits.trae === traeBefore13, `${rr.status} trae=${hits.trae} ${body.slice(0, 160)}`);
+    cfg.routeStrategy = "smart";
+
+    // A14 不进跨设备同步（定案 Q12=B）：poolsync 的白名单里绝不能出现这个键。
+    //     先证明块真的被解析到，否则「不含」是空转得出的绿。
+    const psSrc = fs.readFileSync(path.join(__dirname, "../electron/backend/proxy/poolsync.cjs"), "utf8");
+    const sharedBlock = /const SHARED_CONFIG_KEYS = \[[\s\S]*?\];/.exec(psSrc);
+    check("A14 SHARED_CONFIG_KEYS 已解析到", !!sharedBlock, "起点正则失效则 A14b 空转");
+    check("A14b 白名单不含 modelChannelExcludes", !!sharedBlock && !/modelChannelExcludes/.test(sharedBlock[0]), String(sharedBlock && sharedBlock[0]).slice(0, 200));
+
+    cfg.modelChannelExcludes = {};
+
     // ===== A6 单 owner 且空池：失败文案必须带渠道名与原因（旧实现只有「渠道暂不可用」）=====
     rr = await call({ model: "ai-only-model", stream: false, messages: bodyMsg });
     body = await rr.text();

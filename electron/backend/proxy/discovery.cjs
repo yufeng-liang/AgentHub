@@ -44,6 +44,7 @@ const raccoonAuth = require("./raccoonAuth.cjs");
 const zcodeLocal = require("./zcodeLocal.cjs");
 const wbCrypto = require("./wbCrypto.cjs");
 const qoderAuth = require("./qoderAuth.cjs");
+const EP = require("./qoderEndpoints.cjs"); // fork-port: 双区域名读唯一真相源
 
 const OAUTH_PORT = 17388; // 首选回环端口；被占用时退到系统随机端口（授权地址里会带实际端口）
 const OAUTH_TIMEOUT_MS = 180000;
@@ -1375,173 +1376,6 @@ function zcodeInterstitial(c) {
   return u.toString();
 }
 
-/**
- * Qoder 登录（PKCE 设备码轮询）—— 逆向自客户端 startDeviceFlow()，已实测端点。
- *
- * 与其它渠道的形态差异：
- *   · 不需要回环端口，也不靠 state 轮询换 accessToken——它**直接轮询出完整凭据对**
- *     { token, refresh_token }（即 dt-/drt-），一步到位，比 WB/ZCode 都简单。
- *   · 授权页是 Qoder 官方登录页，用 oauth_callback 参数携带 PKCE 回调地址。
- *
- * 流程（客户端同款）：
- *   ① verifier = 64 位随机；challenge = base64url(sha256(verifier))
- *   ② 打开 {authBase}/users/sign-in?biz_variant=qoder&oauth_callback=<selectAccounts URL>
- *      selectAccounts URL = {authBase}/device/selectAccounts?challenge=&challenge_method=S256
- *                           &nonce=&machine_id=&client_id=
- *   ③ 轮询 GET {openApi}/api/v1/deviceToken/poll?nonce=&verifier=&challenge_method=S256
- *      · 404 = 用户还没完成登录（客户端同款分支）→ 继续等
- *      · 200 且含 { token, refresh_token } → 成功
- *
- * machine_id 是签名与续期都要用的，必须在此时就取到并落库：
- * 客户端用 native 模块生成；这里复用 qoderAuth 的读取/生成逻辑（同源同口径）。
- */
-async function beginQoderOAuth(channel, onDone) {
-  const c = qoderAuth.PRODUCTS[channel] || qoderAuth.PRODUCTS.qoder;
-  const authBase = String(c.authBase || "https://qoder.cn").replace(/\/+$/, "");
-  const openApi = String(c.openApi || "").replace(/\/+$/, "");
-  const clientId = c.clientId || "732aef47-9cf2-46a2-95fe-4cebb5d0d1fa";
-  const bizVariant = c.authBizVariant || "qoder";
-
-  const { verifier, challenge } = pkcePair();
-  const nonce = util.uuid();
-  const machineId = qoderAuth.ensureMachineId(channel);
-
-  const selectUrl = new URL("/device/selectAccounts", authBase);
-  selectUrl.searchParams.set("challenge", challenge);
-  selectUrl.searchParams.set("challenge_method", "S256");
-  selectUrl.searchParams.set("nonce", nonce);
-  selectUrl.searchParams.set("machine_id", machineId);
-  selectUrl.searchParams.set("client_id", clientId);
-
-  const loginUrl = new URL("/users/sign-in", authBase);
-  loginUrl.searchParams.set("biz_variant", bizVariant);
-  loginUrl.searchParams.set("oauth_callback", selectUrl.toString());
-
-  const pollUrl = new URL("/api/v1/deviceToken/poll", openApi);
-  pollUrl.searchParams.set("nonce", nonce);
-  pollUrl.searchParams.set("verifier", verifier);
-  pollUrl.searchParams.set("challenge_method", "S256");
-
-  oauthSession = {
-    mode: "poll",
-    channel,
-    state: nonce,
-    onDone,
-    server: null,
-    timer: null,
-    intervalMs: 1000, // 客户端常量 V6 = 1000ms
-    deadline: Date.now() + OAUTH_TIMEOUT_MS,
-  };
-
-  const tick = async () => {
-    const session = oauthSession;
-    if (!session || session.state !== nonce) return;
-    if (Date.now() > session.deadline) {
-      finishOAuth({ ok: false, message: "登录超时（3 分钟），请重新发起" });
-      return;
-    }
-    const r = await adapters
-      .httpJson(pollUrl.toString(), { method: "GET", headers: { Accept: "application/json" } })
-      .catch(() => null);
-
-    // 404 = 尚未完成登录（客户端同款：继续轮询）。网络错误/5xx 也继续等，由 deadline 兜底。
-    if (r && r.ok && r.data && typeof r.data.token === "string" && typeof r.data.refresh_token === "string") {
-      try {
-        const saved = await saveQoderAccount(channel, {
-          token: r.data.token,
-          refreshToken: r.data.refresh_token,
-          machineId,
-        });
-        finishOAuth({ ok: true, id: saved.id, uid: saved.uid });
-      } catch (e) {
-        finishOAuth({ ok: false, message: String((e && e.message) || e) });
-      }
-      return;
-    }
-    // 明确的终局错误（非 404/408/429 的 4xx）才中止，其余继续等
-    if (r && r.status >= 400 && r.status < 500 && r.status !== 404 && r.status !== 408 && r.status !== 429) {
-      finishOAuth({ ok: false, message: `登录轮询失败（HTTP ${r.status}）` });
-      return;
-    }
-    if (oauthSession && oauthSession.state === nonce) session.timer = setTimeout(tick, session.intervalMs);
-  };
-  oauthSession.timer = setTimeout(tick, 1000);
-
-  return { ok: true, url: loginUrl.toString(), mode: "poll" };
-}
-
-/**
- * Qoder OAuth 结果落库。
- * 与扫描导入共用同一套字段口径（meta.machineId 必需；expires_at 落 token 到期）。
- *
- * 两处必须做对（实测踩出来的）：
- *   · uid/name 需拉一次 /api/v1/userinfo——OAuth 轮询只回凭据，不含用户资料；
- *   · 轮询响应**不含到期时间**，故紧接着调一次 refresh 换取 expires_at /
- *     refresh_token_expires_at（顺便验证这对凭据当场可用；refresh 是轮换制，
- *     返回的即最新一代，直接落库）。
- */
-async function saveQoderAccount(channel, cred) {
-  const c = qoderAuth.PRODUCTS[channel] || qoderAuth.PRODUCTS.qoder;
-  let user = {};
-  try {
-    const r = await adapters.httpJson(new URL("/api/v1/userinfo", c.openApi).toString(), {
-      method: "GET",
-      headers: { Authorization: `Bearer ${cred.token}`, Accept: "application/json", "User-Agent": "Qoder" },
-    });
-    if (r && r.ok && r.data) user = r.data.user || r.data.data || r.data;
-  } catch { /* userinfo 拿不到不阻断登录：uid 缺失时下面兜底 */ }
-  const uid = String(user.id || user.user_id || user.uid || "").trim();
-  if (!uid) throw new Error("登录成功但取不到账号 uid（userinfo 不可用），请改用「从本机软件导入」");
-  const name = String(user.name || user.nickname || user.email || "").trim();
-  // userinfo 实测字段：{id, name, username, avatar, source}——**没有独立的 email 字段**，
-  // 邮箱是塞在 name 里的（如 "user@example.com"）。故 name 含 @ 时同时当作邮箱记录，
-  // 与其它渠道的 meta.email 口径保持一致（UI 会优先显示邮箱）。
-  const email = String(user.email || (name.includes("@") ? name : ""));
-
-  // 用 refresh 换取到期时间（轮询响应没有这两个字段）。
-  // 失败不阻断登录：没有到期时间的账号仍可用，只是临期预刷新与 PoolSync 仲裁少了依据。
-  let token = cred.token;
-  let refreshToken = cred.refreshToken;
-  let expiresAt = 0;
-  let refreshTokenExpiresAt = 0;
-  try {
-    const rr = await qoderAuth.refreshDeviceToken(channel, refreshToken, cred.machineId);
-    if (rr && rr.ok) {
-      token = rr.token || token;
-      refreshToken = rr.refreshToken || refreshToken;
-      expiresAt = rr.expiresAt || 0;
-      refreshTokenExpiresAt = rr.refreshTokenExpiresAt || 0;
-    }
-  } catch { /* 拿不到到期时间不影响入池 */ }
-
-  const existing = store.listAccounts(channel).find((a) => a.uid === uid);
-  const meta = { machineId: cred.machineId, product: channel, email, avatar: String(user.avatar || "") };
-  if (existing) {
-    const oldMeta = readAccountMeta(existing.id);
-    store.updateAccount(existing.id, {
-      token,
-      refreshToken,
-      expiresAt: expiresAt || undefined,
-      meta: { ...oldMeta, ...meta },
-      status: "online",
-      coolUntil: 0,
-      coolReason: "",
-    });
-    return { id: existing.id, uid, updated: true };
-  }
-  const id = store.addAccount({
-    channel,
-    uid,
-    name,
-    token,
-    refreshToken,
-    source: "oauth",
-    expiresAt: expiresAt || undefined,
-    meta,
-  });
-  return { id, uid, updated: false };
-}
-
 async function beginZcodeOAuth(channel, onDone) {
   const c = zcodeCfg();
   const provider = String(c.oauthProvider || "zai");
@@ -2265,22 +2099,29 @@ async function beginClineOAuth(channel, onDone) {
 }
 
 // qoder：无起始请求，本地拼授权页；2s 轮询 poll（202/404 = 继续）→ userinfo 补资料 → 落库 meta.mode
+/** OAuth 落库的 meta 构造：machineId 与 machine_id **同值双写**。
+ *  读侧（qoderAdapter 五处：签名头 Cosy-MachineId / 续期 / 风控身份）只认 meta.machineId，
+ *  而这里历史上只写 machine_id；本机扫描导入路（scanQoder）又只写 machineId。
+ *  双写是零迁移的收口：老账号下次重登自然补齐，新账号两条口径都读得到。
+ *  两个键都留着而不是改读侧，是因为读侧是上游文件、且 machine_id 这个 snake_case 键
+ *  已被 refreshToken 打包串等外部格式引用过，改读侧等于同时赌两边都跟得上。
+ */
+function qoderOauthMeta(machineId, region, email, userId) {
+  return { mode: region, email, machine_id: machineId, machineId, user_id: userId };
+}
+
 async function beginQoderOAuth(channel, edition, onDone) {
-  const region = qoderRegionOfMode(edition);
-  // 归一移植后地区由**渠道 id** 决定（qoder=CN），Global 区要靠 qoder_intl 承载，而它尚未注册
-  // （store.QODER_INTL_ENABLED=false）。放过去会落一个 meta.mode=global 的 qoder 账号并被静默
-  // 打到 CN 网关——「答非所问」比「明确说不支持」难排查得多，故当场拒绝、且不留任何 global 号。
-  // 计划二注册 qoder_intl 并同批翻开开关后，本分支自然失效（region=global 命中已注册渠道）。
-  if (region === "global" && !store.QODER_INTL_ENABLED) {
-    return { ok: false, message: "Qoder 国际版渠道尚未接入：当前仅支持中国版（CN）" };
-  }
-  const cfg = {
-    global: { webOrigin: "https://qoder.com", openApi: "https://openapi.qoder.sh" },
-    cn: { webOrigin: "https://qoder.com.cn", openApi: "https://openapi.qoder.com.cn" },
-  }[region];
+  // 区服由**渠道 id** 决定（与 qoderAdapter / qoderAuth / qoderSelfSign 同一口径）：
+  // qoder=CN、qoder_intl=global。edition 是「单渠道 + meta.mode 切区」时代的遗留登录参数，
+  // 这里不再读它——一个渠道对应一个区服，要登国际版就加 qoder_intl 那一行，不靠弹窗里的 radio。
+  const region = EP.regionOf(channel);
+  // 原先这里有一条「region===global 且开关未开 ⇒ 明确拒绝」：qoder_intl 现在按开关条件注册，
+  // 开关关时 beginOAuth 在 `if (!adapters.get(ch))` 就报「未知渠道」，开关开时它是合法渠道，
+  // 两头都到不了这条判断，故删除。
+  const cfg = EP.REGIONS[region]; // 域名读真相源（此前这里是第四份手抄表）
   const verifier = crypto.randomBytes(32).toString("base64url");
   const challenge = crypto.createHash("sha256").update(verifier).digest("base64url"); // S256 无填充
-  const machineId = qoderMachineIdOf();
+  const machineId = qoderMachineIdOf(channel);
   const nonce = util.uuid().replace(/-/g, "");
   const url = `${cfg.webOrigin}/device/selectAccounts?challenge=${encodeURIComponent(challenge)}&challenge_method=S256&machine_id=${encodeURIComponent(machineId)}&nonce=${nonce}`;
   oauthSession = {
@@ -2316,7 +2157,7 @@ async function beginQoderOAuth(channel, edition, onDone) {
             uid: userId, name, token: String(d.token),
             refreshToken: `${String(d.refresh_token)}|${userId}|${machineId}`, // 打包串（协议参考 §3.7）
             expiresAt: util.toMs(d.expires_at) || Date.now() + 30 * 86400 * 1000, // 毫秒|秒|RFC3339 自动识别（§3.7 credentials.rs:175-182）
-            meta: { mode: region, email, machine_id: machineId, user_id: userId },
+            meta: qoderOauthMeta(machineId, region, email, userId),
             source: "oauth",
           });
           finishOAuth({ ok: true, id, uid: userId });
@@ -2343,9 +2184,10 @@ async function saveDiscoveredAccount(channel, { uid, name, token, refreshToken, 
 }
 
 /** qoder 机器标识：与对话侧共用 adapters 的单一实现（同一批候选文件、同一份落盘位置、同一进程内缓存），
- *  避免两处各写一份读文件逻辑导致机器码漂移。 */
-function qoderMachineIdOf() {
-  return adapters._qoderMachineId();
+ *  避免两处各写一份读文件逻辑导致机器码漂移。按渠道分取——CN 与国际版各自的客户端目录不同
+ *  （~/.qoder-cn vs ~/.qoder），混用会让登录 URL 送出的 id 与签名用的 id 不是同一个。 */
+function qoderMachineIdOf(product = "qoder") {
+  return adapters._qoderMachineId(product);
 }
 
 // ===== AutoClaw 国际版 OAuth（协议参考 第四章 §3.2）：三步——
@@ -3175,7 +3017,9 @@ async function beginOAuth(channel, opts, onDone, helpers) {
     throw new Error("AutoClaw（国内）官方没有网页登录：请用「从本机软件导入」（自动读取 %APPDATA%/AutoClaw/auth.json）或粘贴 token");
   }
   if (ch === "cline_free" || ch === "cline_pass") return beginClineOAuth(ch, cb);
-  if (ch === "qoder") return beginQoderOAuth(ch, o.edition, cb);
+  // qoder 双区共用同一条设备码链路。漏掉 qoder_intl 会掉到本函数末尾的 WorkBuddy 兜底——
+  // 用 WorkBuddy 的回环 OAuth 去打 Qoder 登录，表现为「授权页打开了、但永远等不到号」。
+  if (ch === "qoder" || ch === "qoder_intl") return beginQoderOAuth(ch, o.edition, cb);
   if (ch === "zcode" || ch === "zcode_intl") return beginZcodeOAuth(ch, cb);
   // autoclaw 国际版只有网页 OAuth（阿里云滑块前置 + 回环回调换码）；滑块参数由 renderer 两次调用透传
   if (ch === "autoclaw_intl") return beginAutoClawIntlOAuth(ch, o, cb);
@@ -3276,6 +3120,8 @@ module.exports = {
   // 测试窥视口（下划线前缀 = 非公共契约）：设备流的轮询判定与地区归一纯函数，dev-cline/dev-qoder-test 直测
   _workosPollVerdict: workosPollVerdict,
   _qoderRegionOfMode: qoderRegionOfMode,
+  // 自测用：OAuth 落库 meta 的构造（双写口径见函数注释）
+  _qoderOauthMetaForTest: qoderOauthMeta,
   // autoclaw 国际版回调的双 state 拆解（路径 state ≠ 查询串 state），dev-autoclaw-test 直测
   _autoclawParseCallback: autoclawParseCallback,
 };

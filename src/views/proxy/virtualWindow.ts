@@ -30,10 +30,12 @@ export function winRange(total: number, firstVisible: number, viewRows: number):
   return { start, end, padTop: start * ROW_H, padBottom: (total - end) * ROW_H };
 }
 
- /** 占位行与空态行的 colspan。单渠道视图少一列「来源渠道」。
+ /** 占位行与空态行的 colspan。
   *  2026-09-30 重组：原「元数据」列（独立编辑入口）并进「能力」格，9/8 列收敛为 8/7 列。
-  *  放这儿而不是写在组件里：结构闸要拿「渲染出来的 colspan」和表头实际列数对，
+  *  2026-10-08 合并列改造：「来源渠道」与「渠道覆盖」并成一列常驻的「渠道」，
+  *  于是单渠道视图不再少一列——两个视图都是 7 列（模型/上下文/思考强度/倍率/能力/渠道/状态）。
+  *  函数保留而不是让组件写死数字：结构闸要拿「渲染出来的 colspan」和表头实际列数对，
   *  组件里写死一个数、或者门禁自己注入一个数，都只是自证。 */
- export function colCountFor(activeTab: string): number {
-   return activeTab ? 7 : 8;
+ export function colCountFor(_activeTab: string): number {
+   return 7;
  }

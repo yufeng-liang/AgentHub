@@ -143,6 +143,9 @@ const extraUserCmds = [
   // 实现体在子进程 index.cjs、主进程只转发。preload 白名单与转发名单已由合并带入，
   // 这里补上登记，否则本闸会把「三处已对齐」报成「白名单外多出的键」。
   { name: "proxy_pool_tier", why: "渠道成本档：读/写 agents.cost_tier（上游 v1.50 cost-first 路由，写号池）" },
+  // 上游 v1.55 的按渠道自动签到设置：写的是 config.json 的 proxy.checkinAutoRules（与 poolsync
+  // applyShared 写 cfg.proxy 同一条子进程路径，读侧 tick 每 60s 热读），不是第二份主进程写者
+  { name: "proxy_checkin_auto_set", why: "自动签到按渠道设置：写 cfg.proxy.checkinAutoRules（上游 v1.55，号池页弹窗）" },
 ];
 const upstreamUserNames = extraUserCmds.map((c) => c.name);
 check("④ 子进程表含 proxy_account_import_blob（import_file 拆两段的子进程半段）",

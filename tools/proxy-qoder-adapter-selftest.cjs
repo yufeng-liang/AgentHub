@@ -462,6 +462,7 @@ async function main() {
   console.log("\n[8] makeSelfSign().fetchModelsRemote 产出上游形状");
   {
     const qSS = require("../electron/backend/proxy/qoderSelfSign.cjs");
+    const EP = require("../electron/backend/proxy/qoderEndpoints.cjs"); // host 判据的取值来源（与产品代码同一份表）
     let called = null;
     const stubHttpJson = async (url, o) => {
       called = url;
@@ -475,6 +476,9 @@ async function main() {
     const r = await ss.fetchModelsRemote({ account: { uid: "u1" }, secrets: { token: "jwt" } });
     assert(r.ok === true, "远程目录拉取成功");
     assert(/model\/list/.test(String(called)), "确实打了 model/list");
+    // 不只判路径：**host 必须等于真相源**。端点闸判的是 REGIONS 表等值，这里判的是
+    // 「拼 URL 那一行真的用了它」——两处缺一都能各自绿，只有合起来才封住改回常量的回归。
+    assert(String(called).startsWith(EP.inferGateway("qoder") + "/algo/"), `CN 自签打在 ${EP.inferGateway("qoder")}（实得 ${called}）`);
     assert(r.models.some((m) => m.id === "dfmodel"), "id 是上游 key");
     assert(!r.models.some((m) => m.id === "DeepSeek-Flash"), "绝不产出展示名 id");
     assert(r.models.find((m) => m.id === "dfmodel").name === "DeepSeek-Flash", "展示名落在 name");
@@ -485,6 +489,10 @@ async function main() {
     assert(ss.region === "cn", "qoder 产品的自签地区是 cn（不再读 meta.mode）");
     const intl = qSS.makeSelfSign("qoder_intl", { fetchStream: deps.fetchStream, pumpSse: deps.pumpSse, httpJson: stubHttpJson });
     assert(intl.region === "global", "qoder_intl 产品对应 global 区");
+    // 国际版走一遍同一条链路，判它落到的 host：这是开关关闭期唯一能自证「国际版网关取值正确」的方式
+    called = "";
+    const ri = await intl.fetchModelsRemote({ account: { uid: "u9" }, secrets: { token: "jwt" } });
+    assert(ri.ok === true && String(called).startsWith(EP.inferGateway("qoder_intl") + "/algo/"), `国际版自签打在 ${EP.inferGateway("qoder_intl")}（实得 ${called}）`);
   }
 
   // ===== 9. 双路签名：签名器不可用 → 回落自签（fork「零安装可用」卖点） =====
