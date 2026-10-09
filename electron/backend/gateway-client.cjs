@@ -1,10 +1,13 @@
 // 网关子进程的主进程侧监督器（二期 Task 3）+ 主进程注册面（二期 Task 5）。
 //
 // 职责：spawn / 认领 / 看门狗对端（父进程）/ 优雅停机等待 / 命令转发出口 / 事件扇出 /
-//       **全部 proxy_* 命令的 ipcMain 注册面**（44 条：37 条纯转发 + 4 条 UI_LOCAL + 3 条薄包装）。
+//       **全部 proxy_* 命令的 ipcMain 注册面**（条数不在此处手写：以
+//       scripts/dev-gateway-forward-parity-test.cjs 的 ①==②∪新增==③、④⊇② 为准）。
 // 业务实现体一条不在这里——这些命令的实现体在 proxy/index.cjs，经这里的 call() 走管道下发；
 // 仅有的主进程本地逻辑：UI_LOCAL 四条（dialog/shell 的真 UI 依赖）与薄包装成功后的
-// restoreOnLaunch 写权（config.json 归主进程写，子进程永不写）。
+// restoreOnLaunch 写权。config.json 里**只有 restoreOnLaunch 这一键归主进程**；
+// cfg.proxy 的业务键按实现体归属走（poolsync 的共享配置、上游 v1.55 的 checkinAutoRules 都随
+// 子进程的命令实现体写），别把它读成「子进程永不写 config.json」。
 // 为什么主进程侧只 require store 的 proxyDir()：gateway.json 与日志的路径真相源必须与子进程写的
 // 那一份同源（两份解析 = 早晚漂移成两个文件）。这里不调 store.open()，不建库句柄；
 // config.cjs 同理只读写 config.json，不触碰网关 store 的任何数据文件。
@@ -359,7 +362,7 @@ function state() {
   return { ...base, alive: pidAlive(base.pid), connected: !!(conn && conn.connected) };
 }
 
-// ===== 主进程注册面（二期 Task 5）：全部 proxy_* 命令的 ipcMain 注册（现 44 条） =====
+// ===== 主进程注册面（二期 Task 5）：全部 proxy_* 命令的 ipcMain 注册 =====
 
 // 逐字相等闸的三个真相源之一（scripts/dev-gateway-forward-parity-test.cjs）：
 // ① preload.cjs ALLOWED_COMMANDS 的 proxy_* 全集 == ② git show main 一期基线 ∪ 上游用户面新增
@@ -375,6 +378,8 @@ const ALL_PROXY_CMDS = [
   "proxy_account_add", "proxy_account_remove", "proxy_account_toggle", "proxy_account_rename", "proxy_account_cool_off",
   "proxy_account_refresh", "proxy_credits_refresh", "proxy_credits_refresh_channel",
   "proxy_checkin_status", "proxy_checkin_run",
+  // 上游 v1.55 的按渠道自动签到设置：读写整体配置的 proxy.checkinAutoRules，实现体在子进程 index.cjs
+  "proxy_checkin_auto_set",
   "proxy_scan", "proxy_scan_import",
   "proxy_oauth_begin", "proxy_oauth_cancel", "proxy_oauth_submit_callback",
   "proxy_account_import_json", "proxy_account_import_file",
