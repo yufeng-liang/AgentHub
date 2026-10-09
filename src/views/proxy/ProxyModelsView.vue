@@ -346,6 +346,10 @@ const clearStale = (m: ProxyModel) => {
   return writeExcludes(m, keep, "已清除陈旧排除");
 };
 
+/** 弹层打开期间钉住的行序（键 = 模型 id）。为什么需要它见 channelCell.ts 的 frozenIds 说明：
+ *  「被排除的沉底」当场生效会让鼠标底下换成本来就是开的另一行，看着就是「点了没反应」。 */
+const chanFrozen = ref<Record<string, string[]>>({});
+
 /** Popover 的行：顺序与态别由 channelCell 算（结构闸吃同一份实现），「映射」标在这里回填——
  *  反向映射是本机配置，纯函数不接配置才能保持可测。 */
 function chanRowsOf(m: ProxyModel) {
@@ -354,7 +358,17 @@ function chanRowsOf(m: ProxyModel) {
   for (const map of Object.values(rev)) {
     if (map && typeof map === "object" && m.id in map) hit.push(...Object.keys(map));
   }
-  return chanRows(m, channels.value.map((c) => c.id), hit);
+  return chanRows(m, channels.value.map((c) => c.id), hit, chanFrozen.value[m.id] ?? null);
+}
+
+// @show 时冻结：此刻排除态还是打开前的样子，冻的就是用户看到的那一屏顺序。
+// @hide 解除 ⇒ 重新打开才按「沉底」重排。@show 总会覆写，行被虚拟滚动回收而漏掉 @hide
+// 也只会留一条没人读的死值，下次打开即被盖掉。
+function freezeChanOrder(m: ProxyModel) {
+  chanFrozen.value[m.id] = chanRowsOf(m).map((r) => r.id);
+}
+function releaseChanOrder(m: ProxyModel) {
+  delete chanFrozen.value[m.id];
 }
 
 /** 角标跳转：那几把 Key 的路由优先级高于本行排除（server.cjs 里 key.route 在 owners 之前 return），
@@ -687,7 +701,15 @@ onMounted(refresh);
                          明细进 popover 而不是铺成 chips：这列只有 20%，渠道名最长八个字，两颗就撑破
                          ⇒ 换行 ⇒ 破 ROW_H=60 的虚拟滚动垫高数学（见 virtualWindow.ts 顶注）。
                          摘要文案与行序都走 channelCell 的真实现，模板不自己拼——两处拼迟早分叉。 -->
-                    <el-popover placement="bottom-start" :width="272" trigger="click" popper-class="glass-popper" :persistent="false">
+                    <el-popover
+                      placement="bottom-start"
+                      :width="272"
+                      trigger="click"
+                      popper-class="glass-popper"
+                      :persistent="false"
+                      @show="freezeChanOrder(m)"
+                      @hide="releaseChanOrder(m)"
+                    >
                       <template #reference>
                         <span class="chan-sum" :class="chanTone(m)" role="button" tabindex="0" :aria-label="`渠道：${chanSummary(m, activeTab)}（点开调整）`">{{ chanSummary(m, activeTab) }}</span>
                       </template>

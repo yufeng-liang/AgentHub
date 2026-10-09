@@ -50,8 +50,13 @@ export type ChanRow = { id: string; name: string; on: boolean; pinned: boolean; 
 
 /** Popover 行序（定案 Q10c）：反向映射命中的置顶标「映射」→ 其余按内置清单序 → 被排除的沉底。
  *  @param order 内置渠道 id 的权威顺序（渲染层从号池渠道列表拿；这里不写死渠道名，
- *               否则新增渠道又要改两处）。 */
-export function chanRows(m: ProxyModel, order: string[], mappedChannels: string[] = []): ChanRow[] {
+ *               否则新增渠道又要改两处）。
+ *  @param frozenIds 弹层**打开期间**钉住的行序（定案 Q10c 的补充，2026-10-09）：沉底规则若
+ *               当场生效，用户点掉第 1 行后第 2 行会顶到他的鼠标底下且同样是开的——「开关点了
+ *               没反应」的观感就是这么来的。渲染层在 @show 时冻结、@hide 时解除，
+ *               于是顺序只在重新打开时重排。名单里没有的渠道（这期间才出现的）排在末尾，
+ *               彼此仍按默认序。 */
+export function chanRows(m: ProxyModel, order: string[], mappedChannels: string[] = [], frozenIds: string[] | null = null): ChanRow[] {
   const ex = new Set(exOf(m));
   const mapped = new Set(mappedChannels);
   const rank = (id: string) => {
@@ -69,7 +74,13 @@ export function chanRows(m: ProxyModel, order: string[], mappedChannels: string[
   // 先按「映射 > 内置序」排，再把可用的挪到前面、被排除的沉底——两级排序都要稳定，
   // 所以自己算权重而不是连续 sort 两次（后者在 V8 里对相等元素的顺序虽稳定，但读起来像两次都生效）。
   const weight = (r: ChanRow) => (r.on ? 0 : 100) + (r.mapped ? 0 : 10) + rank(r.id);
-  return rows
+  const defaulted = rows
     .sort((a, b) => weight(a) - weight(b))
     .concat(staleExcluded(m).map((id) => ({ id, name: channelName(id), on: false, pinned: false, stale: true, mapped: false })));
+  if (!frozenIds || !frozenIds.length) return defaulted;
+  const pos = new Map(frozenIds.map((id, i) => [id, i]));
+  // 冻结位用 weight() 兜底而不是常量：同一批「不在名单里」的行之间要保序，
+  // 而 Array#sort 只在比较结果确定时才稳定。
+  const frozenRank = (r: ChanRow) => (pos.has(r.id) ? pos.get(r.id)! : frozenIds.length + weight(r));
+  return defaulted.slice().sort((a, b) => frozenRank(a) - frozenRank(b));
 }

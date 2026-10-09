@@ -298,6 +298,17 @@ async function main() {
   const mapRows = chanRows({ id: "y", sources: ["lobster", "trae"], override: "", excluded: [] }, ["trae", "lobster"], ["lobster"]);
   check("㉓e2 反向映射命中的渠道置顶并标「映射」", mapRows[0].id === "lobster" && mapRows[0].mapped === true,
     mapRows.map((r) => `${r.id}${r.mapped ? "(映射)" : ""}`).join(","));
+  // ㉓e3 弹层打开期间冻结行序（2026-10-09）：不传 frozenIds 时 ㉓e 会沉底，
+  //      传了就必须原地不动——否则用户鼠标底下换成本来就开的另一行，「点了没反应」的观感回来了。
+  //      这条对「模板/渲染层根本没把 frozenIds 传下去」同样敏感：那样拿到的就是 ㉓e 的沉底序。
+  const frozenRows = chanRows({ id: "x", sources: ["workbuddy", "trae"], override: "", excluded: ["workbuddy"] }, ["trae", "workbuddy"], [], ["workbuddy", "trae"]);
+  check("㉓e3 冻结序在位：被排除的行不沉底，开关态照实翻转",
+    frozenRows.map((r) => r.id).join(",") === "workbuddy,trae" && frozenRows[0].on === false && frozenRows[1].on === true,
+    frozenRows.map((r) => `${r.id}:${r.on ? "on" : "off"}`).join(","));
+  // ㉓e4 冻结名单外的行（这期间才出现的陈旧排除）只能落到末尾，不许插进冻结序中间把下面的行顶上去
+  const frozenStale = chanRows({ id: "w", sources: ["trae", "workbuddy"], override: "", excluded: ["gone_chan"] }, ["trae", "workbuddy"], [], ["workbuddy", "trae"]);
+  check("㉓e4 冻结名单外的行排在冻结序之后", frozenStale.map((r) => r.id).join(",") === "workbuddy,trae,gone_chan",
+    JSON.stringify(frozenStale.map((r) => [r.id, r.stale])));
   // ㉓f 陈旧排除（渠道已不在 sources 里）要作为灰行出现在末尾，而不是被静默丢掉——
   //     丢掉就没有「一键清除」的入口，配置里那个幽灵 id 永远留着还没人知道。
   const staleRows = chanRows({ id: "z", sources: ["trae"], override: "", excluded: ["gone_chan"] }, ["trae", "workbuddy"]);
