@@ -768,12 +768,16 @@ html[data-theme="light"] .glass-popper .el-month-table td .el-month-table-cell__
    注意：EP 的 select/日期/下拉等弹层根节点同样默认 role="tooltip"
    （popper content role 缺省值），必须整链排除——否则 pointer-events:none
    会让全站下拉/日期面板看得见点不了。
+   .el-popover 也在排除之列（2026-10-09）：模型目录「渠道」列的弹层里是开关与
+   钉定按钮，被这条规则命中后整层穿透，真鼠标点下去命中的是它底下的表格单元格
+   ——「弹层看得见、开关点不动」。它的玻璃外观由 .el-popper.glass-popper 自己给，
+   不依赖本块的 max-width / padding / font-size 覆盖。
    ============================================================ */
-.el-popper[role="tooltip"]:not(.el-select__popper):not(.el-picker__popper):not(.el-dropdown__popper):not(.el-popconfirm__popper):not(.el-cascader__popper),
-.el-popper.is-dark[role="tooltip"]:not(.el-select__popper):not(.el-picker__popper):not(.el-dropdown__popper):not(.el-popconfirm__popper):not(.el-cascader__popper),
-.el-popper.is-light[role="tooltip"]:not(.el-select__popper):not(.el-picker__popper):not(.el-dropdown__popper):not(.el-popconfirm__popper):not(.el-cascader__popper),
-.el-popper.is-dark:not(.el-select__popper):not(.el-picker__popper):not(.el-dropdown__popper):not(.el-popconfirm__popper):not(.el-cascader__popper),
-.el-popper.is-light:not(.el-select__popper):not(.el-picker__popper):not(.el-dropdown__popper):not(.el-popconfirm__popper):not(.el-cascader__popper) {
+.el-popper[role="tooltip"]:not(.el-select__popper):not(.el-picker__popper):not(.el-dropdown__popper):not(.el-popconfirm__popper):not(.el-cascader__popper):not(.el-popover),
+.el-popper.is-dark[role="tooltip"]:not(.el-select__popper):not(.el-picker__popper):not(.el-dropdown__popper):not(.el-popconfirm__popper):not(.el-cascader__popper):not(.el-popover),
+.el-popper.is-light[role="tooltip"]:not(.el-select__popper):not(.el-picker__popper):not(.el-dropdown__popper):not(.el-popconfirm__popper):not(.el-cascader__popper):not(.el-popover),
+.el-popper.is-dark:not(.el-select__popper):not(.el-picker__popper):not(.el-dropdown__popper):not(.el-popconfirm__popper):not(.el-cascader__popper):not(.el-popover),
+.el-popper.is-light:not(.el-select__popper):not(.el-picker__popper):not(.el-dropdown__popper):not(.el-popconfirm__popper):not(.el-cascader__popper):not(.el-popover) {
   max-width: 280px !important;
   width: max-content !important;
   box-sizing: border-box !important;
