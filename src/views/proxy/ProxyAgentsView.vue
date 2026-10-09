@@ -1667,11 +1667,12 @@ onUnmounted(() => {
                 >{{ checkinBusy ? "签到中…" : channelCheckinDone(ch) ? labelsOf(ch.id).done : labelsOf(ch.id).run }}</button>
               </el-tooltip>
               <!-- 自动签到设置（上游 v1.55，按渠道：每天几点 + 抖动分钟；开启后按钮点亮）。
-                   这道能力闸是本仓加的：给没有签到动作的渠道开自动签到，等于每天白发一次注定被拒的请求，
-                   放行集与上游 config.cjs 的 CHECKIN_RULE_CHANNELS 完全一致（zcode 走领取、qoder_intl 与
-                   qoder 同为 isQoderChannel），只是不再被 store.CHANNELS 那种「内置渠道」口径放大到 cline/AutoClaw。 -->
+                   这道能力闸是本仓加的：给没有签到动作的渠道开自动签到，等于每天白发一次注定被拒的
+                   请求。放行集 = CHECKIN_CAPABLE ∪ zcode（zcode 走「一键领取」那条专门分支，
+                   能力表按设计记 false）；不另加 isQoderChannel——那样 qoder_intl 会出现
+                   「有自动签到设置按钮、行内却没有签到按钮」的自相矛盾（真机核验时抓到的）。 -->
               <el-tooltip
-                v-if="checkinCapable(ch.id) || ch.id === 'zcode' || isQoderChannel(ch.id)"
+                v-if="checkinCapable(ch.id) || ch.id === 'zcode'"
                 :content="`${labelsOf(ch.id).auto}设置：自定义每天执行时间与抖动`"
                 placement="top"
               >
