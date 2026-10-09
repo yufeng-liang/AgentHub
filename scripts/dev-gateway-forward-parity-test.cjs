@@ -194,6 +194,22 @@ check("④ ⊇ ②（子进程表覆盖全部 43 条，一条不得少）",
 
 console.log("归属结构证据：主进程两条直连路径收口");
 const COMMENT_LINE = /^\s*(\/\/|\*|\/\*)/;   // 注释里的字样不算（与 dev-write-ownership-test 同一口径）
+
+// UI_LOCAL 集合与它的实现表必须逐字相等。多一个名字而实现表里没有 ⇒ register() 落到 else 分支把
+// 这条命令**转发给子进程**，而子进程对「半段命令」只留了占位 fail() ⇒ 用户点一下拿到一句
+// 看不懂的「该命令的落盘半段只在主进程」。vue-tsc、vite、其余 36 条闸全都看不见这种不对称
+// （本批的 proxy_oplog_export 是这张表的第 5 条，加它的时候正是这条判据要防的场景）。
+const gwSrc = fs.readFileSync(path.join(ROOT, "electron", "backend", "gateway-client.cjs"), "utf8")
+  .split(/\r?\n/).filter((l) => !COMMENT_LINE.test(l)).join("\n");
+const uiLocalNames = ((((gwSrc.match(/const UI_LOCAL = new Set\(\[([\s\S]*?)\]\)/) || [null, ""])[1] || "").match(/"[a-z0-9_]+"/g)) || []).map((s) => s.slice(1, -1));
+const uiImplNames = ((((gwSrc.match(/const UI_LOCAL_IMPL = \{([\s\S]*?)\n\};/) || [null, ""])[1] || "").match(/^[ \t]*([a-z0-9_]+):/gm)) || []).map((s) => s.replace(/[^a-z0-9_]/g, ""));
+check("UI_LOCAL 两张表都解析到内容（解析空转即红，别做静默空闸）",
+  uiLocalNames.length >= 4 && uiImplNames.length >= 4,
+  `集合解析到 ${uiLocalNames.length} 条 / 实现表解析到 ${uiImplNames.length} 条`);
+check("UI_LOCAL == UI_LOCAL_IMPL（多一个名字就没人实现它，少一个名字则实现体永远走不到）",
+  uiLocalNames.length === uiImplNames.length && diff(nameSet(uiLocalNames), nameSet(uiImplNames)).length === 0,
+  "集合有而实现表缺：" + (diff(nameSet(uiLocalNames), nameSet(uiImplNames)).join(", ") || "无")
+  + "；实现表有而集合缺：" + (diff(nameSet(uiImplNames), nameSet(uiLocalNames)).join(", ") || "无"));
 const ipcSrc = fs.readFileSync(path.join(ROOT, "electron", "backend", "ipc.cjs"), "utf8");
 const ipcDirect = ipcSrc.split(/\r?\n/)
   .filter((l) => !COMMENT_LINE.test(l))
