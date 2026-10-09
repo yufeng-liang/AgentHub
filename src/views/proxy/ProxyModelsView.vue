@@ -311,7 +311,7 @@ async function setOverride(m: ProxyModel, v: string) {
   if (v) ov[m.id] = v as ProxyChannelId;
   else delete ov[m.id];
   app.config.proxy.modelOverrides = ov;
-  await persist(v ? `${m.id} → 固定走 ${channelName(v)}` : `${m.id} 恢复自动路由`);
+  await persist(v ? `${m.id} → 首选 ${channelName(v)}` : `${m.id} 恢复自动路由`);
   await refresh();
 }
 
@@ -337,7 +337,9 @@ async function toggleExclude(m: ProxyModel, ch: string) {
   await writeExcludes(m, [...cur], `已${wasExcluded ? "恢复" : "排除"} ${channelName(ch)}${tail}`);
 }
 
-/** 📌 钉定 = 写 modelOverrides（再点一次取消）。与排除互不干涉——两态并存是定案 Q2=B 的全部内容 */
+/** 📌 钉定 = 写 modelOverrides（再点一次取消）。与排除互不干涉——两态并存是定案 Q2=B 的全部内容。
+ *  口径：钉定只定**主渠道**，不改备选队列（server.cjs:113 与 :713），所以界面一律说「首选」
+ *  而不说「只走」，理由见 channelCell.ts 的 chanSummary。 */
 const togglePin = (m: ProxyModel, ch: string) => setOverride(m, m.override === ch ? "" : ch);
 
 /** 一键清除陈旧排除（渠道已不在该模型 sources 里）：只删幽灵 id，不动还有效的排除 */
@@ -617,7 +619,7 @@ onMounted(refresh);
                   <th>思考强度</th>
                   <th>倍率</th>
                   <th>能力<span class="th-sub"> · 编辑</span></th>
-                  <th>渠道<span class="th-sub"> · 点掉=排除 / 📌=钉定</span></th>
+                  <th>渠道<span class="th-sub"> · 点掉=排除 / 📌=首选</span></th>
                   <th style="text-align: center">状态</th>
                 </tr>
               </thead>
@@ -741,7 +743,7 @@ onMounted(refresh);
                               <span v-if="r.stale" class="chan-tag-stale">（已下架）</span>
                             </span>
                             <span class="chan-pop-acts">
-                              <el-tooltip :content="r.pinned ? '已钉定到该渠道，再点一次取消' : '只走这个渠道'" placement="left">
+                              <el-tooltip :content="r.pinned ? '已钉定到该渠道，再点一次取消' : '设为首选渠道（它降级或耗尽时，请求仍会转到其它未排除的渠道）'" placement="left">
                                 <button class="chan-pin" :class="{ on: r.pinned }" :disabled="r.stale" @click="togglePin(m, r.id)">📌</button>
                               </el-tooltip>
                               <!-- 定案 Q8=A：钉定态下这颗开关置灰不可点——「既钉到别家、又把它排除」
@@ -756,6 +758,12 @@ onMounted(refresh);
                                 ></div>
                               </el-tooltip>
                             </span>
+                          </div>
+                          <!-- 钉定只管主渠道，备选队列照旧（server.cjs:113 / :713）。
+                               这行存在的意义是否证「📌=独占」这个误读——不写出来，用户会在
+                               主渠道熔断后想不通请求为什么跑到别家去了。 -->
+                          <div v-if="m.override" class="chan-pop-foot chan-pop-pin-note">
+                            📌 只定主渠道：它降级或耗尽时，请求仍会转到其它未排除的渠道。要彻底锁死这一家，请到「配置 · 反代网关」关掉「跨渠道自动转移」。
                           </div>
                           <div v-if="staleExcluded(m).length" class="chan-pop-foot">
                             <button class="btn btn-sm btn-ghost" @click="clearStale(m)">清除 {{ staleExcluded(m).length }} 项陈旧排除</button>
@@ -910,7 +918,7 @@ onMounted(refresh);
             </el-tooltip>
           </header>
           <div class="rule-body">
-            <div class="rule-item"><b>1. 渠道路由：</b>模型仅存在于单渠道 → 强制走该渠道；多源重叠 → per-model 覆盖优先，否则按路由策略打分。</div>
+            <div class="rule-item"><b>1. 渠道路由：</b>模型仅存在于单渠道 → 强制走该渠道；多源重叠 → per-model 覆盖（📌）优先，否则按路由策略打分。📌 只定<b>主渠道</b>：它降级或耗尽时，请求仍会按配置页「跨渠道自动转移」转到其它未排除的渠道；要彻底锁死这一家，把那个开关关掉。</div>
             <div class="rule-item"><b>2. 自定义模型映射：</b>请求入口先把别名解析为实际模型再路由（响应模型字段保持请求值）。</div>
             <div class="rule-item"><b>3. 反向模型映射：</b>一个统一请求名映射到各渠道不同模型名，渠道确定后自动转为该渠道模型转发（响应保持统一请求名）。</div>
             <div class="rule-item"><b>4. 上下文与思考强度：</b>支持在表格中行内自定义覆盖，修改后即时注入出站参数并反映在模型目录。</div>
@@ -1453,6 +1461,12 @@ onMounted(refresh);
 }
 .chan-keys-hint {
   color: var(--text-3);
+}
+/* 钉定态的「只管主渠道」说明：整段是解释性文字，压到三级灰 + 小一号，别跟操作行抢重心 */
+.chan-pop-pin-note {
+  color: var(--text-3);
+  font-size: 11px;
+  line-height: 1.5;
 }
 /* 状态列：开关固有宽 42px（40 + 1px 双边框），是表里唯一的交互控件，
    被列宽切掉就点不准。左右 padding 收到 2px、列宽给 7.5%。

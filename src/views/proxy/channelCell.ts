@@ -26,13 +26,17 @@ export function staleExcluded(m: ProxyModel): string[] {
 /** 格子里的摘要：只报结果态。
  *  被排除渠道的全名不进格子（定案 Q10a）——渠道名最长八个字，20% 的列宽放两颗就撑破，
  *  而这条信息属于「点开看」的层级。
+ *  钉定态一律写「首选 X」而不是「只走 X」（2026-10-09）：modelOverrides 在 server.cjs:113
+ *  只决定主渠道，备选队列仍取「其余未排除的拥有该模型的渠道」（:713），主渠道降级或耗尽时
+ *  请求照转。写成「只走」是对路由行为的假陈述——它会让用户在主渠道熔断后完全想不到请求
+ *  其实已经换了一家。真要独占请到配置页关掉「跨渠道自动转移」。
  *  @param only 顶部渠道 chip 选中时传该渠道 id：整列降为一颗开关，摘要也说这一件事（定案 Q5=C）。 */
 export function chanSummary(m: ProxyModel, only?: string): string {
   if (only) {
     const off = new Set(exOf(m));
     return off.has(only) ? `已排除 ${channelName(only)}` : `走 ${channelName(only)}`;
   }
-  if (m.override) return `📌 ${channelName(m.override)}`;
+  if (m.override) return `📌 首选 ${channelName(m.override)}`;
   const live = liveCount(m);
   if (!live) return "全部已排除";
   return `自动路由 · ${live} 渠道`;

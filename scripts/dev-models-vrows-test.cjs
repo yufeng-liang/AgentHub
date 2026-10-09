@@ -329,13 +329,24 @@ async function main() {
     /chan-excluded/.test(one) && /chan-pinned/.test(row3),
     `首行 ${JSON.stringify((/class="(chan-sum[^"]*)"/.exec(one) || [])[1])} / 第4行 ${JSON.stringify((/class="(chan-sum[^"]*)"/.exec(row3) || [])[1])}`);
 
+  // ㉕b/㉕c 钉定态的措辞是路由事实的一部分（2026-10-09）：modelOverrides 在 server.cjs:113
+  //      只决定主渠道，备选队列照旧取「其余未排除的拥有者」（:713），主渠道降级时请求照转。
+  //      写成「只走/固定走」等于对产品行为做假陈述，用户会在主渠道熔断后想不通请求为什么换了一家。
+  const pinSum = chanSummary({ id: "p", sources: ["trae", "workbuddy"], override: "trae", excluded: [] });
+  check(`㉕b 钉定摘要说「首选」而不说独占：「${pinSum}」`, /首选/.test(pinSum) && !/只走|固定走|仅走|独占/.test(pinSum));
+  const viewSrc = fs.readFileSync(path.join(ROOT, FILE), "utf8");
+  check("㉕c 视图里不再出现「只走这个渠道」/「固定走」两处独占式文案",
+    !/只走这个渠道/.test(viewSrc) && !/固定走/.test(viewSrc),
+    JSON.stringify((viewSrc.match(/.{0,20}(?:只走这个渠道|固定走).{0,20}/g) || []).slice(0, 3)));
+
   // ===== E++. 能力列全显的两条补充判据 =====
   // ㉗ 未知输出上限要显式给 ↑—：静默不显会让人以为这模型没有上限，而不是「不知道」
   const noOut = { ...models[0], maxOutputTokens: 0 };
   check("㉗ maxOutputTokens 未知时能力列含 ↑—", capabilityTags(noOut).includes("↑—"), JSON.stringify(capabilityTags(noOut)));
   // ㉘ 能力标签只接一个入参 —— 钉住「没有窄宽度降档」这个实测结论：
-  //     表挂 min-width:860 + table-layout:fixed ⇒ 能力格最窄也有 ~204px，五枚加铅笔约 120px
-  //     （真机实测余 102px）。谁要重新引入 compact 档，得先证明格子会窄过 204，
+  //     表挂 min-width:860 + table-layout:fixed ⇒ 19.5% 的能力格最窄也有 ~157px 可视宽，
+  //     而真表 176 行逐行扫下来内容最宽 112px，加上「覆盖」徽标按 146px 计（2026-10-09 回校后）
+  //     ⇒ 仍放得下。谁要重新引入 compact 档，得先证明格子会窄过 146，
   //     而不是像最初那版一样在默认窗口就把「视」白白砍掉。
   check("㉘ capabilityTags 只接一个入参（降档机制已按实测删除）", capabilityTags.length === 1, `形参数 ${capabilityTags.length}`);
 
