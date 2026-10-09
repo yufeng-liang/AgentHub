@@ -243,15 +243,27 @@ const realFetch = globalThis.fetch;
   ok("userinfo 失败仍落库（uid 用 poll 的 user_id、名兜底、到期缺省 now+30 天）", !!acc2 && acc2.name === "Qoder 账号" && acc2.meta.mode === "cn" && seen.some((s) => s.url.startsWith("https://openapi.qoder.com.cn/api/v1/deviceToken/poll")) && row2.expires_at > Date.now() + 29 * 86400 * 1000, acc2 && { name: acc2.name, meta: acc2.meta, exp: row2.expires_at });
 
   // 区服由**渠道 id** 决定（qoder=CN / qoder_intl=global），edition 这个登录参数不再被读。
-  // 旧契约是「edition=intl 且开关未开 ⇒ 当场拒绝」；现在 qoder_intl 按开关条件注册，
-  // 开关关时它连渠道都不存在（下面第二条钉的就是这件事），开关开时它是合法渠道。
   const ri = await discovery.beginOAuth("qoder", { edition: "intl" }, () => {});
   ok("qoder 渠道即使带 edition=intl 也落 CN 授权页（区服跟随渠道 id）", ri.ok === true && /^https:\/\/qoder\.com\.cn\/device\/selectAccounts\?/.test(ri.url), ri.url || ri);
   await drain();
-  // beginOAuth 是 async：同步 try 抓不到它的 throw（会变成 rejected promise），必须 await 收错误。
-  let intlErr = "";
-  try { await discovery.beginOAuth("qoder_intl", {}, () => {}); } catch (e) { intlErr = String((e && e.message) || e); }
-  ok("国际版渠道在开关关闭时根本不存在（不会半接入）", /未知渠道 qoder_intl/.test(intlErr), intlErr || "没抛错");
+
+  // 国际版是独立渠道（store.QODER_INTL_ENABLED=true 后它真的注册了）：授权页与轮询都落 global 区，
+  // 账号进 qoder_intl 池而不是混进 CN 池。开关若被关回去，beginOAuth 会回「未知渠道」，
+  // 这两条一起红——它们同时是「渠道已接入」和「区服不再读登录参数」的证据。
+  resetClock(); seen = []; polls = 0; done = null;
+  globalThis.fetch = async (url, opts) => {
+    seen.push({ url, opts });
+    if (url.includes("/api/v1/deviceToken/poll")) return resp(200, { token: "i-access", refresh_token: "i-rt", user_id: "uid-i-1" });
+    if (url.includes("/api/v1/userinfo")) return resp(200, { data: { id: "uid-i-1", nickname: "Intl User", email: "i@q.com" } });
+    return resp(500, {});
+  };
+  const rint = await discovery.beginOAuth("qoder_intl", {}, (x) => { done = x; });
+  ok("国际版渠道已注册：授权页落 global 门户（qoder.com）", rint.ok === true && /^https:\/\/qoder\.com\/device\/selectAccounts\?/.test(rint.url), rint.url || rint);
+  await drain();
+  const polInt = seen.find((s) => s.url.includes("/deviceToken/poll"));
+  ok("国际版轮询打 global 区 openapi 域（不借 CN 的域）", !!polInt && polInt.url.startsWith("https://openapi.qoder.sh/api/v1/deviceToken/poll"), polInt && polInt.url);
+  const accInt = store.listAccounts("qoder_intl").find((a) => a.uid === "uid-i-1");
+  ok("国际版账号落 qoder_intl 池且 meta.mode=global", !!accInt && accInt.meta.mode === "global" && !store.listAccounts("qoder").some((a) => a.uid === "uid-i-1"), accInt && accInt.meta);
 
   // refresh_token 含 | 判无效（§2.3）→ 不落库、继续轮；取消后不再排期
   resetClock(); seen = []; polls = 0; done = null;

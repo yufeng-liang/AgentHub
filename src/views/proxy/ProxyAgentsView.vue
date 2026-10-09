@@ -83,9 +83,10 @@ const CHANNEL_META: Record<ProxyBuiltinChannelId, { icon: string; hint: string }
   zcode: { icon: "ph-lightning", hint: "GLM 编码套餐 · 领奖励 · 切号保远程" },
   zcode_intl: { icon: "ph-lightning", hint: "GLM 编码套餐 · 国际区（薄别名渠道）" },
 
-  // Qoder 无回环 OAuth（登录在官方客户端内完成，凭据落在加密信封里）→ 只走本机导入/文件/粘贴
+  // Qoder 双区：登录走官方授权页的设备码（PKCE），本机导入只是可选路径；
+  // 两条渠道各管自己的号池与目录（区服由渠道 id 决定，不在弹窗里切）。
   qoder: { icon: "ph-compass", hint: "设备授权登录 · 本机导入 · 去客户端领每日 Credits" },
-  qoder_intl: { icon: "ph-globe-hemisphere-west", hint: "国际版 · 无静态模型兜底，添加后点「拉取模型」取官方目录" },
+  qoder_intl: { icon: "ph-globe-hemisphere-west", hint: "国际版 · 独立号池与目录 · 需充值才有可用模型" },
 };
 // 自定义提供商只有 API Key：没有登录态、没有签到、没有余额概念，措辞要与生态渠道明确区分
 const PROVIDER_META = { icon: "ph-plugs-connected", hint: "API Key 轮转 · 无余额概念" };

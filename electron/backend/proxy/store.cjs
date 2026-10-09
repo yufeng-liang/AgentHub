@@ -144,16 +144,16 @@ CREATE INDEX IF NOT EXISTS idx_usage_model ON usage_requests(model, ts);
  *  costTier = 成本档种子默认（上游 v1.50 的 cost-first 路由排序用）：free=免费额度渠道 /
  *  low=签到白送类 / 不带=未标注（运行时按 normal 解释）。仅收有把握的两条，宁缺勿滥——
  *  错标 free 会把付费渠道排前面烧钱。
- *  Qoder 双区（上游 v1.43 起）：CN 与 INTL 账号与额度池互不相通，各自独立号池；两处签名都
- *  依赖本机安装的对应客户端（wasm 提取），凭据可导入但未装客户端时不可调用。
+ *  Qoder 双区（上游 v1.43 起）：CN 与 INTL 账号与额度池互不相通，各自独立号池。
+ *  签名有两条路：上游从本机安装的客户端里取 wasm（未装即 503），fork 另有一条纯 JS COSY
+ *  自签（零安装可用，两区同构，参考实现 agent2api 的 cosy.rs 是同族同版本），所以
+ *  「没装客户端」不再等于「不可调用」。
  *  INTL 免费额度不含 DeepSeek-Flash / GLM-5.3-Flash 等（需充值或额度覆盖才有可用模型），
  *  界面上要按渠道给出该提示，别让用户以为国际版和 CN 版模型集等价。
- *  ⚠ 本次合并（上游 v1.41–v1.50）先把该开关关掉：本分支此时仍用内联的 qoder 适配器
- *  （单渠道 + meta.mode 切区），ADAPTERS 里没有 qoder_intl 这个键。开着它会让
- *  上游 discovery.scanQoder 交出 channel=qoder_intl 的候选，而 adapters.get() 回 undefined，
- *  导入直接报「未知渠道」。下一个提交（Qoder 归一：改用上游 qoderAdapter/qoderAuth/qoderSigner
- *  双区工厂 + 移植本分支独有的四项能力）把它打开。 */
-const QODER_INTL_ENABLED = false;
+ *  2026-10-09 起该开关为 true：适配器按开关条件注册、扫描导入与登录分发都跟随它，
+ *  intl 的推理基址按账号令牌种类在 api2/api3 之间选（qoderEndpoints.inferenceBase）。
+ *  ⚠ 尚未用真国际版账号端到端验过——闸全是假上游，取值出处见那个模块的头注释。 */
+const QODER_INTL_ENABLED = true;
 
 const BUILTIN_CHANNELS = [
   { id: "trae", display: "Trae SOLO CN", domain: "api.trae.cn", unit: "积分" },
