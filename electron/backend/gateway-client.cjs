@@ -373,6 +373,8 @@ const ALL_PROXY_CMDS = [
   "proxy_status", "proxy_start", "proxy_stop", "proxy_restart",
   "proxy_keys_list", "proxy_key_create", "proxy_key_update", "proxy_key_delete",
   "proxy_pool", "proxy_pool_strategy",
+  // 上游 v1.58.0 的渠道启闭（「上游启闭」弹窗）：读写整体配置的 proxy.channelEnabled，实现体在子进程
+  "proxy_channel_list", "proxy_channel_toggle",
   // 上游 v1.50 的渠道成本档读写（cost-first 排序）：实现体在子进程 index.cjs，主进程只转发
   "proxy_pool_tier",
   "proxy_account_add", "proxy_account_remove", "proxy_account_toggle", "proxy_account_rename", "proxy_account_cool_off",
@@ -386,6 +388,10 @@ const ALL_PROXY_CMDS = [
   "proxy_models", "proxy_models_sync",
   "proxy_ide_switch", "proxy_ide_status",
   "proxy_stats_overview", "proxy_stats_top", "proxy_stats_detail", "proxy_stats_request", "proxy_stats_cleanup", "proxy_recent",
+  // 上游 v1.57.0 的操作日志：查询/类型下拉纯转发；导出是半段命令——子进程出 xlsx 字节
+  // （proxy_oplog_export_rows，读权在 op_logs 那一侧），主进程落进「下载」目录（app.getPath 在
+  // ELECTRON_RUN_AS_NODE 的子进程里拿不到，与 openAuthWindow 同型）。
+  "proxy_oplog_list", "proxy_oplog_ops", "proxy_oplog_export",
   "proxy_rules_list", "proxy_open_rules_dir", "proxy_open_data_dir", "proxy_vault_status",
   "proxy_poolsync_status", "proxy_poolsync_run", "proxy_poolsync_cancel",
   "proxy_ccswitch_status", "proxy_ccswitch_register",
@@ -402,10 +408,10 @@ const ALL_PROXY_CMDS = [
   "proxy_zcode_claim_mode", "proxy_zcode_restore_mid",
 ];
 
-// 4 条真 UI 依赖（规格 §5.7 归属定案）：实现体在本文件，不经管道（dialog/shell 子进程拿不到）。
+// 5 条真 UI 依赖（规格 §5.7 归属定案）：实现体在本文件，不经管道（dialog/shell/app.getPath 子进程拿不到）。
 // proxy_status / proxy_vault_status 规格漏判、实测可转发：它们的 electron 依赖 vaultOk() 已在
 // Task 1 换成 secretbox.backend()（§偏差 D1）。
-const UI_LOCAL = new Set(["proxy_account_import_file", "proxy_open_rules_dir", "proxy_open_data_dir", "proxy_oauth_begin"]);
+const UI_LOCAL = new Set(["proxy_account_import_file", "proxy_open_rules_dir", "proxy_open_data_dir", "proxy_oauth_begin", "proxy_oplog_export"]);
 // 3 条薄包装：转发给子进程，成功后由**主进程**写 config.json 的 restoreOnLaunch（写权归主进程）。
 const RUN_WRITE = new Set(["proxy_start", "proxy_stop", "proxy_restart"]);
 // import_file 拆两段的字节上限：管道单帧 8MB（超限即断连，gateway-proto），base64 再膨胀 1/3。
@@ -520,11 +526,29 @@ async function oauthBeginCmd(args) {
   }
 }
 
+/** UI_LOCAL · 操作日志导出（上游 v1.57.0 的半段命令）：向子进程要 xlsx 字节，由主进程写进系统
+ *  「下载」目录。上游把整条 handler 放在子进程里用 `require("electron").app.getPath`，而本 fork 的
+ *  网关子进程以 ELECTRON_RUN_AS_NODE 启动 —— 那里 `require("electron")` 是路径字符串，app 为
+ *  undefined，一点导出就 TypeError。文件名字节都由子进程生成（时间戳 + .xlsx），不含用户输入。 */
+async function oplogExportCmd(args) {
+  const s = await ensureStarted();
+  if (!s.ok) return { ok: false, message: "后台网关未能启动：" + s.message };
+  const r = await call("proxy_oplog_export_rows", args || {});
+  if (!r || !r.ok) return { ok: false, message: String((r && r.message) || "导出失败") };
+  const { app } = require("electron");
+  const dir = app.getPath("downloads");
+  const file = path.join(dir, String(r.fileName || "proxy-oplog.xlsx"));
+  fs.writeFileSync(file, Buffer.from(String(r.base64 || ""), "base64"));
+  const count = Number(r.count) || 0;
+  return { ok: true, path: file, count, message: count ? `导出成功（${count} 条记录）：${file}` : "导出成功，但当前筛选条件下没有任何记录" };
+}
+
 const UI_LOCAL_IMPL = {
   proxy_account_import_file: importFileCmd,
   proxy_open_rules_dir: () => openDirCmd("rules"),
   proxy_open_data_dir: () => openDirCmd("data"),
   proxy_oauth_begin: oauthBeginCmd,
+  proxy_oplog_export: oplogExportCmd,
 };
 
 /** 注册主进程侧全部 proxy_* 命令（ipc.cjs 唯一的网关注册入口；与 preload 白名单一字不差的对应面）。 */

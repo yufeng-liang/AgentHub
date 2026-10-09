@@ -76,10 +76,11 @@ function parseSessionFile(file, deviceId, deviceName, since) {
     const key = `${turn}:${step}`;
 
     if (t === "request/header") {
-      const model = d.header?.config?.model;
-      // 初始化必须在赋值前无条件执行：header 行可缺 model，若该 step 无前序 message，裸赋值会在 undefined 上抛 TypeError
+      // 条目必须先初始化：header 缺 model 时（罕见）原实现未创建条目即赋值，
+      // TypeError 会冒泡到 collectLocal 的单源 catch，导致整个 raccoon 源被跳过漏采
       byStep[key] = byStep[key] || {};
-      byStep[key].model = model;
+      const model = d.header?.config?.model;
+      if (model) byStep[key].model = model;
       byStep[key].reqTime = item.time;
     } else if (t === "assistant/message") {
       const u = d.message?.usage;

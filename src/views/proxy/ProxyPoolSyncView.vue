@@ -18,7 +18,10 @@ let offEvent: (() => void) | undefined;
 /** 同步范围渠道：id 取自号池实际渠道（隐藏渠道不出现，新增渠道自动跟进），
  *  label 取自权威显示名表 CHANNEL_NAMES。
  *  此前这里手抄了一遍渠道名，已经漂过：zcode_intl 写成「ZCode（智谱·国际）」而权威表是
- *  「ZCode 智谱（国际）」——scripts/dev-channel-names-test.cjs 的 ⑦⑧ 就是钉这件事的。 */
+ *  「ZCode 智谱（国际）」——scripts/dev-channel-names-test.cjs 的 ⑦⑧ 就是钉这件事的。
+ *  上游 v1.58.0 把它换成了 loadChannels()+c.display，两条都是要退回去的：label 用 display 就是
+ *  重新手抄一份口径，且不再排除 openai_compat（提供商会被喂进同步范围）。渠道启闭带来的
+ *  「目标渠道被关闭要回落」语义已并入下方 onMounted（proxyPool 本身已按 channelOn 过滤）。 */
 const channels = ref<ProxyChannelView[]>([]);
 const CHANNELS = computed<{ id: ProxyBuiltinChannelId | ""; label: string }[]>(() => [
   { id: "", label: "全部渠道" },
@@ -70,7 +73,11 @@ function onEvent(e: unknown) {
 onMounted(() => {
   refreshStatus();
   // 渠道清单是本页唯一的操作范围：取不到就只剩「全部渠道」一档，所以报错写进 err 而不是静默吞掉
-  api.proxyPool().then((v) => (channels.value = v)).catch((e) => (err.value = String((e as Error).message || e)));
+  api.proxyPool().then((v) => {
+    channels.value = v;
+    // 上游启闭：目标渠道被关闭（或号池里已不存在）时回落「全部」，别让它悬在一个选不中的选项上
+    if (targetChannel.value && !v.some((c) => c.id === targetChannel.value)) targetChannel.value = "";
+  }).catch((e) => (err.value = String((e as Error).message || e)));
   offEvent = api.onUpdateEvent(onEvent);
 });
 onUnmounted(() => {

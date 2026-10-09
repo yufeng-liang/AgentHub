@@ -104,7 +104,10 @@ try {
 } catch (e) {
   check("④ dispatchTable() 可在纯 Node 收集", false, String((e && e.message) || e));
 }
-const newSubCmds = ["proxy_account_import_blob", "proxy_poolsync_password_changed"];
+const newSubCmds = ["proxy_account_import_blob", "proxy_poolsync_password_changed",
+  // 上游 v1.57.0 操作日志导出的子进程半边：查询 + 生成 xlsx 字节在这里，落盘在主进程
+  // （UI_LOCAL proxy_oplog_export 用 app.getPath("downloads")，子进程 ELECTRON_RUN_AS_NODE 拿不到）
+  "proxy_oplog_export_rows"];
 // 一期基线之外的「用户面」新命令：渲染层真会调用它们 ⇒ 必须同时进 preload 白名单（①）、
 // 主进程转发面（③）与子进程实现体（④）。与 newSubCmds 的分工：那些是子进程内部辅助半段
 // （不过 preload，渲染层看不见，只进 ④ 的白名单），这里每一条则是完整的一条命令面。
@@ -146,6 +149,13 @@ const extraUserCmds = [
   // 上游 v1.55 的按渠道自动签到设置：写的是 config.json 的 proxy.checkinAutoRules（与 poolsync
   // applyShared 写 cfg.proxy 同一条子进程路径，读侧 tick 每 60s 热读），不是第二份主进程写者
   { name: "proxy_checkin_auto_set", why: "自动签到按渠道设置：写 cfg.proxy.checkinAutoRules（上游 v1.55，号池页弹窗）" },
+  // 上游 v1.57.0 操作日志三条 + v1.58.0 渠道启闭两条。导出那条的落盘半段在主进程（UI_LOCAL），
+  // 但按 import_file 的同款工序在子进程留了占位名 ⇒ 仍进本名单，让「④ 必须含实现体」这条红照旧成立。
+  { name: "proxy_oplog_list", why: "操作日志分页查询：读 stats.db 的 op_logs（上游 v1.57，日志页签）" },
+  { name: "proxy_oplog_ops", why: "操作日志类型下拉：读 stats.db 的 op_logs 去重（上游 v1.57）" },
+  { name: "proxy_oplog_export", why: "操作日志导出：子进程只留占位名，字节半边 proxy_oplog_export_rows，落盘归主进程 UI_LOCAL（上游 v1.57）" },
+  { name: "proxy_channel_list", why: "渠道启闭弹窗数据源：读号池视图（含 config 的 channelEnabled），上游 v1.58" },
+  { name: "proxy_channel_toggle", why: "渠道启闭开关：写 cfg.proxy.channelEnabled（上游 v1.58，与 poolsync.applyShared 同一条子进程写 cfg.proxy 的路径）" },
 ];
 const upstreamUserNames = extraUserCmds.map((c) => c.name);
 check("④ 子进程表含 proxy_account_import_blob（import_file 拆两段的子进程半段）",
@@ -184,6 +194,22 @@ check("④ ⊇ ②（子进程表覆盖全部 43 条，一条不得少）",
 
 console.log("归属结构证据：主进程两条直连路径收口");
 const COMMENT_LINE = /^\s*(\/\/|\*|\/\*)/;   // 注释里的字样不算（与 dev-write-ownership-test 同一口径）
+
+// UI_LOCAL 集合与它的实现表必须逐字相等。多一个名字而实现表里没有 ⇒ register() 落到 else 分支把
+// 这条命令**转发给子进程**，而子进程对「半段命令」只留了占位 fail() ⇒ 用户点一下拿到一句
+// 看不懂的「该命令的落盘半段只在主进程」。vue-tsc、vite、其余 36 条闸全都看不见这种不对称
+// （本批的 proxy_oplog_export 是这张表的第 5 条，加它的时候正是这条判据要防的场景）。
+const gwSrc = fs.readFileSync(path.join(ROOT, "electron", "backend", "gateway-client.cjs"), "utf8")
+  .split(/\r?\n/).filter((l) => !COMMENT_LINE.test(l)).join("\n");
+const uiLocalNames = ((((gwSrc.match(/const UI_LOCAL = new Set\(\[([\s\S]*?)\]\)/) || [null, ""])[1] || "").match(/"[a-z0-9_]+"/g)) || []).map((s) => s.slice(1, -1));
+const uiImplNames = ((((gwSrc.match(/const UI_LOCAL_IMPL = \{([\s\S]*?)\n\};/) || [null, ""])[1] || "").match(/^[ \t]*([a-z0-9_]+):/gm)) || []).map((s) => s.replace(/[^a-z0-9_]/g, ""));
+check("UI_LOCAL 两张表都解析到内容（解析空转即红，别做静默空闸）",
+  uiLocalNames.length >= 4 && uiImplNames.length >= 4,
+  `集合解析到 ${uiLocalNames.length} 条 / 实现表解析到 ${uiImplNames.length} 条`);
+check("UI_LOCAL == UI_LOCAL_IMPL（多一个名字就没人实现它，少一个名字则实现体永远走不到）",
+  uiLocalNames.length === uiImplNames.length && diff(nameSet(uiLocalNames), nameSet(uiImplNames)).length === 0,
+  "集合有而实现表缺：" + (diff(nameSet(uiLocalNames), nameSet(uiImplNames)).join(", ") || "无")
+  + "；实现表有而集合缺：" + (diff(nameSet(uiImplNames), nameSet(uiLocalNames)).join(", ") || "无"));
 const ipcSrc = fs.readFileSync(path.join(ROOT, "electron", "backend", "ipc.cjs"), "utf8");
 const ipcDirect = ipcSrc.split(/\r?\n/)
   .filter((l) => !COMMENT_LINE.test(l))

@@ -260,6 +260,9 @@ function editReverseAlias(name: string, targetMap: Record<string, string>) {
   reverseTargets.value = { ...targetMap };
 }
 
+// 上游这份 refresh() 不收：本分支把 channels 与 poolViews 合成一次 proxyPool() 喂两边
+// （见下方那处的注释），照抄会变成同名函数重复声明，且把两次 IPC 打回来。
+// 它带来的「关闭渠道时页签回落」语义已经并入下面 fork 版 refresh 的 views 分支。
 /** 管理态写回整体配置（save 即热生效；保存后重拉对齐服务端口径） */
 async function persist(successMsg: string) {
   const r = await app.save();
@@ -280,6 +283,9 @@ async function refresh() {
     if (views) {
       channels.value = views;
       poolViews.value = views;
+      // 渠道启闭：当前页签指向被关闭的渠道时回落「全部」（上游 v1.58.0 启闭后模型页要立即跟随）。
+      // 判据落在这份响应上而不是 channels 上：号池视图已按 channelOn 过滤，被关闭的渠道根本不在列表里。
+      if (activeTab.value && !views.some((c) => c.id === activeTab.value)) activeTab.value = "";
     }
     err.value = "";
   } catch (e) {

@@ -334,6 +334,8 @@ export interface ProxyConfig {
   channelCooldownCapMs: number;
   /** 按渠道自动签到：{ [渠道 id]: 规则 }，号池页各渠道工具栏各自设置（默认全关） */
   checkinAutoRules: Record<string, ProxyCheckinAutoRule>;
+  /** 渠道启闭（「上游启闭」弹窗）：{ [渠道 id]: true|false }，缺省 = 启用；关闭的渠道全部页面动态隐藏 */
+  channelEnabled: Record<string, boolean>;
   /** 生态接入默认模型（注册进 CC Switch 时使用，缺省取 fallbackModel） */
   ccSwitchModel: string;
   /** 系统提示词策略：passthrough=原样透传（默认）/ custom=替换客户端 system / append=追加网关 system */
@@ -509,7 +511,10 @@ export interface ProxyChannelView {
   display: string;
   domain: string;
   kind: ProxyChannelKind;
-  /** 提供商可停用（停用即从路由视图消失）；内置渠道恒 true */
+  /** 这一行「当前能不能用」，两个写者按 kind 分工（后端 poolView 一处算，别在这儿各写一份）：
+   *  · 内置渠道 = 上游启闭弹窗的 proxy.channelEnabled（false 即从号池/模型/同步页与侧栏计数里退场）；
+   *  · 自建提供商 = 提供商页那个停用开关（停用的行仍在号池里要看到账号，但不计入「已启用上游」）。
+   *  上游 v1.58 原先在接口尾部又声明了一遍同名字段（只讲渠道启闭），两边语义撞车 ⇒ 合成这一条。 */
   enabled?: boolean;
   /** 仅 openai_compat：已归一化的上游地址（写入侧一次成型，展示与拼接同源） */
   baseUrl?: string;
@@ -638,6 +643,27 @@ export interface ProxyStatsDetail {
   page: number;
   pageSize: number;
   rows: ProxyUsageRow[];
+}
+
+/** 反代网关操作日志（proxy_oplog_list / proxy_oplog_export 的行；op_logs 表） */
+export interface ProxyOpLogRow {
+  id: number;
+  ts: number;
+  /** info = 成功/常规；warn = 降级/需人工/4xx；error = 失败/5xx/网络 */
+  level: string;
+  /** 操作分类（代理请求 / 签到 / 网关启停 / API Key / 号池账号 / 网关配置 / OAuth 登录 / 模型目录 / 切换账号 / 生态接入 / 号池同步 / 自动签到 / 冷却与风控） */
+  op: string;
+  message: string;
+  channel: string;
+  /** 对象（账号名 / Key 名 / uid 等业务主体） */
+  target: string;
+  /** 详情（上游错误轨迹等，列表里 tooltip 展示） */
+  detail: string;
+}
+
+export interface ProxyOpLogList {
+  rows: ProxyOpLogRow[];
+  total: number;
 }
 
 export interface ModelCustomEntry {
@@ -905,6 +931,7 @@ export const MODULES: ModuleDef[] = [
       { id: "stats", name: "用量统计" },
       { id: "poolsync", name: "号池同步" },
       { id: "ccswitch", name: "生态接入" },
+      { id: "proxylog", name: "日志" },
     ],
   },
   {

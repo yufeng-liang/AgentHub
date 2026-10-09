@@ -182,6 +182,8 @@ function defaultConfig() {
       channelCooldownCapMs: 900000,  // 渠道降级指数退避封顶（15 分钟）
       checkinAutoRules: {},     // 按渠道自动签到：{ [渠道 id]: { enabled, time:"HH:mm", jitterMin } }，
                                 // 号池页各渠道工具栏各自设置（时间/抖动独立；默认全关）
+      channelEnabled: {},       // 渠道启闭（「上游启闭」弹窗）：{ [渠道 id]: true|false }，缺省 = 启用。
+                                // 关闭的渠道在反代网关全部页面隐藏，路由/调用/调度也不再使用，重新打开立即恢复
       ccSwitchModel: "",        // 生态接入默认模型（注册进 CC Switch 时使用，缺省取 fallbackModel）
       // 系统提示词策略（借鉴 workbuddy2api-panel）：passthrough=原样透传（默认，行为不变）/
       // custom=用网关提示词替换客户端 system / append=在客户端 system 后追加网关提示词。见 promptPolicy.cjs
