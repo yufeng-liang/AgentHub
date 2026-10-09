@@ -594,15 +594,20 @@ onMounted(refresh);
                    能力列加宽（7.5%→14%）：去掉了与上下文列重复的 K/M 数字后，这列现在是
                    「chips + 编辑入口 + 覆盖徽标」三合一。
                    2026-10-08 合并列：「来源渠道 13%」+「渠道覆盖 15.5%」并成一列常驻的「渠道」20%，
-                   腾出的 8.5% 给能力列（14%→22.5%）以全显五枚标签。七列合计仍是 97%，
-                   余量由浏览器按比例摊给各列；窄宽度降级顺序见 channelCell.ts 的 CAP_COMPACT_BELOW。 -->
+                   腾出的 8.5% 给能力列（14%→22.5%）以全显五枚标签。
+                   2026-10-09 宽度回校：22.5% 是按「五枚全显」的上限给的，真表 176 行逐行扫下来
+                   内容最宽只有 112px（当前目录里最多四枚 + 铅笔，且无一行带覆盖徽标），
+                   列却有 204px —— 表头「能力 · 编辑」54px，右边一段全是死宽。
+                   改判据：按「最坏情况 = 112 + 覆盖徽标 34 = 146px」留 11px 余量定能力列，
+                   省下的份额给模型（长 id 一直在截断）与渠道（表头 138px 最挤）。
+                   七列合计仍是 97%，余量由浏览器按比例摊给各列。 -->
               <colgroup>
-                <col style="width: 16%" />
+                <col style="width: 17%" />
                 <col style="width: 11%" />
                 <col style="width: 13%" />
                 <col style="width: 6.5%" />
-                <col style="width: 22.5%" />
-                <col style="width: 20%" />
+                <col style="width: 19.5%" />
+                <col style="width: 22%" />
                 <col style="width: 8%" />
               </colgroup>
               <thead>
@@ -682,8 +687,8 @@ onMounted(refresh);
                          悬停露出铅笔提示可编辑；有用户覆盖时「覆盖」徽标跟过来（信息不丢，列数 -1）。
                          role=button + 键盘 Enter，可访问性与原按钮打平。
                          2026-10-08：合并列把这列加宽到 22.5%，改回五枚全显（此前是「首枚 + 计数角标」）。
-                         不需要窄宽度降档：表挂 min-width:860 + table-layout:fixed，能力格最窄也有
-                         ~204px，而五枚加铅笔约 120px（真机实测余 102px）。 -->
+                         2026-10-09：按真表 176 行实测回校到 19.5% —— 内容最宽 112px，加覆盖徽标
+                         146px，19.5% 在 min-width:860 下给到 157px 可视宽，仍留 11px 余量。 -->
                     <span class="cap-chips">
                       <el-tooltip :content="`能力：${capabilityTags(m).join(' / ')}（点击编辑）`" placement="top">
                         <span class="cap-list">
@@ -698,7 +703,7 @@ onMounted(refresh);
                   </td>
                   <td class="cell-chips chan-cell">
                     <!-- 两态（定案 Q2=B）：点掉=排除（modelChannelExcludes）/ 📌=钉定（modelOverrides）。
-                         明细进 popover 而不是铺成 chips：这列只有 20%，渠道名最长八个字，两颗就撑破
+                         明细进 popover 而不是铺成 chips：这列只有 22%，渠道名最长八个字，两颗就撑破
                          ⇒ 换行 ⇒ 破 ROW_H=60 的虚拟滚动垫高数学（见 virtualWindow.ts 顶注）。
                          摘要文案与行序都走 channelCell 的真实现，模板不自己拼——两处拼迟早分叉。 -->
                     <el-popover
