@@ -82,15 +82,15 @@ check(`⑥ electron/backend 里 api2/api3 字面量只在真相源出现（实�
 ok7();
 function ok7() {
   const disc = read("electron/backend/proxy/discovery.cjs");
-  // 必须按**三参签名**锁定：本文件里有两个 beginQoderOAuth 声明，
-  // 前面那个 (channel, onDone) 的被后面同名声明整体遮蔽（函数声明提升 + 后者覆盖），是死码。
-  // 按名字匹配会命中死的那份 ⇒ 判据看着绿、实际什么也没测到（本闸第一次跑就是这么撞出来的）。
+  // ⑦c 已确认本文件只剩一个 beginQoderOAuth 声明（历史上那个被同名声明遮蔽的 (channel, onDone)
+  // 死码已删）。仍按三参签名锁定，是因为下次上游合并若带回第二份同名声明，按名字匹配的判据
+  // 会命中死的那份 ⇒ 看着绿、实际什么也没测到（本闸第一次跑就是这么撞出来的）。
   const qFn = /async function beginQoderOAuth\(channel, edition, onDone\) \{[\s\S]{0,900}/.exec(disc);
   check("⑦ 主进程区服读渠道 id（活的 beginQoderOAuth 内不读 edition）",
     !!qFn && /EP\.regionOf\(channel\)/.test(qFn[0]) && !/qoderRegionOfMode\(edition\)/.test(qFn[0]),
     qFn ? "没看到 EP.regionOf(channel)" : "按三参签名找不到 beginQoderOAuth（签名变了？判据要跟着改，别改成宽松匹配）");
   const decls = (disc.match(/async function beginQoderOAuth/g) || []).length;
-  check(`⑦c beginQoderOAuth 声明数已知（当前 2 个，第二个才活着）`, decls === 2, `实得 ${decls} 个：若变成 1 说明死码被清理，本条与上一条的锚点都要复核`);
+  check(`⑦c beginQoderOAuth 只有一个声明（没有遮蔽关系）`, decls === 1, `实得 ${decls} 个：>1 说明合并带回了同名声明，后声明的会整体遮蔽前一个，本闸与所有按名字匹配的判据都要复核`);
   const agents = read("src/views/proxy/ProxyAgentsView.vue");
   check("⑦b 渲染层没有 qoder 区服 radio（qoderEdition 已删）", !/qoderEdition/.test(agents), "radio 回来了就会与「区服跟随渠道」冲突");
 }
