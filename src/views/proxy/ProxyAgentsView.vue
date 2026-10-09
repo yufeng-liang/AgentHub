@@ -1647,8 +1647,11 @@ onUnmounted(() => {
                   @click="runCheckinChannel"
                 >{{ checkinBusy ? "领取中…" : channelCheckinDone(ch) ? labelsOf(ch.id).done : labelsOf(ch.id).run }}</button>
               </el-tooltip>
-              <!-- Qoder 双区（上游 v1.50）：官方没有「每日签到」，是活动 Credits 领取，文案与动作名如实区分 -->
-              <el-tooltip v-else-if="isQoderChannel(ch.id)" :content="checkinToolbarTitle(ch)" placement="top">
+              <!-- Qoder 双区（上游 v1.50）：官方没有「每日签到」，是活动 Credits 领取，文案与动作名如实区分。
+                   再加一道 checkinCapable：活动领取是 CN 侧专属（要靠桌面端出风控身份），
+                   CHECKIN_CAPABLE.qoder_intl 按 a2e386f 的判定记 false ⇒ 国际版三处入口都不给摆，
+                   否则工具栏承诺得上的事，行内和自动签到两处都拒绝。 -->
+              <el-tooltip v-else-if="isQoderChannel(ch.id) && checkinCapable(ch.id)" :content="checkinToolbarTitle(ch)" placement="top">
                 <button
                   class="btn btn-sm"
                   :class="{ 'btn-checkin-done': !checkinBusy && channelCheckinDone(ch) }"

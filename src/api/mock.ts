@@ -399,7 +399,8 @@ const PROXY_POOL = [
     checkinAuto: { enabled: false, time: "09:00", jitterMin: 0 },
     summary: { channel: "qoder_intl", totalCredits: 0.0066, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 30 * 86400000, expiringSoon: false, todayReq: 1, todayTokens: 2100, lastCreditsAt: NOW - 30 * 60000 },
     accounts: [
-      // 服务不开放（unavailable）：行内按钮应显示「不开放」而不是「已领取」
+      // 上游夹具原样保留：qoder_intl 带回一条 unavailable 记录。本仓按 CHECKIN_CAPABLE 不给国际版
+      // 摆任何签到入口（工具栏 / 行内 / 自动签到三处同闸），所以这条记录只该被忽略、不该冒出按钮
       { id: "a9", channel: "qoder_intl", uid: "qd_2001", name: "Qoder INTL", status: "online", credits: 0.0066, creditsAt: NOW - 30 * 60000, expiresAt: NOW + 30 * 86400000, coolUntil: 0, coolReason: "", source: "oauth", lastUsed: NOW - 30 * 60000, todayReq: 1, todayTokens: 2100, creditsToday: -1, createdAt: NOW - 86400000, hasToken: true, checkin: { day: TODAY, at: NOW - 6000000, action: "checkin", ok: true, unavailable: true, message: "该账号的服务未开放" } },
     ],
   },
