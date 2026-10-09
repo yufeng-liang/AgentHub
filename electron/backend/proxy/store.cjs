@@ -711,6 +711,8 @@ function accountView(r) {
     coolReason,
     /** 最近一次上游错误（气泡展示用；只留最新一条） */
     lastError,
+    /** 今日签到结果（号池行内按钮三态与详情弹窗数据源；只留当天一条，跨天由前端按 day 判为过期） */
+    checkin: meta.checkin && typeof meta.checkin === "object" ? meta.checkin : null,
     source: r.source,
     lastUsed: r.last_used,
     todayReq: r.today_day === dayStr() ? r.today_req : 0,
@@ -879,6 +881,29 @@ function clearError(id) {
   const meta = parseMeta(cur.meta);
   delete meta.lastError;
   updateAccount(id, { meta });
+}
+
+/** 记录账号今日签到结果（meta.checkin）：号池行内按钮「已签到 / 签到失败 + 详情弹窗」的数据源。
+ *  只留当天最新一条（同日重跑即覆盖）；跨天不做清理，由前端按 day 判为过期。
+ *  上游原文是 getAccount → spread → updateAccount，这里改走 mergeAccountMeta：
+ *  自动签到与额度刷新/池同步并发时，手抄的读快照会把别人的 meta 写入整份盖掉（见该函数注释）。 */
+function noteCheckin(id, result, action) {
+  const r = result || {};
+  return mergeAccountMeta(id, {
+    checkin: {
+      day: dayStr(),
+      at: Date.now(),
+      action: action === "trial" ? "trial" : "checkin",
+      ok: r.ok === true,
+      already: r.already === true,
+      unavailable: r.unavailable === true,
+      needCaptcha: r.needCaptcha === true,
+      deviceBurned: r.deviceBurned === true,
+      credit: Number(r.credit || 0) || 0,
+      streakDays: Number(r.streakDays || 0) || 0,
+      message: String(r.message || "").slice(0, 400),
+    },
+  });
 }
 
 /** 记录账号一次消耗的滚动计数（跨天自动清零）；credits 为上游实报积分（缺省/-1 = 未上报，
@@ -1321,7 +1346,7 @@ module.exports = {
   createKey, importKey, listKeys, findKeyBySecret, updateKey, deleteKey, keyTodayReq,
   listAgents, setPoolStrategy, setAgentCostTier,
   listProviders, getProvider, saveProvider, deleteProvider,
-  listAccounts, accountRows, getAccount, accountMeta, mergeAccountMeta, accountSecrets, addAccount, updateAccount, bumpAccountUsage, setCreditsToday, removeAccount, noteError, clearError,
+  listAccounts, accountRows, getAccount, accountMeta, mergeAccountMeta, accountSecrets, addAccount, updateAccount, bumpAccountUsage, setCreditsToday, removeAccount, noteError, clearError, noteCheckin,
   listModelCooldowns, upsertModelCooldown, deleteModelCooldowns,
   snapshotCredits,
   setCreditPackages, listCreditPackages,
