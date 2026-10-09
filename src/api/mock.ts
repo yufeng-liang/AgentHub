@@ -1181,10 +1181,17 @@ export const mock = {
         return { ok: true };
       }
       case "proxy_pool":
-        return JSON.parse(JSON.stringify(PROXY_POOL));
-      // 渠道启闭（预览）：list 全量带 enabled；toggle 写 mock 配置即生效
+        // 与后端 poolView 同口径：被关闭的渠道不出现在号池视图里（上游 v1.58 渠道启闭）。
+        // 此前 mock 原样返回全量，预览面上关掉一个渠道后号池页照旧显示它，
+        // 「关闭即全部页面动态隐藏」这条链在预览里根本验不了。
+        return JSON.parse(JSON.stringify(PROXY_POOL)).filter(
+          (c: Record<string, unknown>) => (read().proxy.channelEnabled || {})[c.id as string] !== false
+        );
+      // 渠道启闭（预览）：list 全量带 enabled；toggle 写 mock 配置即生效。
+      // 只出内置渠道（kind 缺省视为 builtin）——与后端 poolView 之后的那层过滤同口径：
+      // proxy_channel_toggle 只认内置渠道 id，预览面把自定义提供商摆出来等于给一个必被拒答的开关。
       case "proxy_channel_list":
-        return JSON.parse(JSON.stringify(PROXY_POOL)).map((c: Record<string, unknown>) => ({
+        return JSON.parse(JSON.stringify(PROXY_POOL)).filter((c: Record<string, unknown>) => !c.kind || c.kind === "builtin").map((c: Record<string, unknown>) => ({
           ...c,
           enabled: (read().proxy.channelEnabled || {})[c.id as string] !== false,
         }));
