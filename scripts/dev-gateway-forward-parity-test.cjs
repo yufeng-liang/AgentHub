@@ -104,7 +104,10 @@ try {
 } catch (e) {
   check("④ dispatchTable() 可在纯 Node 收集", false, String((e && e.message) || e));
 }
-const newSubCmds = ["proxy_account_import_blob", "proxy_poolsync_password_changed"];
+const newSubCmds = ["proxy_account_import_blob", "proxy_poolsync_password_changed",
+  // 上游 v1.57.0 操作日志导出的子进程半边：查询 + 生成 xlsx 字节在这里，落盘在主进程
+  // （UI_LOCAL proxy_oplog_export 用 app.getPath("downloads")，子进程 ELECTRON_RUN_AS_NODE 拿不到）
+  "proxy_oplog_export_rows"];
 // 一期基线之外的「用户面」新命令：渲染层真会调用它们 ⇒ 必须同时进 preload 白名单（①）、
 // 主进程转发面（③）与子进程实现体（④）。与 newSubCmds 的分工：那些是子进程内部辅助半段
 // （不过 preload，渲染层看不见，只进 ④ 的白名单），这里每一条则是完整的一条命令面。
@@ -146,6 +149,13 @@ const extraUserCmds = [
   // 上游 v1.55 的按渠道自动签到设置：写的是 config.json 的 proxy.checkinAutoRules（与 poolsync
   // applyShared 写 cfg.proxy 同一条子进程路径，读侧 tick 每 60s 热读），不是第二份主进程写者
   { name: "proxy_checkin_auto_set", why: "自动签到按渠道设置：写 cfg.proxy.checkinAutoRules（上游 v1.55，号池页弹窗）" },
+  // 上游 v1.57.0 操作日志三条 + v1.58.0 渠道启闭两条。导出那条的落盘半段在主进程（UI_LOCAL），
+  // 但按 import_file 的同款工序在子进程留了占位名 ⇒ 仍进本名单，让「④ 必须含实现体」这条红照旧成立。
+  { name: "proxy_oplog_list", why: "操作日志分页查询：读 stats.db 的 op_logs（上游 v1.57，日志页签）" },
+  { name: "proxy_oplog_ops", why: "操作日志类型下拉：读 stats.db 的 op_logs 去重（上游 v1.57）" },
+  { name: "proxy_oplog_export", why: "操作日志导出：子进程只留占位名，字节半边 proxy_oplog_export_rows，落盘归主进程 UI_LOCAL（上游 v1.57）" },
+  { name: "proxy_channel_list", why: "渠道启闭弹窗数据源：读号池视图（含 config 的 channelEnabled），上游 v1.58" },
+  { name: "proxy_channel_toggle", why: "渠道启闭开关：写 cfg.proxy.channelEnabled（上游 v1.58，与 poolsync.applyShared 同一条子进程写 cfg.proxy 的路径）" },
 ];
 const upstreamUserNames = extraUserCmds.map((c) => c.name);
 check("④ 子进程表含 proxy_account_import_blob（import_file 拆两段的子进程半段）",
