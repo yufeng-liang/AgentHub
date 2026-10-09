@@ -115,13 +115,20 @@ async function main() {
   assert(rw2.request_id === "R1" && rw2.session_id === "S1", "meta 提供时复用 id（轮内稳定）");
   // 静态兜底仅在「无目录」时生效（沙箱无 catalog.json）
   assert(ad.models().length >= STATIC_MODELS.length, "无目录时 models() 回退静态兜底表");
-  // ===== 3b. issue #74 回归：静态兜底不得跨产品串味 =====
+  // ===== 3b. issue #74 回归：两张兜底表必须各写各的（不是「谁不许有什么」）=====
+  // 判据形态换了：原先断言「intl 表为空」，因为 intl 目录从没实测过，凭空兜底就是把请求
+  // 导向不存在的模型（issue #74 的原症）。现在 intl 有了自己的实测集（参考仓在真实国际版
+  // 账号上固化的 global 表），正确的不变量是**两表互不借对方独有的 id**——dfmodel 这类
+  // 两区都有的 id 出现在两边是事实，不是串味。
   console.log("\n[3b] 静态兜底表按产品隔离（issue #74 回归）");
   const adIntl = makeQoder("qoder_intl", deps);
-  assert(ad.models().includes("dfmodel"), "qoder(CN) 静态兜底含 dfmodel");
-  assert(!adIntl.models().includes("dfmodel"), "qoder_intl 不得凭空宣称拥有 CN 专属模型（dfmodel）");
-  assert(!adIntl.models().includes("qmodel"), "qoder_intl 静态兜底应为空（未实测过其目录）");
-  assert(adIntl.models().length === 0, "qoder_intl 无目录且无兜底 → 模型清单为空");
+  const CN_ONLY = ["q37fmodel", "gm51model"];           // 只在中国版目录里实测到过
+  const INTL_ONLY = ["ultimate", "performance", "efficient", "smodel", "cmodel"]; // 只有国际版有
+  for (const id of CN_ONLY) assert(!adIntl.models().includes(id), `qoder_intl 不得有 CN 独有模型 ${id}`);
+  for (const id of INTL_ONLY) assert(!ad.models().includes(id), `qoder(CN) 不得有 intl 独有模型 ${id}`);
+  assert(ad.models().includes("dfmodel") && adIntl.models().includes("dfmodel"), "两区都实测到 dfmodel ⇒ 同时出现是事实而非串味");
+  assert(adIntl.models().length === 17, `qoder_intl 静态兜底 17 条，实得 ${adIntl.models().length}`);
+  assert(adIntl.models().length !== ad.models().length, "两表条数不同（相等说明有人把一张表复制了两遍）");
 
   // ===== 3c. issue #74 回归：有目录时只认目录（静态兜底不得复活已下架模型） =====
   // 场景：目录里只有 2 个模型，静态表里却有 14 个。修复前 models() = 并集 → 14 个都会
@@ -675,6 +682,69 @@ async function main() {
     const adUp13 = makeQoder("qoder", { ...deps, auth: { PRODUCTS: { qoder: {} }, readCatalogBlob: () => null } });
     const ru = await adUp13.fetchModels({ uid: "u1", meta: {} }, { token: "dt-x" });
     assert(ru.ok === false && /本机无模型目录缓存/.test(ru.message) && !/远程兜底/.test(ru.message), "未注入 selfSign 时仍是上游语义");
+  }
+
+  // ===== 14. 推理主机按账号令牌选（jt- → api2）：两条签名路都要真的读它 =====
+  // 端点闸 G 组判的是表里的取值，这里判的是「拼 URL 那两处真的按 secrets.token 取」。
+  // 只看闸会漏掉整类缺陷：表写对了但调用点还在用工厂级常数，PAT 号恒定 403 且没人报警。
+  console.log("\n[14] 推理基址按令牌种类分流（两条签名路）");
+  {
+    const EP14 = require("../electron/backend/proxy/qoderEndpoints.cjs");
+    const qSS14 = require("../electron/backend/proxy/qoderSelfSign.cjs");
+    const API2 = EP14.REGIONS.global.jobGateway;
+    const API3 = EP14.inferGateway("qoder_intl");
+    const seenUrl = [];
+    const ssDeps = {
+      fetchStream: async (url) => { seenUrl.push(url); return { resp: { body: sseStream(""), ok: true, status: 200 }, cancelTimer: () => {} }; },
+      pumpSse: async () => {},
+      httpJson: async (url) => { seenUrl.push(url); return { ok: true, status: 200, data: { chat: [] } }; },
+    };
+    const ssIntl = qSS14.makeSelfSign("qoder_intl", ssDeps);
+    const e14 = { key: "auto", is_reasoning: false, is_vl: false, efforts: [] };
+    const callChat = (token) => ssIntl.chat({
+      account: { uid: "u1", meta: {} }, secrets: { token }, modelKey: "auto", entry: e14,
+      body: { messages: [{ role: "user", content: "hi" }] }, emit: () => {},
+    });
+    seenUrl.length = 0;
+    await callChat("jt-job-token");
+    assert(seenUrl.length === 1 && seenUrl[0].startsWith(API2 + "/algo/"), `自签 chat 的 jt- 令牌落 api2（实得 ${seenUrl[0]}）`);
+    seenUrl.length = 0;
+    await callChat("dt-device-token");
+    assert(seenUrl.length === 1 && seenUrl[0].startsWith(API3 + "/algo/"), `自签 chat 的 dt- 令牌仍落 api3（实得 ${seenUrl[0]}）`);
+    seenUrl.length = 0;
+    await ssIntl.fetchModelsRemote({ account: { uid: "u1" }, secrets: { token: "jt-job-token" } });
+    assert(seenUrl.length === 1 && seenUrl[0].startsWith(API2 + "/algo/api/v2/model/list"), `目录拉取与对话同主机（实得 ${seenUrl[0]}）`);
+
+    // wasm 路：prepareInferRequest 的第一实参就是基址，直接收下它
+    const gwSeen = [];
+    const mkSigner = () => ({
+      createSession: async () => ({
+        prepareInferRequest: (base) => { gwSeen.push(base); return { url: "https://gw.invalid/x", headers: {}, body: Buffer.from("{}") }; },
+        modelCacheDecrypt: () => "{}",
+        free() {},
+      }),
+    });
+    // 注入一个与生产种子同形的 headers.json：gateway 有值（覆盖态），验证 jt- 不被它劫持。
+    // 用 Object.create 而不是 {...rules}：展开会丢 this 绑定，catalogIndex 里的
+    // rules.rulesDir() 直接炸（本文件 :145 记过同一个坑）。
+    const cfgRules = Object.create(rules);
+    cfgRules.get = (n) => (n === "headers.json"
+      ? { qoder_intl: { gateway: API3 }, qoder: { gateway: EP14.inferGateway("qoder") } }
+      : rules.get(n));
+    const adIntl14 = makeQoder("qoder_intl", { ...deps, rules: cfgRules, signer: mkSigner() });
+    const chatArgs = (token) => ({
+      account: { uid: "u1", meta: {} }, secrets: { token }, model: "auto",
+      body: { messages: [{ role: "user", content: "hi" }] }, emit: () => {}, meta: {},
+    });
+    await adIntl14.chat(chatArgs("jt-job-token"));
+    assert(gwSeen.length === 1 && gwSeen[0] === API2, `wasm 路把 jt- 的基址换成 api2（实得 ${gwSeen[0]}）`);
+    gwSeen.length = 0;
+    await adIntl14.chat(chatArgs("eyJ.jwt-form"));
+    assert(gwSeen.length === 1 && gwSeen[0] === API3, `wasm 路的非 jt- 令牌仍用 cfg.gateway（实得 ${gwSeen[0]}）`);
+    gwSeen.length = 0;
+    const adCn14 = makeQoder("qoder", { ...deps, rules: cfgRules, signer: mkSigner() });
+    await adCn14.chat(chatArgs("jt-job-token"));
+    assert(gwSeen.length === 1 && gwSeen[0] === EP14.inferGateway("qoder"), `CN 只有一台网关，jt- 不分流（实得 ${gwSeen[0]}）`);
   }
 
   console.log("\n[done] Qoder 适配器单元自测全部通过");

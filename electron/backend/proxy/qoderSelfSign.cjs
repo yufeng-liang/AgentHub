@@ -302,9 +302,9 @@ function prepareBody(body) {
 function makeSelfSign(product, deps) {
   const { fetchStream, pumpSse, httpJson } = deps;
   const region = EP.regionOf(product);
-  // 自签按 `${chatBase}${PATH}` 拼（PATH 不带前导斜杠），所以这里取带尾斜杠的形态；
-  // 真相源本身存的是无尾斜杠口径，与 rules 种子和 qoderAuth 一致。
-  const chatBase = EP.chatBase(product);
+  // 推理基址由 EP.chatBase(product, token) 现场取（两条 /algo 链路都按账号令牌定夺，
+  // 见 inferenceBase 的出处注释）。自签按 `${base}${PATH}` 拼，PATH 不带前导斜杠，
+  // 所以用带尾斜杠的 chatBase 而不是无尾斜杠的 inferGateway。
 
   /** 对话主流程（协议参考 §3.4/§3.5）：自签 → SSE 双层信封解包 → thinking 标签跨片剥离 */
   async function chat({ account, secrets, modelKey, entry, body, emit }) {
@@ -334,7 +334,8 @@ function makeSelfSign(product, deps) {
       }
     }
     const encoded = qcosy.encodeBody(Buffer.from(JSON.stringify(envBody), "utf8")); // 必须先编码后签名
-    const url = `${chatBase}${CHAT_PATH}`;
+    // 基址按账号令牌定夺：国际版的作业令牌（jt-）只有 api2 认，打到 api3 会被判 Login expired
+    const url = `${EP.chatBase(product, secrets && secrets.token)}${CHAT_PATH}`;
     const headers = {
       ...qcosy.buildCosyHeaders({ url, body: encoded, uid: userId, token: (secrets && secrets.token) || "", name: (account && account.name) || "", email: (account && account.meta && account.meta.email) || "", machineId: machineIdStr, requestId }),
       "content-type": "application/json",
@@ -417,7 +418,10 @@ function makeSelfSign(product, deps) {
    *  展示名落 name、档位落 reasoning.supportedEfforts，形状与上游 fetchModels 逐字对齐。 */
   async function fetchModelsRemote({ account, secrets }) {
     const cfg = REGIONS[region];
-    const url = `${chatBase}${MODEL_LIST_PATH}`;
+    // 目录与对话同主机：这条 /algo 链路带的是同一个账号令牌，jt- 打 api3 在对话里判
+    // Login expired，没有理由认为目录拉取能豁免（参考仓把 model/list 写死成 gateway()，
+    // 那是它那侧的一处不一致，不照抄）。
+    const url = `${EP.chatBase(product, secrets && secrets.token)}${MODEL_LIST_PATH}`;
     const requestId = U.uuid();
     const encoded = qcosy.encodeBody(Buffer.from(JSON.stringify({ region }), "utf8"));
     const headers = qcosy.buildCosyHeaders({ url, body: encoded, uid: (account && account.uid) || "", token: (secrets && secrets.token) || "", name: "", email: "", machineId: machineId(product), requestId });

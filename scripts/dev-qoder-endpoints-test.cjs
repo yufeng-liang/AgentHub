@@ -95,5 +95,36 @@ function ok7() {
   check("⑦b 渲染层没有 qoder 区服 radio（qoderEdition 已删）", !/qoderEdition/.test(agents), "radio 回来了就会与「区服跟随渠道」冲突");
 }
 
+// ===== G. 国际版按令牌种类分流的推理主机（2026-10-09 从参考仓 agent2api 补入）=====
+// 参考仓 endpoints.rs:89-113 记的是上游约束而不是取舍：国际版有两台推理主机，api3 认设备流
+// 令牌（dt-/JWT），PAT 换来的作业令牌（jt-）只有 api2 认——jt- 打 api3 会被判
+// 「Login expired」403。中国版只有一台网关，两种令牌都收。
+// 此前本仓把国际版钉成单个常数（定案 Q20），一加 PAT 号就中招，且只在 PAT 形态下现。
+if (typeof EP.inferenceBase !== "function") {
+  check("G0 EP.inferenceBase 存在", false, "qoderEndpoints 还没有按令牌取址的入口");
+} else {
+  const API2 = "https://api2.qoder.sh";
+  const API3 = EP.REGIONS.global.gateway;
+  const CNC = EP.REGIONS.cn.gateway;
+  check("G1 intl 作业令牌（jt-）走 api2", EP.inferenceBase("qoder_intl", "jt-abcdef") === API2, EP.inferenceBase("qoder_intl", "jt-abcdef"));
+  check("G2 intl 设备令牌（dt-）仍走 api3", EP.inferenceBase("qoder_intl", "dt-abcdef") === API3, EP.inferenceBase("qoder_intl", "dt-abcdef"));
+  check("G2b intl 的 JWT/空令牌也走 api3（分流只认 jt- 前缀）",
+    EP.inferenceBase("qoder_intl", "eyJhbGciOi") === API3 && EP.inferenceBase("qoder_intl", "") === API3);
+  check("G3 CN 两种令牌同一台网关（没有第二台可分流）",
+    EP.inferenceBase("qoder", "jt-abcdef") === CNC && EP.inferenceBase("qoder", "dt-abcdef") === CNC,
+    `${EP.inferenceBase("qoder", "jt-abcdef")} vs ${EP.inferenceBase("qoder", "dt-abcdef")}`);
+  // headers.json 的 gateway 是用户「换域名」的口子，覆盖主网关；jt- 那台是协议约束，
+  // 允许被覆盖就会让 PAT 号 403 且无人能解释为什么填了域名还不通。
+  const PIN = "https://pinned.example";
+  check("G4 覆盖值只作用于非 jt- 令牌", EP.inferenceBase("qoder_intl", "dt-x", PIN) === PIN);
+  check("G4b 覆盖值不得劫持 jt- 的落点", EP.inferenceBase("qoder_intl", "jt-x", PIN) === API2, EP.inferenceBase("qoder_intl", "jt-x", PIN));
+  check("G5 chatBase 是同值带尾斜杠形态（自签路拼接口径）",
+    EP.chatBase("qoder_intl", "jt-x") === API2 + "/" && EP.chatBase("qoder_intl", "dt-x") === API3 + "/",
+    `${EP.chatBase("qoder_intl", "jt-x")} / ${EP.chatBase("qoder_intl", "dt-x")}`);
+  // 主网关仍是无尾斜杠口径（rules 种子 / qoderAuth / proxy-smoke 都拿它比），别让分流把它改掉
+  check("G6 inferGateway 保持主网关口径（不随令牌变）",
+    EP.inferGateway("qoder_intl") === API3 && !/\/$/.test(EP.inferGateway("qoder_intl")));
+}
+
 console.log(`\n${failures.length ? "FAIL " + failures.length + " 项" : "OK Qoder 端点表闸全过"}（共 ${pass + failures.length} 项）`);
 if (failures.length) process.exit(1);

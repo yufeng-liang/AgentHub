@@ -15,6 +15,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const os = require("node:os");
+// fork-port：双区推理基址的唯一真相源（按账号令牌选 api2/api3，见 chat() 里的取值）
+const EP = require("./qoderEndpoints.cjs");
 
 /**
  * Cosy-MachineOS 的取值口径：客户端用 Windows 内核版本号（实测 "10.0.26200.0"）。
@@ -35,7 +37,8 @@ function osVersion() {
  *  「没拉取过目录的一侧」会凭空宣称拥有另一侧的全部模型——modelOwners 据此把请求
  *  failover 到该侧，上游回 400 code=11102「model [x] service info not found」，
  *  表现为「模型明明在列表里、本机也能用，却时不时报当前模型不可用」（issue #74）。
- *  故兜底集也必须分产品；未列出的产品不给静态兜底（宁缺勿错，靠拉取目录）。 */
+ *  故兜底集也必须分产品；两个产品各有自己的实测表（intl 那份来自参考仓的真实账号快照），
+ *  没列进表的产品仍不给静态兜底（宁缺勿错，靠拉取目录）。 */
 const STATIC_MODELS_BY_PRODUCT = {
   qoder: [
     { id: "auto", name: "Auto" },
@@ -53,7 +56,30 @@ const STATIC_MODELS_BY_PRODUCT = {
     { id: "kmodel_latest", name: "Kimi-K3" },
     { id: "mmodel", name: "MiniMax-M2.7" },
   ],
-  // qoder_intl：无静态兜底（未实测过其目录；一旦误兜底就会把请求导向不存在的模型）
+  // qoder_intl：国际版自己那套目录（17 条），来源是参考实现 agent2api 在真实国际版账号上
+  // 拉下来并固化的兜底表（models.rs:79-101 的 global 列，2026-09-20 的 price_factor 快照）。
+  // 与 CN 表**互不重叠地各写一份**：intl 独有 ultimate/performance/efficient/smodel/cmodel，
+  // CN 独有 q37fmodel/gm51model——这正是 issue #74 要的「按产品隔离」，共用一张表才会幽灵归属。
+  // 名称口径按上游 display_name 原样（Qwen3.7-Plus 带连字符）；远程拉取成功后整表被覆盖。
+  qoder_intl: [
+    { id: "auto", name: "Auto" },
+    { id: "qfmodel", name: "Qwen3.8-Flash" },
+    { id: "qmodel_38max", name: "Qwen3.8-Max" },
+    { id: "qmodel", name: "Qwen3.7-Plus" },
+    { id: "qmodel_latest", name: "Qwen3.7-Max" },
+    { id: "ultimate", name: "Ultimate" },
+    { id: "performance", name: "Performance" },
+    { id: "efficient", name: "Efficient" },
+    { id: "smodel", name: "Sonus" },
+    { id: "cmodel", name: "Cantus" },
+    { id: "dfmodel", name: "DeepSeek-Flash" },
+    { id: "dmodel", name: "DeepSeek-V4-Pro" },
+    { id: "gfmodel", name: "GLM-5.3-Flash" },
+    { id: "gmodel", name: "GLM-5.3" },
+    { id: "kmodel", name: "Kimi-K2.8-Preview" },
+    { id: "kmodel_latest", name: "Kimi-K3" },
+    { id: "mmodel", name: "MiniMax-M3" },
+  ],
 };
 
 /** 兼容导出：默认（CN）静态表，供自测/外部引用 */
@@ -364,7 +390,11 @@ function makeQoder(product, deps) {
      */
     async chat({ account, secrets, model, body, emit, meta }) {
       const c = cfg();
-      const gateway = c.gateway || auth.PRODUCTS[product].gateway;
+      // fork-port：基址按账号令牌定夺而不是只读一个常数。国际版有两台推理主机——
+      // api3 认设备流令牌（dt-/本应用网页登录的 JWT），api2 才认 PAT 换来的作业令牌（jt-），
+      // jt- 打 api3 上游判「Login expired」403（出处见 qoderEndpoints.inferenceBase）。
+      // cfg.gateway 仍是非 jt- 时的首选值，用户手填域名照旧生效。
+      const gateway = EP.inferenceBase(product, secrets && secrets.token, c.gateway);
       const machineId = (account.meta && account.meta.machineId) || account.machineId || "";
       const uid = account.uid || "";
       const key = String(model || "").toLowerCase();

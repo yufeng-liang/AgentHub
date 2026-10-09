@@ -253,7 +253,7 @@ async function main() {
 
   // ===== Qoder 注册 =====
   // 与既有渠道的关键差异：签名是每请求的（wasm 驱动），headers() 只返回非签名基础头。
-  // qoder_intl 暂停启用（store.QODER_INTL_ENABLED）——断言按开关实际状态校验，
+  // qoder_intl 由 store.QODER_INTL_ENABLED 控制——断言按开关实际状态校验，
   // 防止「隐藏渠道仍参与路由」的静默回归（ADAPTERS 参与 modelOwners）。
   const qd = adapters.get("qoder");
   assert(qd && qd.id === "qoder", "qoder 适配器注册");
@@ -267,31 +267,27 @@ async function main() {
     const need = ["cfg", "models", "fetchModels", "headers", "rewriteBody", "chat", "queryCredits", "refreshToken"];
     assert(need.every((k) => typeof ad[k] === "function"), `${id} 适配器十件套齐备`);
     assert(ad.cfg().gateway === gw, `${id} cfg.gateway 指向 ${gw}`);
-    // 静态兜底表按产品隔离（issue #74）：CN 有 14 个兜底模型；intl 未实测过其目录、
-    // 不设兜底（模型清单应来自拉取目录）。此前这里对两者都断言 ≥14，等于把「intl 凭空
-    // 宣称拥有 CN 专属模型」固化成契约——modelOwners 据此把请求 failover 到无账号的
-    // intl 渠道，上游回 400 code=11102（幽灵模型）。
-    if (id === "qoder") {
-      assert(ad.models().length >= 14, `${id} 静态兜底模型表 ≥14`);
-    } else {
-      assert(Array.isArray(ad.models()), `${id} models() 返回数组`);
-      assert(ad.models().length === 0, `${id} 不得继承 CN 静态兜底（无目录时清单为空）`);
-    }
+    // 静态兜底表按产品隔离（issue #74）：两区各有一份实测清单（CN 14 / INTL 17），
+    // 判据是「互不借对方独有的 id」而不是「intl 必须为空」——把 intl 钉成空表是在
+    // 它没有自己的目录时才成立的前提，目录有了就该换判据，否则这条闸会把真相判成回归。
+    assert(Array.isArray(ad.models()), `${id} models() 返回数组`);
+    assert(ad.models().length >= 14, `${id} 静态兜底模型表 ≥14（实得 ${ad.models().length}）`);
     // headers() 必须**不含** Authorization：签名由 chat() 内 wasm 现场产出，
     // 静态头里出现 Authorization 即为「照抄 WB 静态头组」的错误实现
     const h = ad.headers();
     assert(!("authorization" in h) && !("Authorization" in h), `${id} headers() 不含 Authorization（签名下沉 chat()）`);
     assert(typeof h["user-agent"] === "string" && h.accept === "text/event-stream", `${id} headers() 基础头正确`);
   }
-  // 模型归属（issue #74）：dfmodel 必须只归 qoder。
-  // 此前 INTL 开启时断言「归属双区」——那是把 bug 当契约：qoder_intl 的静态兜底表与 CN
-  // 共用，于是无账号的 intl 也宣称拥有 dfmodel，failover 打过去必然 400 code=11102。
-  // 现在兜底表按产品隔离，intl 无目录时清单为空 → 不可能出现跨区幽灵归属。
-  const dfOwners = adapters.modelOwners("dfmodel");
-  assert(dfOwners.length === 1 && dfOwners[0] === "qoder", "dfmodel 仅归 qoder（INTL 不得幽灵归属）");
+  // 模型归属（issue #74 的当代形态）：每个 id 的归属必须**正好**是「自己那张表里有它的渠道」。
+  // 幽灵归属的成因不是「两区共有某个 id」，而是「一方凭空宣称拥有另一方的 id」——
+  // gm51model 只有 CN 实测到过，ultimate 只有 intl 实测到过，两边都不许越界。
+  const ownersOf = (m) => adapters.modelOwners(m).slice().sort().join(",");
+  assert(ownersOf("gm51model") === "qoder", `gm51model 仅归 qoder（实得 ${ownersOf("gm51model")}）`);
   if (intlOn) {
-    const intlAd = adapters.get("qoder_intl");
-    assert(!intlAd.models().includes("dfmodel"), "qoder_intl 清单不含 CN 专属模型 dfmodel");
+    assert(ownersOf("ultimate") === "qoder_intl", `ultimate 仅归 qoder_intl（实得 ${ownersOf("ultimate")}）`);
+    assert(ownersOf("dfmodel") === "qoder,qoder_intl", `dfmodel 两区各自实测到 → 归属双渠道（实得 ${ownersOf("dfmodel")}）`);
+  } else {
+    assert(ownersOf("dfmodel") === "qoder", `开关关闭时 dfmodel 只归 qoder（实得 ${ownersOf("dfmodel")}）`);
   }
   const qModels = qd.models();
   for (const other of ["trae", "workbuddy", "workbuddy_ai", "raccoon", "zcode", "lobster", "modelscope"]) {
@@ -847,6 +843,11 @@ async function main() {
     "api3.qoder.sh": "qoder",
     "gateway.qoder.com.cn": "qoder",
     "openapi.qoder.com.cn": "qoder",
+    // qoder_intl 注册后（store.QODER_INTL_ENABLED=true）这两台会进入同一张改写表：
+    // api3 = 设备流/JWT 令牌的主网关，api2 = 作业令牌（jt-）专用。不登记的话，一旦有
+    // 代码路径打过去，守卫只会红一次眼，而不是静默把假凭据送上真上游。
+    "api2.qoder.sh": "qoder",
+    "openapi.qoder.sh": "qoder",
   };
   globalThis.fetch = (url, opts) => {
     const u = new URL(String(url));
