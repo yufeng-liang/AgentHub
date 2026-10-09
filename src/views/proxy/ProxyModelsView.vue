@@ -618,7 +618,7 @@ onMounted(refresh);
                   <th>上下文</th>
                   <th>思考强度</th>
                   <th>倍率</th>
-                  <th>能力<span class="th-sub"> · 编辑</span></th>
+                  <th>能力</th>
                   <th>渠道<span class="th-sub"> · 点掉=排除 / 📌=首选</span></th>
                   <th style="text-align: center">状态</th>
                 </tr>
@@ -684,21 +684,30 @@ onMounted(refresh);
                     </div>
                   </td>
                   <td class="mono">{{ fmtRate(m.rate) }}</td>
-                  <td class="cell-chips cap-cell" role="button" tabindex="0" :aria-label="`编辑 ${m.id} 的能力与档位`" @click="openMetaEditor(m)" @keydown.enter.prevent="openMetaEditor(m)">
-                    <!-- 2026-09-30 重组：原「元数据」列并进能力格 —— chips 一眼看能力，整格可点开编辑器，
-                         悬停露出铅笔提示可编辑；有用户覆盖时「覆盖」徽标跟过来（信息不丢，列数 -1）。
-                         role=button + 键盘 Enter，可访问性与原按钮打平。
-                         2026-10-08：合并列把这列加宽到 22.5%，改回五枚全显（此前是「首枚 + 计数角标」）。
-                         2026-10-09：按真表 176 行实测回校到 19.5% —— 内容最宽 112px，加覆盖徽标
-                         146px，19.5% 在 min-width:860 下给到 157px 可视宽，仍留 11px 余量。 -->
-                    <span class="cap-chips">
+                  <td class="cell-chips cap-cell">
+                    <!-- 2026-09-30 重组：原「元数据」列并进能力格 —— chips 一眼看能力，点开进编辑器；
+                         有用户覆盖时「覆盖」徽标跟过来（信息不丢，列数 -1）。
+                    2026-10-08：合并列把这列加宽到 22.5%，改回五枚全显（此前是「首枚 + 计数角标」）。
+                    2026-10-09：按真表 176 行实测回校到 19.5% —— 内容最宽 112px，加覆盖徽标
+                         146px，19.5% 在 min-width:860 下给到 157px 可视宽，仍留 11px 余量。
+                    2026-10-09：可点区从整格收到「能力名 + 铅笔」这一组（.cap-chips）——整格可点时
+                         右侧那 49px 死宽也是热区，点空白处会莫名其妙弹开编辑器。铅笔跟着进按钮，
+                         否则它悬停才亮、亮了又点不动，成了个假可供性。「覆盖」徽标留在按钮外。 -->
+                    <span
+                      class="cap-chips"
+                      role="button"
+                      tabindex="0"
+                      :aria-label="`编辑 ${m.id} 的能力与档位`"
+                      @click="openMetaEditor(m)"
+                      @keydown.enter.prevent="openMetaEditor(m)"
+                    >
                       <el-tooltip :content="`能力：${capabilityTags(m).join(' / ')}（点击编辑）`" placement="top">
                         <span class="cap-list">
                           <span v-for="t in capabilityTags(m)" :key="t" class="tag tag-dim">{{ t }}</span>
                         </span>
                       </el-tooltip>
+                      <i class="ph ph-pencil-simple cap-edit-ic" aria-hidden="true"></i>
                     </span>
-                    <i class="ph ph-pencil-simple cap-edit-ic" aria-hidden="true"></i>
                     <el-tooltip v-if="m.metaOverridden && m.metaOverridden.length" content="含用户覆盖" placement="top">
                       <span class="tag tag-warn meta-badge">覆盖</span>
                     </el-tooltip>
@@ -1668,20 +1677,20 @@ onMounted(refresh);
   margin: 0;
   cursor: pointer;
 }
-/* 能力格 = 可点击编辑入口：默认静默，悬停点亮 */
-.cap-cell {
-  cursor: pointer;
-}
-.cap-cell:focus-visible {
-  outline: 2px solid var(--accent-line);
-  outline-offset: -2px;
-}
+/* 能力格：可点区是「能力名 + 铅笔」这一组，不是整格（整格可点时右侧死宽也是热区，
+   点空白会莫名弹开编辑器）。默认静默，悬停点亮。 */
 .cap-chips {
   display: inline-flex;
   align-items: center;
   gap: 3px;
   min-width: 0;
   overflow: hidden;
+  cursor: pointer;
+  border-radius: 4px;
+}
+.cap-chips:focus-visible {
+  outline: 2px solid var(--accent-line);
+  outline-offset: -2px;
 }
 .cap-edit-ic {
   flex: 0 0 auto;
@@ -1691,16 +1700,16 @@ onMounted(refresh);
   opacity: 0;
   transition: opacity 0.15s;
 }
-.cap-cell:hover .cap-edit-ic,
-.cap-cell:focus-visible .cap-edit-ic {
+.cap-chips:hover .cap-edit-ic,
+.cap-chips:focus-visible .cap-edit-ic {
   opacity: 1;
   color: var(--accent-strong, #4ade80);
 }
-.cap-cell:hover .tag {
+.cap-chips:hover .tag {
   border-color: var(--line-strong);
 }
-/* 视觉重心：悬停整格淡淡提亮，暗示「整格可点」 */
-.cap-cell:hover {
+/* 视觉重心：悬停只提亮可点的那一组，提亮的范围就是可点的范围 */
+.cap-chips:hover {
   background: var(--bg-soft);
 }
 .rev-route-ch {

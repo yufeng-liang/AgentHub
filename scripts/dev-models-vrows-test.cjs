@@ -263,7 +263,16 @@ async function main() {
     selN === 2 ? "渠道覆盖那张 select 还在 ⇒ 合并没落地" : `实得 ${selN}`);
   // 2026-09-30 重组：编辑入口从独立按钮并入能力格（.cap-cell 整格可点开编辑器），
   // 闸跟着钉新形状：能力格可点击（role=button）+ 状态开关仍在。
-  check("⑫ 数据行仍有「能力格编辑入口」（cap-cell role=button）与状态开关", /cap-cell/.test(one) && /role="button"/.test(one) && /role="switch"/.test(one));
+  // ⑫ 能力格的编辑入口落在「能力名那一组」而不是整格（2026-10-09）：整格可点时右侧那截
+  //    死宽也是热区，点空白会莫名弹开编辑器。
+  //    判据必须自己取 cap 那一格：`/role="button"/.test(one)` 早就被渠道格的触发器满足，
+  //    拿它当「能力格还是按钮」是空转（变异对照：把 role 从能力格整条删掉，旧判据仍绿）。
+  const capTd = (/<td class="cell-chips cap-cell[\s\S]*?<\/td>/.exec(one) || [""])[0];
+  check("⑫ 能力格编辑入口在 .cap-chips 上（role=button + tabindex），td 自身不再是按钮",
+    /<span class="cap-chips"[^>]*role="button"[^>]*tabindex="0"/.test(capTd) &&
+      !/<td class="cell-chips cap-cell"[^>]*role="button"/.test(capTd),
+    `片段 ${JSON.stringify(capTd.slice(0, 130))}`);
+  check("⑫b 数据行仍有状态开关", /role="switch"/.test(one));
   check("⑬ 数据行仍渲染上下文输入框", /custom-input/.test(one));
 
   // ===== E+. 合并列与能力列的新形状（2026-10-08，先于实现写下，让它红在旧实现上）=====
