@@ -386,7 +386,7 @@ const PROXY_POOL = [
   },
   {
     // Qoder 双区：credits 用浮点演示（整数化会丢计量，见 format.ts fmtCredits）
-    id: "qoder", display: "Qoder", domain: "gateway.qoder.com.cn", costTier: "", poolStrategy: "expire_first",
+    id: "qoder", display: "Qoder CN", domain: "gateway.qoder.com.cn", costTier: "", poolStrategy: "expire_first",
     health: null as { until: number; reason: string; streak: number } | null,
     checkinAuto: { enabled: false, time: "09:00", jitterMin: 0 },
     summary: { channel: "qoder", totalCredits: 199.9934, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 30 * 86400000, expiringSoon: false, todayReq: 9, todayTokens: 48200, lastCreditsAt: NOW - 6 * 60000 },

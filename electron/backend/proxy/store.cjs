@@ -185,8 +185,9 @@ const BUILTIN_CHANNELS = [
   // 智谱套餐不是积分，是 Token 包：billing/balance 返回 remaining_units/total_units
   { id: "zcode", display: "ZCode（智谱）", domain: "zcode.z.ai", unit: "Token" },
   { id: "zcode_intl", display: "ZCode 智谱（国际）", domain: "api.z.ai", unit: "Token" },
-  // 显示名不写 CN：同一账号可以同时有国内版与国际版（渠道 id 才区分区服），名字里带 CN 会让人以为是同一家的两个版本
-  { id: "qoder", display: "Qoder", domain: "gateway.qoder.com.cn", unit: "Credits" },
+  // 显示名带 CN，与「Qoder 国际」成对：号池两行并排时「Qoder / Qoder 国际」看不出哪行是国内版。
+  // 区服一律由渠道 id 决定（EP.regionOf），显示名不参与任何路由或域名拼接。
+  { id: "qoder", display: "Qoder CN", domain: "gateway.qoder.com.cn", unit: "Credits" },
   ...(QODER_INTL_ENABLED ? [{ id: "qoder_intl", display: "Qoder 国际", domain: "api2.qoder.sh", unit: "Credits" }] : []),
 ];
 const BUILTIN_IDS = new Set(BUILTIN_CHANNELS.map((c) => c.id));
