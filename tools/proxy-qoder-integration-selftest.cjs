@@ -35,9 +35,9 @@ async function main() {
   // 用 stub 覆盖 rules/auth/httpJson，端到端验证领取逻辑（不发真实请求、不消耗额度）
   const { makeQoder } = require("../electron/backend/proxy/qoderAdapter.cjs");
   const RISK = { machineToken: "tok", machineType: "ty", machineCode: "co" };
-  function mkAd(httpJson, risk = RISK) {
-    return makeQoder("qoder", {
-      rules: { get: () => ({ qoder: { openApi: "https://openapi.test", userAgent: "Qoder", cosyVersion: "0.4.3" } }), rulesDir: () => os.tmpdir() },
+  function mkAd(httpJson, risk = RISK, product = "qoder") {
+    return makeQoder(product, {
+      rules: { get: () => ({ [product]: { openApi: "https://openapi.test", userAgent: "Qoder", cosyVersion: "0.4.3" } }), rulesDir: () => os.tmpdir() },
       auth: { readRiskIdentity: () => risk },
       httpJson,
       util: require("../electron/backend/proxy/util.cjs"),
@@ -134,6 +134,40 @@ async function main() {
     assert(r.deferred === true && r.retryAt >= near * 1000 && r.retryAt <= near * 1000 + 6 * 60000, "混合活动时 retryAt 取 CLAIM_BENEFIT 最早的未来 endAt");
   }
 
+  // ===== A1. 国际版的「窗口未开放」形态（issue #140 那侧的缺陷）=====
+  // 国际版每日 100 Credits 的活动窗口 10:00（UTC+8）才下发，而自动签到缺省 00:01 触发，
+  // 拉到的是**一条 CLAIM_BENEFIT 都没有**的空列表（只有 VIEW_DETAILS 促销）。
+  // 这种空表若按 already 落库，当天就再也不会重试 ⇒ 永久错过窗口。必须 deferred。
+  console.log("\n[A1] 国际版窗口未开放 → deferred（不落当日已签）");
+  {
+    const r = await mkAd(async () => mkCampaigns([VIEW]), RISK, "qoder_intl").checkin({ uid: "u" }, { token: "t" });
+    assert(r.deferred === true && r.already === true, "intl 空活动表 → deferred + already");
+    assert(/窗口/.test(r.message), `文案说明是窗口没开而不是「没有活动」：${r.message}`);
+    const utc8Minutes = (r.retryAt + 8 * 3600_000) % 86_400_000 / 60_000;
+    assert(utc8Minutes === 10 * 60 + 5, `retryAt 落在 UTC+8 的 10:05（实得 ${utc8Minutes} 分钟）`);
+    assert(r.retryAt > Date.now() && r.retryAt - Date.now() <= 86_400_000, "retryAt 在未来且不超过 24h（调度器按当天封顶）");
+  }
+  {
+    // 中国版同一张空表**不延后**：Free 套餐实测就是不下发活动，那是账号侧状态；
+    // 当成 deferred 会让这类号每 tick 白跑一整天。
+    const r = await mkAd(async () => mkCampaigns([VIEW])).checkin({ uid: "u" }, { token: "t" });
+    assert(r.already === true && r.deferred !== true, "CN 空活动表仍是 already（不延后）");
+  }
+  {
+    // intl 已领过（有 CLAIM_BENEFIT 的 CLAIMED 实例）→ 走原有的 endAt 分支，不落到窗口分支
+    const future = Math.floor(Date.now() / 1000) + 3600;
+    const r = await mkAd(async () => mkCampaigns([{ ...CLM, claimStatus: "CLAIMED", endAt: future }]), RISK, "qoder_intl")
+      .checkin({ uid: "u" }, { token: "t" });
+    assert(r.deferred === true && Math.abs(r.retryAt - (future * 1000 + 5 * 60000)) <= 60000, "intl 已领过仍按 endAt 延后（窗口分支没抢位）");
+  }
+  {
+    // intl 有可领活动 → 正常领取（证明窗口分支没有把 intl 一律挡在 claim 之前）
+    const r = await mkAd(async (url) => (url.endsWith("/claim")
+      ? { status: 200, ok: true, data: { status: "CLAIMED", replayed: false, benefit: { amount: 100 } } }
+      : mkCampaigns([CLM])), RISK, "qoder_intl").checkin({ uid: "u" }, { token: "t" });
+    assert(r.ok === true && /\+100/.test(r.message), "intl 有 CLAIMABLE 时照常领取");
+  }
+
   // ===== A2. 风控身份：真实调用客户端生成器 + 机器级缓存 =====
   // 实测：runtime-info.exe 产出的是**机器级**身份（与账号无关），单次约 3.6s。
   // 故必须按 product 缓存——按 uid 缓存会让 N 个账号付出 N×3.6s。
@@ -159,6 +193,22 @@ async function main() {
     assert(fiveMs < 200, `5 个账号复用缓存共 ${fiveMs}ms（未重复 spawn，否则约 ${5 * firstMs}ms）`);
     auth.clearRiskCache();
     assert(true, "clearRiskCache 可调用（切号时清理）");
+
+    // 跨区身份必须**不同**：这是 env 位置参数存在的理由（闸 dev-qoder-risk-env-test 判 argv 的构造，
+    // 这条判真实组件确实按 env 产出不同身份——2026-10-10 本机实测：0/3/4 三件套互不相同，
+    // 而换 uid 或传空串输出不变）。只在两区客户端都在时才有意义。
+    const intlExe = auth.riskIdentityPath("qoder_intl");
+    if (fs.existsSync(intlExe)) {
+      auth.clearRiskCache();
+      const idCn = auth.readRiskIdentity("qoder", "uid-A");
+      const idIntl = auth.readRiskIdentity("qoder_intl", "uid-A");
+      assert(!!idCn && !!idIntl, "两区身份都取得到（组件可执行）");
+      assert(idCn.machineToken !== idIntl.machineToken,
+        `同一个 uid 在两区拿到不同身份 ⇒ env 编号真的进到了组件（cn=${idCn.machineToken.slice(0, 8)}… intl=${idIntl.machineToken.slice(0, 8)}…）`);
+      auth.clearRiskCache();
+    } else {
+      console.log("  · 国际版客户端未安装，跳过跨区身份对照");
+    }
   } else {
     console.log("  · 客户端未安装，跳过（credential-only 环境）");
   }

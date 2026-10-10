@@ -73,16 +73,43 @@ function pathsOf(product) {
  * （实测：不带 Cosy-ClientType 时 campaigns 返回 claimable:false，看似"没有活动"）。
  * 我们不做逆向——直接调用客户端自己的生成器（与推理链的 wasm 签名器是两套独立机制）。
  *
- * 调用方式（从主进程逆向所得）：
- *   runtime-info.exe --account-stdin      stdin: {"account":"<uid>"}
- *   stdout: {"machineToken":"...","machineType":"...","machineCode":"...","vmInfo":{...}}
+ * 调用方式：`runtime-info.exe <env> --account-stdin`，stdin `{"account":"<uid>"}`，
+ * stdout 一行 JSON：`{"machineToken":"...","machineType":"...","machineCode":"...","vmInfo":{...}}`
+ *
+ * ⚠ **env 位置参数不能省**（2026-10-10 在本机两个客户端上实测）：同一组件「不传 env」
+ * 与「传 0」输出逐字相同，而 0 / 3 / 4 之间 token/code/type 三件套完全不同。
+ * 国际版要 3——省略它等于拿中国版环境的风控身份去领国际版的活动。
+ * 反过来，uid 在这一版组件里**不参与**输出（换 uid、甚至传空串，三件套不变），
+ * 所以参考仓「身份按 uid 生成 ⇒ 要先拉一次拿 uid 再叠头」那半条本机证否，这里仍单段取。
  */
+const RISK_ENV_BY_REGION = { cn: 0, global: 3 };
+
+/** 组件的 argv：`<env> --account-stdin`（顺序与客户端一致）。
+ *  单独成函数是为了让「环境编号进没进 argv」变成可直接断言的纯函数——
+ *  child_process 是内建模块，进不了 require.cache，桩不掉，只能从这一侧开口。 */
+function riskArgv(product) {
+  return [String(RISK_ENV_BY_REGION[EP.regionOf(product)] ?? 0), "--account-stdin"];
+}
+
+/** 本产品的 UMID 组件路径（不做存在性判断；探测器见 qoderInstall.runtimeInfoPath） */
 function riskIdentityPath(product) {
   const p = PRODUCTS[product];
   if (!p || !p.exeLabel) return "";
   // 安装目录按多候选定位（默认路径 / launcher 版本目录 / 注册表兜底）——
   // 硬编码 %LOCALAPPDATA%\Programs 会在 launcher/自定义路径安装上找不到 runtime-info.exe
   return qoderInstall.runtimeInfoPath(product);
+}
+
+/** 组件候选：本产品的客户端优先，缺失时回落另一区客户端（同 env 输出相同，实测过）。
+ *  这样只装了一个 Qoder 客户端的用户，另一区的号也能领——不是猜的妥协，是组件等价性。 */
+function riskIdentityCandidates(product) {
+  const ids = [product, ...Object.keys(PRODUCTS).filter((id) => id !== product)];
+  const out = [];
+  for (const id of ids) {
+    const p = riskIdentityPath(id);
+    if (p && !out.includes(p) && fs.existsSync(p)) out.push(p);
+  }
+  return out;
 }
 /**
  * 取（必要时生成）machine_id。
@@ -122,27 +149,32 @@ const RISK_CACHE_TTL_MS = 10 * 60 * 1000;
 const riskCache = new Map(); // product -> { at, value }
 
 function readRiskIdentity(product, uid) {
-  const exe = riskIdentityPath(product);
-  if (!exe || !fs.existsSync(exe)) return null;
+  const exes = riskIdentityCandidates(product);
+  if (!exes.length) return null;
   const hit = riskCache.get(product);
   if (hit && Date.now() - hit.at < RISK_CACHE_TTL_MS) return hit.value;
-  try {
-    const out = execFileSync(exe, ["--account-stdin"], {
-      input: JSON.stringify({ account: String(uid || "") }),
-      encoding: "utf8",
-      timeout: 20000, // 实测单次约 3.6s；留足余量（慢机器/杀软扫描时会更长）
-      windowsHide: true,
-      maxBuffer: 1 << 20,
-    }).trim();
-    if (!out) return null;
-    const j = JSON.parse(out);
-    if (!j || typeof j.machineToken !== "string" || !j.machineToken) return null;
-    const value = { machineToken: j.machineToken, machineType: j.machineType || "", machineCode: j.machineCode || "", vmInfo: j.vmInfo || null };
-    riskCache.set(product, { at: Date.now(), value });
-    return value;
-  } catch {
-    return null;
+  for (const exe of exes) {
+    try {
+      // env 由 riskArgv 带上（漏掉它两区身份会撞成同一个环境）
+      const out = execFileSync(exe, riskArgv(product), {
+        input: JSON.stringify({ account: String(uid || "") }),
+        encoding: "utf8",
+        timeout: 20000, // 实测单次约 3.6s；留足余量（慢机器/杀软扫描时会更长）
+        windowsHide: true,
+        maxBuffer: 1 << 20,
+      }).trim();
+      if (!out) continue;
+      const j = JSON.parse(out);
+      if (!j || typeof j.machineToken !== "string" || !j.machineToken) continue;
+      const value = { machineToken: j.machineToken, machineType: j.machineType || "", machineCode: j.machineCode || "", vmInfo: j.vmInfo || null };
+      riskCache.set(product, { at: Date.now(), value });
+      return value;
+    } catch {
+      // 一个候选失败就试下一个（ launcher 目录下的组件可能损坏或被杀软拦下）；全失败才回 null
+      continue;
+    }
   }
+  return null;
 }
 
 /** 清空风控缓存（切号/退出登录后调用；按 product 缓存故一并清理） */
@@ -338,6 +370,8 @@ module.exports = {
   catalogPath,
   readCatalogBlob,
   riskIdentityPath,
+  riskIdentityCandidates,
+  riskArgv,
   readRiskIdentity,
   clearRiskCache,
   ensureMachineId,

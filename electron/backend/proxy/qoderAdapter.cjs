@@ -30,6 +30,18 @@ function osVersion() {
   }
 }
 
+/** 下一个「每日 10:00（UTC+8）」活动窗口的开放时刻（epoch ms）。
+ *  固定按 UTC+8 算而不是本地时区：窗口由服务端定，本机时区一变（或跑在 UTC 机器上）
+ *  就会把重试时刻排到窗口中间，白跑一次还落一次状态。 */
+const WINDOW_OFFSET_MS = 8 * 3600_000;
+function nextWindowOpenAt(nowMs) {
+  const DAY = 86_400_000;
+  const shifted = nowMs + WINDOW_OFFSET_MS;      // 换算到 UTC+8 的「本地」毫秒轴
+  const todayOpen = Math.floor(shifted / DAY) * DAY + 10 * 3600_000;
+  const target = shifted < todayOpen ? todayOpen : todayOpen + DAY;
+  return target - WINDOW_OFFSET_MS;              // 回到真 epoch
+}
+
 /** 静态兜底模型表（catalog 不可用时的最小可用集，全部实测 format=openai）。
  *
  *  ⚠️ 按 product 隔离：这两个产品的模型 key 并不通用（CN 与 intl 是两套上游目录，
@@ -667,6 +679,21 @@ function makeQoder(product, deps) {
             deferred: true,
             retryAt,
             message: `当前窗口已领取；下一窗口开放后（每日 10:00 UTC+8）自动重试`,
+          };
+        }
+        // 国际版的第三种形态：列表里**一条 CLAIM_BENEFIT 都没有**（只有 VIEW_DETAILS 促销）。
+        // 每日 100 Credits 的活动窗口每天 10:00（UTC+8）才下发，而自动签到缺省触发是 00:01，
+        // 必然拉到空表——此时记「今日已完成」等于当天再也不会重试，永久错过窗口
+        // （参考仓 agent2api 3c568fa2 同判据，它旧注释「国际版没有签到计划」的真正原因是缺风控头）。
+        // 中国版不进这条分支：Free 套餐实测就是不下发活动，那是账号侧状态不是时机问题，
+        // 当成 deferred 会让这类号每 tick 白跑一整天。
+        if (EP.regionOf(product) === "global" && !campaigns.some((x) => x && x.actionType === "CLAIM_BENEFIT")) {
+          return {
+            ok: true,
+            already: true,
+            deferred: true,
+            retryAt: nextWindowOpenAt(Date.now()) + 5 * 60000,
+            message: "国际版每日活动窗口尚未开放（10:00 UTC+8 下发），开放后自动重试",
           };
         }
         return {

@@ -94,8 +94,8 @@ const PROVIDER_META = { icon: "ph-plugs-connected", hint: "API Key 轮转 · 无
 // ===== 渠道能力表（与主进程一一对应，缺能力的动作一律不摆按钮）=====
 // 签到：判据是主进程适配器里 checkin/checkinStatus 这两个方法存不存在。
 // 上游 v1.50 起这张表要跟着渠道一起长：modelscope 是「每日任务」（会话触碰 + 点赞）、
-// lobster 是「每日签到 100 积分」、Qoder CN 是「活动 Credits 领取」（每日 100，需装客户端出风控身份），
-// 三家都定义了 checkin ⇒ 记 true。Cline 双池 / AutoClaw 双区官方就没有签到体系，
+// lobster 是「每日签到 100 积分」、Qoder 双区是「活动 Credits 领取」（每日 100，需装客户端出风控身份），
+// 主进程对它们定义了 checkin ⇒ 记 true。Cline 双池 / AutoClaw 双区官方就没有签到体系，
 // 主进程对它们只能回 unavailable，界面上摆个按钮就是骗人点一次、跑一轮空请求。
 // zcode 家记 false 是刻意的：它的「一键领取 / 过码 / 领取模式」在模板里各走专门分支，不吃这张表。
 const CHECKIN_CAPABLE: Record<ProxyBuiltinChannelId, boolean> = {
@@ -110,7 +110,11 @@ const CHECKIN_CAPABLE: Record<ProxyBuiltinChannelId, boolean> = {
   modelscope: true,
   lobster: true,
   qoder: true,
-  qoder_intl: false, // 活动 Credits 领取是 CN 侧专属（每日 100 要靠桌面端出风控身份），国际版只有充值额度
+  // 国际版同样有每日 100 Credits 的活动领取（2026-10-10 校正）。此前记 false 的理由是
+  // 「活动 Credits 领取是 CN 侧专属」——那是抄参考仓的旧注释，而它自己已作废：
+  // 国际版服务端只对带设备风控头（Cosy-MachineToken/Code/Type）的请求下发活动，
+  // 旧观察到的「只有 VIEW_DETAILS 促销」是我们的组件调用漏了环境编号（见 qoderAuth.riskArgv）。
+  qoder_intl: true,
   zcode: false,
   zcode_intl: false,
 };
@@ -1650,9 +1654,9 @@ onUnmounted(() => {
                 >{{ checkinBusy ? "领取中…" : channelCheckinDone(ch) ? labelsOf(ch.id).done : labelsOf(ch.id).run }}</button>
               </el-tooltip>
               <!-- Qoder 双区（上游 v1.50）：官方没有「每日签到」，是活动 Credits 领取，文案与动作名如实区分。
-                   再加一道 checkinCapable：活动领取是 CN 侧专属（要靠桌面端出风控身份），
-                   CHECKIN_CAPABLE.qoder_intl 按 a2e386f 的判定记 false ⇒ 国际版三处入口都不给摆，
-                   否则工具栏承诺得上的事，行内和自动签到两处都拒绝。 -->
+                   再加一道 checkinCapable：双区都有每日 100 Credits 的活动（国际版要带设备风控头才下发），
+                   CHECKIN_CAPABLE 记 true ⇒ 工具栏 / 自动签到 / 行内三处入口同开同关，
+                   否则工具栏承诺得上的事，行内和自动签到两处会拒绝。 -->
               <el-tooltip v-else-if="isQoderChannel(ch.id) && checkinCapable(ch.id)" :content="checkinToolbarTitle(ch)" placement="top">
                 <button
                   class="btn btn-sm"

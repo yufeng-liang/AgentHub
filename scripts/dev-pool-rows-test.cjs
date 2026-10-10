@@ -184,6 +184,22 @@ async function main() {
   check(`⑬ 能力表为 true 的内置渠道（${capable}）确实摆出了签到按钮`, /签到/.test(cp.html),
     "一行都没渲染 ⇒ 门禁或 v-if 被绕过，⑫ 的「没出现」就成了空判据");
 
+  // ===== D. 签到入口的三处一致性（判据在源码，不在渲染产物里）=====
+  // 一个渠道的签到 affordance 在模板里有三处：工具栏动作按钮、工具栏「自动签到设置」按钮、行内按钮。
+  // 三处必须同源吃 CHECKIN_CAPABLE，否则会出现「工具栏承诺得上的事，行内拒绝」（上游 v1.55 真机核验抓到过）。
+  // 这一组是静态判据：SSR 只渲染 tbody 片段，工具栏不在里面，数按钮数不出来。
+  const src = fs.readFileSync(path.join(ROOT, "src/views/proxy/ProxyAgentsView.vue"), "utf8");
+  const toolbarQoder = /v-else-if="isQoderChannel\(ch\.id\) && checkinCapable\(ch\.id\)"/.test(src);
+  check("⑭ 工具栏 Qoder 分支同时含 isQoderChannel 与 checkinCapable", toolbarQoder,
+    "摘掉能力闸 ⇒ intl 会被单独点亮（上游那版就是这么写的）");
+  const autoBtn = /v-if="checkinCapable\(ch\.id\) \|\| ch\.id === 'zcode'"/.test(src);
+  check("⑮ 自动签到设置的放行集 = 能力表 ∪ zcode", autoBtn,
+    "若掺进裸 isQoderChannel，intl 会出现「有自动签到设置、行内没有签到按钮」的自相矛盾");
+  const rowBtn = /v-if="acc\.hasToken && isBuiltin\(ch\) && acc\.channel !== 'zcode' && checkinCapable\(acc\.channel\)"/.test(src);
+  check("⑯ 行内按钮走能力闸（不是上游那句 channel !== 'zcode' 兜底）", rowBtn);
+  check("⑰ Qoder 双区能力同值（同开同关）", CAPABLE.qoder === CAPABLE.qoder_intl,
+    `${CAPABLE.qoder} vs ${CAPABLE.qoder_intl}——分开了就意味着有一区摆的是注定被主进程拒答的按钮`);
+
   console.log(`\n${failures.length ? "FAIL " + failures.length + " 项" : "OK 号池表格结构闸全过"}（共 ${pass + failures.length} 项）`);
   if (failures.length) process.exit(1);
 }
