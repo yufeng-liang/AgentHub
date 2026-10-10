@@ -29,6 +29,16 @@ const check = (n, ok, d) => {
   else { failures.push(n + (d ? `：${d}` : "")); console.log(`FAIL  ${n}${d ? `：${d}` : ""}`); }
 };
 
+// ===== ⓪ 真·安装目录名（桩表之前先读真身：这两个值是磁盘事实，误改会让两区认错同一个客户端目录）
+// 判据是 /\bCN\b/ 而不是全等——所以「Qoder 国内版」这种看着更中文化的改名同样致命且静默：
+// wantCn 会变 false，CN 渠道直接命中国际版的 resources（那里的 runtime-info.exe 真实存在）。
+// 若客户端厂商改了目录名导致这里红：用 node -e 跑 findResources 两区各一次，确认路径互不相同后重录。
+const realInstall = require("../electron/backend/proxy/qoderInstall.cjs");
+const realLabels = realInstall.EXE_LABELS;
+check(`⓪a EXE_LABELS.qoder == "Qoder CN"（实得 ${JSON.stringify(realLabels.qoder)}）`, realLabels.qoder === "Qoder CN");
+check(`⓪b EXE_LABELS.qoder_intl == "Qoder"（实得 ${JSON.stringify(realLabels.qoder_intl)}）`, realLabels.qoder_intl === "Qoder");
+check("⓪c 区服判据把两区分开（CN 命中 / intl 不命中）", /\bCN\b/i.test(realLabels.qoder) === true && /\bCN\b/i.test(realLabels.qoder_intl) === false, "相等即两区会解析到同一个安装目录");
+
 // 假组件路径表（真实探测在 qoderInstall.cjs，这里只桩它的返回值）
 const PROBE_DIR = path.join(TMP, "umid");
 fs.mkdirSync(PROBE_DIR, { recursive: true });

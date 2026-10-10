@@ -19,7 +19,23 @@ const os = require("node:os");
 const path = require("node:path");
 const { execFileSync } = require("node:child_process");
 
-/** 产品 → exeLabel（安装目录名，与 qoderAuth.PRODUCTS 共用同一份事实源） */
+/** 产品 → exeLabel（安装目录名，与 qoderAuth.PRODUCTS 共用同一份事实源）
+ *
+ *  ⚠ 这两个值是**磁盘上的安装目录名**（默认安装即 `%LOCALAPPDATA%\Programs\<值>`；launcher 与
+ *  注册表形态见本文件头），不是界面文案，与 store.BUILTIN_CHANNELS 的 display 无关——只是 qoder 那条
+ *  恰好撞成同一个字串「Qoder CN」（2026-10-10 渠道改名后），别把它当重复项「统一」掉。
+ *  国际版客户端的目录名本来就不带后缀，值必须是裸的 "Qoder"。
+ *
+ *  区服判据依赖这个字面量：sameProductDir / registryResources 用 `/\bCN\b/i.test(exeLabel)` 分辨两区。
+ *  实测本机（launcher 形态）与 3 例判定矩阵：
+ *    qoder      → H:\Qoder CN\.qoder-versions\0.4.3\resources
+ *    qoder_intl → H:\Qoder\resources
+ *    把 qoder 的值改成裸「Qoder」→ findResources("qoder") 返回 H:\Qoder\resources，
+ *    与 qoder_intl **同一个目录**，那里的 umid\runtime-info.exe 真实存在
+ *    （写成「Qoder 国内版」也一样：没有独立的 CN 词 ⇒ wantCn=false）
+ *  所以误改的首要后果不是「找不到」，而是**静默拿另一区的客户端出签名器与风控身份**——
+ *  表现为能跑但区服不对（身份/活动/域名全错），比直接失败难查得多。只有另一区也没装时才显成定位失败。
+ *  要改界面名字改 store.cjs + format.ts + mock.ts 三处，并跑 scripts/dev-channel-names-test.cjs。 */
 const EXE_LABELS = { qoder: "Qoder CN", qoder_intl: "Qoder" };
 /** 产品 → 环境变量覆盖键（调试/测试用：直接指定 resources 目录） */
 const ENV_KEYS = { qoder: "AGENTHUB_QODER_RESOURCES", qoder_intl: "AGENTHUB_QODER_INTL_RESOURCES" };
