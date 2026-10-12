@@ -80,17 +80,20 @@ function osCryptKey(dir) {
 }
 
 /** 解 enc: 字段（协议参考 §2.7 第二步）：v10 + 12B nonce + AES-256-GCM（无 AAD，tag 尾置 16B）。
- *  Rust 侧「密文+tag 整段交给 GCM」与 Node 手动切 tag 语义相同；长度守卫 ≤28 字节判异常。 */
+ *  Rust 侧「密文+tag 整段交给 GCM」与 Node 手动切 tag 语义相同；长度守卫 ≤28 字节判异常。
+ *  aesKey 允许传取值函数（thunk）：明文形态的字段不需要密钥，就别去读 Local State——
+ *  否则缺 Local State 会抛「解密失败」，把本来能用的明文登录态判成读不了（详见 readAutoClawAuth）。 */
 function decryptEncValue(v, aesKey) {
   const s = String(v || "");
-  if (!s.startsWith(ENC_PREFIX)) return s; // 历史版本明文原样返回
+  if (!s.startsWith(ENC_PREFIX)) return s; // 历史版本明文原样返回（这条分支不碰密钥）
+  const key = typeof aesKey === "function" ? aesKey() : aesKey;
   const payload = Buffer.from(s.slice(ENC_PREFIX.length), "base64");
   if (payload.subarray(0, 3).toString("ascii") !== OS_CRYPT_VERSION) throw new Error("不支持的 os_crypt 版本");
   if (payload.length <= 12 + 16) throw new Error("AES-GCM 密文长度异常");
   const nonce = payload.subarray(3, 15);
   const body = payload.subarray(15);
   const tag = body.subarray(body.length - 16);
-  const dec = crypto.createDecipheriv("aes-256-gcm", aesKey, nonce);
+  const dec = crypto.createDecipheriv("aes-256-gcm", key, nonce);
   dec.setAuthTag(tag);
   return Buffer.concat([dec.update(body.subarray(0, body.length - 16)), dec.final()]).toString("utf8");
 }
@@ -113,7 +116,10 @@ function readAutoClawAuth() {
   const obj = readJsonGuarded(path.join(dir, "auth.json"));
   if (!obj) return null;
   try {
-    const cred = parseAuthFile(obj, osCryptKey(dir));
+    // 密钥按 thunk 传下去：明文形态的 auth.json（历史版本/手工改动，上游 autoclaw/credentials.cjs
+    // 同样兼容）本来不需要密钥。早先这里在参数位置直接 osCryptKey(dir)，缺 Local State 会先抛
+    // 「解密失败」——扫描因此静默少一条候选，续期也拿不到桌面端刚旋转过的 refresh_token。
+    const cred = parseAuthFile(obj, () => osCryptKey(dir));
     cred.uid = "";
     cred.name = "AutoClaw 账号";
     return cred;

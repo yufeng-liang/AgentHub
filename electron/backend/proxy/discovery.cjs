@@ -530,42 +530,51 @@ function scanCline() {
 }
 
 // ===== AutoClaw（%APPDATA%/AutoClaw/auth.json，safeStorage 密文；协议参考 §2.7） =====
-// 地区门禁照抄参考项目 local_credentials()：auth.json 无地区标记，只导国内渠道；
-// 国际版账号走 OAuth/粘贴。备来源 openclaw.json 是明文 JWT，无 refreshToken → 标注不可刷新。
+// auth.json **没有地区标记**（国内/国际构建共用同一个文件），所以不猜地区：对每个已启用的渠道
+// 各产一条候选，用户在哪家页面下点导入就落哪家。与 Cline 双池同一条理由——扫描弹窗按「当前正在
+// 新增的渠道」过滤候选（ProxyAgentsView 的 scanRows），只产国内候选会让 autoclaw_intl 那页永远
+// 扫不出本机登录态。猜错的代价可见：对话 401，重导即可（上游同口径）。
+// uid 仍带地区前缀（协议参考 §2.8：两地 userId 空间可能撞号），两条候选 uid 不同、互不顶替。
+// 备来源 openclaw.json 是明文 JWT，无 refreshToken → 标注不可刷新。
+const AUTOCLAW_UID_PREFIX = { autoclaw: "user-", autoclaw_intl: "intl-user-" };
 
 function scanAutoClaw() {
   const out = [];
-  try {
-    const cred = acCred.readAutoClawAuth();
-    if (cred && cred.token) {
-      // util.jwtDecode 返回 {token,uid,exp,payload}，user_id/user_name 声明在 payload（简报直取顶层是笔误，按真实接口修正）
-      const claims = util.jwtDecode(cred.token).payload || {};
+  const channels = ["autoclaw", "autoclaw_intl"].filter((ch) => store.CHANNELS.some((c) => c.id === ch) && adapters.channelOn(ch));
+  /** 一份登录态 → 每个启用渠道各一条候选（file 只到文件名，两区的身份复核靠 channel+file+uid 三元组） */
+  const pushPerChannel = (cred, file, nameFallback) => {
+    // util.jwtDecode 返回 {token,uid,exp,payload}，user_id/user_name 声明在 payload（简报直取顶层是笔误，按真实接口修正）
+    const claims = util.jwtDecode(cred.token).payload || {};
+    const id = String(claims.user_id || cred.uid || "");
+    for (const channel of channels) {
       out.push({
-        channel: "autoclaw",
-        uid: `user-${String(claims.user_id || cred.uid || "")}`,
-        name: String(claims.user_name || cred.name || "AutoClaw 账号"),
+        channel,
+        uid: `${AUTOCLAW_UID_PREFIX[channel]}${id}`,
+        name: nameFallback || String(claims.user_name || cred.name || "AutoClaw 账号"),
         token: cred.token, refreshToken: cred.refreshToken,
         expiresAt: cred.expiresAt,
         // deviceId 同值双写（与 qoder 的 machine_id/machineId 同一手法）：上游 autoclaw/adapter.cjs
         // 的 deviceIdOf 只认驼峰，fork 历史行是 snake 的 device_id（读侧由 store.parseMeta 补齐）。
         // 两键都写，新行从落库起就两条口径一致。
         meta: cred.deviceId ? { device_id: cred.deviceId, deviceId: cred.deviceId } : {},
-        source: "scan", file: "auth.json",
+        source: "scan", file,
       });
     }
+  };
+  try {
+    const cred = acCred.readAutoClawAuth();
+    if (cred && cred.token) pushPerChannel(cred, "auth.json", null);
   } catch { /* 解密失败不进候选（UI 走粘贴） */ }
   try {
     const alt = acCred.readOpenclawFallback();
     if (alt && alt.token) {
       const claims = util.jwtDecode(alt.token).payload || {};
-      out.push({
-        channel: "autoclaw",
-        uid: `user-${String(claims.user_id || "")}`,
-        name: "AutoClaw（openclaw.json，无刷新令牌）",
-        token: alt.token, refreshToken: "", // 无 refreshToken → 刷新链路会如实报「请重新粘贴」
+      pushPerChannel({
+        token: alt.token,
+        refreshToken: "", // 无 refreshToken → 刷新链路会如实报「请重新粘贴」
         expiresAt: Number(claims.exp || 0) * 1000 || 0,
-        meta: {}, source: "scan", file: "openclaw.json",
-      });
+        uid: claims.user_id, deviceId: "",
+      }, "openclaw.json", "AutoClaw（openclaw.json，无刷新令牌）");
     }
   } catch { /* 同上 */ }
   return out;
@@ -656,10 +665,11 @@ function scanCatpaw() {
   return out;
 }
 
-// ⚠ 上游本批还带来 scanAutoclaw / scanCline 两个新扫描器，此处刻意不收：
-//   · 名与 fork 的 scanAutoClaw 只差大小写，两个都会给 autoclaw 双区产出候选 → 同号重复行；
-//   · scanCline 与 fork 的同名函数**逐字同名**，并列即声明遮蔽（第十一批 beginQoderOAuth 双生体同型），
-//     后定义者静默胜出，判据读的是死代码。随 cline/autoclaw 目录实现一起在移植提交里接线。
+// ⚠ 上游本批带来的 scanAutoclaw / scanCline 两个新扫描器，接线完成后仍不收：
+//   · 名与 fork 的 scanAutoClaw 只差大小写，两个都给 autoclaw 双区产候选 → 并列即同号重复行；
+//   · scanCline 与 fork 的同名函数**逐字同名**，并列即声明遮蔽（第十一批 beginQoderOAuth 双生体同型）。
+//   2026-10-12 两份目录实现接线后，fork 这两个函数的产出形状已与上游一致（按启用的渠道/池各产一条），
+//   并保留 fork 独有的两点：autoclaw 的 uid 带地区前缀（协议参考 §2.8）、openclaw.json 备来源。
 
 /** 全量扫描（本机全渠道候选）：八路 = 上游四家 + fork 的 cline/autoclaw + 上游的 qoder 双区、zcode 与 catpaw。
  *  逐扫描器 try/catch：单渠道扫描抛错（如登录文件在扫描间隙被删）只跳过该渠道并留痕，
@@ -780,14 +790,10 @@ function currentLocalLogins() {
     if (login.uid) out.catpaw = { uid: login.uid, name: String(login.loginName || "") };
   } catch { /* 同上 */ }
   try {
-    // AutoClaw 两地共用同一个登录态文件（无地区标记），两键同值——徽标只是「本机有登录态」的提示。
     // 读法刻意复用本文件的 scanAutoClaw()，而不是上游 autoclaw/credentials 的另一个入口：
     // 徽标与号池扫描必须同源，否则会出现「徽标说本机没登录、扫描列表里却有候选」这种自相矛盾。
-    const first = scanAutoClaw().find((c) => c.uid) || null;
-    if (first) {
-      out.autoclaw = { uid: first.uid, name: first.name || "" };
-      if (store.AUTOCLAW_INTL_ENABLED) out.autoclaw_intl = { uid: first.uid, name: first.name || "" };
-    }
+    // 两区各有一条候选，各带自己的地区前缀（以前这里把国内 uid 抄给 intl 键，是显示层的错）。
+    for (const c of scanAutoClaw()) if (c.uid) out[c.channel] = { uid: c.uid, name: c.name || "" };
   } catch { /* 同上 */ }
   try {
     // Cline 两池同样是「一个客户端登录态」：两键同值（池由渠道身份决定）。同上，走 scanCline()。
@@ -2265,8 +2271,9 @@ function qoderMachineIdOf(product = "qoder") {
 // ① captcha-config（主进程拉，签名头）→ ② renderer 弹滑块拿 captchaVerifyParam → oauth-url 拿授权页
 // → ③ 系统浏览器登录 302 回环 /aclaw-cb/{vendor}/{taskState}?code&state（上游不校验回调主机）
 // 双 state 陷阱：路径里是本网关任务 state（CSRF 校验），换码必须用查询串里上游回的 state——传错稳定 631001。
-// 与 rules/headers.json 的 autoclaw_intl.userapiBase 同值，字面量写在这里避免跨文件私有引用
-//（内联时代的 AUTOCLAW_REGIONS 常量组已随上游 autoclaw/ 目录接线删除）
+// 兜底域名：与 rules/headers.json 的 autoclaw_intl.userapiBase 同值。真正用的是 autoclawCfg() 读到的
+// 配置值（见 beginAutoClawIntlOAuth），字面量只在配置缺失时垫底——硬编码域名会让自测没法把登录三跳
+// 指到假上游，也会让热改域名这件事只对一半（对话/余额走配置，登录走常量）。
 const AUTOCLAW_INTL_USERAPI = "https://autoglm-api.autoglm.ai";
 const AUTOCLAW_CALLBACK_PREFIX = "/aclaw-cb/";
 const AUTOCLAW_INTL_OK_PAGE = '<meta charset=utf-8><body style="font-family:system-ui;background:#0b0d0f;color:#44e07f;display:grid;place-items:center;height:100vh">登录成功，已返回网关，可以关闭此页面。</body>';
@@ -2306,7 +2313,8 @@ function finishAutoClawIntlOAuth(mine, result) {
 }
 
 async function beginAutoClawIntlOAuth(channel, opts, onDone) {
-  const userapi = AUTOCLAW_INTL_USERAPI;
+  // 域名走 headers.json 的 autoclaw_intl.userapiBase（与对话/余额同一份配置），常量只垫底
+  const userapi = String(autoclawCfg(channel).userapiBase || AUTOCLAW_INTL_USERAPI).replace(/\/+$/, "");
   // 第 0 步：没带 captchaVerifyParam → 回滑块配置（renderer 加载阿里云 SDK 弹滑块，Task 13）
   if (!opts || !opts.captchaVerifyParam) {
     const cfg = await adapters.httpJson(`${userapi}/userapi/overseasv1/oauth-captcha-config`, { method: "POST", headers: autoclawSignedHeaders(""), body: "{}" })
@@ -3124,6 +3132,14 @@ async function saveAutoclawAccount(channel, cred, deviceId) {
  */
 const AUTOCLAW_CALLBACK_PORTS = [18432, 19654, 19723, 53699];
 
+/**
+ * ⚠ 上游 v1.60 的国际版登录实现，本分支**未接线**（唯一在用的是 beginAutoClawIntlOAuth，见
+ * beginOAuth 的分派）：它要求回调地址落在 z.ai 给官方客户端登记的四个固定 loopback 端口
+ * （AUTOCLAW_CALLBACK_PORTS + /auth/callback-{vendor}），而 fork 的 UI/闸与上游滑块两步式握手
+ * 都是「任意端口 + /aclaw-cb/{vendor}/{taskState}」这一套（dev-autoclaw-test 的 intl OAuth 段
+ * 整段盯着那条契约）。两套并存时保留这份是等价的取舍点：若哪天要换成上游的固定端口方案，
+ * 得同时改前端与那一段闸，别只把分派改过来。
+ */
 async function beginAutoClawOauth(channel, onDone, opts) {
   const autoclawLogin = require("./autoclaw/login.cjs");
   const c = autoclawCfg(channel);
@@ -3349,9 +3365,9 @@ module.exports = {
   submitLobsterCallback,
   resolveLobsterUid,
   // AutoClaw：落库函数供 SMS 两跳 IPC 直调（上游 v1.60 的实现，自包含、不依赖注册哪个适配器）。
-  // 上游同批还导出它自己的 scanAutoclaw（小写 c），本批刻意不收：它与上面 fork 的
-  // scanAutoClaw 只差大小写、且对同一份 %APPDATA%/AutoClaw/auth.json 各产出一份候选，
-  // 两个都挂进 scanAll 就是同号重复行。随 autoclaw/ 适配器接线一起在移植提交里换过来。
+  // 上游同批的 scanAutoclaw（小写 c）仍不收：它与 fork 的 scanAutoClaw 只差大小写，同一份
+  // %APPDATA%/AutoClaw/auth.json 会被两遍挂进 scanAll → 同号重复行。2026-10-12 接线后两者
+  // 产出形状已一致（两区各一条候选），fork 这份多带 uid 地区前缀与 openclaw.json 备来源。
   saveAutoclawAccount,
   // ModelScope（魔搭）：OAuth 主路径 + 粘贴令牌兜底 + 续期
   beginModelScopeOAuth,

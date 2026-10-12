@@ -12,7 +12,12 @@ const http = require("node:http");
 const crypto = require("node:crypto");
 
 // 独立数据目录：rules/config 落临时目录，绝不触碰真实 %APPDATA%（须在 require store/rules 之前设）
+// 主目录也要一起沙箱：scanAutoClaw 的备来源读 ~/.openclaw-autoclaw/openclaw.json（os.homedir()，
+// 只看 USERPROFILE/HOME，不看 APPDATA）。本机装过 AutoClaw 时会把**真账号**扫进候选，
+// 于是「两区各产两条」变成四条，判据红得莫名其妙——这条就是 2026-10-12 实跑踩到的形态。
 process.env.APPDATA = fs.mkdtempSync(path.join(os.tmpdir(), "agenthub-autoclaw-test-"));
+process.env.USERPROFILE = fs.mkdtempSync(path.join(os.tmpdir(), "agenthub-autoclaw-home-"));
+process.env.HOME = process.env.USERPROFILE;
 
 const assert = (cond, msg) => {
   if (!cond) throw new Error("断言失败: " + msg);
@@ -368,14 +373,26 @@ async function e2e() {
     let autoThrew = "";
     try { await discovery.beginOAuth("autoclaw", () => {}); } catch (e) { autoThrew = String((e && e.message) || e); }
     assert(/手机验证码/.test(autoThrew), "beginOAuth(autoclaw) 显式 throw 指引 SMS");
-    const noCaptcha = await discovery.beginOAuth("autoclaw_intl", () => {}, {}, {});
-    assert(noCaptcha.ok === false && /风控验证参数/.test(noCaptcha.message || ""), "intl 缺 captchaVerifyParam 被前置拦截");
+    // fork 的国际版登录是**两步式握手**（beginOAuth 的分派走 beginAutoClawIntlOAuth，签名是
+    // (channel, opts, onDone)）：不带 captchaVerifyParam 时第 0 步只回 needCaptcha + 归一后的滑块配置
+    // 且不留会话，带上了才走 vendor 白名单 → 起回环 → 换授权地址。上游那份「缺参数直接 ok:false」
+    // 的实现（同文件里的 beginAutoClawOauth）在本分支未接线，理由写在那条注释上。
+    const firstHop = await discovery.beginOAuth("autoclaw_intl", {}, () => {});
+    assert(firstHop.ok === true && firstHop.needCaptcha === true && firstHop.captcha && firstHop.captcha.sceneId === "scn1",
+      "intl 首跳回 needCaptcha + 滑块配置（不带滑块参数就不往下走，也不占用单飞会话）");
+    const badVendor = await discovery.beginOAuth("autoclaw_intl", { captchaVerifyParam: "P", vendor: "qq" }, () => {});
+    assert(badVendor.ok === false && badVendor.message === "vendor 只支持 zai / google",
+      "intl 参数齐了才校 vendor 白名单（且这一步零网络、零端口）");
     // 桌面导入：写明文形态 auth.json（明文 token 直通解密），两区各产出一条候选
     const authDir = path.join(process.env.APPDATA, "AutoClaw");
     fs.mkdirSync(authDir, { recursive: true });
     fs.writeFileSync(path.join(authDir, "auth.json"), JSON.stringify({ deviceId: "d".repeat(64), token: jwtOf("u77", Math.floor(Date.now() / 1000) + 86400), refreshToken: "rt-desktop" }), "utf8");
-    const cands = discovery.scanAutoclaw();
-    assert(cands.length === 2 && cands.every((c) => c.uid === "u77"), "桌面登录态两区各产出候选（不猜地区）");
+    // fork 侧的扫描器是 discovery.scanAutoClaw（大写 C），且 uid 带地区前缀（协议参考 §2.8：
+    // 两地 userId 空间可能撞号，同一份登录态导进两个渠道是两行不同 uid）。候选条数与「不猜地区」
+    // 这条与上游一致；上游那份小写 c 的同名扫描器不进 scanAll，理由见 discovery.cjs 里的注释。
+    const cands = discovery.scanAutoClaw();
+    assert(cands.length === 2 && cands.map((c) => c.uid).join() === "user-u77,intl-user-u77",
+      "桌面登录态两区各产出候选（不猜地区，uid 各带地区前缀）");
     assert(cands[0].meta.deviceId === "d".repeat(64), "桌面导入带 deviceId 进 meta");
     const imported = discovery.importCandidate(cands[0], "autoclaw");
     assert(!!imported.id, "桌面候选可导入");

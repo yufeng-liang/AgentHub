@@ -56,6 +56,32 @@ ok("readAutoClawAuth 全链（APPDATA 指向夹具）", (() => {
   const r = ac.readAutoClawAuth();
   return !!r && r.token === "eyJtok" && r.deviceId === "dev-1";
 })());
+// 明文形态的 auth.json（历史版本/手工改动）本来不需要密钥：早先 osCryptKey 在参数位置 eager 求值，
+// 缺 Local State 就先抛「解密失败」，扫描因此静默少一条候选、续期也拿不到桌面端刚旋转的 rt。
+ok("明文 auth.json 无 Local State 照样读出凭据（密钥改成惰性获取）", (() => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "autoclaw-plain-"));
+  fs.mkdirSync(path.join(dir, "AutoClaw"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "AutoClaw", "auth.json"), JSON.stringify({ deviceId: "dev-plain", token: "Bearer plain-jwt", refreshToken: "rt-plain" }));
+  const prev = process.env.APPDATA;
+  process.env.APPDATA = dir;
+    // 抛错也算断言红（而不是把后面一百多条断言一起带崩）
+    try {
+      const r = ac.readAutoClawAuth();
+      return !!r && r.token === "plain-jwt" && r.refreshToken === "rt-plain" && r.deviceId === "dev-plain";
+    } catch { return false; }
+    finally { process.env.APPDATA = prev; }
+})());
+// 惰性不等于放宽：真需要解密而 Local State 缺失时，错误必须照原样抛出来
+ok("enc: 字段遇到缺 Local State 仍然如实抛（惰性不能把坏凭据念成好）", (() => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "autoclaw-enc-nostate-"));
+  fs.mkdirSync(path.join(dir, "AutoClaw"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "AutoClaw", "auth.json"), JSON.stringify({ deviceId: "d", token: "enc:AAAA", refreshToken: "enc:BBBB" }));
+  const prev = process.env.APPDATA;
+  process.env.APPDATA = dir;
+  try { ac.readAutoClawAuth(); return false; }
+  catch (e) { return /解密失败|os_crypt/.test(String(e && e.message)); }
+  finally { process.env.APPDATA = prev; }
+})());
 process.env.APPDATA = APPDATA_TMP; // 测完恢复（后续测试段沿用头部隔离目录）
 ok("坏 enc: 报中文错（版本或解密）", (() => {
   try { ac.decryptEncValue("enc:!!!", ac.osCryptKey(fakeDir)); return false; }
@@ -220,10 +246,17 @@ const realHomeFn = os.homedir;
 os.homedir = () => scanHome;
 process.env.APPDATA = fakeDir;
 const acands = discovery.scanAll().filter((c) => c.channel === "autoclaw");
-ok("扫描出 autoclaw 候选（仅国内渠道）", acands.length === 1 && acands[0].token === "eyJtok" && acands[0].meta.device_id === "dev-1", acands[0]);
+ok("扫描出 autoclaw 国内候选", acands.length === 1 && acands[0].token === "eyJtok" && acands[0].meta.device_id === "dev-1", acands[0]);
 ok("候选 meta 同值双写 deviceId（上游读侧只认驼峰，历史行由 store.parseMeta 补齐）",
   acands.length === 1 && acands[0].meta.deviceId === "dev-1", acands[0] && acands[0].meta);
-ok("intl 渠道不产生 auth.json 候选（地区门禁，参考项目同款）", discovery.scanAll().some((c) => c.channel === "autoclaw_intl") === false);
+// auth.json 没有地区标记（两地构建共用同一个文件），所以不猜地区：两个已启用的渠道各产一条候选。
+// 只产国内候选 = autoclaw_intl 那页永远扫不出本机登录态（扫描弹窗按当前渠道过滤候选）。
+const icands = discovery.scanAll().filter((c) => c.channel === "autoclaw_intl");
+ok("autoclaw_intl 同样产出候选（同一份 auth.json，不猜地区；猜错可见=401 重导即可）",
+  icands.length === 1 && icands[0].token === "eyJtok", icands[0]);
+ok("两区候选的 uid 各带地区前缀（协议参考 §2.8：两地 userId 空间可能撞号，互不顶替）",
+  acands.length === 1 && icands.length === 1 && String(icands[0].uid).startsWith("intl-user-") && !String(acands[0].uid).startsWith("intl-user-"),
+  { cn: acands[0] && acands[0].uid, intl: icands[0] && icands[0].uid });
 ok("老式只写 snake 的行读出来带 deviceId（store.parseMeta 的读侧归一）", (() => {
   const st = require("../electron/backend/proxy/store.cjs");
   const id = st.addAccount({ channel: "autoclaw", uid: "user-legacy", name: "老行", token: "t", refreshToken: "r", source: "paste", meta: { device_id: "dev-snake-only" } });
