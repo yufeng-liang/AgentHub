@@ -3,10 +3,11 @@
 // 也可按 proxy-smoke 同款在 ELECTRON_RUN_AS_NODE=1 electron 下跑）
 //
 // 上游这份自测按它自己 9 家渠道立的口径，本分支改了三条判据（都属「探针口径 ≠ 产品坏了」）：
-//   ① 必需集只钉 models/chat。cfg/queryCredits 在本分支不是必需：Cline 免费/订阅池与 AutoClaw
-//      两地区没有对外余额接口，自定义提供商也刻意不定义 queryCredits（credits.cjs 的
+//   ① 必需集只钉 models/chat。cfg/queryCredits 在本分支不是必需：AutoClaw 两地区的内联适配器
+//      没有对外余额接口（Cline 双池已随上游 cline/ 目录接线拿到 cfg/queryCredits/checkin，
+//      2026-10-12），自定义提供商也刻意不定义 queryCredits（credits.cjs 的
 //      creditsCapable() 先判能力再刷，那里写着理由）。把它们列进必需集 = 网关子进程在 require
-//      阶段就抛「渠道 cline_free 缺少必需的适配器方法 queryCredits()」，整个网关起不来。
+//      阶段就抛「渠道 autoclaw 缺少必需的适配器方法 queryCredits()」，整个网关起不来。
 //   ② 「推荐方法全员存在」改成两条更严且成立得更彻底的：模型目录必须有来源（fetchModels 或
 //      非空 models()，上游硬要求 fetchModels 全员存在，而本分支 AutoClaw 两地区的目录是内置常量）、
 //      refreshToken 14 家全有；checkin 与 checkinStatus 必须**成对**，且缺这一对的渠道只能是下面
@@ -50,7 +51,8 @@ async function main() {
   }
 
   // 3b. 签到两法必须成对（号池页按这一对摆「行内签到」；只接一半就是工具栏承诺了行内拒绝的那件事）
-  const NO_CHECKIN = ["cline_free", "cline_pass", "autoclaw", "autoclaw_intl"]; // 官方无签到接口
+  // Cline 双池的签到随上游 cline/ 目录接线已具备（接上了就从这个豁免表里删掉，别留着当装饰）
+  const NO_CHECKIN = ["autoclaw", "autoclaw_intl"]; // 官方无签到接口
   for (const c of store.CHANNELS) {
     const ad = adapters.get(c.id);
     const has = ["checkin", "checkinStatus"].map((m) => typeof ad[m] === "function");
