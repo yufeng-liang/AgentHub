@@ -610,7 +610,12 @@ function makeQoder(product, deps) {
           const d = r.data;
           const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
           const remaining = num(d.userQuota && d.userQuota.remaining) + num(d.addOnQuota && d.addOnQuota.remaining);
-          const expiresAt = num(d.expiresAt);
+          // 上游对「永不过期」的账号给 253402214400000（9999-12-31）。原样落库会让侧栏
+          // 「最早到期」写成 9999-12-31、积分日历算出「剩几百万天」——参考项目
+          // providers/qoder/balance.rs 为此专设 EXPIRY_SENTINEL_MS（判据 2100-01-01）。
+          // 这里用 normalizeExpiryMs 的远未来判据（>5 年 → 0 = 长期有效）等效处理：
+          // trae / workbuddy / zcode 三家的到期都走它，qoder 此前是唯一漏的一家。
+          const expiresAt = U.normalizeExpiryMs(d.expiresAt);
           if (d.userQuota || d.addOnQuota) {
             return {
               credits: Math.round(remaining * 100) / 100,

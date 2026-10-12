@@ -419,6 +419,14 @@ async function main() {
     assert(r.credits === 0.75, "小数保留（浮点 credits，两位内不截断）");
   }
   {
+    // 上游对「永不过期」的账号给 253402214400000（9999-12-31）——参考项目
+    // providers/qoder/balance.rs 的 EXPIRY_SENTINEL_MS 实证。不夹掉的话侧栏「最早到期」
+    // 会显示 9999-12-31，积分日历（账号级聚合行）会算出「剩 299 万天」
+    const r = await mkQ({ userQuota: { total: 300, used: 0, remaining: 300 }, expiresAt: 253402214400000 }).queryCredits({}, { token: "t" });
+    assert(r.credits === 300, "哨兵到期不影响余额读数");
+    assert(r.expiresAt === 0, "expiresAt 的 9999-12-31 哨兵归 0（=长期有效），不透传给界面");
+  }
+  {
     const r = await mkQ(null, 401, false).queryCredits({}, { token: "t" });
     assert(r.authError === true, "HTTP 401 → authError（触发刷新重试/relogin）");
   }
