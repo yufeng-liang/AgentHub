@@ -11,7 +11,14 @@ const path = require("node:path");
 const fs = require("node:fs");
 
 // 独立数据目录：rules/config 落临时目录，绝不触碰真实 %APPDATA%
-process.env.APPDATA = fs.mkdtempSync(path.join(os.tmpdir(), "agenthub-catpaw-test-"));
+const SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), "agenthub-catpaw-test-"));
+process.env.APPDATA = SANDBOX;
+// 家目录也必须一起指走：credentials.cjs 的 catpawHome() 读 USERPROFILE/HOME，
+// resolveCredentials() 在「账号无 token → 无环境变量」时会回落到桌面端实时登录态
+// (~/.meituan-catpaw/auth.json)。本机装着 CatPaw 且登录过，于是不管哪条「取不到凭证」
+// 的断言都会拿真 token 发出请求，结果随装机状态而变（上游同批的 cline 自测就做了这层隔离）。
+process.env.USERPROFILE = SANDBOX;
+process.env.HOME = SANDBOX;
 
 async function main() {
   const assert = (cond, msg) => {
