@@ -4054,7 +4054,11 @@ const zcode = {
 //   ③ rules/headers.json 等规则文件加渠道配置
 //   ④ 前端 format.ts 补 CHANNEL_NAMES / checkinLabels / balanceUnit 等展示文案
 //   ⑤ tools/ 自测补注册断言（双表一致性由 consistencyReport 兜底，漏挂即自测失败）
-const REQUIRED_ADAPTER_METHODS = ["models", "chat"];
+// fork 曾把必需集收窄到 ["models","chat"]：那时 Cline 双池与 AutoClaw 两地区没有对外余额/配置接口。
+// 2026-10-12 两份上游目录实现（cline/ 与 autoclaw/）接线完成后，15 家内置渠道全部具备
+// cfg/models/chat/queryCredits，故与上游同口径。**别照这里再推自定义提供商**——openai-compat 适配器
+// 不进 ADAPTERS、也不过 assertAdapterContract，credits.cjs 的 creditsCapable() 才是它那侧的门槛。
+const REQUIRED_ADAPTER_METHODS = ["cfg", "models", "chat", "queryCredits"];
 
 /** 契约断言：必需方法缺失即抛错（启动期 fail-fast，而非运行期 TypeError） */
 function assertAdapterContract(channel, ad) {

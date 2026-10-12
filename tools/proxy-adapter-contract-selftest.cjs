@@ -2,18 +2,15 @@
 // 用法：node tools/proxy-adapter-contract-selftest.cjs（纯逻辑，不触碰 SQLite；
 // 也可按 proxy-smoke 同款在 ELECTRON_RUN_AS_NODE=1 electron 下跑）
 //
-// 上游这份自测按它自己 9 家渠道立的口径，本分支改了三条判据（都属「探针口径 ≠ 产品坏了」）：
-//   ① 必需集只钉 models/chat。cfg/queryCredits 在本分支不是必需：AutoClaw 两地区的内联适配器
-//      没有对外余额接口（Cline 双池已随上游 cline/ 目录接线拿到 cfg/queryCredits/checkin，
-//      2026-10-12），自定义提供商也刻意不定义 queryCredits（credits.cjs 的
-//      creditsCapable() 先判能力再刷，那里写着理由）。把它们列进必需集 = 网关子进程在 require
-//      阶段就抛「渠道 autoclaw 缺少必需的适配器方法 queryCredits()」，整个网关起不来。
-//   ② 「推荐方法全员存在」改成两条更严且成立得更彻底的：模型目录必须有来源（fetchModels 或
-//      非空 models()，上游硬要求 fetchModels 全员存在，而本分支 AutoClaw 两地区的目录是内置常量）、
-//      refreshToken 14 家全有；checkin 与 checkinStatus 必须**成对**，且缺这一对的渠道只能是下面
-//      NO_CHECKIN 点名的四家。新增渠道漏接签到照样红，而 Cline/AutoClaw 的豁免是可审计的显式名单。
-//   ③ 最小适配器用例跟着必需集走：只实现 models/chat 必须通过；只有 cfg/queryCredits 必须被拦，
-//      免得「收窄必需集」被读成「契约没门槛」。
+// 上游这份自测按它自己 9 家渠道立的口径，本分支曾为 Cline/AutoClaw 的内联实现改过三条判据；
+// 2026-10-12 两份上游目录实现（cline/ 与 autoclaw/）接线完成后**全部回到上游口径**，留这段是为
+// 了下一次合并时别再改回去：
+//   ① 必需集与上游同为 cfg/models/chat/queryCredits——15 家内置渠道现在都有。自定义提供商不受
+//      影响：它不进 ADAPTERS、也不过 assertAdapterContract，那侧的门槛是 credits.cjs 的 creditsCapable()。
+//   ② 模型目录硬要求 fetchModels() 全员存在、签到两法（checkin/checkinStatus）全员成对。
+//      fork 原来的「fetchModels 或非空 models() 二选一」与 NO_CHECKIN 豁免表都已清空——
+//      豁免表一旦留着，新增渠道漏接签到就有了可以塞进去的现成格子。
+//   ③ 最小适配器用例跟着必需集走：四个必需方法齐了才通过；只有 models/chat 必须被拦。
 "use strict";
 
 async function main() {
@@ -25,8 +22,8 @@ async function main() {
 
   // 1. 契约方法清单固定（漏改契约注释块即失败）
   assert(
-    JSON.stringify(adapters.REQUIRED_ADAPTER_METHODS) === JSON.stringify(["models", "chat"]),
-    "REQUIRED_ADAPTER_METHODS = models/chat（cfg/queryCredits 不必需的理由见文件头 ①）"
+    JSON.stringify(adapters.REQUIRED_ADAPTER_METHODS) === JSON.stringify(["cfg", "models", "chat", "queryCredits"]),
+    "REQUIRED_ADAPTER_METHODS = 上游四件套（fork 收窄过的理由随 Cline/AutoClaw 接线一起失效，见文件头 ①）"
   );
 
   // 2. 双表一致性：两向差集必须为空（只加一张表 = 模型被路由到无账号渠道/渠道不出现在 UI）
@@ -35,30 +32,27 @@ async function main() {
   assert(!report.adaptersWithoutChannel.length, `ADAPTERS 全有渠道行（缺：${report.adaptersWithoutChannel.join("/")}）`);
   assert(Object.keys(adapters.ADAPTERS).length === store.CHANNELS.length, `ADAPTERS 数 = CHANNELS 数 = ${store.CHANNELS.length}`);
 
-  // 3a. 必需方法 + 「目录有来源」+ refreshToken 全员符合
-  //     上游原判据在这里还硬要求 fetchModels() 全员存在；本分支的 AutoClaw 两地区做不到——
-  //     它的模型目录是内置常量（AUTOCLAW_MODELS），官方没有对外目录接口。改成成立的口径：
-  //     要么能拉云端目录（fetchModels），要么静态 models() 非空，二者必居其一。
+  // 3a. 必需方法 + 目录来源 + refreshToken 全员符合（上游口径：fetchModels() 必须存在）
+  //     fork 曾允许「fetchModels 或非空 models() 二选一」，那是 AutoClaw 内联目录时代的产物；
+  //     接上游 autoclaw/ 目录后它有官方目录接口，这条放宽失去依据——留着就等于给未来的漏接留门。
   for (const c of store.CHANNELS) {
     const ad = adapters.get(c.id);
     assert(ad, `渠道 ${c.id} 适配器已注册`);
     adapters.assertAdapterContract(c.id, ad);
-    let staticCount = 0;
-    try { staticCount = ad.models().length; } catch { /* 算 0，由下面这条断言点名 */ }
-    assert(typeof ad.fetchModels === "function" || staticCount > 0,
-      `渠道 ${c.id} 的模型目录必须有来源（fetchModels() 或 models() 非空，现在两者皆空）`);
+    assert(typeof ad.fetchModels === "function", `渠道 ${c.id} 缺 fetchModels()（模型目录必须能从上游拉）`);
+    assert(ad.models().length > 0, `渠道 ${c.id} 的 models() 非空`);
     assert(typeof ad.refreshToken === "function", `渠道 ${c.id} 推荐方法 refreshToken() 存在`);
   }
 
-  // 3b. 签到两法必须成对（号池页按这一对摆「行内签到」；只接一半就是工具栏承诺了行内拒绝的那件事）
-  // Cline 双池的签到随上游 cline/ 目录接线已具备（接上了就从这个豁免表里删掉，别留着当装饰）
-  const NO_CHECKIN = ["autoclaw", "autoclaw_intl"]; // 官方无签到接口
+  // 3b. 签到两法必须成对且全员齐备（号池页按这一对摆「行内签到」；只接一半就是工具栏承诺了行内拒绝的那件事）
+  // 签到两法全员成对（上游口径）。fork 的 NO_CHECKIN 豁免表已清空：Cline 双池随 cline/ 目录、
+  // AutoClaw 两地区随 autoclaw/ 目录接线后都有官方签到接口了。豁免表留着比缺判据更危险——
+  // 它给「新渠道先不加签到」准备了现成的格子。
   for (const c of store.CHANNELS) {
     const ad = adapters.get(c.id);
     const has = ["checkin", "checkinStatus"].map((m) => typeof ad[m] === "function");
     assert(has[0] === has[1], `渠道 ${c.id} 的 checkin/checkinStatus 必须成对（实际 ${has.join("/")}）`);
-    if (NO_CHECKIN.includes(c.id)) assert(!has[0], `渠道 ${c.id} 在 NO_CHECKIN 豁免表里就不该有签到（接上了就从表里删掉它）`);
-    else assert(has[0], `渠道 ${c.id} 缺签到实现（新渠道要接 checkin + checkinStatus，或进 NO_CHECKIN 并写明理由）`);
+    assert(has[0], `渠道 ${c.id} 缺签到实现（新渠道要接 checkin + checkinStatus）`);
   }
 
   // 4. 守卫可拦截：缺 chat 的残缺适配器必须抛错且点名缺失方法
@@ -70,24 +64,25 @@ async function main() {
   }
   assert(/缺少必需的适配器方法 chat/.test(threw), "缺 chat 的残缺适配器被断言拦截（实际：" + (threw || "未抛错") + "）");
 
-  // 5. 只实现必需方法的最小适配器通过契约（推荐/可选方法由调用点守卫，不在契约层封死）
+  // 5. 四个必需方法齐备的最小适配器通过契约（refreshToken/checkin 等由调用点守卫，不在契约层封死）
   let minimal = true;
   try {
-    adapters.assertAdapterContract("最小渠道", { models() { return []; }, chat() {} });
+    adapters.assertAdapterContract("最小渠道", { cfg() {}, models() { return []; }, chat() {}, queryCredits() {} });
   } catch {
     minimal = false;
   }
-  assert(minimal, "只实现 models/chat 的最小适配器通过契约");
+  assert(minimal, "实现 cfg/models/chat/queryCredits 的最小适配器通过契约");
 
-  // 5b. 只有 cfg/queryCredits（无 models/chat）必须被拦：必需集收窄不等于放宽到没门槛
+  // 5b. 只有 models/chat（缺 cfg/queryCredits）必须被拦。fork 收窄必需集的那段日子里这条是绿的，
+  //     接线完成后它就是「必需集真的升回去了」的证据。
   let loose = false;
   try {
-    adapters.assertAdapterContract("只有可选方法的渠道", { cfg() {}, queryCredits() {} });
+    adapters.assertAdapterContract("只有 models/chat 的渠道", { models() { return []; }, chat() {} });
     loose = true;
   } catch { /* 期望抛错 */ }
-  assert(!loose, "只实现 cfg/queryCredits 而无 models/chat 的适配器被拦截");
+  assert(!loose, "缺 cfg()/queryCredits() 的适配器被契约守卫拦截");
 
-  console.log(`适配器契约自测全过（${store.CHANNELS.length} 渠道 × 必需/推荐 + 签到成对与豁免表 + 双表一致 + 守卫拦截）`);
+  console.log(`适配器契约自测全过（${store.CHANNELS.length} 渠道 × 上游四件套必需集 + 签到全员成对 + 双表一致 + 守卫拦截）`);
 }
 
 main().catch((e) => {
