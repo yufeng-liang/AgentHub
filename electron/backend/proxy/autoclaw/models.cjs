@@ -75,6 +75,14 @@ function resolveRoute(raw, catalogModels) {
   if (hit && hit.routeId) {
     return { routeModelId: String(hit.routeId), bodyModelId: stripRoutePrefix(hit.id || name) };
   }
+  // 命中目录条目、但条目不带 routeId：装机上 rules/catalog.json 的 autoclaw 段是 ensureFiles 从
+  // 内置默认拷出来的，那份默认只有 id/name/rate/能力（routeId 剥不出来也反推不出，只有远程目录
+  // 归一 normalizeCatalogEntry 才写它）。不补这一跳就一路掉到 zai_auto —— X-Request-Model 是
+  // 计费通道选择器，掉进「上游自动选型」等于悄悄换了通道（fork 内联实现从来发的是精确 routeId）。
+  if (hit) {
+    const st = STATIC_MODELS.find((m) => String(m.id).toLowerCase() === String(hit.id || name).toLowerCase());
+    if (st) return { routeModelId: String(st.routeId), bodyModelId: stripRoutePrefix(st.id) };
+  }
   for (const p of KNOWN_ROUTE_PREFIXES) {
     if (name.startsWith(p)) return { routeModelId: name, bodyModelId: name.slice(p.length) };
   }

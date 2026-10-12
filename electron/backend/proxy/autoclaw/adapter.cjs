@@ -196,8 +196,16 @@ function makeAutoClaw(channel, deps) {
           try { chunk = JSON.parse(raw); } catch { return; }
           if (!chunk || typeof chunk !== "object") return;
           if (chunk.error) {
+            // 带内错误帧（HTTP 200 的 SSE 里塞 {"error":{…}}）要保留上游给的 status：401 得触发刷新链、
+            // 429 得按额度受限换号（协议参考 §2.6，fork 内联实现一直在做，内容拦截三文案则刻意留 502）。
+            // 全压成 502 会让这三种形态都落进「服务端错误 3 次熔断」——凭证过期的账号既刷不了、
+            // 也判不了废，额度受限的号也不会切。
             const msg = String((chunk.error && (chunk.error.message || chunk.error.code)) || "上游返回错误");
-            emit({ type: "error", status: 502, code: chunk.error.code, message: msg });
+            const est = Number(chunk.error.status || 0);
+            const blocked = /blocked by security policy|unapproved channel|illegal api invocation/i.test(msg);
+            const s = est === 401 ? 401 : est === 429 ? 402 : blocked ? 502 : (est || 502);
+            if (s === 402) result.planLimit = true;
+            emit({ type: "error", status: s, code: chunk.error.code, message: msg.slice(0, 300) });
             return;
           }
           // 参照实现 sse_model_rewrite：响应帧 model 回写为客户端请求名（chunk 里是路由 ID，会暴露内部命名）

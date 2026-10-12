@@ -381,7 +381,9 @@ globalThis.fetch = async (url, opts) => { lastReq = { url, opts }; return { ok: 
     const r = await discovery.beginOAuth("autoclaw_intl", { vendor: "qq", captchaVerifyParam: "p" }, () => {});
     return r.ok === false && r.message === "vendor 只支持 zai / google";
   })());
-  ok("autoclaw（国内）没有网页登录 → 明确抛错引导导入", await discovery.beginOAuth("autoclaw", { edition: "cn" }, () => {}).then(() => false, (e) => /没有网页登录/.test(e.message)));
+  // 文案必须点名「手机验证码」：国内版的短信两跳登录（proxy_autoclaw_sms_login）是通的，
+  // 只引导导入等于把弹窗里就在的那个页签藏起来（2026-10-12 接线时核对过 UI 与 IPC）。
+  ok("autoclaw（国内）没有网页登录 → 明确抛错并引导到真有的三条路（验证码 / 本机导入 / 粘贴）", await discovery.beginOAuth("autoclaw", { edition: "cn" }, () => {}).then(() => false, (e) => /没有网页登录/.test(e.message) && /手机验证码/.test(e.message)));
   // 旧两参签名兼容（第二参直接是回调）仍走到分派：小浣熊上游 v1.18.0 起支持应用内登录，
   // 故这里断言「返回 manual 模式会话」而不是「抛不支持」（本分支基点时还是抛错，合并后按上游事实改）
   ok("旧两参签名兼容（第二参直接是回调）仍走到分派", await discovery.beginOAuth("raccoon", () => {}).then(

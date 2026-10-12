@@ -801,7 +801,13 @@ function accountView(r) {
 function parseMeta(raw) {
   try {
     const m = JSON.parse(raw || "{}");
-    return m && typeof m === "object" && !Array.isArray(m) ? m : {};
+    const out = m && typeof m === "object" && !Array.isArray(m) ? m : {};
+    // device_id 键名读侧归一：AutoClaw 的扫描导入历史行只写了 snake 的 device_id，而上游
+    // autoclaw/adapter.cjs 的 deviceIdOf 只认 meta.deviceId——不归一会**静默**退化成按账号 id
+    // 派生的合成 machineId，刷新/签到/余额带着另一个 device_id 打上游（不是报错，是身份变了）。
+    // 与 discovery.cjs scanAutoClaw 的双写配对：新行落库即两键一致，老行靠这里补齐、不迁移。
+    if (out.device_id && !out.deviceId) out.deviceId = String(out.device_id);
+    return out;
   } catch {
     return {};
   }

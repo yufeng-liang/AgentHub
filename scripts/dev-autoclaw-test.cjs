@@ -62,74 +62,129 @@ ok("坏 enc: 报中文错（版本或解密）", (() => {
   catch (e) { return /解密|版本|长度/.test(e.message); }
 })());
 
-console.log("autoclawPrompt:");
-const ap = require("../electron/backend/proxy/autoclawPrompt.cjs");
+console.log("autoclaw/prompt.cjs（上游归一实现，取代 fork 的 autoclawPrompt.cjs）:");
+const ap = require("../electron/backend/proxy/autoclaw/prompt.cjs");
 ok("身份句逐字", ap.IDENTITY_LINE === "You are a personal assistant running inside OpenClaw.");
 ok("前缀含 Tooling 段", ap.IDENTITY_PREFIX.includes("## Tooling"));
 
 const b1 = { messages: [{ role: "user", content: "hi" }] };
-ap.normalizeSystemPrompt(b1);
+ap.normalizeSystemMessages(b1);
 ok("无 system 时插一条只带前缀的", b1.messages[0].role === "system" && b1.messages[0].content.startsWith(ap.IDENTITY_LINE));
 
 const b2 = { messages: [{ role: "system", content: "You are Claude Code, Anthropic's official CLI tool for Claude." }, { role: "user", content: "hi" }] };
-ap.normalizeSystemPrompt(b2);
+ap.normalizeSystemMessages(b2);
 ok("外来身份句改写", !b2.messages[0].content.includes("Claude Code") && b2.messages[0].content.includes("You are a coding assistant"));
 ok("前缀在前、客户端提示词逐字保留在后", b2.messages[0].content.indexOf(ap.IDENTITY_LINE) === 0 && b2.messages[0].content.endsWith("official CLI tool for Claude."));
 ok("messages 数量不变", b2.messages.length === 2);
 
 const b3 = { messages: [{ role: "system", content: ap.IDENTITY_PREFIX + "custom prompt" }] };
-ap.normalizeSystemPrompt(b3);
-ap.normalizeSystemPrompt(b3);
+ap.normalizeSystemMessages(b3);
+ap.normalizeSystemMessages(b3);
 ok("幂等（重复归一只有一份前缀）", (b3.messages[0].content.match(/running inside OpenClaw/g) || []).length === 1 && b3.messages[0].content.includes("custom prompt"));
 
 const b4 = { messages: [{ role: "system", content: [{ type: "text", text: "You are ZCode, an interactive coding agent" }, { type: "text", text: "more" }] }] };
-ap.normalizeSystemPrompt(b4);
+ap.normalizeSystemMessages(b4);
 ok("数组 content 拼第一个文本 part 且 ZCode 改写", b4.messages[0].content[0].text.startsWith(ap.IDENTITY_LINE) && !b4.messages[0].content[0].text.includes("ZCode"));
 
 const b5 = { messages: [{ role: "user", content: "You are Claude Code" }] };
-ap.normalizeSystemPrompt(b5);
-// 简报笔误修正：无 system 时 unshift 一条 system 在 messages[0]（b1 已断言该行为），
-// 原 user 消息落到 messages[1]，「不动」指其 content 逐字保留
-ok("user 消息不动", b5.messages[0].role === "system" && b5.messages[1].content === "You are Claude Code");
+ap.normalizeSystemMessages(b5);
+ok("user 消息不动（闸门只看 system/developer，身份句放进 user 消息不拦）", b5.messages[0].role === "system" && b5.messages[1].content === "You are Claude Code");
 
-console.log("autoclaw 适配器:");
+// 上游这份比内联版多的三条能力——接线后生产路径就是它，没断言盯着等于盲接：
+ok("改写忽略 ASCII 大小写（内联版按 includes 逐字匹配，客户端写成大写就漏闸）", (() => {
+  const b = { messages: [{ role: "system", content: "YOU ARE CLAUDE CODE, hi" }] };
+  ap.normalizeSystemMessages(b);
+  const rest = b.messages[0].content.slice(ap.IDENTITY_PREFIX.length);
+  return !/CLAUDE CODE/i.test(rest) && rest.includes("You are a coding assistant");
+})());
+ok("Codex CLI / DeepSeek harness 身份句也在表内（内联版只有 ZCode 与 Claude 两家）", (() => {
+  const b = { messages: [{ role: "system", content: "You are a coding agent running in the Codex CLI tool.\nYou are an AI agent powered by DeepSeek Harness." }] };
+  ap.normalizeSystemMessages(b);
+  return !/Codex|DeepSeek/.test(b.messages[0].content.slice(ap.IDENTITY_PREFIX.length));
+})());
+ok("normalizeMaxTokens：0<v<10000 归一到 10000（上游对小值做预校验并回 406 空体）", (() => {
+  const b = { max_tokens: 1024 }; ap.normalizeMaxTokens(b); return b.max_tokens === 10000;
+})());
+ok("normalizeMaxTokens：缺省不注入 / ≥10000 不动 / 字符串不强转 / max_completion_tokens 不参与", (() => {
+  const a = {}; ap.normalizeMaxTokens(a);
+  const b = { max_tokens: 20000 }; ap.normalizeMaxTokens(b);
+  const c = { max_tokens: "4096" }; ap.normalizeMaxTokens(c);
+  const d = { max_completion_tokens: 512 }; ap.normalizeMaxTokens(d);
+  return !("max_tokens" in a) && b.max_tokens === 20000 && c.max_tokens === "4096" && d.max_completion_tokens === 512;
+})());
+
+console.log("autoclaw 适配器（上游 autoclaw/ 目录 + fork 语义装饰）:");
 const adapters = require("../electron/backend/proxy/adapters.cjs");
+const acHeaders = require("../electron/backend/proxy/autoclaw/headers.cjs");
+const acModels = require("../electron/backend/proxy/autoclaw/models.cjs");
 const cnAd = adapters.get("autoclaw"), intlAd = adapters.get("autoclaw_intl");
 ok("两地区都已注册", !!cnAd && !!intlAd);
-const h = cnAd._llmHeaders("tok123", "zaicoding_glm-5.3");
+ok("上游能力面齐（cfg/fetchModels/queryCredits/checkin/checkinStatus 都在）",
+  ["cfg", "fetchModels", "queryCredits", "checkin", "checkinStatus", "headers", "rewriteBody"].every((k) => typeof cnAd[k] === "function"), Object.keys(cnAd).join(","));
+ok("cfg() 按渠道读 headers.json（两区域名不同、代理路径相同）",
+  cnAd.cfg().userapiBase === "https://autoglm-acceleration-api.zhipuai.cn" && intlAd.cfg().userapiBase === "https://autoglm-api.autoglm.ai"
+    && cnAd.cfg().llmProxyPath === intlAd.cfg().llmProxyPath, cnAd.cfg());
+ok("临期窗口 300s 由 fork 装饰补回（上游目录没这个键，缺省会按 24h 判临期，于是每次刷额度都在刷 token，与桌面端抢同一个 refresh_token）",
+  cnAd.refreshWindowSec === 300 && intlAd.refreshWindowSec === 300);
+ok("headers() 只给非签名基础头且不含 authorization（LLM 认证头在 chat 内按账号现场出）",
+  !("authorization" in cnAd.headers()) && cnAd.headers()["x-product"] === "autoclaw" && cnAd.headers()["x-version"] === "1.17.8", cnAd.headers());
+const h = acHeaders.llmHeaders(cnAd.cfg(), "tok123", "zaicoding_glm-5.3");
 ok("LLM 域认证头是 X-Authorization", h["x-authorization"] === "Bearer tok123");
 ok("LLM 域禁发 X-Harness-Type（2026-09-22 闸门）", !("x-harness-type" in h));
 ok("LLM 域带产品指纹头", h["x-product"] === "autoclaw" && h["x-client-type"] === "pc" && h["x-tm"] === "win" && h["x-version"] === "1.17.8" && h["x-request-model"] === "zaicoding_glm-5.3");
-const uh = cnAd._userapiHeaders("tok123");
+const uh = acHeaders.signedAuthHeaders(cnAd.cfg(), "tok123");
 ok("userapi 域保留 X-Harness-Type 且带签名头", uh["x-harness-type"] === "zcode" && uh["x-auth-appid"] === "100003" && /^[0-9a-f]{32}$/.test(uh["x-auth-sign"]));
-ok("签名公式 MD5(appId&ts&appKey)", adapters._autoclawSign(1700000000) === crypto.createHash("md5").update("100003&1700000000&38d2391985e2369a5fb8227d8e6cd5e5").digest("hex"));
+ok("签名公式 MD5(appId&秒级时间戳&appKey)", acHeaders.authSign("100003", "38d2391985e2369a5fb8227d8e6cd5e5", 1700000000000).sign
+  === crypto.createHash("md5").update("100003&1700000000&38d2391985e2369a5fb8227d8e6cd5e5").digest("hex"));
+ok("签名头族在无 token 时整条 authorization 不发（captcha-config 那一步是匿名形态）",
+  !("authorization" in acHeaders.signedAuthHeaders(cnAd.cfg(), "")));
+ok("会话透传三头按客户端原样改名透传，没带就不发", (() => {
+  const s = acHeaders.sessionPassthroughHeaders({ "x-autoclaw-session-id": "sid-1", "other": "x" });
+  return Object.keys(s).join() === "X-Session-Id" && s["X-Session-Id"] === "sid-1"
+    && Object.keys(acHeaders.sessionPassthroughHeaders({})).length === 0;
+})());
 
-console.log("autoclaw 模型路由:");
-const R = (m) => adapters._autoclawResolveRoute(m);
+console.log("autoclaw 模型路由（autoclaw/models.cjs）:");
+const R = (m) => acModels.resolveRoute(m, acModels.STATIC_MODELS).routeModelId;
 ok("glm-5.3 → zaicoding_", R("glm-5.3") === "zaicoding_glm-5.3");
 ok("glm-5.3-flash → zai_", R("glm-5.3-flash") === "zai_glm-5.3-flash");
 ok("未知模型兜底 zai_auto", R("whatever") === "zai_auto");
 ok("已带合法路由前缀透传", R("zai_glm-5.3") === "zai_glm-5.3" && R("zaicoding_glm-5.3") === "zaicoding_glm-5.3");
-ok("rewriteBody：body.model 剥前缀 + system 白名单改写", (() => {
-  const b = cnAd.rewriteBody("glm-5.3", { model: "glm-5.3", messages: [{ role: "system", content: "You are Claude Code" }] });
-  const okModel = b.model === "glm-5.3";
-  const okPrompt = b.messages[0].content.startsWith("You are a personal assistant");
-  return okModel && okPrompt && typeof b._routeId === "string" && b._routeId === "zaicoding_glm-5.3";
+ok("目录条目不带 routeId 时按 id 回静态表补（装机默认段就是这种形状，掉到 zai_auto 等于悄悄换计费通道）",
+  acModels.resolveRoute("glm-5.3", [{ id: "glm-5.3", name: "GLM-5.3" }]).routeModelId === "zaicoding_glm-5.3"
+    && acModels.resolveRoute("glm-5.3", [{ id: "glm-5.3", name: "GLM-5.3" }]).bodyModelId === "glm-5.3");
+ok("目录条目自带 routeId 时以目录为准（拉过官方目录后不再看静态表）",
+  acModels.resolveRoute("glm-5.3-flash", [{ id: "glm-5.3-flash", routeId: "zai_glm-5.3-flash" }]).routeModelId === "zai_glm-5.3-flash");
+ok("目录归一：id 存剥前缀形态、routeId 原样保留、input 含 image 才算能看图", (() => {
+  const e = acModels.normalizeCatalogEntry({ id: "zai_glm-5.3-flash", name: "GLM-5.3-Flash", contextWindow: 1048576, maxTokens: 131072, input: ["text", "image"] });
+  return e.id === "glm-5.3-flash" && e.routeId === "zai_glm-5.3-flash" && e.capabilities.images === true && e.contextLength === 1048576;
+})(), acModels.normalizeCatalogEntry({ id: "zai_x", input: [] }));
+ok("目录归一：裸字符串条目也认（上游偶发只给 id 列表）", (() => {
+  const e = acModels.normalizeCatalogEntry("zaicoding_glm-5.3");
+  return e.id === "glm-5.3" && e.routeId === "zaicoding_glm-5.3";
 })());
-ok("rewriteBody 幂等清理：强制流式/usage/剥内部字段", (() => {
-  const b = cnAd.rewriteBody("glm-5.3", { model: "glm-5.3", stream: false, conversation_id: "c1", prompt_cache_key: "p1", messages: [] });
-  return b.stream === true && b.stream_options.include_usage === true && !("conversation_id" in b) && !("prompt_cache_key" in b);
+
+console.log("autoclaw rewriteBody（上游形状 + fork 装饰）:");
+ok("rewriteBody 返回 { body, routeModelId, bodyModelId }（路由名与 body 名分开，不再往 body 塞 _routeId）", (() => {
+  const r = cnAd.rewriteBody("glm-5.3", { model: "glm-5.3", messages: [{ role: "system", content: "You are Claude Code" }] });
+  return r.routeModelId === "zaicoding_glm-5.3" && r.bodyModelId === "glm-5.3" && r.body.model === "glm-5.3"
+    && r.body.messages[0].content.startsWith("You are a personal assistant") && !("_routeId" in r.body);
+})(), cnAd.rewriteBody("glm-5.3", { model: "glm-5.3", messages: [] }));
+ok("fork 装饰：补 stream_options.include_usage 并剥掉会话键（缺 include_usage 时上游流式不回 usage，token 记账归零）", (() => {
+  const r = cnAd.rewriteBody("glm-5.3", { model: "glm-5.3", conversation_id: "c1", prompt_cache_key: "p1", messages: [] });
+  return r.body.stream_options.include_usage === true && !("conversation_id" in r.body)
+    && !("prompt_cache_key" in r.body) && !("conversationId" in r.body);
 })());
-// F1：normalizeSystemPrompt 就地改写 messages（改 content + unshift 身份前缀），而 rewriteBody 的
-// out 只是 body 的浅拷——不深拷就会污染调用方那份 body。server.cjs 的模型回退/换号循环复用同一个
-// body，autoclaw 失败落到 cline/qoder/trae 时正文里已带着 OpenClaw 身份前缀、外来身份句已被改写。
-ok("rewriteBody 不改调用方 body（无 system 时 unshift 与身份句改写都只落在副本上）", (() => {
+ok("max_tokens 小值在 rewriteBody 里就归一到 10000（406 预校验那道闸在 body 上）", (() => {
+  return cnAd.rewriteBody("glm-5.3", { model: "glm-5.3", max_tokens: 1024, messages: [] }).body.max_tokens === 10000;
+})());
+ok("rewriteBody 不改调用方 body（身份前缀与身份句改写只落副本）", (() => {
   const orig = { model: "glm-5.3", messages: [{ role: "user", content: "hi" }, { role: "system", content: "You are Claude Code, Anthropic's official CLI tool for Claude." }] };
   const before = JSON.stringify(orig);
-  const copy = cnAd.rewriteBody("glm-5.3", orig);
+  const copy = cnAd.rewriteBody("glm-5.3", orig).body;
   const untouched = JSON.stringify(orig) === before
-    && orig.messages.length === 2                                    // 没被 unshift
-    && orig.messages[0].role === "user"                              // 首条仍是客户原本的 user
+    && orig.messages.length === 2
+    && orig.messages[0].role === "user"
     && orig.messages[1].content === "You are Claude Code, Anthropic's official CLI tool for Claude."; // 原文案没被改写
   const prefixed = copy !== orig && copy.messages.length === 3
     && copy.messages[0].role === "system" && copy.messages[0].content.startsWith(ap.IDENTITY_LINE)
@@ -140,20 +195,19 @@ ok("rewriteBody 不改调用方 body（无 system 时 unshift 与身份句改写
   return untouched && prefixed;
 })(), (() => {
   const o = { messages: [{ role: "user", content: "hi" }, { role: "system", content: "You are Claude Code" }] };
-  const c = cnAd.rewriteBody("glm-5.3", o);
+  const c = cnAd.rewriteBody("glm-5.3", o).body;
   return { orig: o.messages.map((m) => `${m.role}:${m.content}`), copy: c.messages.map((m) => `${m.role}:${m.content}`) };
 })());
-ok("rewriteBody 深拷到 content 数组的 part（多模态正文同样不被就地改写）", (() => {
+ok("深拷覆盖到 content 数组的 part 与嵌套对象（上游用 structuredClone，内联版只拷一层）", (() => {
   const parts = [{ type: "text", text: "You are Claude Code" }, { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } }];
   const msg = { role: "system", content: parts, name: "s" };
   const orig = { messages: [msg] };
-  const copy = cnAd.rewriteBody("glm-5.3", orig);
+  const copy = cnAd.rewriteBody("glm-5.3", orig).body;
   return msg.content === parts && parts[0].text === "You are Claude Code"
     && copy.messages[0] !== msg && copy.messages[0].content !== parts
-    && copy.messages[0].content[0] !== parts[0] && copy.messages[0].content[0].text.startsWith(ap.IDENTITY_LINE)
-    && copy.messages[0].content[1] !== parts[1] && copy.messages[0].content[1].type === "image_url"
-    // 只拷到 part 这一层：image_url 是嵌套对象，没有归一逻辑会碰它，不递归拷（拷了反而重复大 base64 的引用图）
-    && copy.messages[0].content[1].image_url === parts[1].image_url
+    && copy.messages[0].content[0].text.startsWith(ap.IDENTITY_LINE)
+    && copy.messages[0].content[1].image_url !== parts[1].image_url // 嵌套对象同样是副本，不是共享引用
+    && copy.messages[0].content[1].image_url.url === parts[1].image_url.url
     && copy.messages[0].name === "s";
 })());
 
@@ -167,7 +221,18 @@ os.homedir = () => scanHome;
 process.env.APPDATA = fakeDir;
 const acands = discovery.scanAll().filter((c) => c.channel === "autoclaw");
 ok("扫描出 autoclaw 候选（仅国内渠道）", acands.length === 1 && acands[0].token === "eyJtok" && acands[0].meta.device_id === "dev-1", acands[0]);
+ok("候选 meta 同值双写 deviceId（上游读侧只认驼峰，历史行由 store.parseMeta 补齐）",
+  acands.length === 1 && acands[0].meta.deviceId === "dev-1", acands[0] && acands[0].meta);
 ok("intl 渠道不产生 auth.json 候选（地区门禁，参考项目同款）", discovery.scanAll().some((c) => c.channel === "autoclaw_intl") === false);
+ok("老式只写 snake 的行读出来带 deviceId（store.parseMeta 的读侧归一）", (() => {
+  const st = require("../electron/backend/proxy/store.cjs");
+  const id = st.addAccount({ channel: "autoclaw", uid: "user-legacy", name: "老行", token: "t", refreshToken: "r", source: "paste", meta: { device_id: "dev-snake-only" } });
+  const view = st.listAccounts("autoclaw").find((a) => a.id === id);
+  const raw = JSON.parse((st.getAccount(id) || {}).meta || "{}"); // 原始列里仍只有 snake：归一发生在读侧
+  const shape = !!view && view.meta.deviceId === "dev-snake-only" && raw.deviceId === undefined;
+  st.removeAccount(id); // 夹具行删干净，别给后面的落库断言留影子
+  return shape;
+})(), "meta 读侧归一");
 os.homedir = realHomeFn;
 process.env.APPDATA = APPDATA_TMP; // 测完恢复（与上方 readAutoClawAuth 段同一约定）
 
@@ -193,24 +258,29 @@ const calls = [];
     "[DONE]",
   ]); };
   const events = [];
-  const chatRes = await cnAd.chat({ secrets: { token: "tok123" }, model: "glm-5.3", body: { model: "glm-5.3", messages: [{ role: "user", content: "hi" }] }, emit: (e) => events.push(e) });
+  const chatRes = await cnAd.chat({ account: { id: "a1", uid: "user-1", meta: {} }, secrets: { token: "tok123" }, model: "glm-5.3", body: { model: "glm-5.3", messages: [{ role: "user", content: "hi" }] }, emit: (e) => events.push(e) });
   ok("chat URL 拼 /chat/completions", calls[0].url === "https://autoglm-acceleration-api.zhipuai.cn/autoclaw-proxy/proxy/autoclaw/chat/completions", calls[0].url);
   ok("chat 出站 X-Authorization 且无 X-Harness-Type、路由进 X-Request-Model", calls[0].opts.headers["x-authorization"] === "Bearer tok123" && !("x-harness-type" in calls[0].opts.headers) && calls[0].opts.headers["x-request-model"] === "zaicoding_glm-5.3");
   const sentBody = JSON.parse(calls[0].opts.body);
-  ok("chat 体：model 剥前缀/_routeId 已删/无 system 时注入身份前缀", sentBody.model === "glm-5.3" && !("_routeId" in sentBody) && sentBody.messages[0].role === "system" && sentBody.messages[0].content.startsWith("You are a personal assistant"));
+  ok("chat 体：model 剥前缀 / 无 _routeId 残留 / 无 system 时注入身份前缀", sentBody.model === "glm-5.3" && !("_routeId" in sentBody) && sentBody.messages[0].role === "system" && sentBody.messages[0].content.startsWith("You are a personal assistant"));
+  ok("chat 体：恒流式并带 include_usage（fork 装饰补的那条，缺它流式不回 usage）", sentBody.stream === true && sentBody.stream_options.include_usage === true, sentBody.stream_options);
   ok("chat 事件：delta/finish/usage 齐全", events.some((e) => e.type === "delta" && e.delta.content === "hi") && events.some((e) => e.type === "finish" && e.reason === "stop") && events.some((e) => e.type === "usage" && e.usage.total_tokens === 3), events);
   ok("chat 返回 {status:200, planLimit:false}", chatRes.status === 200 && chatRes.planLimit === false);
 
-  // chat 错误分类（协议参考 §2.6）：401→401 刷新；429→402 换号；内容拦截三文案→502
+  // chat 带内错误分类（协议参考 §2.6）：401→401 触发刷新；429→402 换号；内容拦截三文案→502
+  // 这条是 fork 侧修复：上游目录实现原先把所有带内错误压成 502，三种形态都会落进「服务端错误 3 次熔断」
   globalThis.fetch = async () => sseResp([JSON.stringify({ error: { status: 429, code: 1302, message: "rate" } })]);
-  const ev429 = []; const res429 = await cnAd.chat({ secrets: { token: "t" }, model: "glm-5.3", body: { messages: [] }, emit: (e) => ev429.push(e) });
-  ok("上游 429 → 402 + planLimit", res429.planLimit === true && ev429.some((e) => e.type === "error" && e.status === 402));
+  const ev429 = []; const res429 = await cnAd.chat({ account: { id: "a1", meta: {} }, secrets: { token: "t" }, model: "glm-5.3", body: { messages: [] }, emit: (e) => ev429.push(e) });
+  ok("上游 429 → 402 + planLimit", res429.planLimit === true && ev429.some((e) => e.type === "error" && e.status === 402), { res429, ev429 });
   globalThis.fetch = async () => sseResp([JSON.stringify({ error: { status: 401, code: 0, message: "unauthorized" } })]);
-  const ev401 = []; const res401 = await cnAd.chat({ secrets: { token: "t" }, model: "glm-5.3", body: { messages: [] }, emit: (e) => ev401.push(e) });
-  ok("上游 401 → 401（触发刷新）", res401.planLimit === false && ev401.some((e) => e.type === "error" && e.status === 401));
+  const ev401 = []; const res401 = await cnAd.chat({ account: { id: "a1", meta: {} }, secrets: { token: "t" }, model: "glm-5.3", body: { messages: [] }, emit: (e) => ev401.push(e) });
+  ok("上游 401 → 401（触发刷新链，不是熔断）", res401.planLimit === false && ev401.some((e) => e.type === "error" && e.status === 401), { res401, ev401 });
   globalThis.fetch = async () => sseResp([JSON.stringify({ error: { status: 403, code: 0, message: "request blocked by security policy" } })]);
-  const evBlocked = []; await cnAd.chat({ secrets: { token: "t" }, model: "glm-5.3", body: { messages: [] }, emit: (e) => evBlocked.push(e) });
-  ok("内容拦截文案 → 502（不当 403 透传）", evBlocked.some((e) => e.type === "error" && e.status === 502 && /blocked by security policy/.test(e.message)));
+  const evBlocked = []; await cnAd.chat({ account: { id: "a1", meta: {} }, secrets: { token: "t" }, model: "glm-5.3", body: { messages: [] }, emit: (e) => evBlocked.push(e) });
+  ok("内容拦截文案 → 502（不当 403 透传，也不换号）", evBlocked.some((e) => e.type === "error" && e.status === 502 && /blocked by security policy/.test(e.message)));
+  globalThis.fetch = async () => sseResp([JSON.stringify({ error: { status: 400, code: 0, message: "bad" } })]);
+  const ev400 = []; await cnAd.chat({ account: { id: "a1", meta: {} }, secrets: { token: "t" }, model: "glm-5.3", body: { messages: [] }, emit: (e) => ev400.push(e) });
+  ok("其它 status 原样透传（400 不折算成 502）", ev400.some((e) => e.type === "error" && e.status === 400), ev400);
 
   // 刷新降级链（协议参考 §2.3）：v1/refresh 回 400002 → 二跳 agent-refresh；成功按 JWT exp 重算
   calls.length = 0;
@@ -219,13 +289,20 @@ const calls = [];
     calls.push({ url, opts });
     return calls.length === 1 ? jsonResp({ code: 400002, message: "use agent refresh" }) : jsonResp({ code: 0, message: "ok", data: { access_token: newTok, refresh_token: "rt-new" } });
   };
-  const rr = await cnAd.refreshToken({ meta: {} }, { token: "old-tok", refreshToken: "rt-old" });
-  ok("刷新降级链 400002 → 二跳 agent-refresh", calls.length === 2 && calls[0].url === "https://autoglm-acceleration-api.zhipuai.cn/userapi/v1/refresh" && calls[1].url === "https://autoglm-acceleration-api.zhipuai.cn/userapi/v1/agent-refresh", calls.map((c) => c.url));
+  const rr = await cnAd.refreshToken({ id: "a9", meta: {} }, { token: "old-tok", refreshToken: "rt-old" });
+  ok("刷新降级链 400002 → 二跳 agent-refresh（同头同 body 重发）", calls.length === 2
+    && calls[0].url === "https://autoglm-acceleration-api.zhipuai.cn/userapi/v1/refresh"
+    && calls[1].url === "https://autoglm-acceleration-api.zhipuai.cn/userapi/v1/agent-refresh"
+    && calls[0].opts.body === calls[1].opts.body, calls.map((c) => c.url));
   ok("刷新请求走 userapi 头族（签名 + 保留 Harness-Type）+ body 带 source_id", calls[0].opts.headers["x-harness-type"] === "zcode" && /^[0-9a-f]{32}$/.test(calls[0].opts.headers["x-auth-sign"]) && calls[0].opts.headers.authorization === "Bearer old-tok" && JSON.parse(calls[0].opts.body).source_id === "autoclaw");
   ok("刷新成功：access_token 剥 Bearer/exp 按 JWT 重算", rr.ok === true && rr.token === newTok && rr.refreshToken === "rt-new" && rr.expiresAt === 1900000000000, rr);
+  ok("刷新结果标 noPersist（方案 §7：新凭证只进进程缓存，落库会与桌面端互顶）", rr.noPersist === true, rr);
   globalThis.fetch = async () => jsonResp({ code: 410000, message: "expired" });
-  const re = await cnAd.refreshToken({ meta: {} }, { token: "t", refreshToken: "r" });
-  ok("410000 → expired 标记（触发重登）", re.ok === false && re.expired === true, re);
+  const re = await cnAd.refreshToken({ id: "a9", meta: {} }, { token: "t", refreshToken: "r" });
+  ok("410000 → authError 标记（credits.cjs 认这个键，旧内联版的 expired 无人消费）", re.ok === false && re.authError === true, re);
+  globalThis.fetch = async () => jsonResp({ code: 0, message: "ok", data: {} });
+  const rno = await cnAd.refreshToken({ id: "a9", meta: {} }, { token: "t", refreshToken: "r" });
+  ok("code=0 但没给新 token → 如实报错，不返回空 token 让账号上线", rno.ok === false && /未返回新 token/.test(rno.message || ""), rno);
 
   // ===== source=scan 的桌面文件凭据必须过身份比对（否则桌面端换账号后旧行会刷进新账号额度）=====
   // 夹具走 AUTOCLAW_USER_DATA_DIR（autoclawUserDataDir 的第一优先级）直接指向临时目录，
@@ -246,44 +323,60 @@ const calls = [];
     }));
     return dir;
   };
-  const refreshWithFile = async (dir, account, secrets) => {
+  const refreshWithFile = async (ad, dir, account, secrets) => {
     calls.length = 0;
     process.env.AUTOCLAW_USER_DATA_DIR = dir;
     globalThis.fetch = async (url, opts) => {
       calls.push({ url, opts });
       return jsonResp({ code: 0, message: "ok", data: { access_token: mkJwt({ user_id: "42", exp: 1900000000 }), refresh_token: "rt-upstream" } });
     };
-    const r = await cnAd.refreshToken(account, secrets);
+    const r = await ad.refreshToken(account, secrets);
     delete process.env.AUTOCLAW_USER_DATA_DIR;
     return { body: JSON.parse(calls[0].opts.body), r };
   };
   // 号池那一行的 uid 是 user-42，桌面文件已换成 user-99：refresh_token / device_id 都不许跟过去
-  const mismatch = await refreshWithFile(
+  const mismatch = await refreshWithFile(cnAd,
     acFile("99", "rt-file-OTHER", "file-dev-OTHER"),
-    { source: "scan", uid: "user-42", meta: {} },
+    { id: "a10", source: "scan", uid: "user-42", meta: {} },
     { token: mkJwt({ user_id: "42", exp: 1900000000 }), refreshToken: "rt-pool" }
   );
   ok("桌面文件是别人的账号（文件 user-99 ≠ 号池 user-42）→ 刷新仍用号池快照，不采用文件值",
-    mismatch.body.refresh_token === "rt-pool" && !("device_id" in mismatch.body) && mismatch.r.ok === true, mismatch.body);
+    mismatch.body.refresh_token === "rt-pool" && mismatch.body.device_id !== "file-dev-OTHER" && mismatch.r.ok === true, mismatch.body);
   // 同 uid 时必须采用文件值（桌面端可能刚刷过并旋转了 refresh_token）——防修过头把同步能力删干净
-  const matched = await refreshWithFile(
+  const matched = await refreshWithFile(cnAd,
     acFile("42", "rt-file-MINE", "file-dev-MINE"),
-    { source: "scan", uid: "user-42", meta: {} },
+    { id: "a11", source: "scan", uid: "user-42", meta: {} },
     { token: mkJwt({ user_id: "42", exp: 1900000000 }), refreshToken: "rt-pool" }
   );
   ok("同 uid 时正常采用桌面文件值（refresh_token 跟上旋转、device_id 回落文件值）",
     matched.body.refresh_token === "rt-file-MINE" && matched.body.device_id === "file-dev-MINE", matched.body);
-
-  // uid 解析（协议参考 §2.8）：地区前缀 + JWT user_id，两地 uid 空间隔离
-  const ui = await cnAd.userInfo(mkJwt({ user_id: "42", user_name: "张三" }));
-  ok("uid = user- + JWT user_id", ui.uid === "user-42" && ui.name === "张三", ui);
-  const uiI = await intlAd.userInfo(mkJwt({ user_id: "42", nickname: "Z" }));
-  ok("国际区前缀 intl-user-（防两地撞号）", uiI.uid === "intl-user-42" && uiI.name === "Z", uiI);
+  // 前缀参与身份比对的证据：CN 行（uid=user-42）走 intlAd 时，文件里的 user_id 42 拼成 intl-user-42，
+  // 与行 uid 对不上 ⇒ 整份文件值都不采用。auth.json 本身没有地区标记，前缀只由渠道 id 决定，
+  // 所以「同一台机器上的 CN 号被刷进国际区凭据」这类错配必须由这一步拦住。
+  const crossMismatch = await refreshWithFile(intlAd,
+    acFile("42", "rt-file-CN", "file-dev-CN"),
+    { id: "a12", source: "scan", uid: "user-42", meta: {} },
+    { token: mkJwt({ user_id: "42", exp: 1900000000 }), refreshToken: "rt-pool-cn" }
+  );
+  ok("CN 行走 intlAd 续期不采用文件值（uid 地区前缀参与身份比对）",
+    crossMismatch.body.refresh_token === "rt-pool-cn" && crossMismatch.body.device_id !== "file-dev-CN", crossMismatch.body);
+  const intlMatched = await refreshWithFile(intlAd,
+    acFile("42", "rt-file-INTL", "file-dev-INTL"),
+    { id: "a13", source: "scan", uid: "intl-user-42", meta: {} },
+    { token: mkJwt({ user_id: "42", exp: 1900000000 }), refreshToken: "rt-pool-intl" }
+  );
+  ok("intl 行走 intlAd 时正常采用（前缀由渠道 id 决定，auth.json 里没有地区标记）",
+    intlMatched.body.refresh_token === "rt-file-INTL" && intlMatched.body.device_id === "file-dev-INTL", intlMatched.body);
+  // 粘贴导入的行没有 meta 设备号：从当前 access token 的 JWT device_id 声明取（内联版口径）
+  calls.length = 0;
+  globalThis.fetch = async (url, opts) => { calls.push({ url, opts }); return jsonResp({ code: 0, message: "ok", data: { access_token: mkJwt({ user_id: "42", exp: 1900000000 }), refresh_token: "rt-new" } }); };
+  await cnAd.refreshToken({ id: "a14", source: "paste", uid: "user-42", meta: {} }, { token: mkJwt({ user_id: "42", device_id: "jwt-dev-7", exp: 1900000000 }), refreshToken: "rt-pool" });
+  ok("无 meta 设备号时取 JWT 的 device_id 声明（不被合成 machineId 顶掉）", JSON.parse(calls[0].opts.body).device_id === "jwt-dev-7", calls[0] && calls[0].opts.body);
 
   // 国际区域名参数化：同一份适配器代码只换域
   let intlUrl = "";
   globalThis.fetch = async (url) => { intlUrl = url; return sseResp(["[DONE]"]); };
-  await intlAd.chat({ secrets: { token: "t" }, model: "glm-5.3", body: { messages: [] }, emit: () => {} });
+  await intlAd.chat({ account: { id: "b1", meta: {} }, secrets: { token: "t" }, model: "glm-5.3", body: { messages: [] }, emit: () => {} });
   ok("国际区上游域 autoglm-api.autoglm.ai", intlUrl === "https://autoglm-api.autoglm.ai/autoclaw-proxy/proxy/autoclaw/chat/completions", intlUrl);
 
   console.log("autoclaw intl 回调解析（双 state 陷阱）:");
@@ -359,7 +452,9 @@ const calls = [];
     const h = seen[0].opts.headers;
     return h["x-product"] === "autoclaw" && h["x-client-type"] === "pc" && h["x-harness-type"] === "zcode" && h["x-auth-appid"] === "100003"
       && /^\d{10}$/.test(h["x-auth-timestamp"]) && /^[0-9a-f]{32}$/.test(h["x-auth-sign"])
-      && h["x-auth-sign"] === adapters._autoclawSign(Number(h["x-auth-timestamp"])) && !("authorization" in h);
+      // 签名公式复算一遍：用头里自带的 appid 与配置里的 appKey，按秒级时间戳重算 md5
+      && h["x-auth-sign"] === acHeaders.authSign(h["x-auth-appid"], intlAd.cfg().authAppKey, Number(h["x-auth-timestamp"]) * 1000).sign
+      && !("authorization" in h);
   })(), seen[0] && seen[0].opts.headers);
   ok("滑块配置这一步不留会话（不占用单飞）", discovery.cancelOAuth() === false && servers.length === 0);
   ok("supplier 缺省兜底 aliyun", await (async () => {

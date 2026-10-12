@@ -12,7 +12,6 @@ const util = require("./util.cjs");
 const raccoonAuth = require("./raccoonAuth.cjs");
 const clineAuth = require("./clineAuth.cjs");
 const acCred = require("./autoclawCredentials.cjs");
-const acPrompt = require("./autoclawPrompt.cjs");
 const aup = require("./protocols/anthropic-up.cjs");
 const rup = require("./protocols/responses-up.cjs");
 const qcosy = require("./qoderCosy.cjs");
@@ -4101,220 +4100,85 @@ const clineDeps = { fetchStream, pumpSse, httpJson, rules, util };
 const cline_free = withClineScanReread(makeUpstreamCline("cline_free", clineDeps));
 const cline_pass = withClineScanReread(makeUpstreamCline("cline_pass", clineDeps));
 
-// ===== AutoClaw（智谱，makeAutoClaw(region) 两地区参数化；协议参考 §2） =====
-// 头集合两地逐字相同（参考 region.rs 实测），只换域名；账号 id 前缀 user- / intl-user-。
-const AUTOCLAW_AUTH_APP_ID = "100003";
-const AUTOCLAW_AUTH_APP_KEY = "38d2391985e2369a5fb8227d8e6cd5e5"; // 客户端内嵌指纹
-const AUTOCLAW_REGIONS = {
-  cn: {
-    userapi: "https://autoglm-acceleration-api.zhipuai.cn",
-    upstream: "https://autoglm-acceleration-api.zhipuai.cn/autoclaw-proxy/proxy/autoclaw",
-    catalogUrl: "https://autoglm-acceleration-api.zhipuai.cn/autoclaw-proxy/proxy/autoclaw-model-config", // 目录藏在 /proxy/ 一级，不是对话的 /proxy/autoclaw
-    uidPrefix: "user-",
-  },
-  intl: {
-    userapi: "https://autoglm-api.autoglm.ai",
-    upstream: "https://autoglm-api.autoglm.ai/autoclaw-proxy/proxy/autoclaw",
-    catalogUrl: "https://autoglm-api.autoglm.ai/autoclaw-proxy/proxy/autoclaw-model-config",
-    uidPrefix: "intl-user-",
-  },
-};
-// 静态路由表 = 实际客户端模型选择器当前仅有的两个（协议参考 §2.4；其余条目官方已下架）
-const AUTOCLAW_MODELS = [
-  { id: "glm-5.3", routeId: "zaicoding_glm-5.3", name: "GLM-5.3", contextLength: 1048576, maxOutputTokens: 307200, capabilities: { images: false, reasoning: true, tools: true } },
-  { id: "glm-5.3-flash", routeId: "zai_glm-5.3-flash", name: "GLM-5.3-Flash", contextLength: 1048576, maxOutputTokens: 131072, capabilities: { images: true, reasoning: true, tools: true } },
-];
-const AUTOCLAW_DEFAULT_ROUTE = "zai_auto";
-const AUTOCLAW_ROUTE_RE = /^[a-z][a-z0-9]*_[A-Za-z0-9._:-]{1,127}$/; // 合法路由 id 形态
+/** AutoClaw uid 地区前缀（协议参考 §2.8）：两地 userId 空间可能撞号，uid 必须带区前缀。
+ *  只用于扫描回读时的身份比对——内联时代的 autoclawFileUid 随接线删除。 */
+const AUTOCLAW_UID_PREFIX = { autoclaw: "user-", autoclaw_intl: "intl-user-" };
 
-/** X-Auth-Sign = MD5("{appId}&{秒级时间戳}&{appKey}") 小写 hex（X-Auth-TimeStamp 是秒，别用毫秒） */
-function autoclawSign(ts) {
-  return crypto.createHash("md5").update(`${AUTOCLAW_AUTH_APP_ID}&${ts}&${AUTOCLAW_AUTH_APP_KEY}`).digest("hex");
-}
+/**
+ * fork 独有语义（上游 autoclaw/ 目录都没有），按内联实现的口径逐条搬：
+ * ① refreshWindowSec=300：credits.cjs 缺省按 24h 判临期，而 AutoClaw 的 access 只有约 2h，
+ *   用 24h 会把每轮额度刷新都变成一次 token 刷新——与桌面端抢同一个 refresh_token 互相作废
+ *   （掉登录根因），故贴官方 DESKTOP_REFRESH_AHEAD_MS 的 300s 惰性语义。
+ * ② 扫描导入（source==="scan"）的账号续期前**回读** %APPDATA%/AutoClaw/auth.json，且必须过身份
+ *   比对：桌面端换账号登录后 auth.json 里是新账号的凭据，无条件采用会把新账号的额度刷进旧行。
+ *   上游的 refresh.cjs 是纯协议函数，没有这条；成功仍不回写文件（两条写链会互相顶掉）。
+ * ③ 出站 body 补 stream_options.include_usage 并剥掉 conversation_id/conversationId/
+ *   prompt_cache_key：上游目录实现两个都不做。缺 include_usage 时上游流式不回 usage 帧，
+ *   token 记账全归零；残留的会话键则会让别家渠道的记账字段出现在 autoclaw 请求里。
+ */
+function withAutoclawForkSemantics(ad, channel) {
+  const innerRefresh = ad.refreshToken.bind(ad);
+  const innerRewrite = ad.rewriteBody.bind(ad);
+  return Object.assign(Object.create(Object.getPrototypeOf(ad)), ad, {
+    refreshWindowSec: 300,
 
-/** 模型 → 路由 id（协议参考 §2.4 解析顺序）：静态表 → 已带前缀透传 → 合法形态透传 → 兜底 zai_auto */
-function autoclawResolveRoute(model) {
-  const s = String(model || "").trim();
-  const hit = AUTOCLAW_MODELS.find((m) => m.id.toLowerCase() === s.toLowerCase());
-  if (hit) return hit.routeId;
-  if (/^(zai_|zaicoding_)/i.test(s)) return s;
-  if (AUTOCLAW_ROUTE_RE.test(s)) return s;
-  return AUTOCLAW_DEFAULT_ROUTE;
-}
-
-function makeAutoClaw(region) {
-  const cfg = AUTOCLAW_REGIONS[region];
-  const channel = region === "intl" ? "autoclaw_intl" : "autoclaw";
-
-  /** 桌面文件里的 token → 号池 uid 口径（地区前缀 + JWT user_id，与 userInfo / scanAutoClaw 同源）。
-   *  解不出（不是 JWT / 缺 user_id）返回空串，调用方据此判「认不出身份」——宁可不采用文件值。 */
-  function autoclawFileUid(token) {
-    const c = util.jwtDecode(token).payload || {};
-    const id = String(c.user_id || "");
-    return id ? `${cfg.uidPrefix}${id}` : "";
-  }
-
-  return {
-    id: channel,
-    refreshWindowSec: 300, // 临期 5 分钟（对齐官方 DESKTOP_REFRESH_AHEAD_MS，协议参考 §2.3）
-
-    _llmHeaders(token, routeId) {
-      // LLM 域头（协议参考 §2.2 A，逐字）。铁律：认证头是 X-Authorization 不是 Authorization；
-      // 2026-09-22 起 chat 路径禁发 X-Harness-Type: zcode（带上稳定 403 pay-view / 406 空体）
-      return {
-        "content-type": "application/json",
-        accept: "*/*", // 不是 text/event-stream，照抄源实现
-        "x-product": "autoclaw",
-        "x-client-type": "pc",
-        "x-tm": "win", // platformTm：darwin→mac / linux→linux / 其余 win
-        "x-version": "1.17.8", // DESKTOP_APP_VERSION，进兼容路径判定
-        "x-lang": "zh-CN",
-        "x-channel": "official",
-        "x_trace_id": "autoclaw-desktop", // 下划线写法照抄源实现
-        "x-authorization": `Bearer ${token}`,
-        "x-request-id": util.uuid(),
-        "x-request-model": routeId,
-      };
-    },
-
-    _userapiHeaders(token) {
-      // userapi 域头（协议参考 §2.2 B）：保留 X-Harness-Type + 签名头族；authorization 小写、token 空则整条不发
-      const ts = Math.floor(Date.now() / 1000);
-      const h = {
-        "content-type": "application/json",
-        accept: "*/*",
-        "x-product": "autoclaw",
-        "x-client-type": "pc",
-        "x-harness-type": "zcode",
-        "x-tm": "win",
-        "x-lang": "zh-CN",
-        "x-channel": "official",
-        "x-auth-appid": AUTOCLAW_AUTH_APP_ID,
-        "x-auth-timestamp": String(ts),
-        "x-auth-sign": autoclawSign(ts),
-        "x-trace-id": util.uuid(),
-      };
-      if (token) h["authorization"] = `Bearer ${token}`;
-      return h;
-    },
-
-    models() { return AUTOCLAW_MODELS.map((m) => m.id); },
-    modelEntries() { return AUTOCLAW_MODELS.map((m) => ({ client: m.id, upstream: m.id, entry: m })); },
-    upstreamFor(model) { return autoclawResolveRoute(String(model || "").trim()); },
-
-    rewriteBody(model, body) {
-      const out = { ...(body || {}) };
-      const routeId = autoclawResolveRoute(model);
-      const dirHit = AUTOCLAW_MODELS.find((m) => m.routeId === routeId);
-      out.model = dirHit ? dirHit.id : String(model || AUTOCLAW_DEFAULT_ROUTE); // body.model = 剥前缀后的模型 id
-      out.stream = true;
-      if (!out.stream_options || typeof out.stream_options !== "object") out.stream_options = {};
-      out.stream_options.include_usage = true;
-      delete out.conversation_id; delete out.conversationId; delete out.prompt_cache_key;
-      // normalizeSystemPrompt 是**就地**改写（改 m.content、往 messages 头部 unshift），而 out 只是
-      // body 的浅拷——messages 数组和每条消息对象都还与调用方共享。server.cjs 的模型回退 + 换号循环
-      // 复用同一个 body，autoclaw 失败后落到 cline/qoder/trae 时，客户端正文里已经被人塞进 OpenClaw
-      // 身份前缀、外来身份句也已被改写，入站 token 估算同样吃这份脏正文。故归一前先把 messages 拷一层。
-      // 只拷到「消息对象 + content 为数组时的 part 对象」这一层：数组元素里没有更深的可变结构，
-      // 图片 base64 是字符串（值语义），不必递归。
-      if (Array.isArray(out.messages)) {
-        out.messages = out.messages.map((m) => {
-          if (!m || typeof m !== "object") return m;
-          if (!Array.isArray(m.content)) return { ...m };
-          return { ...m, content: m.content.map((p) => (p && typeof p === "object" ? { ...p } : p)) };
-        });
+    rewriteBody(model, body, account, meta) {
+      const r = innerRewrite(model, body, account, meta);
+      const out = r && r.body ? r.body : r; // 上游形状是 { body, routeModelId, bodyModelId }
+      if (out && typeof out === "object") {
+        if (!out.stream_options || typeof out.stream_options !== "object") out.stream_options = {};
+        out.stream_options.include_usage = true;
+        delete out.conversation_id; delete out.conversationId; delete out.prompt_cache_key;
       }
-      acPrompt.normalizeSystemPrompt(out); // 2026-09-22 白名单闸门（幂等）
-      out._routeId = routeId; // chat 组装时取走放进 X-Request-Model，序列化前 delete
-      return out;
+      return r;
     },
 
-    async chat({ secrets, model, body, emit }) {
-      const prepared = this.rewriteBody(model, body);
-      const routeId = prepared._routeId || AUTOCLAW_DEFAULT_ROUTE;
-      delete prepared._routeId;
-      const payload = JSON.stringify(prepared);
-      const headers = this._llmHeaders((secrets && secrets.token) || "", routeId);
-      const { resp, cancelTimer } = await fetchStream(`${cfg.upstream}/chat/completions`, { method: "POST", headers, body: payload });
-      const result = { status: 200, planLimit: false };
-      try {
-        await pumpSse(resp, (_event, raw) => {
-          if (raw === "[DONE]") { emit({ type: "finish", reason: "" }); return; }
-          const data = parseJson(raw);
-          if (!data) return;
-          const errObj = data.error || null;
-          if (errObj) {
-            // 401→401 刷新；429→402；其余先过内容拦截三文案再 Fatal 透传（协议参考 §2.6）
-            const msg = String(errObj.message || errObj);
-            const blocked = /blocked by security policy|unapproved channel|illegal api invocation/i.test(msg);
-            const status = Number((errObj && errObj.status) || 0);
-            const s = status === 401 ? 401 : status === 429 ? 402 : blocked ? 502 : (status || 502);
-            if (s === 402) result.planLimit = true;
-            emit({ type: "error", status: s, code: Number(errObj.code) || 0, message: msg.slice(0, 300) });
-            return;
-          }
-          const choice = Array.isArray(data.choices) && data.choices[0];
-          if (choice) {
-            if (choice.delta && Object.keys(choice.delta).length) emit({ type: "delta", delta: choice.delta });
-            if (choice.finish_reason) emit({ type: "finish", reason: choice.finish_reason });
-          }
-          if (data.usage) {
-            emit({ type: "usage", usage: util.normalizeOpenAiUsage(data.usage) });
-          }
-        });
-      } finally { cancelTimer(); }
-      return result;
-    },
-
-    /** 刷新（协议参考 §2.3）：POST {userapi}/userapi/v1/refresh；code 400002 降级 /agent-refresh；
-     *  410000/401 → 401。deviceId：meta.device_id 优先，缺省回落 JWT device_id 声明。
-     *  桌面导入（source=scan）：刷新前重读 auth.json（桌面端重登自动跟上）；成功只更号池行，不回写文件。 */
     async refreshToken(account, secrets) {
-      let rt = (secrets && secrets.refreshToken) || "";
-      let deviceId = String((account && account.meta && account.meta.device_id) || "");
+      const meta = (account && account.meta) || {};
+      // device_id 三级取值（内联口径）：meta（store.parseMeta 已把历史行的 snake 补成 deviceId）
+      // → 当前 access token 的 JWT device_id 声明（粘贴导入的行常见只有这个）→ 交给上游按账号 id
+      // 派生稳定值。第一级不归一就会静默换成合成 machineId，那是身份变了而不是报错。
+      let deviceId = String(meta.deviceId || meta.device_id || "");
       if (!deviceId && secrets && secrets.token) {
-        // util.jwtDecode 返回 {token,uid,exp,payload}，声明在 payload（简报写 .device_id 直取是笔误，按真实接口修正）
-        const claims = util.jwtDecode(secrets.token).payload || {};
-        deviceId = String(claims.device_id || "");
+        deviceId = String((util.jwtDecode(secrets.token).payload || {}).device_id || "");
       }
+      let s = secrets;
       if (account && account.source === "scan") {
         try {
           const live = acCred.readAutoClawAuth();
-          // 身份比对（cline 的 refreshToken 同款，见上方 makeCline）：桌面端换账号登录后 auth.json 里
-          // 是**新账号**的凭据，无条件采用就会拿新账号的 refresh_token 去刷新旧账号那一行——
-          // 上游不报 401，直接把新账号的额度刷进旧行，号池从此错位。认不出身份（uid 解不出/不一致）
-          // 就整份文件值都不采用，继续用号池快照。
-          const sameIdentity = !!live && (!account.uid || autoclawFileUid(live.token) === String(account.uid));
-          if (live && live.refreshToken && sameIdentity) rt = live.refreshToken;
-          if (live && live.deviceId && !deviceId && sameIdentity) deviceId = live.deviceId;
+          const claims = live && live.token ? (util.jwtDecode(live.token).payload || {}) : null;
+          const fileUid = claims && claims.user_id ? `${AUTOCLAW_UID_PREFIX[channel] || ""}${claims.user_id}` : "";
+          const sameIdentity = !!live && (!account.uid || (fileUid && fileUid === String(account.uid)));
+          if (live && live.refreshToken && sameIdentity) s = Object.assign({}, secrets, { refreshToken: live.refreshToken });
+          if (live && live.deviceId && !deviceId && sameIdentity) deviceId = String(live.deviceId);
         } catch { /* 文件读不了就用号池快照 */ }
       }
-      if (!rt) return { ok: false, message: "无 refreshToken，请重新粘贴或导入" };
-      const body = JSON.stringify({ refresh_token: rt, source_id: "autoclaw", ...(deviceId ? { device_id: deviceId } : {}) });
-      let r = await httpJson(`${cfg.userapi}/userapi/v1/refresh`, { method: "POST", headers: this._userapiHeaders((secrets && secrets.token) || ""), body })
-        .catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
-      if (r.data && Number(r.data.code) === 400002) {
-        r = await httpJson(`${cfg.userapi}/userapi/v1/agent-refresh`, { method: "POST", headers: this._userapiHeaders((secrets && secrets.token) || ""), body })
-          .catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
-      }
-      const code = Number(r.data && r.data.code);
-      if (code === 410000 || r.status === 401) return { ok: false, expired: true, message: "登录态已过期，请重新登录" };
-      const d = r.data && r.data.data;
-      const token = d && String(d.access_token || "").replace(/^Bearer\s+/i, "");
-      if (!(code === 0 && token)) return { ok: false, message: (r.data && r.data.message) || r.message || `刷新失败 HTTP ${r.status}` };
-      const exp = Number(util.jwtDecode(token).exp) || 0; // 过期按新 token JWT exp 重算（解不出保留 0）
-      return { ok: true, token, refreshToken: String((d && d.refresh_token) || rt), expiresAt: exp > 0 ? exp * 1000 : 0 };
+      // 上游只从 meta.deviceId 取 device_id，故把上面算出的值经 meta 传进去（不改库里的行）
+      const a = deviceId && deviceId !== String(meta.deviceId || "")
+        ? Object.assign({}, account, { meta: Object.assign({}, meta, { deviceId }) })
+        : account;
+      return innerRefresh(a, s);
     },
-
-    /** uid 用地区前缀 + JWT user_id（两地 userId 空间可能撞号，协议参考 §2.8） */
-    async userInfo(token) {
-      const c = util.jwtDecode(token).payload || {}; // 声明在 payload（util.jwtDecode 顶层只有 uid/exp）
-      return { uid: `${cfg.uidPrefix}${String(c.user_id || "")}`, name: String(c.user_name || c.nickname || "AutoClaw 账号") };
-    },
-  };
+  });
 }
-const autoclaw = makeAutoClaw("cn");
-const autoclaw_intl = makeAutoClaw("intl");
+
+// ===== AutoClaw 双区接线（上游 v1.64 的 autoclaw/ 目录实现）=====
+// 来历：fork 原有一份内联实现（makeAutoClaw(region) + AUTOCLAW_REGIONS/AUTOCLAW_MODELS 常量组 +
+// autoclawPrompt.cjs），上游本批把协议层拆进 autoclaw/ 目录，并补上了 fork 没有的能力：
+// cfg() / fetchModels()（官方目录 routeId 归一）/ queryCredits()（钱包三跳聚合 + 订阅）/
+// checkin() 与 checkinStatus()（判 reward 而非 HTTP 状态）。按 2026-10-08 定的「上游为主干」
+// 取上游那份，fork 侧只留下面 withAutoclawForkSemantics 的三条独有语义。签名公式与路由解析
+// 改由 autoclaw/headers.cjs / autoclaw/models.cjs 直测（旧的 _autoclawSign/_autoclawResolveRoute
+// 窥视口随之删除）。内联的 upstreamFor()/modelEntries()/userInfo() 全仓无调用点，一并删除
+//（uid 地区前缀口径由 discovery 的 scanAutoClaw 与国际版 OAuth 落库各自负责，两处都有断言盯）。
+// deps 按上游注册处逐字传：fetchStream/pumpSse/httpJson/deviceIds 是本模块私有（未导出），
+// 只能注入；store 上游也传（autoclaw/adapter.cjs 当前只解前六个，多传一项是为合并不必改）。
+const { makeAutoClaw: makeUpstreamAutoClaw } = require("./autoclaw/adapter.cjs");
+const autoclawDeps = { fetchStream, pumpSse, httpJson, rules, util, store, deviceIds };
+// const 名保持 autoclaw / autoclaw_intl：ADAPTERS 字面量按这两个名字取，键序因此逐字不变——
+// modelOwners 的返回顺序就是裸名默认归属（与上面 Cline 那节同一条约束）。
+const autoclaw = withAutoclawForkSemantics(makeUpstreamAutoClaw("autoclaw", autoclawDeps), "autoclaw");
+const autoclaw_intl = withAutoclawForkSemantics(makeUpstreamAutoClaw("autoclaw_intl", autoclawDeps), "autoclaw_intl");
 
 // ===== Qoder（归一移植：上游 qoderAdapter 为主干 + fork 自签兜底，地区由渠道 id 定） =====
 // deps 必须注入：fetchStream/pumpSse/httpJson 是本模块私有（未导出），反向 require 会成循环依赖
@@ -5096,9 +4960,8 @@ module.exports = {
   makeOpenaiCompat,
   // 测试窥视口：cline 的错误分类与归池已随上游目录实现变成适配器方法
   // classifyError() / cline/models.cjs 的 filterByPool，dev-cline-test 改按新形状直测。
-  // autoclaw 窥视口：签名公式与路由解析纯函数，dev-autoclaw-test 直测
-  _autoclawSign: autoclawSign,
-  _autoclawResolveRoute: autoclawResolveRoute,
+  // autoclaw 的签名公式与路由解析已随接线变成 autoclaw/headers.cjs 的 authSign 与
+  // autoclaw/models.cjs 的 resolveRoute，dev-autoclaw-test 改按新形状直测。
   // qoder 窥视口：错误分类/id 派生/信封体/双层解包/标签状态机纯函数，dev-qoder-test 直测。
   // 归一移植后实现住在 qoderSelfSign.cjs，此处只转出，调用形状逐字不变
   // （跨文件消费者：discovery.cjs 用 _qoderMachineId 取自签机器标识）。

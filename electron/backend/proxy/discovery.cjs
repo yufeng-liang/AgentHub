@@ -40,6 +40,7 @@ const util = require("./util.cjs");
 const adapters = require("./adapters.cjs");
 const clineAuth = require("./clineAuth.cjs");
 const acCred = require("./autoclawCredentials.cjs");
+const acHeaders = require("./autoclaw/headers.cjs"); // 国际版登录三跳的签名头族（与对话/刷新同一实现）
 const raccoonAuth = require("./raccoonAuth.cjs");
 const zcodeLocal = require("./zcodeLocal.cjs");
 const wbCrypto = require("./wbCrypto.cjs");
@@ -545,7 +546,10 @@ function scanAutoClaw() {
         name: String(claims.user_name || cred.name || "AutoClaw 账号"),
         token: cred.token, refreshToken: cred.refreshToken,
         expiresAt: cred.expiresAt,
-        meta: cred.deviceId ? { device_id: cred.deviceId } : {},
+        // deviceId 同值双写（与 qoder 的 machine_id/machineId 同一手法）：上游 autoclaw/adapter.cjs
+        // 的 deviceIdOf 只认驼峰，fork 历史行是 snake 的 device_id（读侧由 store.parseMeta 补齐）。
+        // 两键都写，新行从落库起就两条口径一致。
+        meta: cred.deviceId ? { device_id: cred.deviceId, deviceId: cred.deviceId } : {},
         source: "scan", file: "auth.json",
       });
     }
@@ -2261,7 +2265,9 @@ function qoderMachineIdOf(product = "qoder") {
 // ① captcha-config（主进程拉，签名头）→ ② renderer 弹滑块拿 captchaVerifyParam → oauth-url 拿授权页
 // → ③ 系统浏览器登录 302 回环 /aclaw-cb/{vendor}/{taskState}?code&state（上游不校验回调主机）
 // 双 state 陷阱：路径里是本网关任务 state（CSRF 校验），换码必须用查询串里上游回的 state——传错稳定 631001。
-const AUTOCLAW_INTL_USERAPI = "https://autoglm-api.autoglm.ai"; // 与 adapters.cjs 的 AUTOCLAW_REGIONS.intl.userapi 同值，直接字面量写在这里避免跨文件私有引用
+// 与 rules/headers.json 的 autoclaw_intl.userapiBase 同值，字面量写在这里避免跨文件私有引用
+//（内联时代的 AUTOCLAW_REGIONS 常量组已随上游 autoclaw/ 目录接线删除）
+const AUTOCLAW_INTL_USERAPI = "https://autoglm-api.autoglm.ai";
 const AUTOCLAW_CALLBACK_PREFIX = "/aclaw-cb/";
 const AUTOCLAW_INTL_OK_PAGE = '<meta charset=utf-8><body style="font-family:system-ui;background:#0b0d0f;color:#44e07f;display:grid;place-items:center;height:100vh">登录成功，已返回网关，可以关闭此页面。</body>';
 
@@ -2273,9 +2279,13 @@ function autoclawParseCallback(pathname, search) {
 }
 
 function autoclawSignedHeaders(token) {
-  // userapi 域签名头族与 adapters 的 _userapiHeaders 逐字同构（含 x-harness-type: zcode + MD5 签名）。
-  // 复用单一实现而非在本文件再写一份：appId/appKey 与签名公式两处副本迟早漂移（qoderMachineIdOf 同一口径）
-  return adapters.get("autoclaw_intl")._userapiHeaders(token || "");
+  // userapi 域签名头族的唯一实现是上游 autoclaw/headers.cjs（x-harness-type: zcode + MD5 签名都在里面）。
+  // 原先借道 adapters.get("autoclaw_intl")._userapiHeaders，那个私有方法随上游 autoclaw/ 目录接线删除；
+  // 继续复用单一实现而不是在本文件再写一份——appId/appKey 与签名公式两处副本迟早漂移（qoderMachineIdOf 同口径）。
+  // 与内联版相比多出 x-version: apiVersion（1.18.5），这正是上游登录三跳（captcha-config/oauth-url/
+  // oauth-login）在 autoclaw/login.cjs 里发的形态，这里与它对齐。
+  const c = (rules.get("headers.json") || {}).autoclaw_intl || {};
+  return acHeaders.signedAuthHeaders(c, token || "");
 }
 
 /**
@@ -3248,10 +3258,11 @@ async function beginOAuth(channel, opts, onDone, helpers) {
   if (ch === "zcode" || ch === "zcode_intl") return beginZcodeOAuth(ch, cb);
   if (ch === "autoclaw_intl") return beginAutoClawIntlOAuth(ch, o, cb);
   if (ch === "trae") return beginTraeOAuth(ch, cb);
-  // AutoClaw 国内版：fork 侧仍只有「本机导入 / 粘贴 token」。上游的手机号+验证码两跳登录
-  // 属于被推迟的 autoclaw/ 接线，文案要等那条真通了再改，否则承诺一个不存在的能力。
+  // AutoClaw 国内版没有网页授权，但有官方「手机号 + 验证码」两跳登录（proxy_autoclaw_sms_send /
+  // proxy_autoclaw_sms_login → autoclaw/login.cjs → saveAutoclawAccount 落库），另有本机导入与粘贴两条兜底。
+  // 这一跳必须显式挡住：落到末尾兜底会去拉 WorkBuddy 的授权页并轮询它的端点（渠道串味）。
   if (ch === "autoclaw") {
-    throw new Error("AutoClaw（国内）官方没有网页登录：请用「从本机软件导入」（自动读取 %APPDATA%/AutoClaw/auth.json）或粘贴 token");
+    throw new Error("AutoClaw（国内）官方没有网页登录：请用「手机验证码」登录、「从本机软件导入」（自动读取 %APPDATA%/AutoClaw/auth.json）或粘贴 token");
   }
   // CatPaw（上游 v1.60 新渠道）没有 OAuth：凭据是桌面端会话 Cookie 值。
   // 必须显式挡住——落到末尾兜底会拉起 WorkBuddy 的授权页并轮询它的端点（渠道串味）。
