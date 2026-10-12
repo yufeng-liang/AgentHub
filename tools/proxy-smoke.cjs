@@ -831,6 +831,10 @@ async function main() {
   rr = await call({ model: "not-exist-model", stream: true, messages: [{ role: "user", content: "hi" }] });
   const fbText = await rr.text();
   assert(rr.status === 200 && fbText.includes('"content":"Hello"'), "未知模型经回退链成功: " + rr.status);
+  // 回退注释帧必须在流里真出现：这条同时是「issue #90 的 fork 形态」的回归钉。上游那版写的是
+  // 裸 write(...)，本 fork 该作用域没有这个名字（sink 抽象把它换成 sink.comment()），ReferenceError
+  // 会被 streamErr 吞成一条 in-stream error 帧 —— 状态仍是 200，只凭上一条断言抓不住。
+  assert(fbText.includes(": fallback not-exist-model -> "), "流式回退写出 SSE 注释帧（不是静默改判）");
   assert(fbText.includes('"model":"not-exist-model"'), "响应模型字段保持请求值（契约不变）");
   const fbRow = store.recentRequests(1)[0];
   assert(fbRow.error === "fallback→deepseek-v4-flash", "流水备注回退命中: " + fbRow.error);

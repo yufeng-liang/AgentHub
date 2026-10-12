@@ -789,9 +789,13 @@ async function handleChat(req, res, settings, surface) {
       usedModel = chainModel;
       if (chainModel !== actualModel) {
         // 明示模型回退（issue #90）：非流式用响应头；流式头已冲刷，改发 SSE 注释帧
-        //（冒号开头，客户端按规范忽略，抓包/代理可见），不再完全静默
+        //（冒号开头，客户端按规范忽略，抓包/代理可见），不再完全静默。
+        // 字节怎么写归 sink：本 fork 的三种出站协议各有「头什么时候真的落地」的纪律
+        // （anthropic/responses 有 deferred 首帧），上游那句裸 write(...) 在这里既没有
+        // 对应的局部函数（真机上是 ReferenceError，被 SSE 错误帧吞成一条 in-stream error），
+        // 也会绕过 deferred。
         try { res.setHeader("x-agenthub-fallback", `${actualModel} -> ${chainModel}`); } catch { /* 头已发出时忽略 */ }
-        if (wantStream) write(`: fallback ${actualModel} -> ${chainModel}\n\n`);
+        sink.comment(`fallback ${actualModel} -> ${chainModel}`);
       }
       // ===== 渠道候选队列（跨渠道故障转移）：主渠道尊重全部现有路由语义（单源强制 /
       // key.route / per-model 覆盖 / fixed / 生效档排序 / 提供商前缀直达），备选 = 拥有该模型的

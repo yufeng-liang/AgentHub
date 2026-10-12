@@ -259,6 +259,14 @@ function create(ctx) {
       write(ev("ping", { type: "ping" }));
     },
 
+    /** 流内 SSE 注释帧（模型回退明示用，issue #90 的 fork 形态）：与 keepAlive 同一套
+     *  「先落地头与 message_start」纪律，注释行按 SSE 规范被客户端忽略 */
+    comment(text) {
+      if (!wantStream) return;
+      flushDeferred();
+      write(`: ${text}\n\n`);
+    },
+
     endOk(finishReason) {
       if (reasonToStop(finishReason)) stopReason = reasonToStop(finishReason);
       if (!wantStream) {

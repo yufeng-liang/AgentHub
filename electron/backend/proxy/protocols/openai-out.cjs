@@ -46,19 +46,24 @@ function create(ctx) {
     }
   };
 
+  /** 提交流头 + 首帧 role。抽成局部函数而不是只挂在返回对象上：comment() 也要保证
+   *  「写任何字节之前头已经落地」，而对象方法之间互相拿不到（裸 res.write 在未发头时
+   *  会隐式提交 200 且无 content-type，按内容类型判流的客户端直接失败） */
+  const commitHead = () => {
+    if (!wantStream || res.headersSent) return;
+    res.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache",
+      "connection": "keep-alive",
+    });
+    write(util.chunk(reqId, requestedModel, { role: "assistant" }));
+  };
+
   return {
     protocol: "openai",
 
     /** 开流：写 SSE 响应头 + 首帧 role。非流式没有这一步（等到 endOk 一次性 res.json） */
-    writeHead() {
-      if (!wantStream) return;
-      res.writeHead(200, {
-        "content-type": "text/event-stream; charset=utf-8",
-        "cache-control": "no-cache",
-        "connection": "keep-alive",
-      });
-      write(util.chunk(reqId, requestedModel, { role: "assistant" }));
-    },
+    writeHead: commitHead,
 
     /**
      * 一个上游 delta。返回「客户端真正可消费的实质内容有没有出现过」——
@@ -115,6 +120,14 @@ function create(ctx) {
     /** 静默期保活字节。OpenAI 协议用注释行，Anthropic 用 event: ping —— 差异就该留在这里 */
     keepAlive() {
       if (wantStream) write(": keep-alive\n\n");
+    },
+
+    /** 流内 SSE 注释帧（模型回退明示用，issue #90 的 fork 形态）：按 SSE 规范客户端忽略它，
+     *  抓包/代理可见。写之前一律走 commitHead，头已落地时是空转 */
+    comment(text) {
+      if (!wantStream) return;
+      commitHead();
+      write(`: ${text}\n\n`);
     },
 
     /** 成功收尾。usage 由调度侧算好（含估算兜底），这里只管成形 */

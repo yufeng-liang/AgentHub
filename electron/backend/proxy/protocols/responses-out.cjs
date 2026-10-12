@@ -268,6 +268,14 @@ function create(ctx) {
       }
     },
 
+    /** 流内 SSE 注释帧（模型回退明示用，issue #90 的 fork 形态）：与 keepAlive 同样先
+     *  flushDeferred，客户端只读 data 里的 type，注释行按 SSE 规范被忽略 */
+    comment(text) {
+      if (!wantStream) return;
+      flushDeferred();
+      write(`: ${text}\n\n`);
+    },
+
     endOk() {
       flushDeferred();
       closeAll();
