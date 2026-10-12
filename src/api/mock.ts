@@ -250,8 +250,9 @@ const PROXY_KEYS = [
   { id: "k4", name: "旧测试 Key", mask: "sk-4419···0b3f", secret: "", route: "auto", routeOrder: "", dailyQuota: 100, rateLimit: 0, enabled: false, createdAt: NOW - 30 * 86400000, todayReq: 0, todayTokens: 0 },
 ];
 
-// 预览态号池。账号上的 packages 是「积分日历」页的数据源：没有它那一页在 dev:web 里永远是空的
-// （expired / expiringSoon 由主进程按 expiringSoonDays 派生，预览态直接写死结果值）。
+// 预览态号池。账号上的 packages 是「积分日历」的逐包数据源（expired / expiringSoon 由主进程按
+// expiringSoonDays 派生，预览态直接写死结果值）；没有 packages 的账号会退化成一条账号级聚合行，
+// 所以 modelscope / lobster / qoder / autoclaw 这些上游不拆包的渠道在预览里也进日历。
 const PROXY_POOL = [
   {
     id: "trae", display: "Trae SOLO CN", domain: "api.trae.cn", costTier: "", poolStrategy: "expire_first",
@@ -316,7 +317,7 @@ const PROXY_POOL = [
   // 新增的五个生态渠道：预览态基本空号池，只为让「添加账号」弹窗里的设备码 / 滑块 / edition 切换
   // 面板在 npm run dev:web 里可达（display / domain 与 store.cjs 的 BUILTIN_CHANNELS 逐字同源）。
   // 例外是 cline_pass：它带一个「订阅到期且余额为 0」的号，用来演示侧栏「渠道额度」卡片隐藏死渠道，
-  // 以及积分日历页里「已过期但仍有余额」的行（账号 offline ⇒ 不计入 totalCredits，故汇总为 0）
+  // 以及积分日历页里两条过期行的不同去向（账号 offline ⇒ 不计入 totalCredits，故汇总为 0）
   {
     id: "cline_free", display: "Cline 免费池", domain: "api.cline.bot", poolStrategy: "expire_first",
     health: null as { until: number; reason: string; streak: number } | null,
@@ -329,8 +330,12 @@ const PROXY_POOL = [
     summary: { channel: "cline_pass", totalCredits: 0, accountCount: 1, onlineCount: 0, earliestExpire: NOW - 9 * 86400000, expired: true, expiringSoon: false, todayReq: 0, todayTokens: 0, lastCreditsAt: NOW - 30 * 86400000 },
     accounts: [
       { id: "a8", channel: "cline_pass", uid: "cl_55201", name: "订阅到期号", status: "relogin", credits: 0, creditsAt: NOW - 30 * 86400000, expiresAt: NOW - 9 * 86400000, coolUntil: 0, coolReason: "", source: "paste", lastUsed: NOW - 30 * 86400000, todayReq: 0, todayTokens: 0, creditsToday: -1, createdAt: NOW - 40 * 86400000, hasToken: true,
-        // 已过期但还剩 3：默认档必须保留它（「隐藏已用完」不等于「隐藏已过期」）
-        packages: [{ code: "clp-sub", name: "Cline 订阅额度", total: 500, used: 497, remaining: 3, expiresAt: NOW - 9 * 86400000, expired: true }] },
+        // 两条过期行演示两个去向：过期 1 天半的默认档必须保留（「隐藏已用完」不等于「隐藏已过期」），
+        // 过期 9 天的已被「过期满 2 天自动收起」收进「历史过期积分」按钮，默认档看不到
+        packages: [
+          { code: "clp-recent", name: "Cline 订阅额度（刚过期）", total: 500, used: 497, remaining: 3, expiresAt: NOW - 1.5 * 86400000, expired: true },
+          { code: "clp-sub", name: "Cline 订阅额度", total: 500, used: 497, remaining: 3, expiresAt: NOW - 9 * 86400000, expired: true },
+        ] },
     ],
   },
   {

@@ -4,6 +4,12 @@
 // 这类缺陷 vue-tsc 与原有 node 门禁全看不见——过滤逻辑写在 computed 里，只有运行时才算得出来。
 // 所以把过滤/排序抽到 src/views/proxy/expiryRows.ts（纯函数），本脚本转译后直接断言。
 //
+// 2026-10-12 起还钉住三件事（都是同一页的产品口径，写错不会编译失败也不会测试失败）：
+//   G/H 过期满 STALE_EXPIRED_DAYS 天的行退出默认档、且只在「历史过期积分」档回来（收起≠删除）；
+//   I   上游不拆包的渠道按账号出聚合行（从未刷过额度的账号不得混进来）；
+//   J   total=-1 是「上游不给总额」不是「不限」——两者混同会把 1,880 积分写成「1,880 / 不限」。
+// 本闸加载两份 TS 模块（expiryRows 与 format），加载器必须 bundle 且每次换临时文件名。
+//
 // 跑法：node scripts/dev-expiry-rows-test.cjs
 "use strict";
 if (require.main !== module) return;
@@ -24,10 +30,22 @@ function check(name, ok, detail) {
   else { failures.push(name + (detail ? `：${detail}` : "")); console.log(`FAIL  ${name}${detail ? `：${detail}` : ""}`); }
 }
 
-/** 转译 TS 纯函数模块后 require（类型导入被 esbuild 抹掉，不会触发运行时 require） */
+/** 转译并加载 TS 纯函数模块（类型导入被 esbuild 抹掉，不会触发运行时 require）。
+ *  必须 bundle 而不是 transform：src/views/proxy/format.ts 转出 `export { fmtCtx } from
+ *  "../../utils/format"`，裸 transform 会把这条相对依赖原样留在产物里，从临时目录 require 必炸。
+ *  临时文件名必须每次唯一：require 按路径缓存，复用同一个路径会让第二次加载直接拿到第一个模块
+ *  （本闸加载 expiryRows 与 format 两份，写死路径时 format 的导出会静默变成 expiryRows 的） */
+let loadSeq = 0;
 function loadModule(rel) {
-  const { code } = esbuild.transformSync(fs.readFileSync(path.join(ROOT, rel), "utf8"), { loader: "ts", format: "cjs" });
-  const tmp = path.join(os.tmpdir(), `expiry-rows-${process.pid}.cjs`);
+  const { outputFiles: [{ text: code }] } = esbuild.buildSync({
+    entryPoints: [path.join(ROOT, rel)],
+    bundle: true,
+    format: "cjs",
+    platform: "node",
+    target: "node18",
+    write: false,
+  });
+  const tmp = path.join(os.tmpdir(), `expiry-rows-${process.pid}-${loadSeq++}.cjs`);
   fs.writeFileSync(tmp, code);
   try {
     return require(tmp);
@@ -67,7 +85,10 @@ const ROWS_BY = (out) => out.map((r) => r.pkg.code).join(",");
 
 function main() {
   const m = loadModule(TS);
-  const { applyExpiryFilter, isUsedUp, statusOf, countByState, STATUS_OPTIONS, SORT_OPTIONS } = m;
+  const {
+    applyExpiryFilter, isUsedUp, statusOf, countByState, STATUS_OPTIONS, SORT_OPTIONS,
+    isStaleExpired, expiredDays, STALE_EXPIRED_DAYS, aggregateRow, AGGREGATE_PKG_NAME,
+  } = m;
   const filter = (o) => applyExpiryFilter(ROWS, { status: "usable", channelId: "all", sort: "expiryAsc", ...o });
 
   // ===== A. 哨兵与状态归类 =====
@@ -120,6 +141,93 @@ function main() {
     /!\(c\.summary\.expired && c\.summary\.totalCredits === 0\)/.test(sidebar));
   check("㉓ 侧栏列表遍历 visibleChannels，且空态也认可见集合",
     /v-for="c in visibleChannels"/.test(sidebar) && !/v-for="c in channels"/.test(sidebar) && /v-if="!visibleChannels\.length"/.test(sidebar));
+
+  // ===== G. 过期满 2 天自动收起（2026-10-12：日历被过期好几天的包刷屏） =====
+  // 独立夹具：上面 6 行的过期时刻是 1 天前，正好落在「保留」侧，所以本节的边界样本不能混进去。
+  // 本节判据是**成员集合**（顺序另有 ⑮–⑱ 钉），免得把排序算进收起规则的断言里互相掩盖。
+  const SET = (out) => out.map((r) => r.pkg.code).sort().join(",");
+  const T = Date.now();
+  const stale = (code, agoMs, over = {}) => row("trae", "Trae SOLO CN", "t1", pkg(code, 5, 10, T - agoMs, { expired: true, ...over }));
+  const STALE = [
+    stale("k0", DAY - 60000), // 过期 1 天差 1 分钟 → 留
+    stale("k1", 2 * DAY - 60000), // 过期 1天23h59m → 留（差 1 分钟才满 2 天）
+    stale("k2", 2 * DAY), // 正好满 2 天 → 收起（阈值含 2）
+    stale("k3", 30 * DAY), // 过期一个月 → 收起
+    row("trae", "Trae SOLO CN", "t1", pkg("k4", 5, 10, T + 5 * DAY, { expiringSoon: true })), // 未过期 → 留
+    stale("k5", 10 * DAY, { remaining: 0 }), // 陈旧过期且已用完 → 收起
+    row("trae", "Trae SOLO CN", "t1", pkg("k6", 5, 10, 0)), // 长期有效 → 永不算陈旧
+  ];
+  const sflt = (o) => applyExpiryFilter(STALE, { status: "all", channelId: "all", sort: "expiryAsc", ...o }, T);
+  check("G1 默认「全部」档收起过期满 2 天的 k2/k3/k5，保留 k0/k1/k4/k6（实得 " + SET(sflt({})) + "）",
+    SET(sflt({})) === "k0,k1,k4,k6", SET(sflt({})));
+  check("G2 阈值含 2 天：差 1 分钟满 2 天的 k1 必须还在，正好 2 天的 k2 必须收起",
+    sflt({}).some((r) => r.pkg.code === "k1") && !sflt({}).some((r) => r.pkg.code === "k2"));
+  check("G3 切到「已过期」档也不召回陈旧的包（那是同一批行，收起规则先于状态档）",
+    SET(sflt({ status: "expired" })) === "k0,k1", SET(sflt({ status: "expired" })));
+  check("G4 长期有效（expiresAt=0）永不算陈旧过期", isStaleExpired(pkg("x", 5, 10, 0), T) === false);
+  check("G5 expiredDays 按整天向下取整：满 2 天报 2、1 天零 1 小时报 1、不足 1 天报 0、未过期报 -1",
+    expiredDays(pkg("a", 5, 10, T - 2 * DAY), T) === 2 &&
+      expiredDays(pkg("b", 5, 10, T - DAY - 3600000), T) === 1 &&
+      expiredDays(pkg("c", 5, 10, T - 60000), T) === 0 &&
+      expiredDays(pkg("d", 5, 10, T + DAY), T) === -1);
+  check("G6 STALE_EXPIRED_DAYS 就是 2（文案与判据共用同一个常量，改阈值必须同步改口径）", STALE_EXPIRED_DAYS === 2);
+
+  // ===== H. 历史过期档：把收起的行全部放回来，一条都不丢 =====
+  const hflt = (o) => applyExpiryFilter(STALE, { status: "all", channelId: "all", sort: "expiryAsc", history: true, ...o }, T);
+  check("H1 历史档 = 全部已过期（含收起的 k2/k3/k5），且不含未过期的 k4/k6（实得 " + SET(hflt({})) + "）",
+    SET(hflt({})) === "k0,k1,k2,k3,k5", SET(hflt({})));
+  check("H2 反向对照：两档并集覆盖夹具全集（收起不等于删除），且默认档收起的正是 k2/k3/k5",
+    new Set([...sflt({}), ...hflt({})].map((r) => r.pkg.code)).size === STALE.length &&
+      SET(STALE.filter((r) => !sflt({}).includes(r))) === "k2,k3,k5",
+    SET(STALE.filter((r) => !sflt({}).includes(r))));
+  check("H3 历史档下 status 维度让位：切成「生效中」也照样只出已过期行",
+    SET(hflt({ status: "ok" })) === "k0,k1,k2,k3,k5", SET(hflt({ status: "ok" })));
+  check("H4 历史档仍认渠道筛选",
+    ROWS_BY(applyExpiryFilter(STALE, { status: "all", channelId: "workbuddy", sort: "expiryAsc", history: true }, T)) === "");
+  check("H5 已用完但过期满 2 天的包只在历史档可见（默认档收不起，历史档不丢）",
+    !sflt({}).some((r) => r.pkg.code === "k5") && hflt({}).some((r) => r.pkg.code === "k5"));
+
+  // ===== I. 账号级聚合行：上游不拆包的渠道也要能进日历 =====
+  const acc = (over) => ({ id: "x1", name: "账号甲", credits: 1880, creditsAt: T - 1000, expiresAt: T + 40 * DAY, ...over });
+  const agg = aggregateRow("catpaw", "CatPaw（美团）", acc({}));
+  check("I1 聚合行落在 total=-1（上游不给总额）+ aggregate 标记，包名与逐包行区分得开",
+    !!agg && agg.aggregate === true && agg.pkg.total === -1 && agg.pkg.remaining === 1880 && agg.pkg.name === AGGREGATE_PKG_NAME);
+  check("I2 从未刷过额度的账号（creditsAt=0）不出聚合行——那时 credits/expiresAt 都是建号默认值",
+    aggregateRow("catpaw", "CatPaw（美团）", acc({ creditsAt: 0 })) === null);
+  check("I3 余额非数值不出聚合行", aggregateRow("catpaw", "CatPaw（美团）", acc({ credits: NaN })) === null);
+  check("I4 无到期时间的账号仍出聚合行（落 0 → 显示「长期」），不因缺到期就被丢掉",
+    (() => {
+      const r = aggregateRow("lobster", "LobsterAI（有道）", acc({ expiresAt: 0 }));
+      return !!r && r.pkg.expiresAt === 0 && statusOf(r.pkg) === "ok";
+    })());
+  check("I5 聚合行的 key 与逐包行不撞（同一账号既可能走包集也可能走聚合）", agg.key === "x1:agg");
+  check("I6 未命名账号回落占位名", aggregateRow("catpaw", "CatPaw（美团）", acc({ name: "" })).accountName === "（未命名）");
+
+  // ===== J. 「剩余 / 总额」单元格：不给总额 ≠ 不限 =====
+  const fmt = loadModule("src/views/proxy/format.ts");
+  const { fmtBalancePair } = fmt;
+  check("J1 上游不给总额（total=-1 且剩余有数值）渲染成「—」，绝不能渲染成「1,880 / 不限」",
+    fmtBalancePair(1880, -1, "lobster") === "1,880 / — 积分", fmtBalancePair(1880, -1, "lobster"));
+  check("J2 两头都是 -1 才是真·不限，且不缀单位", fmtBalancePair(-1, -1, "catpaw") === "不限 / 不限", fmtBalancePair(-1, -1, "catpaw"));
+  check("J3 正常逐包行口径不变（Token 渠道过 fmtToken 换算）",
+    fmtBalancePair(3000000, 3000000, "zcode") === "3 百万 / 3 百万 Token", fmtBalancePair(3000000, 3000000, "zcode"));
+  check("J4 剩余不限、总额有数值时照实并列", fmtBalancePair(-1, 500, "trae") === "不限 / 500 积分", fmtBalancePair(-1, 500, "trae"));
+
+  // ===== K. 新增行为的源码接线钉（纯函数对了但视图没接上一样白搭） =====
+  check("K1 视图把 historyOpen 灌进过滤器（否则按钮只是个装饰）",
+    /history:\s*historyOpen\.value/.test(view));
+  check("K2 视图遍历聚合行：packages 为空时才走 aggregateRow，两者互斥所以不会重复计数",
+    /aggregateRow\(/.test(view) && /packs\.length/.test(view));
+  check("K3 总额单元格走 fmtBalancePair（回退成两个 fmtBalance 拼接会把「—」写成「不限」）",
+    /fmtBalancePair\(/.test(view) && !/fmtBalance\(r\.pkg\.total/.test(view));
+  check("K4 过期行报的是「过期 N 天」而不是光秃秃的「已过期」（用户要的就是知道过期多久）",
+    /过期 \$\{gone\} 天|过期 \$\{gone\}天/.test(view));
+  check("K5 收起条数的提示走 staleHidden，且阈值取自常量而不是写死 2",
+    /staleHidden/.test(view) && /STALE_EXPIRED_DAYS/.test(view));
+  check("K6 历史档下 status 下拉被换成说明标签，不是留一个点不动的下拉",
+    /v-if="historyOpen"[\s\S]{0,80}hist-chip/.test(view) && /v-else v-model="statusFilter"/.test(view));
+  check("K7 按钮文案就是「历史过期积分」，不带条数（条数归「已过期」徽标与「N 条已收起」提示，别三处各摆一份）",
+    /: "历史过期积分"/.test(view) && !/历史过期积分 \$\{/.test(view));
 
   console.log(`\n${failures.length ? "FAIL " + failures.length + " 项" : "OK 积分日历行过滤闸全过"}（共 ${pass + failures.length} 项）`);
   if (failures.length) process.exit(1);

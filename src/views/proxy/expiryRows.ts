@@ -1,5 +1,5 @@
 // 积分日历页的行过滤与排序：纯函数，与渲染解耦（scripts/dev-expiry-rows-test.cjs 直接断言）
-import type { ProxyCreditPackage } from "../../types";
+import type { ProxyAccount, ProxyCreditPackage } from "../../types";
 
 export interface ExpiryRow {
   key: string;
@@ -7,6 +7,8 @@ export interface ExpiryRow {
   channelDisplay: string;
   accountName: string;
   pkg: ProxyCreditPackage;
+  /** 账号级聚合行（该渠道上游不拆包）：总额列不编数字，渲染成「—」 */
+  aggregate?: boolean;
 }
 
 /** 状态筛选；usable = 有余额（排除已用完），是页面默认档 */
@@ -42,6 +44,28 @@ export function statusOf(pkg: ProxyCreditPackage): ExpiryState {
   return "ok";
 }
 
+/** 已过期多少天（不足一天按 0）；未过期或长期有效返回 -1 */
+export function expiredDays(pkg: ProxyCreditPackage, now: number): number {
+  if (!pkg.expiresAt || pkg.expiresAt > now) return -1;
+  return Math.floor((now - pkg.expiresAt) / 86400000);
+}
+
+/** 陈旧过期阈值（天）：过期满 2 天（含）的包退出日历默认视图。
+ *  刚过期一天内仍留在列表——那正是该催用户去用的；三天前的过期包只剩刷屏价值。 */
+export const STALE_EXPIRED_DAYS = 2;
+const STALE_EXPIRED_MS = STALE_EXPIRED_DAYS * 86400000;
+
+/** 陈旧过期 = 过期时刻距今 ≥ 2 天。按 expiresAt 重算而不读 pkg.expired：
+ *  后者是主进程派生的一次性快照，页面常驻时会比 expiresAt 慢一整个刷新周期。 */
+export function isStaleExpired(pkg: ProxyCreditPackage, now: number): boolean {
+  return !!pkg.expiresAt && now - pkg.expiresAt >= STALE_EXPIRED_MS;
+}
+
+/** 已过期（含刚过期与陈旧过期）：历史档的入选判据 */
+export function isExpiredPkg(pkg: ProxyCreditPackage, now: number): boolean {
+  return !!pkg.expiresAt && pkg.expiresAt <= now;
+}
+
 /** 剩余额度排序键：-1（不限）视为最大 */
 const remainKey = (pkg: ProxyCreditPackage) => (pkg.remaining === -1 ? Number.POSITIVE_INFINITY : pkg.remaining);
 /** 到期排序键：0（长期有效）视为最大，故升序时排在最后 */
@@ -61,11 +85,16 @@ export interface ExpiryFilter {
   /** "all" = 不限渠道 */
   channelId: string;
   sort: ExpirySortKey;
+  /** 历史过期档：只看全部已过期（含默认视图里被自动隐藏的陈旧过期），status 维度让位 */
+  history?: boolean;
 }
 
-export function applyExpiryFilter(rows: ExpiryRow[], f: ExpiryFilter): ExpiryRow[] {
+export function applyExpiryFilter(rows: ExpiryRow[], f: ExpiryFilter, now: number = Date.now()): ExpiryRow[] {
   const out = rows.filter((r) => {
     if (f.channelId !== "all" && r.channelId !== f.channelId) return false;
+    if (f.history) return isExpiredPkg(r.pkg, now);
+    // 过期满 2 天的退出日历默认视图（含「已过期」档——那是同一批行，切档不该把它们召回来）
+    if (isStaleExpired(r.pkg, now)) return false;
     if (f.status === "all") return true;
     if (f.status === "usable") return !isUsedUp(r.pkg);
     return statusOf(r.pkg) === f.status;
@@ -89,4 +118,33 @@ export function countByState(rows: ExpiryRow[]): Record<ExpiryState, number> & {
   const out = { expired: 0, soon: 0, used: 0, ok: 0, total: rows.length };
   for (const r of rows) out[statusOf(r.pkg)]++;
   return out;
+}
+
+/** 聚合行的包名：与逐包行区分开，避免用户把它当成一个真实的包 */
+export const AGGREGATE_PKG_NAME = "账号额度汇总";
+
+/** 账号级聚合行：该渠道上游不拆包（只有一个聚合余额数）时，按账号出一条进日历。
+ *  覆盖 catpaw / cline 双池 / autoclaw 双区 / raccoon / lobster / modelscope / qoder 双区
+ *  这些「有积分或额度、但适配器产不出 packages」的渠道（2026-10-12）。
+ *
+ *  只用已经落库的账号级字段，不碰任何上游字段名，所以新渠道零改造即被覆盖。
+ *  - 跳过 creditsAt=0 的账号：那是建号默认值，从未刷过额度，列出来是假数据
+ *  - total = -1 表示「上游不给总额」，渲染成「—」；与 remaining = -1 的「不限」哨兵是两回事
+ *  - 无到期时间照实落 0 → 显示「长期」，排序仍按现有口径排到最后 */
+export function aggregateRow(
+  channelId: string,
+  channelDisplay: string,
+  acc: Pick<ProxyAccount, "id" | "name" | "credits" | "creditsAt" | "expiresAt">,
+): ExpiryRow | null {
+  if (!acc.creditsAt) return null;
+  const remaining = Number(acc.credits);
+  if (!Number.isFinite(remaining)) return null;
+  return {
+    key: `${acc.id}:agg`,
+    channelId,
+    channelDisplay,
+    accountName: acc.name || "（未命名）",
+    aggregate: true,
+    pkg: { code: "", name: AGGREGATE_PKG_NAME, total: -1, used: 0, remaining, expiresAt: Number(acc.expiresAt) || 0 },
+  };
 }

@@ -206,6 +206,17 @@ export function fmtBalance(val: number, channel?: string): string {
   if (isTokenChannel(channel)) return fmtToken(val);
   return fmtCnAmount(val);
 }
+
+/** 日历「剩余 / 总额」单元格。
+ *  total = -1 且 remaining 是具体数值时含义是**上游不给总额**（账号级聚合行：catpaw / cline /
+ *  autoclaw / lobster / modelscope 这些只回一个聚合数的渠道），必须与 remaining = -1 的「不限」
+ *  哨兵分开——否则 1,880 积分会渲染成「1,880 / 不限」这种既错又误导的话。
+ *  两头都是 -1 时才是真·不限，此时不缀单位。 */
+export function fmtBalancePair(remaining: number, total: number, channel?: string): string {
+  const right = total === -1 && remaining !== -1 ? "—" : fmtBalance(total, channel);
+  const unit = remaining === -1 && total === -1 ? "" : ` ${balanceUnit(channel)}`;
+  return `${fmtBalance(remaining, channel)} / ${right}${unit}`;
+}
 export const CHANNEL_NAMES: Record<string, string> = {
   trae: "Trae SOLO CN",
   workbuddy: "WorkBuddy CN",
