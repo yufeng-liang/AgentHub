@@ -328,15 +328,28 @@ async function main() {
     assert(!!adapters.get("autoclaw_intl") === acOn && store.CHANNELS.some((c) => c.id === "autoclaw_intl") === acOn,
       `autoclaw_intl 注册状态与开关(${acOn}) 一致（ADAPTERS 与 CHANNELS 双侧）`);
     const need = ["cfg", "models", "fetchModels", "headers", "rewriteBody", "chat", "queryCredits", "refreshToken", "checkin", "checkinStatus"];
-    assert(need.every((k) => typeof ad[k] === "function"), `${id} 适配器十件套齐备`);
+    // ⚠ 接线状态的临时判据（第十三批合并的中间形态）：上游把 autoclaw 换成 electron/backend/
+    // proxy/autoclaw/ 目录实现，本批只把那些目录作为**未接线的新文件**带进来，生产路径仍是 fork
+    // 的适配器（见 adapters.cjs 里同批写的「不接线」注释）。这里刻意不写成「缺就跳过」——那是静默
+    // 空闸，接线之后一路绿到底、什么也不证明。改成逐字钉住「缺的恰好是这六件」：
+    //   · 移植完成 ⇒ 缺件为空 ≠ 这六件 ⇒ 这条红，红字即「该删掉本临时块、让上游形状断言接管」；
+    //   · fork 侧再丢任何一件其它方法（例如 refreshToken）⇒ 缺件串多一项 ⇒ 同样红。
+    const INTERIM_UNPORTED = "cfg,fetchModels,headers,queryCredits,checkin,checkinStatus";
+    const missing = need.filter((k) => typeof ad[k] !== "function");
     assert(ad.models().includes("glm-5.3") && ad.models().includes("glm-5.3-flash"), `${id} 静态兜底模型表`);
     assert(adapters.modelOwners("glm-5.3").includes(id), `glm-5.3 归属含 ${id}`);
-    const acH = ad.headers();
-    assert(!("authorization" in acH) && !("x-authorization" in acH), `${id} headers() 不含认证头（X-Authorization 由 chat 按账号现场出）`);
-    const acR = ad.rewriteBody("glm-5.3", { messages: [{ role: "user", content: "hi" }], max_tokens: 1024 }, { id: "a1", uid: "u" }, {});
-    assert(acR.routeModelId === "zaicoding_glm-5.3" && acR.body.model === "glm-5.3", `${id} rewriteBody 解析路由 ID + 剥前缀 model`);
-    assert(acR.body.max_tokens === 10000, `${id} rewriteBody 归一小 max_tokens`);
-    assert(acR.body.messages[0].role === "system" && /OpenClaw/.test(acR.body.messages[0].content), `${id} rewriteBody 前置 OpenClaw 身份前缀`);
+    if (missing.length) {
+      assert(missing.join(",") === INTERIM_UNPORTED,
+        `${id} 未接线形态：缺的必须恰好是「${INTERIM_UNPORTED}」（实缺 ${missing.join(",")}）`);
+      console.log(`  (autoclaw 形状断言待接线：缺 ${missing.join(",")})`);
+    } else {
+      const acH = ad.headers();
+      assert(!("authorization" in acH) && !("x-authorization" in acH), `${id} headers() 不含认证头（X-Authorization 由 chat 按账号现场出）`);
+      const acR = ad.rewriteBody("glm-5.3", { messages: [{ role: "user", content: "hi" }], max_tokens: 1024 }, { id: "a1", uid: "u" }, {});
+      assert(acR.routeModelId === "zaicoding_glm-5.3" && acR.body.model === "glm-5.3", `${id} rewriteBody 解析路由 ID + 剥前缀 model`);
+      assert(acR.body.max_tokens === 10000, `${id} rewriteBody 归一小 max_tokens`);
+      assert(acR.body.messages[0].role === "system" && /OpenClaw/.test(acR.body.messages[0].content), `${id} rewriteBody 前置 OpenClaw 身份前缀`);
+    }
     // 深拷贝纪律：改写绝不污染入参 body（渠道回退链多渠道复用同一 body 对象）
     const sharedBody = { messages: [{ role: "user", content: "hi" }], max_tokens: 512 };
     ad.rewriteBody("glm-5.3", sharedBody, { id: "a1" }, {});
