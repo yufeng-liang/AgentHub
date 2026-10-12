@@ -505,20 +505,27 @@ function raccoonJwtPayload(token) {
 
 // ===== Cline（~/.cline/data/settings/providers.json，明文；协议参考 §1.7） =====
 
+// 两池（cline_free / cline_pass）共用同一份客户端登录态：**不猜池**，对每个已启用的池各产一条候选。
+// 单候选会让 cline_pass 那页永远扫不出东西——扫描弹窗按「当前正在新增的渠道」过滤候选
+//（ProxyAgentsView 的 scanRows），而 importCandidate 的 channelOverride 没有 UI 入口喂它。
+// 读侧仍走 fork 的 clineAuth：它把 providers.json 的 metadata.userInfo 并进 claims 当展示名权威来源
+//（桌面端 JWT 常缺 firstName/lastName，改用上游 readDesktopProviders 会退化成只显示 email）。
 function scanCline() {
+  const channels = ["cline_free", "cline_pass"].filter((ch) => store.CHANNELS.some((c) => c.id === ch) && adapters.channelOn(ch));
+  if (!channels.length) return [];
   const cred = clineAuth.readClineDesktopAuth();
   if (!cred) return [];
   // uid 必须用 JWT external_id（usr-…），sub 是 WorkOS user_… 不能用于去重/余额路径
   const uid = clineAuth.clineUid(cred.token, cred.accountId);
   if (!uid) return [];
-  return [{
-    channel: "cline_free", // 两池同账号同凭证：默认落 free 池，UI 可 channelOverride 改投 pass
+  return channels.map((channel) => ({
+    channel,
     uid, name: cred.displayName || "Cline 账号",
     token: cred.token, refreshToken: cred.refreshToken,
     expiresAt: cred.expiresAt,
     meta: {},
     source: "scan", file: "providers.json",
-  }];
+  }));
 }
 
 // ===== AutoClaw（%APPDATA%/AutoClaw/auth.json，safeStorage 密文；协议参考 §2.7） =====

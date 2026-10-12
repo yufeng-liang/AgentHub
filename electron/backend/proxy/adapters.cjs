@@ -2232,17 +2232,7 @@ const raccoon = {
   },
 };
 
-// ===== Cline（cline-free / cline-pass 同账号两额度池，makeCline(pool) 参数化；协议参考 §1） =====
-const CLINE_BASE = "https://api.cline.bot/api/v1"; // 只有单层 v1：拼成 /api/v1/v1/... 实测 404，别再补
-const CLINE_HEADERS_BASE = {
-  "content-type": "application/json",
-  accept: "text/event-stream",
-  "x-client-type": "cline-sdk", // 关键：缺它免费池全 403 "only available via Cline product surfaces"；cline-cli 走兼容路径回 500，禁用
-  "user-agent": "Cline/3.0.62",
-  "x-client-version": "3.0.62",
-  "http-referer": "https://cline.bot",
-  "x-title": "Cline",
-};
+// ===== Cline（cline_free / cline_pass）===== 实现已接上游 cline/ 目录，见下方注册处。
 // ===== LobsterAI（网易有道龙虾，渠道 id: lobster） =====// 协议事实（2026-10-05 本机实测 + 参考实现 lobsterai2api@21c39a4 交叉验证，见 docs/lobster-反代）：
 //   · 鉴权 = Bearer JWT（OAuth 授权码换发；回环回调 http://127.0.0.1:<port>/auth/callback）
 //   · 对话 = 原生 OpenAI Chat Completions，但**上游只接受 stream=true**（非流式实测 500）
@@ -4077,141 +4067,39 @@ function assertAdapterContract(channel, ad) {
 }
 
 
-/** cline 错误 → AgentHub 语义。403 刻意不当限额：ENTITLEMENT/API_REQUEST 是「账号×模型」
- *  维度的确定性拒绝，换号同样 403，冷却只会把确定失败变成静默跳过——透传让用户看到
- *  「该订阅/换模型」（协议参考 §1.6）。429→402 走既有「切号+planLimit」链路。 */
-function clineErrorStatus(status, errObj) {
-  if (status === 401) return 401;
-  if (status === 429) return 402;
-  if (status === 403 || status === 404) return status;
-  return 502;
-}
-
-/** 远程目录归池：free 组归 free 池、clinePass 组归 pass 池；recommended 走 credit 计费不收、
- *  clineCloud 实测 403 不收（协议参考 §1.4）。归池看分组不看前缀——free 组混有裸名条目。 */
-function pickClineModels(groups, pool) {
-  const arr = (groups && (pool === "pass" ? groups.clinePass : groups.free)) || [];
-  return arr.map((m) => String((m && m.id) || "")).filter(Boolean);
-}
-
-function makeCline(pool) {
-  const channel = pool === "pass" ? "cline_pass" : "cline_free";
-  return {
-    id: channel,
-    refreshWindowSec: 600, // accessToken 1h、临期 10min 主动刷（协议参考 §1.3；语义同 raccoon.refreshWindowSec）
-
-    headers(secrets) {
-      return { ...CLINE_HEADERS_BASE, authorization: `Bearer ${clineAuth.ensureTokenPrefix(secrets && secrets.token)}` };
-    },
-
-    // 目录 id 本身带池前缀（cline-free/xxx），两池天然不重名，mergedModels/modelOwners 零特判
-    models() {
-      return unionIds([...catalogMap(channel).values()].map((m) => String(m.id)), []);
-    },
-    modelEntries() { return [...catalogMap(channel).values()].map((m) => ({ client: String(m.id), upstream: String(m.id), entry: m })); },
-
-    /** 拉取官方推荐目录（免鉴权 GET /ai/cline/recommended-models）：按响应分组归池，
-     *  元数据（name/rate/能力/上下文）从静态目录回填，目录缺的条目用 id 兜底；
-     *  拉取失败/空目录返回 ok:false（index.cjs 管道失败不写空，保留旧目录） */
-    async fetchModels(account, secrets) {
-      const r = await httpJson(`${CLINE_BASE}/ai/cline/recommended-models`, { method: "GET", headers: this.headers(secrets) })
-        .catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
-      if (!r.ok) return { ok: false, message: `目录拉取失败（HTTP ${r.status || 0}）${r.message ? " " + r.message : ""}` };
-      const ids = pickClineModels(r.data || {}, pool);
-      if (!ids.length) return { ok: false, message: "目录为空" };
-      const cat = catalogMap(channel);
-      const models = ids.map((id) => {
-        const meta = cat.get(id.toLowerCase());
-        return {
-          id, name: String((meta && meta.name) || id), rate: (meta && meta.rate) ?? null,
-          capabilities: (meta && meta.capabilities) || { images: false, reasoning: true, tools: true },
-          contextLength: Number((meta && meta.contextLength) || 0), maxOutputTokens: Number((meta && meta.maxOutputTokens) || 0),
-        };
-      });
-      return { ok: true, models };
-    },
-
-    /** 客户端名 → 上游名：带前缀原样（前缀是计费通道选择器，剥掉 404）；裸名补本池前缀 */
-    upstreamFor(clientModel) {
-      const s = String(clientModel || "");
-      return s.startsWith("cline-free/") || s.startsWith("cline-pass/") ? s : `${pool === "pass" ? "cline-pass/" : "cline-free/"}${s}`;
-    },
-
-    rewriteBody(model, body) {
-      const out = { ...(body || {}) };
-      out.model = this.upstreamFor(model);
-      out.stream = true;
-      if (!out.stream_options || typeof out.stream_options !== "object") out.stream_options = {};
-      out.stream_options.include_usage = true;
-      delete out.conversation_id; delete out.conversationId; delete out.prompt_cache_key;
-      return out; // 其余字段完全透传（协议参考 §1.4：上游是标准 OpenAI body）
-    },
-
-    async chat({ secrets, model, body, emit }) {
-      const payload = JSON.stringify(this.rewriteBody(model, body));
-      const { resp, cancelTimer } = await fetchStream(`${CLINE_BASE}/chat/completions`, { method: "POST", headers: this.headers(secrets), body: payload });
-      const result = { status: 200, planLimit: false };
-      try {
-        // stream:true 恒回裸 chat.completion.chunk；上游错误可能以 {"error":"..."} 或 {"error":{...}} 出现（协议参考 §1.5）
-        await pumpSse(resp, (_event, raw) => {
-          if (raw === "[DONE]") { emit({ type: "finish", reason: "" }); return; }
-          const data = parseJson(raw);
-          if (!data) return;
-          if (data.error) {
-            const isObj = typeof data.error === "object" && data.error !== null;
-            const status = clineErrorStatus(Number((isObj && data.error.status) || 0), data.error);
-            if (status === 402) result.planLimit = true;
-            const msg = isObj ? String(data.error.message || "上游错误") : String(data.error);
-            emit({ type: "error", status: status || 502, code: 0, message: msg });
-            return;
-          }
-          const choice = Array.isArray(data.choices) && data.choices[0];
-          if (choice) {
-            if (choice.delta && Object.keys(choice.delta).length) emit({ type: "delta", delta: choice.delta });
-            if (choice.finish_reason) emit({ type: "finish", reason: choice.finish_reason });
-          }
-          if (data.usage) {
-            emit({ type: "usage", usage: util.normalizeOpenAiUsage(data.usage) });
-          }
-        });
-      } finally { cancelTimer(); }
-      return result;
-    },
-
-    /** 刷新（协议参考 §1.3）：grantType 是 camelCase（源实现 @cline/core 就发这个键名，别改 snake_case）。
-     *  刷新前重读桌面端文件取最新 refresh_token（桌面端可能刚刷过并旋转）；成功不回写文件（防互相顶掉）。 */
+/** fork 独有语义：扫描导入（source==="scan"）的 Cline 账号，续期前**回读桌面端 providers.json**
+ *  取最新 refreshToken。桌面端自己刷过就会旋转掉库里那份，不回读则拿旧 rt 去换必失败；
+ *  上游的 cline/refresh.cjs 是纯 httpJson，没有这条。成功不回写文件（两条写链会互相顶掉）。
+ *  uid 对得上才回读：否则可能把 A 号的活凭据续到 B 号头上。 */
+function withClineScanReread(ad) {
+  const inner = ad.refreshToken.bind(ad);
+  return Object.assign(Object.create(Object.getPrototypeOf(ad)), ad, {
     async refreshToken(account, secrets) {
-      let rt = (secrets && secrets.refreshToken) || "";
+      let s = secrets;
       if (account && account.source === "scan") {
         const live = clineAuth.readClineDesktopAuth();
-        if (live && live.refreshToken && (!account.uid || clineAuth.clineUid(live.token) === account.uid)) rt = live.refreshToken;
+        if (live && live.refreshToken && (!account.uid || clineAuth.clineUid(live.token) === account.uid)) {
+          s = Object.assign({}, secrets, { refreshToken: live.refreshToken });
+        }
       }
-      if (!rt) return { ok: false, message: "无 refreshToken，请重新登录或粘贴" };
-      const r = await httpJson(`${CLINE_BASE}/auth/refresh`, {
-        method: "POST",
-        headers: { "content-type": "application/json", accept: "application/json" },
-        body: JSON.stringify({ refreshToken: rt, grantType: "refresh_token" }),
-      }).catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
-      if (r.status === 401 || r.status === 403) return { ok: false, expired: true, message: "登录态已过期，请重新登录" };
-      const d = (r.data && (r.data.data || r.data)) || null;
-      const token = d && d.accessToken;
-      if (!r.ok || !token) {
-        const msg = (r.data && r.data.error && (r.data.error.message || r.data.error)) || r.message || `刷新失败 HTTP ${r.status}`;
-        return { ok: false, message: String(msg).slice(0, 200) };
-      }
-      // 响应的 accessToken 不带 workos: 前缀，统一补；refreshToken 缺失沿用旧值（协议参考 §1.3 三个实测口径）
-      return { ok: true, token: clineAuth.ensureTokenPrefix(token), refreshToken: String(d.refreshToken || rt), expiresAt: clineAuth.clineExpiresAt(d.expiresAt, clineAuth.jwtClaims(token)) };
+      return inner(account, s);
     },
-
-    /** uid/昵称本地解码兜底（不依赖网络；余额/订阅查询 v1 不做，见 spec §九） */
-    async userInfo(token) {
-      const c = clineAuth.jwtClaims(token);
-      return { uid: String(c.external_id || ""), name: clineAuth.clineDisplayName(c, c.email) };
-    },
-  };
+  });
 }
-const cline_free = makeCline("free");
-const cline_pass = makeCline("pass");
+
+// ===== Cline 双池接线（上游 v1.64 的 cline/ 目录实现）=====
+// 来历：fork 原有一份内联实现（makeCline(pool) + CLINE_BASE 常量组），上游本批拆成 cline/ 目录并补了
+// cfg() / queryCredits() / classifyError()，以及「短名补本池前缀」对记账可见（usedForwardModel）。
+// 按 2026-10-08 定的「上游为主干」取上游那份；fork 只留上面 withClineScanReread 这一条独有语义。
+// deps 里 fetchStream/pumpSse/httpJson 是本模块私有（未导出），所以只能由调用方注入；
+// rules/util 直接共享。两池共用 headers.json 的 cline 段（rules.get("headers.json").cline）。
+const { makeCline: makeUpstreamCline } = require("./cline/adapter.cjs");
+const clineDeps = { fetchStream, pumpSse, httpJson, rules, util };
+// const 名保持 cline_free / cline_pass 不变：ADAPTERS 字面量按这两个名字取，键序因此逐字不变——
+// modelOwners 的返回值顺序就是默认归属顺序，autoclaw/catpaw 共享的裸名（glm-5.3 等）一旦换位，
+// 默认路由就悄悄改了（第八批「双份实现」与 catpaw 追加在末尾的注释是同一条约束）。
+const cline_free = withClineScanReread(makeUpstreamCline("cline_free", clineDeps));
+const cline_pass = withClineScanReread(makeUpstreamCline("cline_pass", clineDeps));
 
 // ===== AutoClaw（智谱，makeAutoClaw(region) 两地区参数化；协议参考 §2） =====
 // 头集合两地逐字相同（参考 region.rs 实测），只换域名；账号 id 前缀 user- / intl-user-。
@@ -5206,9 +5094,8 @@ module.exports = {
   _metaOverriddenKeys: metaOverriddenKeys,
   // 提供商管理面要拿一份「尚未落库的表单值」建临时适配器做连通性探测，故导出工厂本身
   makeOpenaiCompat,
-  // 测试窥视口（下划线前缀 = 非公共契约）：cline 错误分类的纯函数，dev-cline-test 直测
-  _clineErrorStatus: clineErrorStatus,
-  _pickClineModels: pickClineModels,
+  // 测试窥视口：cline 的错误分类与归池已随上游目录实现变成适配器方法
+  // classifyError() / cline/models.cjs 的 filterByPool，dev-cline-test 改按新形状直测。
   // autoclaw 窥视口：签名公式与路由解析纯函数，dev-autoclaw-test 直测
   _autoclawSign: autoclawSign,
   _autoclawResolveRoute: autoclawResolveRoute,

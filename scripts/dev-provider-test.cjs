@@ -468,19 +468,47 @@ const call = async (base, secret, model, stream) => {
   // 缺能力分支改用 cline_free：qoder 自上游主干接入起就有 checkin/checkinStatus/queryCredits，
   // 再拿它测「适配器根本没有这个方法」这条守卫已经测不到目标分支了（门禁判据是 typeof === "function"）。
   store.addAccount({ channel: "cline_free", uid: "cl-uid", name: "Cline 号", token: "eyJjbGluZQ", refreshToken: "", source: "paste" });
+  let fetchCalls = 0;
   const realFetch2 = globalThis.fetch;
-  globalThis.fetch = async () => ({ ok: false, status: 500, text: async () => '{"code":500,"message":"boom"}' });
+  globalThis.fetch = async (...a) => { fetchCalls++; return { ok: false, status: 500, text: async () => '{"code":500,"message":"boom"}' }; };
 
+  // 缺能力守卫这三条**不硬编码「哪个渠道没这能力」**：能力集会随接线漂移（cline 在接上游 cline/
+  // 目录实现之前没有 checkin/checkinStatus/queryCredits，之后三件齐备），拿真实渠道当反例的闸
+  // 会在某个提交之后变成「永久不可达分支 + 断言还在绿」。改成临时摘掉方法再恢复，判据只依赖守卫本身。
+  const withoutMethod = (channel, names, run) => {
+    const ad = adapters.get(channel);
+    const saved = names.map((n) => [n, ad[n]]);
+    names.forEach((n) => { delete ad[n]; });
+    return Promise.resolve().then(run).finally(() => saved.forEach(([n, v]) => { ad[n] = v; }));
+  };
+
+  const ckGuard = await withoutMethod("cline_free", ["checkin", "checkinStatus"],
+    () => callIpc("proxy_checkin_run", { channel: "cline_free", action: "checkin" }));
+  ok("渠道缺 checkin 方法 ⇒ 守卫给「该渠道没有签到」的结构化 unavailable，不是 TypeError", (() => {
+    const row = (ckGuard.rows || [])[0] || {};
+    return ckGuard.ok === true && ckGuard.total === 1 && row.ok === true && row.unavailable === true
+      && /该渠道没有签到/.test(String(row.message || "")) && !/is not a function|TypeError/.test(String(row.message || ""));
+  })(), ckGuard);
+  const stGuard = await withoutMethod("cline_free", ["checkinStatus"],
+    () => callIpc("proxy_checkin_status", { channel: "cline_free" }));
+  ok("缺 checkinStatus 时 status 动作同样按 unavailable 收口", (() => {
+    const row = (stGuard.rows || [])[0] || {};
+    return stGuard.ok === true && row.unavailable === true && /该渠道没有签到/.test(String(row.message || "")) && !/is not a function|TypeError/.test(String(row.message || ""));
+  })(), stGuard);
+
+  // cline 现在自己声明了签到能力，但官方没有签到活动：适配器**如实回 unavailable 并且一个请求都不发**
+  // （与 qoder_intl「拿不到风控身份就不降级、不发注定 401 的请求」同口径，见 CHECKIN_CAPABLE 那套注释）。
+  fetchCalls = 0;
   const ckCline = await callIpc("proxy_checkin_run", { channel: "cline_free", action: "checkin" });
-  ok("无签到方法的渠道 → 批量签到回结构化 unavailable，不是 TypeError", (() => {
+  ok("cline 声明签到能力但上游无活动 ⇒ 结构化 unavailable 且不发出上游请求", (() => {
     const row = (ckCline.rows || [])[0] || {};
-    return ckCline.ok === true && ckCline.total === 1 && row.ok === true && row.unavailable === true
-      && row.channel === "cline_free" && /该渠道没有签到/.test(row.message || "") && !/is not a function|TypeError/.test(row.message || "");
-  })(), ckCline);
+    return ckCline.ok === true && row.unavailable === true && fetchCalls === 0
+      && /无签到活动/.test(String(row.message || "")) && !/该渠道没有签到/.test(String(row.message || ""));
+  })(), { ckCline, fetchCalls });
   const stCline = await callIpc("proxy_checkin_status", { channel: "cline_free" });
-  ok("status 动作同样不抛（缺 checkinStatus 也按 unavailable 收口）", (() => {
+  ok("status 动作走适配器自己的如实答复（不再落守卫文案）", (() => {
     const row = (stCline.rows || [])[0] || {};
-    return stCline.ok === true && row.unavailable === true && !/is not a function|TypeError/.test(row.message || "");
+    return stCline.ok === true && row.unavailable === true && !/该渠道没有签到/.test(String(row.message || ""));
   })(), stCline);
   // qoder 侧只断言「有方法、且打到接口后仍按结构化回，不冒 TypeError」，不钉具体文案：
   // checkin 先取本机客户端的风控身份（runtime-info.exe），装没装决定它走 unavailable 分支还是真打接口，
@@ -496,21 +524,30 @@ const call = async (base, secret, model, stream) => {
     return ckRaccoon.ok === true && !row.unavailable && !/该渠道没有签到/.test(row.message || "");
   })(), ckRaccoon);
 
-  const syncAclaw = await callIpc("proxy_models_sync", { channel: "autoclaw" });
-  ok("autoclaw 有适配器但无 fetchModels → 说「模型目录为内置」，不谎报未知渠道",
-    syncAclaw.ok === false && /模型目录为内置，不支持同步/.test(syncAclaw.message || "") && !/未知渠道/.test(syncAclaw.message || ""), syncAclaw);
+  const syncNoFetch = await withoutMethod("trae", ["fetchModels"], () => callIpc("proxy_models_sync", { channel: "trae" }));
+  ok("有适配器但没有 fetchModels ⇒ 说「模型目录为内置」，不谎报未知渠道",
+    syncNoFetch.ok === false && /模型目录为内置，不支持同步/.test(syncNoFetch.message || "") && !/未知渠道/.test(syncNoFetch.message || ""), syncNoFetch);
   const syncBogus = await callIpc("proxy_models_sync", { channel: "no-such-channel" });
   ok("真·未知渠道仍报未知渠道", syncBogus.ok === false && /未知渠道/.test(syncBogus.message || ""), syncBogus);
   const syncTrae = await callIpc("proxy_models_sync", { channel: "trae" });
   ok("有 fetchModels 的渠道照常进后续判断（不被能力门禁挡掉）",
     syncTrae.ok === false && /无可用账号/.test(syncTrae.message || ""), syncTrae);
 
+  const rcGuard = await withoutMethod("cline_free", ["queryCredits"], () => credits.refreshChannel("cline_free"));
+  ok("渠道缺 queryCredits ⇒ 文案说清「不提供额度查询」，不扣 API Key 的帽子",
+    rcGuard.ok === false && /不提供额度查询/.test(rcGuard.message || "") && !/API Key/.test(rcGuard.message || ""), rcGuard);
+  fetchCalls = 0;
   const rcCline = await credits.refreshChannel("cline_free");
-  ok("无额度接口的内置渠道 → 文案说清「不提供额度查询」，不扣 API Key 的帽子",
-    rcCline.ok === false && /不提供额度查询/.test(rcCline.message || "") && !/API Key/.test(rcCline.message || ""), rcCline);
+  ok("cline 有额度接口：如实回报真实失败原因，不误套缺能力文案", (() => {
+    const one = (rcCline.results || [])[0] || {};
+    const all = JSON.stringify(rcCline);
+    return rcCline.ok === true && one.ok === false && /余额查询失败/.test(String(one.message || ""))
+      && !/不提供额度查询/.test(all) && !/API Key/.test(all) && fetchCalls > 0;
+  })(), { rcCline, fetchCalls });
   const clineRow = store.accountRows("cline_free")[0];
   const raCline = await credits.refreshAccount(clineRow.id).then(() => null, (e) => String(e.message));
-  ok("单账号刷新同样按渠道类别说文案", /不提供额度查询/.test(raCline || "") && !/API Key/.test(raCline || ""), raCline);
+  ok("单账号刷新同样报真实原因，不套缺能力文案",
+    /余额查询失败/.test(raCline || "") && !/不提供额度查询/.test(raCline || "") && !/API Key/.test(raCline || ""), raCline);
   // qoder 自上游主干接入后有 queryCredits（/api/v2/quota/usage）：500 时必须报真实失败，
   // 不能再被套上「不提供额度查询」那句——那会把「接口调不通」伪装成「这渠道本来就没余额」。
   const rcQoder = await credits.refreshChannel("qoder");

@@ -48,40 +48,105 @@ ok("读到 token 且带前缀", !!cred && cred.token === "workos:eyJh.eyJi.c", c
 ok("displayName 中文姓在前", !!cred && cred.displayName === "张三", cred && cred.displayName);
 ok("未安装返回 null", (() => { const h = os.homedir; os.homedir = () => path.join(fakeHome, "empty"); const r = clineAuth.readClineDesktopAuth(); os.homedir = h; return r === null; })());
 
-console.log("cline 适配器:");
+console.log("cline 适配器（上游 cline/ 目录实现）:");
 const adapters = require("../electron/backend/proxy/adapters.cjs");
+const clineModels = require("../electron/backend/proxy/cline/models.cjs");
+const clineAdapterMod = require("../electron/backend/proxy/cline/adapter.cjs");
 const free = adapters.get("cline_free"), passAd = adapters.get("cline_pass");
 ok("两池都已注册", !!free && !!passAd);
-ok("裸名补 free 前缀", free.upstreamFor("deepseek-v4.1-flash") === "cline-free/deepseek-v4.1-flash");
-ok("已带 pass 前缀原样", passAd.upstreamFor("cline-pass/kimi-k3") === "cline-pass/kimi-k3");
-ok("headers 带 X-CLIENT-TYPE: cline-sdk", free.headers({ token: "eyJh" })["x-client-type"] === "cline-sdk");
-ok("headers 带 workos: 前缀 Bearer", free.headers({ token: "eyJh" }).authorization === "Bearer workos:eyJh");
-ok("rewriteBody 强制流式+剥内部字段", (() => {
-  const b = free.rewriteBody("cline-free/deepseek-v4.1-flash", { model: "x", stream: false, conversation_id: "1", messages: [] });
-  return b.stream === true && b.stream_options.include_usage === true && b.conversation_id === undefined && b.model === "cline-free/deepseek-v4.1-flash";
+ok("上游能力面齐（cfg/queryCredits/classifyError/checkin 都在）", ["cfg", "queryCredits", "classifyError", "checkin", "checkinStatus", "headers", "rewriteBody", "fetchModels"].every((k) => typeof free[k] === "function"), Object.keys(free).join(","));
+ok("cfg() 读 headers.json 的 cline 段（apiBase 只有单层 v1）", free.cfg().apiBase === "https://api.cline.bot/api/v1", free.cfg());
+ok("目录接口无需鉴权（modelsNeedAuth=false：导入账号前就能同步模型）", free.modelsNeedAuth === false);
+ok("临期窗口 600s（access 实测 1h 的 1/6）", free.refreshWindowSec === 600);
+ok("headers() 带 X-CLIENT-TYPE: cline-sdk（免费池硬门槛，缺它整池 403）", free.headers()["x-client-type"] === "cline-sdk", free.headers());
+ok("headers() 不含 authorization（鉴权在 chat 内按账号出）", !("authorization" in free.headers()));
+ok("rewriteBody：短名按本池目录补前缀，并给出 sessionId（与 X-Task-ID 同值）", (() => {
+  const r = free.rewriteBody("deepseek-v4.1-flash", { model: "x", messages: [] });
+  return r.body.model === "cline-free/deepseek-v4.1-flash" && /^sess_\d+$/.test(String(r.sessionId));
+})(), free.rewriteBody("deepseek-v4.1-flash", { model: "x", messages: [] }));
+ok("rewriteBody：完整 id 原样；带另一池前缀也不改写（跨池不换计费通道）",
+  passAd.rewriteBody("cline-free/glm-5.3-flash", { messages: [] }).body.model === "cline-free/glm-5.3-flash");
+ok("rewriteBody：目录里没有的名字原样透传（未知模型交给上游 404，绝不静默替换）",
+  free.rewriteBody("no-such/model-x", { messages: [] }).body.model === "no-such/model-x");
+ok("rewriteBody：不注入 max_tokens、不改 stream 字段（缺失交给上游按模型默认）", (() => {
+  const b = free.rewriteBody("cline-free/solar-pro4", { messages: [] }).body;
+  return !("max_tokens" in b) && !("stream" in b);
+})(), free.rewriteBody("cline-free/solar-pro4", { messages: [] }));
+ok("rewriteBody：reasoning_effort 缺省补 high，驼峰键翻译后删原键", (() => {
+  const a = free.rewriteBody("cline-free/solar-pro4", { messages: [], reasoningEffort: "low" }).body;
+  const b = free.rewriteBody("cline-free/solar-pro4", { messages: [] }).body;
+  return a.reasoning_effort === "low" && !("reasoningEffort" in a) && b.reasoning_effort === "high";
+})(), free.rewriteBody("cline-free/solar-pro4", { messages: [] }));
+ok("rewriteBody：深拷贝改写，绝不污染入参 body（回退链多渠道复用同一对象）", (() => {
+  const input = { model: "x", messages: [{ role: "user", content: "hi" }] };
+  free.rewriteBody("deepseek-v4.1-flash", input);
+  return input.model === "x" && input.messages.length === 1 && !("session_id" in input) && !("reasoning_effort" in input);
 })());
 
-console.log("cline 错误分类:");
-const E = (s, errObj) => adapters._clineErrorStatus(s, errObj || {});
-ok("401→401 刷新", E(401) === 401);
-ok("429→402 换号", E(429) === 402);
-ok("403 原样透传（ENTITLEMENT 是确定性拒绝，不冷却）", E(403, { error: { code: "ENTITLEMENT_ERROR", message: "not subscribed" } }) === 403);
-ok("404 原样透传", E(404) === 404);
-ok("500→502", E(500) === 502);
+console.log("cline 错误分类（适配器 classifyError）:");
+const C403 = (msg) => free.classifyError({ status: 403, body: JSON.stringify({ error: { code: "ENTITLEMENT_ERROR", message: msg } }) });
+ok("403 → model_denied 且不换号（确定性拒绝，冷却只会把确定失败变静默跳过）", (() => {
+  const c = C403("Your account is not subscribed to this model");
+  return c.kind === "model_denied" && c.switchable === false && c.status === 403 && c.channelLevel === false;
+})(), free.classifyError({ status: 403, body: "{}" }));
+ok("403 渠道级产品面校验 → 文案点出 X-CLIENT-TYPE 伪装头（整池静默失效不能无感）", (() => {
+  const c = C403("This model is only available via Cline product surfaces");
+  return c.channelLevel === true && /X-CLIENT-TYPE/.test(c.message) && c.kind === "model_denied";
+})(), C403("only available via Cline product surfaces"));
+ok("404 → model_denied（模型名不对，换号无用）", (() => {
+  const c = free.classifyError({ status: 404, body: "{\"error\":\"model not found\"}" });
+  return c.kind === "model_denied" && c.switchable === false;
+})(), free.classifyError({ status: 404 }));
+ok("429 → rate 且解析人话时长填 resetMs（免费池冷却可达小时级）", (() => {
+  const c = free.classifyError({ status: 429, body: "Try again in 17h 59m" });
+  const gap = c.resetMs - Date.now();
+  return c.kind === "rate" && c.switchable === true && gap > 17 * 3600000 && gap <= 18 * 3600000;
+})(), free.classifyError({ status: 429, body: "Try again in 17h 59m" }));
+ok("401 不拦截（交回通用层走 relogin 刷新重试）", free.classifyError({ status: 401 }) === null);
+ok("parseTryAgainMs：1d 2h 30m / 30s / 认不出都按事实算", (() => {
+  const P = clineAdapterMod.parseTryAgainMs;
+  return P("Try again in 1d 2h 30m") === 95400000 && P("Try again in 30s") === 30000 && P("no hint") === 0;
+})(), clineAdapterMod.parseTryAgainMs("Try again in 1d 2h 30m"));
 
-console.log("cline 目录归池:");
-const P = adapters._pickClineModels;
-const groups = { free: [{ id: "cline-free/a" }, { id: "z-ai/glm-5.3-flash" }], clinePass: [{ id: "cline-pass/b" }], recommended: [{ id: "openai/x" }], clineCloud: [{ id: "cloud/y" }] };
-ok("free 组归 free 池（含裸前缀条目，归池看分组不看前缀）", P(groups, "free").join(",") === "cline-free/a,z-ai/glm-5.3-flash");
-ok("pass 组归 pass 池", P(groups, "pass").join(",") === "cline-pass/b");
-ok("recommended/cloud 不归任何池", !P(groups, "pass").includes("openai/x") && !P(groups, "free").includes("cloud/y"));
+console.log("cline 目录归池（上游 cline/models.cjs）:");
+const groups = {
+  free: [{ id: "cline-free/a" }, { id: "z-ai/glm-5.3-flash" }],
+  clinePass: [{ id: "cline-pass/b" }],
+  recommended: [{ id: "openai/gpt-x" }, { id: "cline-free/from-recommended" }],
+  clineCloud: [{ id: "cline-cloud/y" }],
+};
+const parsed = clineModels.parseRecommended(groups);
+const inPool = (pool) => clineModels.filterByPool(parsed, pool).map((e) => e.id).join(",");
+ok("free 组归 free 池（含裸厂商 id 条目，归池看分组不看前缀）", inPool("free") === "cline-free/a,z-ai/glm-5.3-flash,cline-free/from-recommended", inPool("free"));
+ok("pass 组归 pass 池", inPool("pass") === "cline-pass/b,openai/gpt-x", inPool("pass"));
+ok("recommended 组按前缀兜底判池（上游不标注池归属）", parsed.some((e) => e.id === "cline-free/from-recommended" && e.pool === "free") && parsed.some((e) => e.id === "openai/gpt-x" && e.pool === "pass"), parsed);
+ok("云池条目不收录（实测 403，广告一个必然失败的模型只会让客户端选中后报错）", !parsed.some((e) => e.id === "cline-cloud/y"));
+ok("friendlyAlias 只剥池前缀，不剥承载方前缀（z-ai/... 剥了就是上游不存在的名字）",
+  clineModels.friendlyAlias("cline-pass/kimi-k3") === "kimi-k3" && clineModels.friendlyAlias("z-ai/glm-5.3-flash") === null);
+ok("同 id 只留第一条（四组之间有重叠，去重防目录里出现两份）",
+  clineModels.parseRecommended({ free: [{ id: "x/y" }], recommended: [{ id: "x/y" }] }).length === 1);
 
 console.log("scanCline:");
 const discovery = require("../electron/backend/proxy/discovery.cjs");
 os.homedir = () => fakeHome; // Task 2 已造 ~/.cline/data/settings/providers.json 夹具
 const cands = discovery.scanAll().filter((c) => c.channel.startsWith("cline_"));
 os.homedir = () => path.join(fakeHome, "empty");
-ok("扫描出 cline 候选且 uid=external_id", cands.length === 1 && cands[0].uid === "usr-9", cands[0] && cands[0].uid);
+// 两池各一条候选是 fork 的真实缺口修补：扫描弹窗按「当前正在新增的渠道」过滤候选
+//（ProxyAgentsView 的 scanRows），单候选 = cline_pass 那页永远扫不出本机登录态。
+ok("两池各产一条候选（不猜池）", cands.map((c) => c.channel).join(",") === "cline_free,cline_pass", cands.map((c) => c.channel));
+ok("两条候选是同一份桌面登录态（同 uid / 带前缀 token / 同源文件），导入哪条就落哪个池",
+  cands.length === 2 && cands.every((c) => c.uid === "usr-9" && String(c.token).startsWith("workos:") && c.file === "providers.json" && c.source === "scan"), cands[0]);
+ok("池被关时不产该池候选（channelOn 门禁）", (() => {
+  const realOn = adapters.channelOn;
+  adapters.channelOn = (ch) => (ch === "cline_pass" ? false : realOn(ch));
+  os.homedir = () => fakeHome;
+  try {
+    return discovery.scanAll().filter((c) => c.channel.startsWith("cline_")).map((c) => c.channel).join(",") === "cline_free";
+  } finally {
+    adapters.channelOn = realOn;
+    os.homedir = () => path.join(fakeHome, "empty");
+  }
+})());
 
 // fetchModels 全链路用假 fetch 注入夹具（httpJson 走全局 fetch），不发真实网络请求
 console.log("cline fetchModels（假 fetch 夹具，不发真实网络）:");
@@ -89,31 +154,77 @@ const RECOMMENDED_FIXTURE = {
   recommended: [{ id: "openai/gpt-x", name: "GPT-X" }],
   free: [{ id: "cline-free/deepseek-v4.1-flash", name: "DeepSeek V4.1 Flash (免费)" }, { id: "z-ai/glm-5.3-flash", name: "GLM-5.3-Flash (免费)" }],
   clinePass: [{ id: "cline-pass/kimi-k3", name: "Kimi K3 (ClinePass)" }, { id: "whatever/not-in-catalog", name: "Not In Catalog" }],
-  clineCloud: [{ id: "cloud/y", name: "Cloud Y" }],
+  clineCloud: [{ id: "cline-cloud/y", name: "Cloud Y" }],
 };
 let lastReq = null;
 const realFetch = globalThis.fetch;
 globalThis.fetch = async (url, opts) => { lastReq = { url, opts }; return { ok: true, status: 200, text: async () => JSON.stringify(RECOMMENDED_FIXTURE) }; };
 (async () => {
-  const fmFree = await free.fetchModels({}, { token: "eyJh" });
-  ok("请求 URL 是 recommended-models（单层 v1）", lastReq && lastReq.url === "https://api.cline.bot/api/v1/ai/cline/recommended-models", lastReq && lastReq.url);
-  ok("请求带 Bearer workos: 前缀与 cline-sdk 头", !!lastReq && lastReq.opts.headers.authorization === "Bearer workos:eyJh" && lastReq.opts.headers["x-client-type"] === "cline-sdk");
-  ok("free 池只收 free 组两条（recommended/cloud 不混入）", fmFree.ok === true && fmFree.models.map((m) => m.id).join(",") === "cline-free/deepseek-v4.1-flash,z-ai/glm-5.3-flash", fmFree);
-  const zai = fmFree.models.find((m) => m.id === "z-ai/glm-5.3-flash");
-  ok("目录元数据回填（name/contextLength/capabilities/rate）", !!zai && zai.name === "GLM-5.3-Flash (免费)" && zai.contextLength === 1310720 && zai.capabilities.reasoning === true && zai.rate === null, zai);
-  const fmPass = await passAd.fetchModels({}, { token: "eyJh" });
-  const stranger = fmPass.models.find((m) => m.id === "whatever/not-in-catalog");
-  ok("pass 池收 pass 组（目录缺元数据时兜底 id 名/默认能力/0 上下文）", fmPass.ok === true && fmPass.models.map((m) => m.id).join(",") === "cline-pass/kimi-k3,whatever/not-in-catalog" && stranger.name === "whatever/not-in-catalog" && stranger.contextLength === 0 && stranger.capabilities.images === false && stranger.capabilities.tools === true, { fmPass, stranger });
+  const fmFree = await free.fetchModels();
+  ok("请求 URL 是 recommended-models（apiBase 只有单层 v1，拼成 /v1/v1/ 实测 404）", lastReq && lastReq.url === "https://api.cline.bot/api/v1/ai/cline/recommended-models", lastReq && lastReq.url);
+  ok("目录请求不带 authorization（实测免鉴权，也是 modelsNeedAuth 的实现面）",
+    !!lastReq && !("authorization" in lastReq.opts.headers) && lastReq.opts.headers["x-client-type"] === "cline-sdk", lastReq && lastReq.opts.headers);
+  ok("free 池只收 free 组两条（recommended/cloud 不混进来）", fmFree.ok === true && fmFree.models.map((m) => m.id).join(",") === "cline-free/deepseek-v4.1-flash,z-ai/glm-5.3-flash", fmFree);
+  const fmP = await passAd.fetchModels();
+  ok("pass 池收 clinePass 组 + recommended 里其余条目（无池信息按前缀兜底归 pass）", (() => {
+    const ids = fmP.models.map((m) => m.id);
+    return fmP.ok === true && ids.join(",") === "cline-pass/kimi-k3,whatever/not-in-catalog,openai/gpt-x";
+  })(), fmP);
+  ok("目录条目只给 id/name 与能力声明，元数据不由这次拉取回填（rate 恒 null、contextLength 恒 0）", (() => {
+    const one = fmFree.models.find((m) => m.id === "z-ai/glm-5.3-flash");
+    return one.rate === null && one.contextLength === 0 && one.maxOutputTokens === 0 && one.capabilities.images === true && one.capabilities.reasoning === true && one.capabilities.tools === true;
+  })(), fmFree.models);
 
   globalThis.fetch = async () => ({ ok: false, status: 500, text: async () => "boom" });
-  const fm500 = await free.fetchModels({}, { token: "eyJh" });
-  ok("上游 500 → ok:false 带状态码", fm500.ok === false && /HTTP 500/.test(fm500.message), fm500);
+  const fm500 = await free.fetchModels();
+  ok("上游 500 → ok:false 且文案带状态码（管道失败不写空目录）", fm500.ok === false && /模型目录 HTTP 500/.test(fm500.message), fm500);
   globalThis.fetch = async () => { throw new Error("net down"); };
-  const fmNet = await free.fetchModels({}, { token: "eyJh" });
-  ok("网络异常 → ok:false（HTTP 0）", fmNet.ok === false && /HTTP 0/.test(fmNet.message), fmNet);
+  const fmNet = await free.fetchModels();
+  ok("网络异常 → ok:false 带 HTTP 0 与原因", fmNet.ok === false && /模型目录 HTTP 0/.test(fmNet.message) && /net down/.test(fmNet.message), fmNet);
   globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => "{}" });
-  const fmEmpty = await free.fetchModels({}, { token: "eyJh" });
-  ok("空目录 → ok:false 目录为空", fmEmpty.ok === false && fmEmpty.message === "目录为空", fmEmpty);
+  const fmEmpty = await free.fetchModels();
+  ok("响应里没有本池可用模型 → ok:false 如实说空", fmEmpty.ok === false && /本池/.test(fmEmpty.message), fmEmpty);
+
+  // ===== fork 独有语义：scan 来源账号续期前回读桌面端 providers.json =====
+  // 上游 refresh.cjs 是纯 httpJson，没有这条；这里必须**观测出站请求**才能证明包装真的生效，
+  // 只断言「返回值 ok」的话包装即使是空转也会绿。
+  console.log("scan 来源账号续期回读桌面端（fork 独有语义）:");
+  const liveHome = fs.mkdtempSync(path.join(os.tmpdir(), "cline-scan-home-"));
+  fs.mkdirSync(path.join(liveHome, ".cline", "data", "settings"), { recursive: true });
+  fs.writeFileSync(path.join(liveHome, ".cline", "data", "settings", "providers.json"), JSON.stringify({
+    providers: { cline: { settings: { auth: {
+      accessToken: mkJwt({ external_id: "usr-9", exp: 1893456000 }),
+      refreshToken: "rt-live", accountId: "usr-9",
+    } } } },
+  }));
+  const realHome2 = os.homedir;
+  const refreshBodies = [];
+  globalThis.fetch = async (url, opts) => {
+    refreshBodies.push({ url, body: opts && opts.body });
+    return { ok: true, status: 200, text: async () => JSON.stringify({ data: { accessToken: "eyJh.eyJj.c", refreshToken: "rt-rotated", expiresAt: 1893456000000 }, success: true }) };
+  };
+  const rtCall = async (account) => free.refreshToken(account, { token: "workos:eyJh.eyJj.c", refreshToken: "rt-old" });
+  let r;
+  os.homedir = () => liveHome;
+  r = await rtCall({ id: "s1", channel: "cline_free", uid: "usr-9", source: "scan" });
+  os.homedir = realHome2;
+  ok("scan 来源 + uid 对得上 ⇒ 出站用的是桌面端活 refreshToken",
+    r.ok === true && JSON.parse(refreshBodies[0].body).refreshToken === "rt-live", refreshBodies[0]);
+  ok("续期成功透传旋转后的双令牌与 expiresAt", r.token && String(r.token).startsWith("workos:") && r.refreshToken === "rt-rotated" && r.expiresAt === 1893456000000, r);
+  os.homedir = () => liveHome;
+  r = await rtCall({ id: "s2", channel: "cline_free", uid: "usr-DIFFERENT", source: "scan" });
+  os.homedir = realHome2;
+  ok("scan 来源但 uid 对不上 ⇒ 不回读（绝不把 A 号的活凭据续到 B 号头上）",
+    r.ok === true && JSON.parse(refreshBodies[1].body).refreshToken === "rt-old", refreshBodies[1]);
+  r = await rtCall({ id: "s3", channel: "cline_free", uid: "usr-9", source: "oauth" });
+  ok("非 scan 来源不读桌面端文件（库里那份就是真相）",
+    r.ok === true && JSON.parse(refreshBodies[2].body).refreshToken === "rt-old", refreshBodies[2]);
+  ok("grantType 保持 camelCase（源实现 @cline/core 就发这个键名）",
+    JSON.parse(refreshBodies[0].body).grantType === "refresh_token", refreshBodies[0]);
+  refreshBodies.length = 0;
+  globalThis.fetch = async () => ({ ok: false, status: 401, text: async () => "{}" });
+  r = await free.refreshToken({ id: "x", uid: "u", source: "oauth" }, { token: "t", refreshToken: "rt" });
+  ok("401 ⇒ authError:true（credits/pool 就认这一个标记，据此把账号标 relogin）", r.ok === false && r.authError === true && /重新登录/.test(r.message), r);
 
   // ===== Task 11：cline WorkOS 设备授权流（假 fetch + 假时钟：不发真实网络、不真等轮询间隔） =====
   console.log("workos 设备流轮询判定:");
