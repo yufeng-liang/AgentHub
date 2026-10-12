@@ -141,6 +141,9 @@ const ALLOWED_COMMANDS = new Set([
   "proxy_oauth_begin",
   "proxy_oauth_cancel",
   "proxy_oauth_submit_callback",
+  "proxy_autoclaw_sms_send",
+  "proxy_autoclaw_sms_login",
+  "proxy_autoclaw_captcha_config",
   "proxy_account_import_json",
   "proxy_account_import_file",
   "proxy_models",
@@ -186,6 +189,9 @@ const ALLOWED_COMMANDS = new Set([
   "webdav_shared_get",
   "webdav_shared_save",
   "webdav_shared_test",
+  "webdav_shared_clear",
+  // ===== 四大板块启用开关（issue #91） =====
+  "module_toggle",
   // ===== 记忆中枢：配置 / 根目录 =====
   "memory_config_get",
   "memory_config_save",

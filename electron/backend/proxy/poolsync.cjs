@@ -511,6 +511,44 @@ function noteRemoved(accountKey) {
   writeLocalTombstones(t);
 }
 
+// ===== Key 删除墓碑（issue #92：API Key 的删除与修改一样要跨设备传播） =====
+
+function keyTombstoneFile() {
+  return path.join(store.proxyDir(), "pool-keys-tombstones.json");
+}
+
+function readKeyTombstones() {
+  try {
+    const s = JSON.parse(fs.readFileSync(keyTombstoneFile(), "utf8"));
+    return s && typeof s === "object" ? s : {};
+  } catch {
+    return {};
+  }
+}
+
+/** 写墓碑文件；返回是否成功。调用方若需要「写失败要留痕」语义（如删除 Key）应检查返回值 */
+function writeKeyTombstones(t) {
+  try {
+    fs.writeFileSync(keyTombstoneFile(), JSON.stringify(t, null, 2), "utf8");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 供 index.cjs 在删除 API Key 时调用：记录墓碑（值为删除时间戳），同步时推给远端。
+ *  写失败必须留痕（审查整改）：Key 已删而墓碑永缺时，他机共享包里的这把 Key 会复活
+ *  且没有任何重试触发点——至少在操作日志里留下可诊断的错误 */
+function noteKeyRemoved(keyId) {
+  if (!keyId) return;
+  const t = readKeyTombstones();
+  t[String(keyId)] = Date.now();
+  // 复用同一写入器：避免「两处各写一份写盘逻辑」日后漂移（改了一处忘了另一处）
+  if (!writeKeyTombstones(t)) {
+    oplog.log("error", "API Key", "删除墓碑写入失败（该 Key 的删除将无法同步到其他设备）");
+  }
+}
+
 // ===== 同步主流程 =====
 
 async function run(opts) {
@@ -521,24 +559,29 @@ async function run(opts) {
   if (channel && !store.BUILTIN_CHANNELS.some((c) => c.id === channel)) throw new Error(`未知渠道 "${channel}"`);
   const w = wd();
   if (!configured()) throw new Error("WebDAV 未配置完整：请先在「设置 · 数据存储」配置统一服务器");
-  // 号池压缩包用 WebDAV 密码加密：未设密码时拒绝同步，避免凭据裸奔
-  if (!w.password) throw new Error("请先在「设置 · 数据存储」填写 WebDAV 密码（号池压缩包用它加密）");
-  // 弱口令告警（不阻断）：WebDAV 密码既是服务器凭据也是压缩包加密口令（scrypt 派生 AES-256），
-  // 太短的口令打的包在远端可被离线爆破。刻意只 warn 不拒绝——部分用户的 WebDAV 服务器本身
-  // 只支持短密码，阻断会破坏既有同步；密码强度由用户在「设置 · 数据存储」自行权衡
-  if (String(w.password).length < 8) {
-    oplog.log("warn", "号池同步", "WebDAV 密码不足 8 位：号池压缩包用它加密，短口令在远端可被离线爆破，建议改用更长密码");
+  // 号池压缩包用加密口令加密（issue #89：显式口令优先，缺省沿用 password / S3 SecretKey）
+  if (!w.password) throw new Error("请先在「设置 · 数据存储」配置服务器与密码（S3 模式为 SecretKey）");
+  // 弱口令告警（不阻断）：太短的口令打的包在远端可被离线爆破。刻意只 warn 不拒绝——
+  // 部分用户的 WebDAV 服务器本身只支持短密码，阻断会破坏既有同步；强度由用户自行权衡
+  if (String(w.passphrase).length < 8) {
+    oplog.log("warn", "号池同步", "号池压缩包加密口令不足 8 位：短口令在远端可被离线爆破，建议改用更长密码或设置独立加密口令");
   }
+  // 远端同步跨模块互斥（issue #92）：技能/用量/记忆同步进行中时跳过本轮
+  if (!webdav.tryBeginSync("proxy")) throw new Error("其他模块的远端同步正在进行，本轮已跳过");
 
-  state = { ...state, running: true, stage: "connect", detail: "", lastError: "", percent: 0, channel };
-  cancelSignal = new AbortController();
-  webdav.setActiveSignal(cancelSignal.signal);
-  const persisted = loadPersisted();
-  const myId = deviceId();
-  const myName = deviceName();
-  const result = { pulled: 0, added: 0, updated: 0, removed: 0, skipped: 0, uploaded: false, skippedUpload: false };
-
+  // 占锁与收尾必须同处一个保护块（审查加固）：原先 state/cancelSignal/deviceId 等初始化
+  // 位于 try 之外，一旦其中任何一步抛错，finally 里的 webdav.endSync() 不会执行，
+  // 全局同步槽位（syncRunTag）将永久被占，技能/用量/号池/记忆四个模块的同步入口
+  // 全部被拒直到重启应用。当前这些调用在现有实现下不抛，但结构上必须收紧。
   try {
+    state = { ...state, running: true, stage: "connect", detail: "", lastError: "", percent: 0, channel };
+    cancelSignal = new AbortController();
+    webdav.setActiveSignal(cancelSignal.signal);
+    const persisted = loadPersisted();
+    const myId = deviceId();
+    const myName = deviceName();
+    const result = { pulled: 0, added: 0, updated: 0, removed: 0, skipped: 0, uploaded: false, skippedUpload: false };
+
     // ---- 连接检查 + 远端目录就绪 ----
     setStage("connect", "检查远端连接…");
     const t = await webdav.test(w);
@@ -565,7 +608,7 @@ async function run(opts) {
       const mergeKey = devId + (channel ? `|${channel}` : "");
       if (persisted.merged[mergeKey] === hash) continue; // 内容未变，上次已合并过
       try {
-        const snap = decodeArchive(buf, w.password);
+        const snap = decodeArchive(buf, w.passphrase);
         const m = mergeSnapshot(snap, channel);
         result.pulled++;
         result.added += m.added;
@@ -608,9 +651,9 @@ async function run(opts) {
     setStage("upload", channel ? `打包上传本机号池（仅 ${store.channelDisplay(channel)}）…` : "打包上传本机号池…");
     checkAborted();
     const snapshot = exportPool(channel);
-    const zipBuf = encodeArchive(snapshot, w.password);
+    const zipBuf = encodeArchive(snapshot, w.passphrase);
     const hash = sha1(zipBuf);
-    const fp = keyFingerprint(w.password);
+    const fp = keyFingerprint(w.passphrase);
     const remoteKey = `${w.endpoint}|${w.root}|${channel || "*"}|${fp}`;
     // 上传跳过条件：内容 hash 一致 + 同远端 + 同渠道范围 + 同密码 + 打包时间晚于密码改动时间
     if (persisted.uploadedHash === hash && persisted.uploadedFor === remoteKey && persisted.lastSyncAt >= persisted.keyChangeAt) {
@@ -650,6 +693,7 @@ async function run(opts) {
     events.emit({ type: "poolsync", stage: "error", running: false, detail: state.lastError, percent: 100 });
     return { ok: false, message: state.lastError };
   } finally {
+    webdav.endSync();
     cancelSignal = null;
     webdav.setActiveSignal(null);
   }
@@ -718,7 +762,7 @@ async function restoreAnchorMidFromRemote() {
   return { action: "restored", deviceMid: mid };
 }
 
-module.exports = { run, cancel, progress, configured, noteRemoved, onSharedPasswordMaybeChanged, accountKeyOf, accountStamp, accountIntentStamp, renameWouldChangeIdentity, backupAnchorMid, restoreAnchorMidFromRemote,
+module.exports = { run, cancel, progress, configured, noteRemoved, noteKeyRemoved, onSharedPasswordMaybeChanged, accountKeyOf, accountStamp, accountIntentStamp, renameWouldChangeIdentity, backupAnchorMid, restoreAnchorMidFromRemote,
   // 共享配置同步（自测与诊断用；主流程在 run() 内部调用 runSharedSync）
   exportShared, applyShared, encodeEnvelope, decodeEnvelope, runSharedSync,
   // 号池归档封套（自测用：与共享配置共用同一 encode/decodeEnvelope，去重后靠这组断言守住行为）
@@ -751,6 +795,7 @@ function exportShared() {
       id: k.id, name: k.name, secret: k.secret, route: k.route, routeOrder: k.routeOrder || "",
       dailyQuota: k.dailyQuota, rateLimit: k.rateLimit,
       enabled: k.enabled, createdAt: k.createdAt,
+      updatedAt: k.updatedAt || 0, // LWW 仲裁：改名/改配额/启停靠它传播到其他设备（issue #92）
     }));
   // 模型清单及参数（rules/catalog.json）：整份随共享包走，新设备免重新拉官方目录。
   // get 返回的是缓存对象本身，必须深拷贝，避免后续合并改动污染缓存。
@@ -816,13 +861,14 @@ function mergeSharedCatalog(localCat, remoteCat) {
 /**
  * 把对端共享配置合并进本机。
  * 语义：映射类逐键并集、冲突取远端（远端 exportedAt 更晚）；
- *       API Key 按 id/hash 去重，只补本机没有的（本机已有的以本机为准，不覆盖启停状态）；
+ *       API Key 按 updatedAt 新者胜（issue #92）：改名/改配额/启停会传播；
+ *       本机墓碑时间晚于对端修改时间的 Key 不导入（对端还没感知删除）；
  *       模型清单按渠道 syncedAt 新者胜（见 mergeSharedCatalog）。
  */
 function applyShared(snap) {
-  const none = { applied: false, configChanged: 0, keyAdded: 0, catalogAdded: 0, catalogUpdated: 0 };
+  const none = { applied: false, configChanged: 0, keyAdded: 0, keyUpdated: 0, catalogAdded: 0, catalogUpdated: 0 };
   if (!snap || snap.format !== SHARED_FORMAT) return none;
-  const out = { applied: true, configChanged: 0, keyAdded: 0, catalogAdded: 0, catalogUpdated: 0 };
+  const out = { applied: true, configChanged: 0, keyAdded: 0, keyUpdated: 0, catalogAdded: 0, catalogUpdated: 0 };
   const cfg = config.loadConfig();
   cfg.proxy = cfg.proxy || {};
   for (const k of SHARED_CONFIG_KEYS) {
@@ -836,8 +882,17 @@ function applyShared(snap) {
     if (r.changed) { cfg.proxy[k] = r.out; out.configChanged += r.changed; }
   }
   if (out.configChanged) config.saveConfig(cfg);
+  const keyTomb = readKeyTombstones();
   for (const kk of Array.isArray(snap.keys) ? snap.keys : []) {
-    if (store.importKey(kk).ok) out.keyAdded++;
+    if (!kk || !kk.id) continue;
+    // 墓碑优先（issue #92）：远端包可能来自还没感知删除的老设备——
+    // 删除时间晚于对端最后修改 → 不导入；对端在删除之后又改过（updatedAt 更新）→ 视为重建。
+    // 用 >= 而非 >：同一毫秒内的「删除 vs 修改」判删除优先（否则该删除会丢），
+    // 与 runSharedSync 的本机删除判据（下方 Number(at) >= updatedAt）保持同口径，两处须同改。
+    const tombAt = Number(keyTomb[kk.id]) || 0;
+    if (tombAt && tombAt >= (Number(kk.updatedAt) || 0)) continue;
+    const r = store.importKey(kk);
+    if (r.ok) { if (r.updated) out.keyUpdated++; else out.keyAdded++; }
   }
   // 模型清单：与「拉取官方目录」同一写回路径（落盘 + reload 热生效）
   if (snap.catalog && typeof snap.catalog === "object" && Object.keys(snap.catalog).length) {
@@ -856,8 +911,11 @@ function applyShared(snap) {
 
 /** 通用加密封套（与号池归档同一套：AES-256-GCM + scrypt 固定盐 + AHPPOOL1 magic） */
 function encodeEnvelope(snapshot, password) {
+  // 空口令守卫（审查整改）：口令没接上时宁可同步失败，也绝不用公开可推导的空密钥
+  // 加密号池归档/共享配置（里面有账号凭据与 API Key 明文）传到远端
+  if (!password) throw new Error("号池加密口令为空，拒绝打包上传（请检查统一服务器配置）");
   const plain = Buffer.from(JSON.stringify(snapshot), "utf8");
-  const key = crypto.scryptSync(String(password || ""), KDF_SALT, 32);
+  const key = crypto.scryptSync(String(password), KDF_SALT, 32);
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
   const enc = Buffer.concat([cipher.update(plain), cipher.final()]);
@@ -890,6 +948,10 @@ function decodeEnvelope(buf, password) {
  * 独立成函数是为了不动 run() 主体，改动面小、也好单独验证。
  */
 async function runSharedSync(w, persisted, result) {
+  // 口令口径：显式 passphrase 优先，缺省沿用 w.password（与 wd() 的注入语义一致；
+  // 直接以自有 w 对象调用本函数的测试/诊断路径两者都缺时才拒绝）
+  const phrase = w.passphrase || w.password;
+  if (!phrase) throw new Error("号池加密口令为空，拒绝共享配置同步（请检查统一服务器配置）");
   // 只有「远端读得成」才允许本轮上传：GET 报错（网络/鉴权）时远端是什么状态我们并不知道，
   // 这时推本机版本会把对端更新的配置盖掉（LWW 语义下对端下次同步又反过来吃掉本机改动）。
   // 读到内容但解不开（损坏/密码变过）不算「不知道」——按首次上传自愈，与号池归档同一处理。
@@ -900,7 +962,7 @@ async function runSharedSync(w, persisted, result) {
     if (got) {
       let snap = null;
       try {
-        snap = decodeEnvelope(got, w.password);
+        snap = decodeEnvelope(got, phrase);
       } catch (e) {
         result.sharedDecodeError = String((e && e.message) || e);
       }
@@ -910,11 +972,47 @@ async function runSharedSync(w, persisted, result) {
         result.sharedFrom = snap.deviceName || snap.deviceId || "";
         result.sharedConfigChanged = ap.configChanged;
         result.sharedKeyAdded = ap.keyAdded;
+        result.sharedKeyUpdated = ap.keyUpdated;
         result.sharedCatalogAdded = ap.catalogAdded;
         result.sharedCatalogUpdated = ap.catalogUpdated;
       }
     }
   } catch (e) { result.sharedPullError = String((e && e.message) || e); /* 网络/鉴权异常：不阻断号池同步，但留痕可诊断 */ }
+  // ---- Key 删除墓碑：远端生效到本机 + 双向合并推回（issue #92，同账号墓碑语义） ----
+  try {
+    const ktText = await webdav.getText(remoteUrl(w, POOL_DIR, "keys-tombstones.json"), w);
+    let remoteKT = {};
+    try { remoteKT = ktText ? JSON.parse(ktText) : {}; } catch { remoteKT = {}; }
+    if (!remoteKT || typeof remoteKT !== "object" || Array.isArray(remoteKT)) remoteKT = {};
+    const localKT = readKeyTombstones();
+    const merged = { ...remoteKT };
+    let dirty = false;
+    for (const [id, at] of Object.entries(localKT)) {
+      if (!merged[id] || Number(at) > Number(merged[id])) { merged[id] = at; dirty = true; }
+    }
+    // 远端墓碑生效到本机：删除时间晚于本机 Key 的最后修改 → 本机跟随删除。
+    // >= 与 applyShared 的墓碑判据同口径（同毫秒判删除优先），两处须同改。
+    // 先取一次 Key 快照：listKeys() 含当日用量聚合，若放在墓碑循环里会随 Key 数放大成 O(n²)
+    const keyById = new Map(store.listKeys().map((x) => [x.id, x]));
+    for (const [id, at] of Object.entries(merged)) {
+      const k = keyById.get(id);
+      if (k && Number(at) >= (k.updatedAt || 0)) {
+        store.deleteKey(id);
+        result.sharedKeyRemoved = (result.sharedKeyRemoved || 0) + 1;
+      }
+    }
+    // 30 天前的墓碑清理（Key 条目存活周期内足够传播）
+    const kcut = Date.now() - 30 * 86400000;
+    for (const [id, at] of Object.entries(merged)) {
+      if (Number(at) < kcut) { delete merged[id]; delete localKT[id]; dirty = true; }
+    }
+    writeKeyTombstones(localKT);
+    // 只在确有墓碑内容时上传：否则「远端缺文件 + 本机无墓碑」会写入一个空对象 {}，
+    // 徒增一次写请求与远端噪音
+    if ((dirty || ktText == null) && Object.keys(merged).length) {
+      await webdav.put(remoteUrl(w, POOL_DIR, "keys-tombstones.json"), w, JSON.stringify(merged));
+    }
+  } catch (e) { result.sharedKeyTombError = String((e && e.message) || e); /* 墓碑同步失败不影响本轮其余部分，留痕可诊断 */ }
   try {
     const shared = exportShared();
     // hash 只覆盖内容（不含 exportedAt），否则每次同步都因时间戳不同而重传
@@ -922,7 +1020,7 @@ async function runSharedSync(w, persisted, result) {
     if (!remoteReadOk) {
       result.sharedUploadSkipped = true;
     } else if (persisted.sharedHash !== stable) {
-      await webdav.put(remoteUrl(w, POOL_DIR, SHARED_FILE), w, encodeEnvelope(shared, w.password));
+      await webdav.put(remoteUrl(w, POOL_DIR, SHARED_FILE), w, encodeEnvelope(shared, phrase));
       persisted.sharedHash = stable;
       result.sharedUploaded = true;
     }
@@ -931,6 +1029,8 @@ async function runSharedSync(w, persisted, result) {
     result.sharedFrom ? "配置取自 " + result.sharedFrom : "",
     result.sharedConfigChanged ? "改 " + result.sharedConfigChanged + " 项" : "",
     result.sharedKeyAdded ? "补 Key " + result.sharedKeyAdded : "",
+    result.sharedKeyUpdated ? "更新 Key " + result.sharedKeyUpdated : "",
+    result.sharedKeyRemoved ? "删 Key " + result.sharedKeyRemoved : "",
     result.sharedCatalogAdded ? "增清单渠道 " + result.sharedCatalogAdded : "",
     result.sharedCatalogUpdated ? "更新清单渠道 " + result.sharedCatalogUpdated : "",
     result.sharedUploadSkipped ? "共享配置本轮未上传（远端读取失败，等下轮）" : "",

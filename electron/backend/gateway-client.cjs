@@ -369,6 +369,8 @@ function state() {
 // == ③ 这张名单。
 // 名单在此处字面写死而不是从 index.cjs 的 dispatchTable 反推：反推要把整张 proxy 依赖图拉进
 // 主进程（§5.4 白做）。新增命令的工序是 preload + index.cjs 注册体 + 这张名单三处同改，闸会盯住漏改。
+// 只登记渲染层看得见的用户面命令：内部半段（proxy_runtime_set、proxy_oplog_export_rows）由主进程
+// 直接 call()，登记进来等于在 preload 白名单之外多开一个 ipcMain 注册面，①==③ 那条会红。
 const ALL_PROXY_CMDS = [
   "proxy_status", "proxy_start", "proxy_stop", "proxy_restart",
   "proxy_keys_list", "proxy_key_create", "proxy_key_update", "proxy_key_delete",
@@ -406,6 +408,9 @@ const ALL_PROXY_CMDS = [
   // ZCode 登录文件，实现体全在子进程（主进程只转发）；漏登记会让号池页按钮报「未授权的 IPC 命令」
   "proxy_zcode_device_status", "proxy_zcode_device_repair",
   "proxy_zcode_claim_mode", "proxy_zcode_restore_mid",
+  // 上游 v1.60 的 AutoClaw 登录两半段 + 国际版滑块风控配置：验证码短信要 deviceId、滑块参数读
+  // headers.json，实现体全在子进程 index.cjs（写号池 store.addAccount），主进程只转发。
+  "proxy_autoclaw_captcha_config", "proxy_autoclaw_sms_send", "proxy_autoclaw_sms_login",
 ];
 
 // 5 条真 UI 依赖（规格 §5.7 归属定案）：实现体在本文件，不经管道（dialog/shell/app.getPath 子进程拿不到）。

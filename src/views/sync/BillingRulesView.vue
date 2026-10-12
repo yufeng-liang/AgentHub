@@ -2,6 +2,7 @@
 import { onMounted, ref, reactive, computed, watch } from "vue";
 import { useSyncStore } from "../../stores/sync";
 import { formatToken, formatInteger, formatDateTime } from "../../composables/useFormat";
+import { toast as ElMessage } from "../../utils/toast";
 import * as api from "../../api/sync";
 import type { PriceRow, PriceEntry, UnpricedModel, ImportPreview, ImportPreviewItem, RemotePricingConfig, ModelAlias } from "../../types/sync";
 
@@ -208,9 +209,21 @@ interface MergeCandidate {
   hit: number; // 目标模型关键字被命中的个数
   total: number; // 目标模型关键字总数
   tokens: string[]; // 命中的关键字
+  source?: string; // 目标现行价格的来源（手动/远程/内置），下拉里展示供选择参考
+  exactOnly?: boolean; // 目标仅有供应商精确价（无通配价）——其它供应商记录归并后按估算价计
 }
 function mergeCandidates(aliasModelId: string): MergeCandidate[] {
   const src = new Set(tokenizeModel(aliasModelId));
+  // 目标价格侧信息：来源（manual 优先展示）+ 是否「仅有」供应商精确价
+  const meta = new Map<string, { source?: string; exact: boolean; generic: boolean }>();
+  for (const p of prices.value) {
+    if (!p.active) continue;
+    const m = meta.get(p.modelId) || { exact: false, generic: false };
+    if (p.source === "manual" || !m.source) m.source = p.source;
+    if (p.providerId) m.exact = true;
+    else m.generic = true;
+    meta.set(p.modelId, m);
+  }
   const hits: MergeCandidate[] = [];
   const missed: string[] = [];
   const seen = new Set<string>();
@@ -219,12 +232,13 @@ function mergeCandidates(aliasModelId: string): MergeCandidate[] {
     seen.add(p.modelId);
     const tokens = [...new Set(tokenizeModel(p.modelId))];
     const hitTokens = tokens.filter((t) => src.has(t));
-    if (hitTokens.length) hits.push({ modelId: p.modelId, hit: hitTokens.length, total: tokens.length, tokens: hitTokens });
+    const info = meta.get(p.modelId);
+    if (hitTokens.length) hits.push({ modelId: p.modelId, hit: hitTokens.length, total: tokens.length, tokens: hitTokens, source: info?.source, exactOnly: !!(info?.exact && !info?.generic) });
     else missed.push(p.modelId);
   }
   // 命中占比高者优先；占比相同取关键字更多的（更精确，如 glm-5.3-flash 优于 glm-5.3）
   hits.sort((a, b) => b.hit / b.total - a.hit / a.total || b.total - a.total || a.modelId.localeCompare(b.modelId));
-  return [...hits, ...missed.sort().map((m) => ({ modelId: m, hit: 0, total: 0, tokens: [] as string[] }))];
+  return [...hits, ...missed.sort().map((m) => ({ modelId: m, hit: 0, total: 0, tokens: [] as string[], source: meta.get(m)?.source, exactOnly: !!(meta.get(m)?.exact && !meta.get(m)?.generic) }))];
 }
 
 const mergeModal = reactive({
@@ -235,6 +249,7 @@ const mergeModal = reactive({
   candidates: [] as MergeCandidate[],
   target: "",
   submitting: false,
+  error: "",
 });
 
 function openMerge(u: UnpricedModel) {
@@ -243,6 +258,7 @@ function openMerge(u: UnpricedModel) {
   mergeModal.tokens = u.tokens;
   mergeModal.candidates = mergeCandidates(u.modelId);
   mergeModal.target = mergeModal.candidates[0]?.modelId || "";
+  mergeModal.error = "";
   mergeModal.show = true;
 }
 
@@ -255,15 +271,21 @@ const bestMerge = computed(() => {
 async function submitMerge() {
   if (!mergeModal.target || mergeModal.submitting) return;
   mergeModal.submitting = true;
+  mergeModal.error = "";
   try {
     const r = await api.addAlias(mergeModal.aliasModelId, mergeModal.target);
-    flash(r);
     if (r.ok) {
+      // 提示走全局 toast：弹窗随即关闭，顶部 flash 会被遮罩挡住、3.6 秒自动消失，用户会以为「没反应」
+      ElMessage.success(r.message || "已归并");
       mergeModal.show = false;
       await Promise.all([loadPrices(), loadAliases(), loadUnpriced()]);
+    } else {
+      mergeModal.error = r.message || "归并失败，请重试";
+      ElMessage.error(mergeModal.error);
     }
   } catch (e) {
-    flash({ ok: false, message: e instanceof Error ? e.message : "归并失败，请重试" });
+    mergeModal.error = e instanceof Error ? e.message : "归并失败，请重试";
+    ElMessage.error(mergeModal.error);
   } finally {
     mergeModal.submitting = false;
   }
@@ -766,7 +788,7 @@ watch(() => app.activePage, (p) => {
             v-for="c in mergeModal.candidates"
             :key="c.modelId"
             :value="c.modelId"
-            :label="c.modelId + (c.hit > 0 ? ` · 命中 ${c.tokens.join(' / ')}` : '')"
+            :label="c.modelId + (c.hit > 0 ? ` · 命中 ${c.tokens.join(' / ')}` : '') + (c.source ? ` · ${sourceLabel[c.source] || c.source}` : '') + (c.exactOnly ? ' · 仅供应商精确价' : '')"
           />
         </el-select>
       </div>
@@ -776,6 +798,7 @@ watch(() => app.activePage, (p) => {
       </p>
       <p v-else class="m-hint">未能按关键字自动匹配（与已配置模型无重合关键字），请从列表手动选择归并目标。</p>
       <p class="m-hint">归并后该模型历史费用按目标模型价格自动重算；别名显示在价格表模型名下方，可随时取消。归并关系随价格表经 WebDAV 多设备同步。</p>
+      <p v-if="mergeModal.error" class="m-error">{{ mergeModal.error }}</p>
       <div class="modal-actions">
         <button class="btn-outline" @click="mergeModal.show = false">取消</button>
         <button class="btn btn-cta" :disabled="!mergeModal.target || mergeModal.submitting" @click="submitMerge">{{ mergeModal.submitting ? "归并中…" : "确认归并" }}</button>
@@ -805,6 +828,8 @@ td.op-cell { text-align: right; white-space: nowrap; }
 /* 保存结果提示：标题行已去除，改为卡片上方的独立反馈行 */
 .save-line { font-size: 12px; color: var(--err); margin-bottom: 14px; }
 .save-line.ok { color: var(--ok); }
+/* 归并弹窗内错误行：失败时留在弹窗里（全局 toast 3 秒消失，红字停留供重试时对照） */
+.m-error { font-size: 12px; color: var(--err); margin: 10px 0 0; line-height: 1.6; }
 .footnote-card { padding: 16px 20px; }
 
 .tr-unpriced td { background: rgba(217, 119, 6, 0.045); }

@@ -352,6 +352,43 @@ async function main() {
     const ownersRev = adapters.modelOwners("glm-5.3", { modelReverseAliases: { "glm-5.3": { raccoon: "sn-glm-5-3-flash" } } });
     assert(ownersRev[0] === "raccoon", "T10 反向映射命中的渠道排最前: " + ownersRev.join("/"));
     assert(ownersRev.length >= 2, "T10 反向映射不得收窄备选（实际 " + ownersRev.join("/") + "）");
+
+    // 历史 UI 曾写入自映射；配置残留时也必须跳过该渠道，不能把虚拟名透传给 CatPaw。
+    const realCatPaw = adapters.ADAPTERS.catpaw;
+    let catPawHits = 0;
+    adapters.ADAPTERS.catpaw = {
+      ...realCatPaw,
+      models: () => ["kimi-k3"],
+      stateful: () => true,
+      chatSession: async () => {
+        catPawHits++;
+        throw Object.assign(new Error("CatPaw should not receive a virtual reverse-alias name"), { status: 400 });
+      },
+    };
+    try {
+      cfg.modelReverseAliases = {
+        "rev-failover": { trae: "glm-5.3", workbuddy_ai: "glm-5.3", catpaw: "rev-failover" },
+      };
+      mode.trae = "ok";
+      // 前置用例（T1/T4a/T4b 的 3 次 500）会把 trae 账号打成账号级 5xx 熔断（连续 3 次 →
+      // 30 分钟冷却），压缩节奏下这个窗口不会自然过期；可用性优先排序会正确地绕开它落到
+      // 另一健康渠道。本用例的意图是「key 指到无有效映射渠道时落到有映射的 trae」，
+      // 故先复位该账号冷却，让断言保持确定性（与 T9 头部同款复位）
+      store.updateAccount(t1, { status: "online", coolUntil: 0, coolReason: "" });
+      store.updateKey(k.id, { route: "catpaw" });
+      const h10 = { ...hits };
+      rr = await call({ model: "rev-failover", stream: false, messages: bodyMsg });
+      const b10 = await rr.text();
+      assert(rr.status === 200, "T10 指定无效映射渠道时应落到有效渠道: " + rr.status + " " + b10.slice(0, 200));
+      assert(catPawHits === 0, "T10 自映射的 CatPaw 渠道不得收到请求");
+      assert(hits.trae === h10.trae + 1, "T10 实际请求打到已配置映射的 trae: " + JSON.stringify(hits));
+      row = store.recentRequests(1)[0];
+      assert(row.channel === "trae" && /rev→glm-5\.3/.test(row.error || ""), "T10 记账为 trae + rev→glm-5.3: " + row.error);
+      store.updateKey(k.id, { route: "auto" });
+      cfg.modelReverseAliases = {};
+    } finally {
+      adapters.ADAPTERS.catpaw = realCatPaw;
+    }
   }
 
   // ===== 收尾：恢复规则文件，关服务与假上游，清种子 =====

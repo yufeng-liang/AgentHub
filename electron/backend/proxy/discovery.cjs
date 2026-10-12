@@ -614,14 +614,50 @@ function scanQoder() {
   return out;
 }
 
-/** 全量扫描（本机全渠道候选）：七路 = 上游四家 + fork 的 cline/autoclaw + 上游的 qoder 双区与 zcode。
+/** CatPaw 本机登录态扫描：读 ~/.meituan-catpaw/auth.json（桌面端登录态）。
+ *
+ *  与其它渠道的不同：CatPaw 的凭证是会话 Cookie 值（X-Passport-Token）+ 独立 user-uid 头，
+ *  且客户端重新登录会改写这个文件。导入时**同时把 token 落库**（号池按 hasToken 判可用性），
+ *  并打 meta.desktop 标记 —— 转发时优先实时读文件（客户端换号/续期自动跟着走），
+ *  文件读不到才回落库里那份（客户端未安装 / 临时不可读时仍可用）。 */
+function scanCatpaw() {
+  const out = [];
+  // 关闭的渠道不产出候选（上游启闭：探测/导入对它一律不可见，与 qoder 扫描同口径）
+  if (!adapters.channelOn("catpaw")) return out;
+  let login = null;
+  try {
+    login = require("./catpaw/credentials.cjs").readDesktopLogin();
+  } catch {
+    return out; // 未安装 / 未登录 / 登录态文件不可读
+  }
+  out.push({
+    channel: "catpaw",
+    uid: String(login.uid || ""),
+    name: String(login.loginName || (login.uid ? `账号 ${login.uid}` : "")),
+    token: login.token,
+    refreshToken: "",
+    expiresAt: 0,
+    // desktop 标记：转发时优先实时读该文件（见 catpaw/credentials.cjs 的来源顺序）
+    meta: { desktop: true },
+    source: "scan",
+    file: `~/.meituan-catpaw/auth.json（登录态尾号 ${login.tokenTail}）`,
+  });
+  return out;
+}
+
+// ⚠ 上游本批还带来 scanAutoclaw / scanCline 两个新扫描器，此处刻意不收：
+//   · 名与 fork 的 scanAutoClaw 只差大小写，两个都会给 autoclaw 双区产出候选 → 同号重复行；
+//   · scanCline 与 fork 的同名函数**逐字同名**，并列即声明遮蔽（第十一批 beginQoderOAuth 双生体同型），
+//     后定义者静默胜出，判据读的是死代码。随 cline/autoclaw 目录实现一起在移植提交里接线。
+
+/** 全量扫描（本机全渠道候选）：八路 = 上游四家 + fork 的 cline/autoclaw + 上游的 qoder 双区、zcode 与 catpaw。
  *  逐扫描器 try/catch：单渠道扫描抛错（如登录文件在扫描间隙被删）只跳过该渠道并留痕，
  *  不中断整轮——其余渠道的候选照常返回（与 currentLocalLogins 的单渠道隔离同一口径） */
 function scanAll() {
   const out = [];
   // 单渠道异常只跳过该渠道：一个扫失败就让整台机器的候选列表变空，比少扫一家严重得多
   // （上游那版是裸 spread，任一个 scan 抛错全表皆空）。scanQoder 是上游 v1.43 的双区本机扫描。
-  for (const scan of [scanTrae, scanWorkBuddy, scanRaccoon, scanCline, scanAutoClaw, scanQoder, scanZcode]) {
+  for (const scan of [scanTrae, scanWorkBuddy, scanRaccoon, scanCline, scanAutoClaw, scanQoder, scanZcode, scanCatpaw]) {
     try {
       out.push(...scan());
     } catch (e) {
@@ -726,6 +762,28 @@ function currentLocalLogins() {
       const rec = zcodeLocal.accountRecord(live, {});
       const uid = String(rec.uid || zcodeLocal.uidFromJwt(live.jwt) || "");
       if (uid) out.zcode = { uid, name: String(rec.name || "") };
+    }
+  } catch { /* 同上 */ }
+  try {
+    const login = require("./catpaw/credentials.cjs").readDesktopLogin();
+    if (login.uid) out.catpaw = { uid: login.uid, name: String(login.loginName || "") };
+  } catch { /* 同上 */ }
+  try {
+    // AutoClaw 两地共用同一个登录态文件（无地区标记），两键同值——徽标只是「本机有登录态」的提示。
+    // 读法刻意复用本文件的 scanAutoClaw()，而不是上游 autoclaw/credentials 的另一个入口：
+    // 徽标与号池扫描必须同源，否则会出现「徽标说本机没登录、扫描列表里却有候选」这种自相矛盾。
+    const first = scanAutoClaw().find((c) => c.uid) || null;
+    if (first) {
+      out.autoclaw = { uid: first.uid, name: first.name || "" };
+      if (store.AUTOCLAW_INTL_ENABLED) out.autoclaw_intl = { uid: first.uid, name: first.name || "" };
+    }
+  } catch { /* 同上 */ }
+  try {
+    // Cline 两池同样是「一个客户端登录态」：两键同值（池由渠道身份决定）。同上，走 scanCline()。
+    const first = scanCline().find((c) => c.uid) || null;
+    if (first) {
+      out.cline_free = { uid: first.uid, name: first.name || "" };
+      out.cline_pass = { uid: first.uid, name: first.name || "" };
     }
   } catch { /* 同上 */ }
   return out;
@@ -2991,6 +3049,174 @@ async function beginModelScopeOAuth(channel, onDone, helpers) {
   return { ok: true, url, mode: "loopback", port, host: "www.modelscope.cn" };
 }
 
+// ===== AutoClaw 登录：国内版手机验证码（IPC 两跳直调）+ 国际版回环 OAuth =====
+
+/** AutoClaw 配置（headers.json.autoclaw / autoclaw_intl） */
+function autoclawCfg(channel) {
+  return (rules.get("headers.json") || {})[channel] || {};
+}
+
+/** AutoClaw 登录结果落库（SMS / OAuth 共用）：uid 优先取协议返回，缺了从 JWT 解。 */
+async function saveAutoclawAccount(channel, cred, deviceId) {
+  const autoclawLogin = require("./autoclaw/login.cjs");
+  const credentials = require("./autoclaw/credentials.cjs");
+  const c = autoclawCfg(channel);
+  const token = String(cred.token || "");
+  const uid = String(cred.userId || credentials.uidFromToken(token) || "").trim();
+  if (!uid) throw new Error("登录成功但取不到账号 uid（token 不是 JWT 且上游未返回 user_id），请重试");
+  // best-effort 邮箱回填（user-profile；拿不到不阻断）
+  const email = await autoclawLogin.fetchUserEmail({ cfg: c, httpJson: adapters.httpJson, token, deviceId }).catch(() => "");
+  const name = String(cred.userName || cred.name || email || (cred.phoneTail ? `手机 ${cred.phoneTail}` : "")).trim();
+  const expiresAt = (() => {
+    try { const p = util.jwtDecode(token); return p && p.exp ? p.exp * 1000 : 0; } catch { return 0; }
+  })();
+  const meta = { product: channel, ...(deviceId ? { deviceId } : {}), ...(email ? { email } : {}) };
+  const existing = store.listAccounts(channel).find((a) => a.uid === uid);
+  if (existing) {
+    const oldMeta = readAccountMeta(existing.id);
+    store.updateAccount(existing.id, {
+      token,
+      ...(cred.refreshToken ? { refreshToken: cred.refreshToken } : {}),
+      expiresAt: expiresAt || undefined,
+      meta: { ...oldMeta, ...meta },
+      status: "online",
+      coolUntil: 0,
+      coolReason: "",
+    });
+    return { id: existing.id, uid, updated: true };
+  }
+  const id = store.addAccount({
+    channel,
+    uid,
+    name,
+    token,
+    refreshToken: cred.refreshToken || "",
+    source: "oauth",
+    expiresAt: expiresAt || undefined,
+    meta,
+  });
+  return { id, uid, updated: false };
+}
+
+/**
+ * AutoClaw 国际版 OAuth（Zai / Google）：回环监听 + 三跳协议。
+ * 与 lobster 回环模式的关键差异：回调地址**必须**落在 z.ai 给官方客户端登记的
+ * 四个 loopback 端口之一（localhost + /auth/callback-<vendor>，127.0.0.1 与其它端口
+ * 一律 Redirect URI not registered），故逐个试端口而非首选+随机兜底。
+ * 前置：前端已跑完阿里云滑块（captchaVerifyParam 由 IPC 传入），验证码阶段不占本会话。
+ */
+const AUTOCLAW_CALLBACK_PORTS = [18432, 19654, 19723, 53699];
+
+async function beginAutoClawOauth(channel, onDone, opts) {
+  const autoclawLogin = require("./autoclaw/login.cjs");
+  const c = autoclawCfg(channel);
+  const vendor = opts && opts.vendor === "google" ? "google" : "zai";
+  const captchaVerifyParam = String((opts && opts.captchaVerifyParam) || "").trim();
+  if (!captchaVerifyParam) {
+    return { ok: false, message: "缺少风控验证参数，请先完成滑块验证再发起登录" };
+  }
+
+  // 窗口期守卫（审查加固）：server.listen 在本函数首个 await 之前就已生效，而 started /
+  // handleCallback 要等 oauthStart 返回后才就绪。若此刻有请求到达（上一轮残留页预取、
+  // 手动刷新旧回调页），直接进 handleCallback 会踩 const 的 TDZ（ReferenceError），
+  // 该异常在 HTTP 回调栈内抛出、逃逸出 .catch → 未捕获异常 → 主进程退出。
+  // 故在回调入口挡掉「尚未就绪」的请求，并把 handleCallback 提升为函数声明消除 TDZ。
+  let started = null;
+  const server = http.createServer((req, res) => {
+    if (!started) {
+      try { res.statusCode = 503; res.end("initializing"); } catch { /* 连接已断 */ }
+      return;
+    }
+    Promise.resolve().then(() => handleCallback(req, res)).catch(() => { /* 回调处理异常已在内部落页 */ });
+  });
+  let port = 0;
+  for (const p of AUTOCLAW_CALLBACK_PORTS) {
+    const bound = await new Promise((resolve) => {
+      server.once("error", () => resolve(false));
+      server.listen(p, "127.0.0.1", () => resolve(true));
+    });
+    if (bound) { port = p; break; }
+  }
+  if (!port) {
+    return { ok: false, message: "回调端口全部被占用（可能 AutoClaw 客户端正在运行登录流程），请关闭后重试" };
+  }
+
+  const deviceId = autoclawLogin.newDeviceId();
+  const navigateUri = `http://localhost:${port}${autoclawLogin.oauthPaths(c, vendor).callback}`;
+
+  // 会话必须在任何 await 之前挂上（审查加固）：server 此刻已 listen，若等 oauthStart 返回才赋值，
+  // 窗口期内 cancelOAuth() 看不到这个 server（不关连接、无超时收尾），beginOAuth 顶部的
+  // 「已有进行中的登录」守卫也失效 → 回环 server 泄漏 / 双 server 并存。
+  oauthSession = {
+    mode: "loopback",
+    channel,
+    server,
+    onDone,
+    timer: setTimeout(() => finishOAuth({ ok: false, message: "登录超时（3 分钟），请重新发起" }), OAUTH_TIMEOUT_MS),
+    // 浏览器没跳回回环地址时的兜底：整段粘贴回调地址（与 lobster 同款 submit 语义）。
+    // 必须如实返回 handleCallback 的结果——原先无条件 ok:true 会在路径校验失败时「假成功」，
+    // 用户以为已登录而会话其实悬挂到超时。
+    submit: async (rawInput) => {
+      if (!started) return { ok: false, message: "授权页尚未就绪，请稍候再试" };
+      const q = parseCallbackInput(rawInput);
+      if (!q) return { ok: false, message: "无法解析回调地址：请整段复制浏览器地址栏内容（需包含 code）" };
+      const code = q.get("code");
+      if (!code) return { ok: false, message: "回调地址缺少 code 参数（授权码）" };
+      return await handleCallback({ url: `?${q.toString()}` }, null, { viaSubmit: true });
+    },
+  };
+
+  started = await autoclawLogin.oauthStart({ cfg: c, httpJson: adapters.httpJson, vendor, captchaVerifyParam, navigateUri, deviceId });
+  if (!started.ok) {
+    // 统一收尾：关 server + 清 timer + 清会话（原先只 close server，靠会话尚未赋值「恰好」没泄漏 timer）
+    finishOAuth({ ok: false, message: started.message });
+    return { ok: false, message: started.message };
+  }
+  // 会话可能在 await 期间被取消/超时收尾（finishOAuth 已关 server）：本次发起已作废，
+  // 不能再返回 url，否则前端会打开一个注定失败的授权页
+  if (!oauthSession || oauthSession.server !== server) {
+    return { ok: false, message: "登录已取消或超时，请重新发起" };
+  }
+
+  async function handleCallback(req, res, opts) {
+    const writeRes = (fn) => { if (res) { try { fn(); } catch { /* 连接已断 */ } } };
+    const u = new URL(req.url || "/", "http://localhost");
+    // submit 兜底路径只有查询串（无 pathname 可校验），显式跳过路径校验；真实 HTTP 回调仍严格校验，
+    // 否则「粘贴回调地址」必然被判 404（`new URL("?code=..").pathname === "/"`）而静默失败
+    const viaSubmit = !!(opts && opts.viaSubmit);
+    if (!viaSubmit && u.pathname !== started.callbackPath) {
+      writeRes(() => { res.statusCode = 404; res.end("not found"); });
+      return { ok: false, message: "回调路径不匹配" };
+    }
+    const q = u.searchParams;
+    const errParam = q.get("error") || q.get("error_description");
+    if (errParam) {
+      const msg = `授权失败：${errParam}`;
+      writeRes(() => { res.statusCode = 400; res.end(ERR_PAGE(msg)); });
+      finishOAuth({ ok: false, message: msg });
+      return { ok: false, message: msg };
+    }
+    const code = q.get("code");
+    if (!code) { writeRes(() => res.end(PENDING_PAGE)); return { ok: false, message: "回调地址缺少 code 参数（授权码）" }; } // 官方页登录前可能空参探测回调可达性
+    const state = q.get("state") || "";
+    try {
+      const ex = await autoclawLogin.oauthExchange({ cfg: c, httpJson: adapters.httpJson, vendor, deviceId, code, state, navigateUri });
+      if (!ex.ok) throw new Error(ex.message);
+      const saved = await saveAutoclawAccount(channel, ex, deviceId);
+      writeRes(() => res.end(OK_PAGE("登录成功，已加入 AutoClaw 号池，可关闭本页")));
+      finishOAuth({ ok: true, id: saved.id, uid: saved.uid });
+      return { ok: true, id: saved.id, uid: saved.uid };
+    } catch (e) {
+      const msg = String((e && e.message) || e);
+      writeRes(() => res.end(ERR_PAGE(`登录失败：${msg}`)));
+      finishOAuth({ ok: false, message: msg });
+      return { ok: false, message: msg };
+    }
+  }
+
+  return { ok: true, url: started.oauthUrl, mode: "loopback", port };
+}
+
 /**
  * 开始 OAuth：按渠道选流程
  * @param {string} channel 内置渠道 id
@@ -3007,25 +3233,24 @@ async function beginOAuth(channel, opts, onDone, helpers) {
   const ch = String(channel || "trae");
   if (oauthSession) throw new Error("已有进行中的登录，请先完成或取消");
   if (!adapters.get(ch)) throw new Error(`未知渠道 ${ch}`);
-  // 小浣熊：上游 v1.18.0 已支持应用内登录（打开官方授权页 → 用户粘回 office-raccoon:// 深链换码），
-  // 本分支基点（b476f52）时还只有「不支持」的抛错，合并时按上游实现放行（不再抛错）。
   if (ch === "raccoon") return beginRaccoonOAuth(ch, cb, helpers); // helpers.openAuthWindow 可选（上游内嵌窗；子进程场景缺省走系统浏览器）
-  // 上游 v1.47/v1.48 的两个新渠道：lobster 纯回环 OAuth；modelscope 需要授权窗采 Cookie，
-  // 子进程场景 helpers 恒缺省 → 上游自带降级（系统浏览器 + 回环回调），推理可用、魔粒任务不可用
   if (ch === "modelscope") return beginModelScopeOAuth(ch, cb, helpers);
   if (ch === "lobster") return beginLobsterOAuth(ch, cb);
-  if (ch === "autoclaw") {
-    // 国内版官方只有客户端登录（手机号+验证码）+ auth.json 落盘，没有可代收的网页授权
-    throw new Error("AutoClaw（国内）官方没有网页登录：请用「从本机软件导入」（自动读取 %APPDATA%/AutoClaw/auth.json）或粘贴 token");
-  }
   if (ch === "cline_free" || ch === "cline_pass") return beginClineOAuth(ch, cb);
-  // qoder 双区共用同一条设备码链路。漏掉 qoder_intl 会掉到本函数末尾的 WorkBuddy 兜底——
-  // 用 WorkBuddy 的回环 OAuth 去打 Qoder 登录，表现为「授权页打开了、但永远等不到号」。
   if (ch === "qoder" || ch === "qoder_intl") return beginQoderOAuth(ch, o.edition, cb);
   if (ch === "zcode" || ch === "zcode_intl") return beginZcodeOAuth(ch, cb);
-  // autoclaw 国际版只有网页 OAuth（阿里云滑块前置 + 回环回调换码）；滑块参数由 renderer 两次调用透传
   if (ch === "autoclaw_intl") return beginAutoClawIntlOAuth(ch, o, cb);
   if (ch === "trae") return beginTraeOAuth(ch, cb);
+  // AutoClaw 国内版：fork 侧仍只有「本机导入 / 粘贴 token」。上游的手机号+验证码两跳登录
+  // 属于被推迟的 autoclaw/ 接线，文案要等那条真通了再改，否则承诺一个不存在的能力。
+  if (ch === "autoclaw") {
+    throw new Error("AutoClaw（国内）官方没有网页登录：请用「从本机软件导入」（自动读取 %APPDATA%/AutoClaw/auth.json）或粘贴 token");
+  }
+  // CatPaw（上游 v1.60 新渠道）没有 OAuth：凭据是桌面端会话 Cookie 值。
+  // 必须显式挡住——落到末尾兜底会拉起 WorkBuddy 的授权页并轮询它的端点（渠道串味）。
+  if (ch === "catpaw") {
+    throw new Error("CatPaw 不支持 OAuth 登录：请先在 CatPaw 客户端登录，再用「从本机软件导入」读取登录态（或粘贴登录态 JSON）");
+  }
   return beginWorkBuddyOAuth(ch, cb);
 }
 
@@ -3096,7 +3321,8 @@ module.exports = {
   scanWorkBuddy,
   scanTrae,
   scanCline,
-  scanAutoClaw,  scanZcode,
+  scanAutoClaw,
+  scanZcode,
   currentLocalLogins,
 
   importCandidate,
@@ -3104,6 +3330,11 @@ module.exports = {
   submitCallbackUrl,
   submitLobsterCallback,
   resolveLobsterUid,
+  // AutoClaw：落库函数供 SMS 两跳 IPC 直调（上游 v1.60 的实现，自包含、不依赖注册哪个适配器）。
+  // 上游同批还导出它自己的 scanAutoclaw（小写 c），本批刻意不收：它与上面 fork 的
+  // scanAutoClaw 只差大小写、且对同一份 %APPDATA%/AutoClaw/auth.json 各产出一份候选，
+  // 两个都挂进 scanAll 就是同号重复行。随 autoclaw/ 适配器接线一起在移植提交里换过来。
+  saveAutoclawAccount,
   // ModelScope（魔搭）：OAuth 主路径 + 粘贴令牌兜底 + 续期
   beginModelScopeOAuth,
   registerModelScopeApp,

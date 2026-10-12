@@ -302,17 +302,21 @@ function buildTrayMenu() {
   const cfg = config.loadConfig();
   const running = remotesync.isRunning();
   const p = remotesync.progress();
+  // 板块开关（issue #91）：关闭板块的托盘入口一并隐藏，避免绕过 UI 触发已停用模块
+  const on = (k) => {
+    const m = (cfg.modules || {})[k];
+    return !m || m.enabled !== false;
+  };
   const statusText = running
     ? `同步中…（${p.stageLabel}）`
     : remotesync.configured(cfg)
       ? `上次同步 ${fmtTime(remotesync.loadRemoteState().lastSyncAt) || "—"}`
       : "未配置 WebDAV";
-  const usageToday = usageTodaySummary();
-  const items = [
-    { label: `技能仓库：${statusText}`, enabled: false },
-    { label: usageToday != null ? `今日用量 ${formatNum(usageToday)} token` : "今日用量 —", enabled: false },
-    { type: "separator" },
-  ];
+  const usageToday = on("sync") ? usageTodaySummary() : null;
+  const items = [];
+  if (on("skills")) items.push({ label: `技能仓库：${statusText}`, enabled: false });
+  if (on("sync")) items.push({ label: usageToday != null ? `今日用量 ${formatNum(usageToday)} token` : "今日用量 —", enabled: false });
+  if (items.length) items.push({ type: "separator" });
   const st = updater.getStatus();
   if (st.status === "available" || st.status === "downloaded") {
     items.push({ label: `发现新版本 v${st.latestVersion} →`, click: focusSettingsUpdate });
@@ -320,17 +324,21 @@ function buildTrayMenu() {
   }
   items.push(
     { label: "显示主界面", click: showWindow },
-    { label: "立即同步技能", enabled: remotesync.configured(cfg) && !running, click: triggerSync },
-    { label: "立即同步用量", click: triggerUsageSync },
-    {
+    ...(on("skills") ? [{
+      label: "立即同步技能",
+      enabled: remotesync.configured(cfg) && !running,
+      click: triggerSync,
+    }] : []),
+    ...(on("sync") ? [{ label: "立即同步用量", click: triggerUsageSync }] : []),
+    ...(on("skills") ? [{
       label: scheduler.isPaused() ? "恢复定时同步" : "暂停定时同步",
       enabled: remotesync.configured(cfg) && !!(cfg.schedule && (cfg.schedule.hourly || cfg.schedule.daily)),
       click: () => { scheduler.setPaused(!scheduler.isPaused()); refreshTrayMenu(); },
-    },
-    {
+    }] : []),
+    ...(on("sync") ? [{
       label: usageScheduler.isPaused() ? "恢复用量定时同步" : "暂停用量定时同步",
       click: () => { usageScheduler.setPaused(!usageScheduler.isPaused()); refreshTrayMenu(); },
-    },
+    }] : []),
     { type: "separator" },
     // stopping 窗口的托盘竞态（Task 7b）：**只在 stopAndWait 在飞（stopping）时**点「退出」什么都不做 ——
     // 此刻 quitForInstall 的停机正在飞，再来一次 app.quit() 会并发走第二遍停机路径（托盘这条是唯一
@@ -353,6 +361,78 @@ function buildTrayMenu() {
 }
 
 /** 新版本提示点击（托盘条目与桌面通知共用）→ 打开主界面并定位到「软件更新」卡片 */
+/**
+ * 四大板块启用开关（issue #91）唯一写入口：设置页与「模块顺序」区的开关都走这里。
+ * 放在 main 而非 ipc.cjs：运行时启停要调 scheduler/watch/usageScheduler/proxy/memory，
+ * 这些设施的启停本来就归本文件管（before-quit 同款收口）。
+ * 落盘走 config.saveConfig 直写；saveConfigFromUI 对 modules 做磁盘优先，
+ * 渲染层旧快照的整份保存不会把开关状态写回去。
+ */
+function registerModuleToggle() {
+  ipcMain.handle("module_toggle", async (_e, args) => {
+    try {
+      const m = String((args && args.module) || "");
+      const enabled = !!(args && args.enabled);
+      if (!["skills", "sync", "proxy", "memory"].includes(m)) return { ok: false, message: "未知板块" };
+      const cfg = config.loadConfig();
+      const next = { ...cfg.modules, [m]: { ...((cfg.modules || {})[m] || {}), enabled } };
+      if (!enabled && Object.values(next).every((x) => !x || x.enabled === false)) {
+        return { ok: false, message: "至少保留一个启用的板块" };
+      }
+      cfg.modules = next;
+      config.saveConfig(cfg);
+      // 运行时启停：关 = 停后台设施（定时器/监听/服务/库）；开 = 重新拉起（各处均幂等）
+      if (m === "skills") {
+        if (enabled) { scheduler.start(); watch.start(); }
+        else { scheduler.stop(); watch.stop(); }
+      } else if (m === "sync") {
+        if (enabled) usageScheduler.start();
+        else {
+          usageScheduler.stop();
+          // 在途同步一并取消（与 proxy 停用时 poolsync.cancel 对称）：否则收尾写库会把
+          // 刚关掉的库惰性重开，违背「停用后后台完全不运行」的语义
+          try { usagesync.cancel(); } catch { /* 无在途任务时无碍 */ }
+          try { usagedb.close(); } catch { /* 关闭失败无碍，重新启用时惰性重开 */ }
+        }
+      } else if (m === "proxy") {
+        // 只做运行时启停，不触碰「记住网关开关」（proxy.restoreOnLaunch）——那是用户的设置，
+        // 静默改写会与设置页提示「网关是否自启仍看『记住网关开关』」自相矛盾，且用户无法察觉
+        // 设置已被改动。模块停用后重启也不拉起网关、不跑后台设施：whenReady 里板块关着就当场
+        // 补发一条 enabled:false（见 gatewayClient.call("proxy_runtime_set") 那处），
+        // 所以不需要为「停用态重启」改写任何用户设置。
+        // 本 fork 的 proxy 域整体在**网关子进程**里（主进程 require("./proxy/index.cjs") 会把
+        // store/rules/credits 的依赖图与库句柄拉回主进程，违背二期 Task 5 的单写者契约），
+        // 所以这里不直调 setRuntime，而是沿用同一进程内那条命令的管道形状转发给子进程。
+        // 子进程不在（网关从未起过）时 call 直接 reject：开关状态已落盘，下一次 spawn 时
+        // whenReady 会按 modules.proxy 补发同一条，行为不丢。
+        await gatewayClient.call("proxy_runtime_set", { enabled }).catch(() => {});
+      } else if (m === "memory") {
+        // 与 memory_toggle 同口径双写旧字段 memory.enabled：loadConfig 每次都会执行
+        // 「旧字段 false → modules.memory.enabled=false」的迁移，只写新字段的话
+        // 旧字段残留的 false 会把刚启用的开关在下一次任意 loadConfig 时打回（审查整改）
+        try {
+          const c2 = config.loadConfig();
+          c2.memory = { ...(c2.memory || {}), enabled };
+          config.saveConfig(c2);
+        } catch { /* 双写失败时迁移仍以旧字段为准，行为退化为旧版一致 */ }
+        if (enabled) await memory.boot().catch(() => {});
+        else await memory.shutdown().catch(() => {});
+      }
+      // 渲染层各页订阅该事件刷新（左栏灰态即时生效、统计数字停止轮询）
+      try {
+        for (const w of BrowserWindow.getAllWindows()) {
+          if (!w.isDestroyed()) w.webContents.send("app:event", { event: "module-toggled", module: m, enabled });
+        }
+      } catch { /* 通知失败不影响切换结果 */ }
+      refreshTrayMenu();
+      return { ok: true, message: enabled ? "已启用" : "已停用" };
+    } catch (e) {
+      return { ok: false, message: String((e && e.message) || e) };
+    }
+  });
+}
+
+
 function focusSettingsUpdate() {
   pendingFocusUpdate = true;
   showWindow();
@@ -493,14 +573,22 @@ if (!gotLock) {
     const boot = config.loadConfig();
     // 建窗前先应用主题，避免深色配置下标题栏先白后黑闪烁
     applyNativeTheme(boot.theme);
+    // 四大板块启用开关（上游 issue #91）：关闭的板块后台完全不运行（不装定时器/监听/服务/库）
+    const on = (k) => {
+      const m = (boot.modules || {})[k];
+      return !m || m.enabled !== false;
+    };
 
     // 用量同步：初始化本地库（惰性打开），并确保本机设备登记在册（设备列表/本机口径立即可用）
-    usagedb.get();
-    const usageCfg0 = usageConfig.loadConfig();
-    const usageLocalId = usagesync.ensureLocalDeviceId(usageCfg0);
-    usagedb.upsertDevice(usageLocalId, usageCfg0.deviceName || "这台电脑", usagesync.enabledSourceIds(usageCfg0).join(","), usagedb.getLastSyncAt(usageLocalId));
+    if (on("sync")) {
+      usagedb.get();
+      const usageCfg0 = usageConfig.loadConfig();
+      const usageLocalId = usagesync.ensureLocalDeviceId(usageCfg0);
+      usagedb.upsertDevice(usageLocalId, usageCfg0.deviceName || "这台电脑", usagesync.enabledSourceIds(usageCfg0).join(","), usagedb.getLastSyncAt(usageLocalId));
+    }
 
     ipc.register({ ipcMain, app, shell, nativeTheme });
+    registerModuleToggle();
     remotesync.setOnFinish(notifySync);
     usagesync.setOnFinish(notifyUsageSync);
     // 网关子进程（Task 5 起为正式启动路径，不再是 opt-in）：那张 proxy_* 命令表全部在子进程跑，
@@ -533,6 +621,11 @@ if (!gotLock) {
         if (!win.isDestroyed()) win.webContents.send("app:event", payload);
       }
     });
+    // 板块开关（上游 issue #91）在 fork 形态下的落地：子进程照常 spawn（保持「应用起来 = 子进程在」
+    // 的最小不变式），但 proxy 板块关着时立刻把它的后台设施停掉，等价于上游 setRuntime(false) 的效果。
+    if (!on("proxy")) {
+      gatewayClient.call("proxy_runtime_set", { enabled: false }).catch(() => {});
+    }
     // 记忆中枢：仓库初始化 + 本地 HTTP API（供 MCP 桥转发）+ 目录监听；失败只影响本模块
 
     memory.boot().catch(() => {});
@@ -541,9 +634,11 @@ if (!gotLock) {
     // minimizeToTray 关时不生效 —— 那种配置下关窗就是退出，不该留一个没有界面的进程
     if (!(boot.schedule.launchHidden && boot.schedule.minimizeToTray)) createWindow();
     createTray();
-    scheduler.start();
-    usageScheduler.start();
-    watch.start();
+    if (on("skills")) {
+      scheduler.start();
+      watch.start();
+    }
+    if (on("sync")) usageScheduler.start();
     updater.init({ onShowWindow: showWindow, onTrayRefresh: refreshTrayMenu, onFocusUpdate: focusSettingsUpdate });
 
     // 依据配置启用开机自启（便携版不支持：注册的会是临时解压副本路径，退出即失效）。

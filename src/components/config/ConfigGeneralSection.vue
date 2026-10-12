@@ -226,6 +226,40 @@ function move(idx: number, dir: -1 | 1) {
   app.setModuleOrder(order);
 }
 
+// ===== 板块启停开关（issue #91 轻量模式）：走主进程唯一写入口，切换即停后台设施 =====
+const toggling = ref("");
+const moduleMsg = ref("");
+
+function toggleHint(mod: { key: string; name: string; enabled: boolean }) {
+  if (mod.key === "proxy") {
+    return mod.enabled
+      ? `停用「${mod.name}」：网关服务与额度/签到定时全部停止，正在使用网关（127.0.0.1）的客户端会断开`
+      : `启用「${mod.name}」：重新加载规则与号池库（网关是否自启仍看「记住网关开关」）`;
+  }
+  if (mod.key === "memory") {
+    return mod.enabled
+      ? `停用「${mod.name}」：索引库释放、监听与自动化任务停止，已注入外部 Agent 的记忆 MCP 将不可用`
+      : `启用「${mod.name}」：重新打开索引库与监听，立即恢复`;
+  }
+  return mod.enabled
+    ? `停用「${mod.name}」：定时同步/自动感知停止${mod.key === "usage" ? "、本地用量库释放" : ""}，左上角置灰不可点`
+    : `启用「${mod.name}」：恢复定时能力，立即生效`;
+}
+
+async function toggleModule(mod: { key: string; enabled: boolean }) {
+  if (toggling.value) return;
+  toggling.value = mod.key;
+  moduleMsg.value = "";
+  try {
+    const r = await app.toggleModule(mod.key, !mod.enabled);
+    if (r && r.ok === false) moduleMsg.value = r.message || "切换失败";
+  } catch (e) {
+    moduleMsg.value = String((e as Error).message || e);
+  } finally {
+    toggling.value = "";
+  }
+}
+
 // ===== 模块顺序拖拽排序：拖过哪行实时换位（左栏顺序同步预览），松手统一落盘 =====
 const dragIndex = ref(-1); // 拖动行当前所在下标（随换位实时更新）
 const dragOriginal = ref("");
@@ -408,7 +442,7 @@ onUnmounted(() => {
       <div class="set-row set-row-head">
         <div class="set-info">
           <div class="set-name">模块顺序</div>
-          <div class="set-desc">左栏模块的显示顺序，按住上下拖动即可换位</div>
+          <div class="set-desc">左栏模块的显示顺序，按住上下拖动即可换位；右侧开关控制板块启停——停用后左上角置灰不可点，后台完全不运行、不统计（轻量模式）</div>
         </div>
       </div>
       <div class="rows">
@@ -428,8 +462,21 @@ onUnmounted(() => {
           <div class="grow"><div class="name">{{ mod.name }}</div></div>
           <button class="btn btn-ghost" :disabled="i === 0" @click="move(i, -1)">上移</button>
           <button class="btn btn-ghost" :disabled="i === app.orderedModules.length - 1" @click="move(i, 1)">下移</button>
+          <el-tooltip
+            :content="toggleHint(mod)"
+            placement="top"
+          >
+            <div
+              class="switch"
+              :class="{ on: mod.enabled, busy: toggling === mod.key }"
+              role="switch"
+              :aria-checked="mod.enabled"
+              @click="toggleModule(mod)"
+            ></div>
+          </el-tooltip>
         </div>
       </div>
+      <div v-if="moduleMsg" class="set-desc" style="margin-top: 8px; color: var(--err)">{{ moduleMsg }}</div>
     </div>
 
     <!-- 应用行为：窗口级设置（原在技能仓库与用量统计的设置里，归位到框架通用设置） -->
@@ -720,6 +767,11 @@ onUnmounted(() => {
   font-size: 11px;
   color: var(--text-3);
   text-align: right;
+}
+/* 板块启停开关：切换进行中半透明防连点 */
+.switch.busy {
+  opacity: 0.5;
+  pointer-events: none;
 }
 </style>
 <style>

@@ -17,6 +17,7 @@ const events = require("./events.cjs");
 const util = require("./util.cjs");
 const ideswitch = require("./ideswitch.cjs");
 const poolsync = require("./poolsync.cjs");
+const poolsched = require("./poolsched.cjs");
 const ccswitch = require("./ccswitch.cjs");
 const oplog = require("./oplog.cjs");
 const xlsx = require("./xlsx.cjs"); // xlsx 写入器在本目录（v1.57.0 误写 ../xlsx.cjs，顶层 require 抛错 → 启动即崩）
@@ -111,6 +112,12 @@ function normalizeAccountJson(raw, fallbackChannel) {
     if (!token && !refreshToken) return null;
   } else if (!token) {
     return null;
+  }
+  // CatPaw：凭据是桌面端会话 Cookie 里的 X-Passport-Token 值，用户常整段粘 Cookie 串——
+  // 归一到该字段的值（认不出就原样当裸 token，与适配器侧的容错同口径）
+  if (channel === "catpaw") {
+    token = require("./catpaw/credentials.cjs").passportTokenOf(token);
+    if (!token) return null;
   }
   const dec = util.jwtDecode(token);
   let uid = String(raw.uid ?? raw.userId ?? raw.user_id ?? dec.uid ?? "").trim();
@@ -434,6 +441,7 @@ function stopCheckinAuto() {
 function shutdown() {
   credits.stopScheduler();
   stopCheckinAuto();
+  poolsched.stop();
   discovery.cancelOAuth();
   server.stop();
   store.close();
@@ -487,6 +495,37 @@ async function drainLibuvWork(budgetMs) {
     await new Promise((r) => setTimeout(r, 10));
   }
   return true;
+}
+
+/**
+ * 板块开关（issue #91）运行时启停 —— **本 fork 形态**：主进程不 require proxy 域，
+ * 该函数只由子进程侧的 proxy_runtime_set 命令调用（上游那版由主进程 proxy.setRuntime() 直调，
+ * 会把 store/rules/credits 的依赖图与库句柄拉回主进程，与二期 Task 5 的单写者契约冲突）。
+ * 与上游的另一处差异：不再有 `if (!booted) return boot()` 那条装配闸——子进程一起来
+ * 就由 gateway.cjs 调 startBackgroundJobs() 装配完（「应用起来 = 子进程在」是本 fork 的
+ * 最小不变式），板块关着时主进程在 whenReady 里补发一条 enabled:false，语义等价于
+ * 上游「启动短路」。
+ * 开：只重启各定时设施，网关是否自启仍由「记住网关开关」决定——启用模块不等于打开网关。
+ * 关：停定时器/网关并关库（各 store 函数入口都惰性 open，随时可重开）。
+ * 不动 rules 监听：会话内反复开关不做全量拆卸/重建，避免 chokidar 重复挂监听。
+ */
+function setRuntime(on) {
+  if (on) {
+    credits.startScheduler(() => settings().creditsRefreshMin);
+    startCheckinAuto();
+    poolsched.start();
+    events.emit({ type: "status" });
+    return Promise.resolve();
+  }
+  credits.stopScheduler();
+  stopCheckinAuto();
+  poolsched.stop();
+  discovery.cancelOAuth();
+  server.stop();
+  try { poolsync.cancel(); } catch { /* 在途号池同步一并收尾，符合「停用后不运行」承诺 */ }
+  try { store.close(); } catch { /* 关闭失败无碍，句柄随进程退出 */ }
+  events.emit({ type: "status" }); // 侧栏网关卡片立即回到已停止态，不等下一次轮询
+  return Promise.resolve();
 }
 
 // ===== IPC =====
@@ -650,6 +689,10 @@ function startBackgroundJobs() {
   } catch { /* 迁移失败不阻断启动，号池页仍可手动修复 */ }
   credits.startScheduler(() => settings().creditsRefreshMin);
   startCheckinAuto();
+  // 号池定时同步（上游 v1.62 issue #89/#92）：hourly/daily 周期触发，全关时空转。
+  // 上游把它装在 boot() 里，本 fork 无主进程 boot，装配点统一在这条子进程后台作业入口
+  // （停机由 shutdown/gracefulShutdown 里的 poolsched.stop() 收，二者必须成对）。
+  poolsched.start();
   // 远程锚定指纹（remoteMid）的云端兜底（上游 v1.36.0）：本机 anchor 缺锚（重装/换机）先从 WebDAV 拉回；
   // 有锚则顺手上传一份（内容 hash 记账，未变不重传）。fire-and-forget，WebDAV 未配置/网络
   // 失败一律静默——锚定的主事实在本机 anchor 文件里，云端只是防丢副本
@@ -689,6 +732,14 @@ function register(ipcMain) {
     events.emit({ type: "status" });
     return ok({});
   }));
+  // 板块开关（上游 issue #91）的内部半段：主进程 registerModuleToggle 经管道调它，
+  // 渲染层不直接调用（因此不进 preload 白名单，登记在闸的 newSubCmds 一族）。
+  // 上游同名能力是主进程直调 proxy.setRuntime()，本 fork 的 proxy 域只活在子进程里。
+  ipcMain.handle("proxy_runtime_set", handle(async ({ enabled }) => {
+    await setRuntime(!!enabled);
+    oplog.log("info", "板块开关", enabled ? "反代网关板块已启用" : "反代网关板块已停用");
+    return ok({});
+  }));
   // 改端口后调用：同进程 stop→listen，秒级完成（方案 §6.6）
   ipcMain.handle("proxy_restart", handle(async () => {
     const st = await server.stopAsync();
@@ -725,6 +776,7 @@ function register(ipcMain) {
   }));
   ipcMain.handle("proxy_key_delete", handle(({ id }) => {
     if (!store.deleteKey(id)) return fail("Key 不存在");
+    try { poolsync.noteKeyRemoved(id); } catch { /* 墓碑记失败只是其他设备暂时删不掉，下轮可重 */ }
     oplog.log("info", "API Key", `删除 Key ${id}`, { target: id });
     return ok({});
   }));
@@ -924,6 +976,39 @@ function register(ipcMain) {
 
   }));
   ipcMain.handle("proxy_oauth_cancel", handle(() => ok({ cancelled: discovery.cancelOAuth() })));
+  // ===== AutoClaw 登录辅助：国内版手机验证码两跳 + 国际版风控配置（验证码由前端跑 SDK）=====
+  ipcMain.handle("proxy_autoclaw_sms_send", handle(async ({ channel, phone }) => {
+    const ch = String(channel || "autoclaw");
+    if (!adapters.get(ch)) return fail(`未知渠道 ${ch}`);
+    const login = require("./autoclaw/login.cjs");
+    const r = await login.sendSmsCode({ cfg: (rules.get("headers.json") || {})[ch] || {}, httpJson: adapters.httpJson, phone });
+    if (r.ok) oplog.log("info", "AutoClaw 发码", `${store.channelDisplay(ch)} 验证码已发送（${r.phoneTail || r.phone}）`, { channel: ch });
+    return r.ok ? ok(r) : fail(r.message);
+  }));
+  ipcMain.handle("proxy_autoclaw_sms_login", handle(async ({ channel, phone, code, deviceId }) => {
+    const ch = String(channel || "autoclaw");
+    if (!adapters.get(ch)) return fail(`未知渠道 ${ch}`);
+    const login = require("./autoclaw/login.cjs");
+    const r = await login.smsLogin({ cfg: (rules.get("headers.json") || {})[ch] || {}, httpJson: adapters.httpJson, phone, code, deviceId });
+    if (!r.ok) return fail(r.message);
+    try {
+      const saved = await discovery.saveAutoclawAccount(ch, r, r.deviceId);
+      credits.refreshAccount(saved.id).catch(() => {});
+      checkinBatch({ accountId: saved.id, action: "checkin" }).catch(() => {});
+      oplog.log("info", "AutoClaw 登录", `${store.channelDisplay(ch)} 短信登录成功`, { channel: ch });
+      events.emit({ type: "oauth-done", channel: ch, ok: true, id: saved.id, uid: saved.uid });
+      return ok({ id: saved.id, uid: saved.uid, updated: saved.updated });
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
+  }));
+  ipcMain.handle("proxy_autoclaw_captcha_config", handle(async ({ channel }) => {
+    const ch = String(channel || "autoclaw_intl");
+    if (!adapters.get(ch)) return fail(`未知渠道 ${ch}`);
+    const login = require("./autoclaw/login.cjs");
+    const r = await login.oauthCaptchaConfig({ cfg: (rules.get("headers.json") || {})[ch] || {}, httpJson: adapters.httpJson });
+    return r.ok ? ok(r) : fail(r.message);
+  }));
   // 浏览器没跳回回环地址时的兜底：把地址栏内容整段粘回来完成登录
   ipcMain.handle("proxy_oauth_submit_callback", handle(async ({ channel, url }) => {
     const r = await discovery.submitCallbackUrl(url, channel);
@@ -1018,16 +1103,25 @@ function register(ipcMain) {
     // （排除对这些 Key 无效，见 server.cjs resolveChannel 的 key.route 短路），不必再打一次 proxy_keys_list。
     // 只取 id/name/route 三个字段——listKeys 会解密出 secret，绝不能顺着模型行流进渲染层。
     const pinning = store.listKeys().filter((k) => k.enabled && k.route && k.route !== "auto");
-    return adapters.mergedModels(cfg).map((m) => ({
-      ...m,
-      enabled: !(cfg.disabledModels || []).includes(m.id),
-      override: (cfg.modelOverrides || {})[m.id] || "",
-      // sources 不减：被点掉的渠道必须还能点回来（要能回来就得一直在列表里）。排除态另发在 excluded。
-      excluded: (cfg.modelChannelExcludes || {})[m.id] || [],
-      pinnedKeys: pinning.filter((k) => m.sources.includes(k.route)).map((k) => ({ id: k.id, name: String(k.name || ""), route: k.route })),
-      fallback: (cfg.modelFallback || {})[m.id] || "",
-      custom: (cfg.modelCustom || {})[m.id] || undefined,
-    }));
+    const channelModelIds = Object.fromEntries(
+      Object.keys(adapters.ADAPTERS).map((channel) => [channel, adapters.channelModelIds(channel)])
+    );
+    return adapters.mergedModels(cfg).map((m, index) => {
+      const item = {
+        ...m,
+        enabled: !(cfg.disabledModels || []).includes(m.id),
+        override: (cfg.modelOverrides || {})[m.id] || "",
+        // sources 不减：被点掉的渠道必须还能点回来（要能回来就得一直在列表里）。排除态另发在 excluded。
+        excluded: (cfg.modelChannelExcludes || {})[m.id] || [],
+        pinnedKeys: pinning.filter((k) => m.sources.includes(k.route)).map((k) => ({ id: k.id, name: String(k.name || ""), route: k.route })),
+        fallback: (cfg.modelFallback || {})[m.id] || "",
+        custom: (cfg.modelCustom || {})[m.id] || undefined,
+      };
+      // 原始渠道目录只随首条响应返回一次（渲染层从 models[0]?.channelModelIds 读）。
+      // 该隐式契约安全性见上游注释：mergedModels 为空 ⟺ 各渠道 models() 均空，此时本字段本就空。
+      if (index === 0) item.channelModelIds = channelModelIds;
+      return item;
+    });
   }));
   // 官方模型目录拉取（三渠道通用）：取号池里第一个 online 有 token 的账号，adapter.fetchModels 走云端接口
   // （Trae get_detail_param / WB v3/config + console models），结果写回 rules/catalog.json 热生效。
@@ -1052,9 +1146,12 @@ function register(ipcMain) {
     if (typeof adapter.fetchModels !== "function") {
       return fail(store.isBuiltinChannel(ch) ? "该渠道模型目录为内置，不支持同步" : `自定义提供商 "${ch}" 不支持模型目录同步`);
     }
-    const acc = pool.poolAccounts(ch).find((a) => a.status === "online" && a.hasToken);
-    if (!acc) return fail(`${store.channelDisplay(ch)}号池无可用账号，无法拉取模型目录`);
-    const secrets = store.accountSecrets(store.getAccount(acc.id));
+    // 目录接口是否需要登录态（上游 issue #90 跟进）：未声明 modelsNeedAuth 的渠道一律按「需要」处理；
+    // Cline 的 recommended-models 实测免鉴权（modelsNeedAuth:false），无账号也能先同步目录
+    const needAuth = adapter.modelsNeedAuth !== false;
+    const acc = needAuth ? pool.poolAccounts(ch).find((a) => a.status === "online" && a.hasToken) : null;
+    if (needAuth && !acc) return fail(`${store.channelDisplay(ch)}号池无可用账号，无法拉取模型目录`);
+    const secrets = acc ? store.accountSecrets(store.getAccount(acc.id)) : null;
     const r = await adapter.fetchModels(acc, secrets);
     if (!r || !r.ok || !Array.isArray(r.models) || !r.models.length) {
       oplog.log("error", "模型目录", `${store.channelDisplay(ch)} 模型目录拉取失败：${(r && r.message) || "返回为空"}`, { channel: ch });

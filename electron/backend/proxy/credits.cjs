@@ -47,7 +47,8 @@ async function refreshAccount(id) {
   if (dec.exp && dec.exp * 1000 < Date.now() + windowSec * 1000 && secrets.refreshToken) {
     const rr = await adapters.refreshTokenLocked(acc.channel, acc, secrets).catch(() => ({ ok: false }));
     if (rr.ok) {
-      store.updateAccount(acc.id, { token: rr.token, refreshToken: rr.refreshToken });
+      // noPersist 渠道（AutoClaw）：新凭证只进适配器进程缓存，不落库（方案 §7）
+      if (!rr.noPersist) store.updateAccount(acc.id, { token: rr.token, refreshToken: rr.refreshToken });
       secrets = { token: rr.token, refreshToken: rr.refreshToken };
     }
   }
@@ -72,7 +73,7 @@ async function refreshAccount(id) {
     // 401 → 先刷新凭证重试一次（single-flight，与 chat 链路共享互斥）
     const rr = await adapters.refreshTokenLocked(acc.channel, acc, secrets).catch(() => ({ ok: false }));
     if (rr.ok) {
-      store.updateAccount(acc.id, { token: rr.token, refreshToken: rr.refreshToken });
+      if (!rr.noPersist) store.updateAccount(acc.id, { token: rr.token, refreshToken: rr.refreshToken });
       secrets = { token: rr.token, refreshToken: rr.refreshToken };
       r = await adapter.queryCredits(acc, secrets).catch((e) => ({ error: String((e && e.message) || e) }));
     }

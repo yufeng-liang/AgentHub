@@ -105,7 +105,12 @@ function resolveChannel(key, model, settings) {
   // 钉渠道排在单归属之前：key.route 是用户显式意图。排在后面的话，某个通用模型名
   // （auto/ultimate 这类）一旦被别家目录收走，钉着 trae 的客户端会被静默改投且无从察觉。
   // 但排到关闭渠道之前也不行（上游启闭）：被关掉就不参与，按 auto 继续往下选。
-  if (key.route !== "auto" && adapters.channelOn(key.route, settings)) return { channel: key.route };
+  if (key.route !== "auto" && adapters.channelOn(key.route, settings)) {
+    // 上游 v1.62 的守卫：虚拟统一名不能透传给未配置映射的渠道（打过去只会拿到上游的
+    // model not found）；非虚拟模型保留「指定渠道透传试错」的既有语义。
+    if (adapters.resolveModelTarget(model, key.route, settings)) return { channel: key.route };
+    if (!adapters.reverseAliasEntry(model, settings)) return { channel: key.route };
+  }
   // 必须传 settings：modelOwners 读的是「本请求生效配置」里的排除集，
   // 少传一个参数就退回磁盘默认值 ⇒ 用户在目录页点掉的渠道根本不参与路由（A11 会红）。
   const owners = adapters.modelOwners(model, settings);
@@ -118,9 +123,15 @@ function resolveChannel(key, model, settings) {
     if (settings.routeStrategy === "fixed" && owners.includes(settings.fixedChannel)) return { channel: settings.fixedChannel };
     return { channel: pickByOrder(routeOrderOf(key, settings), owners, tierGroups()) };
   }
-  // 模型不在任何目录：auto 且固定渠道策略时放行指定渠道（透传试错），否则 400 给可用模型提示
-  if (settings.routeStrategy === "fixed") return { channel: settings.fixedChannel };
-  // 裸名兜底：没有任何内置渠道拥有该模型时，才允许它唯一命中某个提供商（歧义一律不猜）
+  // 模型不在任何目录：auto 且固定渠道策略时放行指定渠道（透传试错），否则 400 给可用模型提示。
+  // 指定渠道已被「上游启闭」关闭时不再透传试错（上游 issue #90）：打向已关闭渠道只会拿到
+  // 上游透传错误，直接给明确的 channel_disabled 业务码
+  if (settings.routeStrategy === "fixed") {
+    if (adapters.channelOn(settings.fixedChannel, settings)) return { channel: settings.fixedChannel };
+    return { channel: null, disabledChannel: settings.fixedChannel };
+  }
+  // 裸名兜底（本分支的提供商通路）：没有任何内置渠道拥有该模型时，才允许它唯一命中某个提供商
+  // （歧义一律不猜）。上游没有这一支，摘掉即「提供商裸名模型」全量 400。
   const sole = settings.allowBareProviderModel === false ? null : provider.findUniqueByBareModel(model);
   if (sole) return { channel: sole };
   return { channel: null, unknownModel: true };
@@ -160,9 +171,11 @@ function costFirstScore(channel) {
 
 /** 渠道此刻是否真的出得了请求：**与 pickAccount 的静态判据同口径**（不写库、每请求实时派生）。
  *  后两条必须一起算——「已知余额为 0」「余额已到期」的号在池视图里仍是 online
- *  （把号标 exhausted 的是 pickAccount 自己），只看 onlineCount 会把它们当可用渠道继续占预算。 */
-function routeUsable(channel) {
-  if (channelCooling(channel) || !adapters.channelOn(channel)) return false;
+ *  （把号标 exhausted 的是 pickAccount 自己），只看 onlineCount 会把它们当可用渠道继续占预算。
+ *  settings 可选：/v1/models 过滤等调用方持有当前请求的 settings 对象，传入避免 channelOn
+ *  回落到默认配置、漏判「上游启闭」刚做出的关闭（issue #90 自测抓到的口径偏差） */
+function routeUsable(channel, settings) {
+  if (channelCooling(channel) || !adapters.channelOn(channel, settings)) return false;
   const now = Date.now();
   return pool.poolAccounts(channel).some((a) =>
     a.status === "online" && a.hasToken &&
@@ -225,7 +238,11 @@ async function attemptChat(channel, acc, model, body, emit, meta) {
     if (e && e.status === 401) {
       const r = await adapters.refreshTokenLocked(channel, acc, secrets).catch(() => ({ ok: false }));
       if (r.ok) {
-        store.updateAccount(acc.id, { token: r.token, refreshToken: r.refreshToken, status: "online", coolUntil: 0, coolReason: "" });
+        // noPersist 渠道（AutoClaw，方案 §7）：刷新结果只进适配器进程缓存，
+        // 不落库——服务端轮换 refresh_token，落库会与桌面端自己的刷新互相顶掉
+        store.updateAccount(acc.id, r.noPersist
+          ? { status: "online", coolUntil: 0, coolReason: "" }
+          : { token: r.token, refreshToken: r.refreshToken, status: "online", coolUntil: 0, coolReason: "" });
         return await send({ token: r.token, refreshToken: r.refreshToken });
       }
       // 触发计数与冷却交给 catch 侧的 applyCool 统一处理（classifyUpstream → relogin），
@@ -450,7 +467,17 @@ function applyCool(accId, model, cls, message) {
   // 参数/模型配置类错误与账号无关，不罚号也不记错；其余落冷却的错误都记入账号最近错误（号池气泡展示）
   // slow（首字节超时）同样不记错：它是"这次请求太大/上游这一刻慢"，记在账号上只会留下误导性的
   // 长期错误气泡（实测一次 54 万 token 请求超时，账号卡片挂了两天的"上游首字节超时"）
-  if (cls.kind !== "model_config" && cls.kind !== "bad_params" && cls.kind !== "prompt_too_long" && cls.kind !== "slow" && message) {
+  // model_denied 默认也不记错：账号本身是好的，错的是「账号×模型」组合或模型名，用户从客户端
+  // 就能看到该模型的拒绝原因，记到卡片只会误导。**但渠道级 model_denied 必须记**——Cline 403
+  // 产品面校验失败（多为伪装头 X-CLIENT-TYPE 配置错）是配置故障，它不冷却账号，就只有靠
+  // noteError 才看得见（与 11128/WAF 同理），否则「整池静默失效」而用户完全无感
+  const silent =
+    cls.kind === "model_config" ||
+    cls.kind === "bad_params" ||
+    cls.kind === "prompt_too_long" ||
+    cls.kind === "slow" ||
+    (cls.kind === "model_denied" && !cls.channelLevel);
+  if (!silent && message) {
     store.noteError(accId, message);
   }
   switch (cls.kind) {
@@ -458,6 +485,9 @@ function applyCool(accId, model, cls, message) {
     case "bad_params": // 11101：参数问题不罚号（换号仍会发生，由外层轮转决定）
     case "prompt_too_long": // 11115：同一 body 换任何号都超限，零动作
     case "slow": // 首字节超时：请求/上游侧的慢，账号本身没问题，零冷却（外层仍会换号重试）
+    case "model_denied": // Cline 403（未订阅该模型/产品面校验）与 404（模型名不对）：
+      // 确定性拒绝，冷却账号会把"换一个模型就能用"的账号无意义地静默跳过——
+      // 零动作、如实透传（classifyError 已置 switchable:false，链在此终止不再换号）
       return;
     case "model_rate":
       pool.coolAccountModel(accId, model, cls.resetMs || Date.now() + 600000, message); // 6004：对齐墙钟优先，缺省 10min
@@ -621,6 +651,20 @@ async function handleChat(req, res, settings, surface) {
 
   if (!primaryRoute.channel && !fallback) {
     const hint = adapters.listableModels(settings).map((m) => m.id).join(", ");
+    // 文案区分「渠道被上游启闭关闭」与「模型真不存在」（issue #90）：
+    // 前者在合并目录里查得到、只是所有归属渠道都被关/空池，给出可操作指引
+    const cat = adapters.mergedModels(settings).find((m) => String(m.id).toLowerCase() === actualModel.toLowerCase());
+    if (primaryRoute.disabledChannel || cat) {
+      const owners = (primaryRoute.disabledChannel ? [primaryRoute.disabledChannel] : (cat.sources || []))
+        .filter((c, i, arr) => arr.indexOf(c) === i);
+      record({ status: 400, error: "channel disabled" });
+      return sendError(
+        res, 400,
+        `模型 "${actualModel}" 由渠道 ${owners.map((c) => `「${store.channelDisplay(c)}」`).join("、")}提供，` +
+        `当前该渠道已被关闭或号池不可用，请在上游启闭中开启、补充号池，或改用其它模型。可用模型：${hint}`,
+        "invalid_request_error", "channel_disabled"
+      );
+    }
     record({ status: 400, error: "unknown model" });
     return sink.endErr(400, `模型 "${actualModel}" 不在任何渠道目录中。可用模型：${hint}`, "invalid_request_error", "model_not_found");
   }
@@ -631,6 +675,9 @@ async function handleChat(req, res, settings, surface) {
   const chatMeta = {
     conversationRequestId: crypto.randomBytes(16).toString("hex"),
     conversationId: util.stableConvId(body.messages) || "",
+    // 客户端原始请求头（只读引用）：部分渠道按头透传会话标识（AutoClaw 的 X-Session-Id 三头族），
+    // 适配器按白名单取用，未列出的头一律不透传
+    clientHeaders: req.headers,
   };
   runtime.active += 1;
   const rt = runtime; // 捕获引用：stop() 会把 runtime 置 null，finally 里直接碰会 TypeError
@@ -716,6 +763,13 @@ async function handleChat(req, res, settings, surface) {
     // 跨渠道故障转移的请求级状态。上游这里另有一个 upstreamTries 预算计数器，与我们已有的
     // attemptsUsed 数的是同一批「真发出去的上游请求」，统一收成 attemptsUsed 一个：
     // 两个计数器各长各的，记账里的 attempts 迟早和实际尝试次数悄悄脱钩。
+    // done/lastErr/fatalErr/usedModel/targetModel 一律声明在本函数外层（见 PoolService 那段），
+    // 链外收尾的 record() 直接读得到。上游是在 try 里另起一份、并额外加一个 usedTargetModel，
+    // 叠在本分支那份外层声明之上就成了同名遮蔽，故只收它真正新增的那一个变量。
+    // 适配器内部改写后的「实际转发名」（Cline 短名补本池前缀）：**仅**用于记账 rev→ 归因。
+    // 不能覆盖 targetModel——后者还喂 pool.noteSuccess，其键须与 applyCool 的 targetModel
+    // 同口径，否则「成功清负缓存」与「失败落冷却」会键不一致、负缓存残留（上游 v1.64）。
+    let usedForwardModel = "";
     const maxTries = 6 * modelChain.length; // 每个模型 6 次上游尝试（跨渠道共享；429 就地重试、
     // 401 刷新重试各计 1）。按模型链长度放大：预算按请求计但逐模型消耗，避免主模型耗尽预算后饿死回退模型
     const triedChannels = []; // 本请求跳过或耗尽的渠道轨迹（最终错误消息用）：{ chan, accounts: string[], note?: string }
@@ -733,6 +787,12 @@ async function handleChat(req, res, settings, surface) {
         continue; // 未知模型 → 尝试回退模型
       }
       usedModel = chainModel;
+      if (chainModel !== actualModel) {
+        // 明示模型回退（issue #90）：非流式用响应头；流式头已冲刷，改发 SSE 注释帧
+        //（冒号开头，客户端按规范忽略，抓包/代理可见），不再完全静默
+        try { res.setHeader("x-agenthub-fallback", `${actualModel} -> ${chainModel}`); } catch { /* 头已发出时忽略 */ }
+        if (wantStream) write(`: fallback ${actualModel} -> ${chainModel}\n\n`);
+      }
       // ===== 渠道候选队列（跨渠道故障转移）：主渠道尊重全部现有路由语义（单源强制 /
       // key.route / per-model 覆盖 / fixed / 生效档排序 / 提供商前缀直达），备选 = 拥有该模型的
       // 其余内置渠道按生效档排序（score=综合分（健康×余额）降序 / cost-first=成本档升序、组内按分）。
@@ -762,19 +822,25 @@ async function handleChat(req, res, settings, surface) {
           continue;
         }
         usageRow.channel = chan;
-        // 反向映射：统一请求模型名 → 该渠道的实际模型名（映射按渠道，换渠道必须重算）
+        // 反向映射：统一请求模型名 → 该渠道的实际模型名（映射按渠道，换渠道必须重算）。
+        // 取值统一走 adapters 的两个助手（与本文件 resolveChannel 的钉渠道支路同源）——
+        // 原先这里手抄了一份 revAliases 大小写兜底查找，与 reverseAliasEntry 已经漂移过一次。
+        // 没有可转发目标时跳过该渠道，绝不能把虚拟统一名原样发给上游（CatPaw 曾因此收到 AgentHub-1.0）。
         targetModel = chainModel;
-        const revAliases = settings.modelReverseAliases || {};
-        let revEntry = revAliases[chainModel];
-        if (!revEntry) {
-          const lowerChain = chainModel.toLowerCase();
-          for (const [k, v] of Object.entries(revAliases)) {
-            if (k.toLowerCase() === lowerChain) { revEntry = v; break; }
+        const revEntry = adapters.reverseAliasEntry(chainModel, settings);
+        const mappedTarget = adapters.resolveModelTarget(chainModel, chan, settings);
+        if (!mappedTarget && revEntry) {
+          // 首错保留：前面渠道的真实上游错误比这里的映射提示更有价值（与其余跳过路径同口径）
+          if (!lastErr) {
+            lastErr = Object.assign(new Error(`渠道 ${chan} 未配置模型 "${chainModel}" 的反向映射`), { status: 400 });
           }
+          triedChannels.push({ chan, accounts: [], note: "未配置反向映射" });
+          continue;
         }
-        if (revEntry && typeof revEntry === "object" && revEntry[chan]) {
-          targetModel = revEntry[chan];
-        }
+        // 非反向映射模型保留原有「指定渠道透传试错」语义（例如 fixed 路由下的未知模型）。
+        // 写链外那份 targetModel（见函数头声明注释）：它同时喂 record() 的 rev→ 归因与
+        // pool.noteSuccess 的键，改成链内 const 就等于把上游 v1.30 那个记账 ReferenceError 请回来。
+        targetModel = mappedTarget || chainModel;
         // 内容审核降级窗口（fork 独有）：该渠道今日已确认误杀过，后续请求直接走中性 system，
         // 不再先撞一次拦截。按 chan 判定——备选渠道没被误杀过，不该跟着吃降级
         if (!promptDegraded && contentDegrading(chan)) {
@@ -844,6 +910,10 @@ async function handleChat(req, res, settings, surface) {
               }
             }
             r = await attemptChat(chan, acc, targetModel, effectiveBody, emitTimed, chatMeta);
+            // 适配器可能改写实际转发的模型名（Cline 短名补池前缀）：记入 usedForwardModel 供链外
+            // record() 以 rev→ 呈现「请求 X 实际发 Y」（否则只有适配器内部知道，属静默改写）。
+            // ⚠ 不能写 usedTargetModel——它同时喂 pool.noteSuccess，键须与冷却同口径
+            if (r && r.model) usedForwardModel = r.model;
             if (r && r.planLimit) {
               // coolAccount 的调用签名别动：dev-sink-golden 按调用面字节等值钉着调度核心；
               // coolReason 文案走 pool.cjs 内部兜底（UI 不渲染它，无需逐渠道化到调用方）
@@ -1014,7 +1084,7 @@ async function handleChat(req, res, settings, surface) {
       if (actualModel !== requestedModel) errParts.push("alias→" + actualModel);
       if (failoverFrom) errParts.push(`failover:${failoverFrom}→${usageRow.channel}`);
       if (usedModel !== actualModel) errParts.push("fallback→" + usedModel);
-      else if (targetModel !== actualModel) errParts.push("rev→" + targetModel);
+      else if ((usedForwardModel || targetModel) !== actualModel) errParts.push("rev→" + (usedForwardModel || targetModel));
       // 上游 200 但一个 token 都没产出：只标注、不改判成功/失败（本机真实流水 id=63 就是这种行，
       // 用户与维护者都容易把它读成「正常回答」）——issue #78 的诊断增强
       if (Number(usage.completion_tokens) === 0) errParts.push("notice:empty-completion");
@@ -1138,6 +1208,12 @@ function buildApp(settings) {
     return handleChat(req, res, settings(), ANTHROPIC_SURFACE).catch((e) => {
       if (!res.headersSent) res.status(500).json({ type: "error", error: { type: "api_error", message: String((e && e.message) || e) } });
     });
+
+  // ⚠ 上游 v1.62 在这里另注册了一条 app.get("/v1/models")（issue #90 的空池过滤）。
+  //   本分支的对外目录面在下方 modelsPayload（同时服务 "/v1/models" 与 "/v1/models/"，
+  //   并按 anthropic-version 头分 Anthropic / OpenAI 两种形状）。同名重注在 Express 里不报错，
+  //   只是后注册的那条永远不会被命中——照抄这段等于同时得到「/v1/messages 被删」和一条死路由。
+  //   #90 的判据本身是对的，已单独搬进 modelsPayload（见那里的 channelHasAnyAccount）。
   });
 
   // 官方文档把 count_tokens 列为可选（缺了客户端退化成字符估算）。这里用网关自己的
@@ -1173,7 +1249,23 @@ function buildApp(settings) {
   const modelsPayload = (req) => {
     // listableModels 而非 mergedModels：上游 v1.42 的「停用模型不对外列出」，本分支的对外面同样适用
     // （口径与请求路径的 400 拦截一致，见 adapters.listableModels）
-    const list = adapters.listableModels(settings() || {});
+    const st = settings() || {};
+    const aliveCache = new Map();
+    // 「有没有号池」判定（上游 issue #90，搬进本分支的 modelsPayload 而不是另开一条路由）：
+    // 只看渠道是否开启 + 池里是否有账号条目，**刻意不判账号此刻能否出请求**
+    // （冷却 / 额度耗尽 / 过期 / 停用都仍算「有号池」）——这类暂时不可用保留展示，
+    // 请求时给 503/402 明确文案，避免客户端模型列表整体闪没。
+    // 注意与 routeUsable() 判据不同（后者服务于路由，要求「此刻真的出得了请求」）；
+    // 两者口径不同是刻意的，切勿互相替换。
+    // 提供商的 slug 同样走得通：channelOn 只查 cfg.channelEnabled，poolAccounts 按 channel 列账号，
+    // 两者对自建提供商都与对内置渠道同义，不会把提供商模型误筛掉。
+    const channelHasAnyAccount = (c) => {
+      if (!aliveCache.has(c)) {
+        aliveCache.set(c, adapters.channelOn(c, st) && pool.poolAccounts(c).length > 0);
+      }
+      return aliveCache.get(c);
+    };
+    const list = adapters.listableModels(st).filter((m) => (m.sources || []).some(channelHasAnyAccount));
     if (req.headers["anthropic-version"]) {
       // Anthropic 形状维持精简（Claude Code 只读 id/display_name），不追加扁平字段
       return {

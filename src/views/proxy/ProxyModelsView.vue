@@ -211,8 +211,7 @@ const reverseAliases = computed<[string, Record<string, string>][]>(() =>
   Object.entries(app.config.proxy.modelReverseAliases || {})
 );
 
-/** 渠道 → 模型列表的预分组：computed 只在 models 变化时重算一次，
- *  模板（反向映射表单的每渠道下拉）取直值，不再每渲染每渠道全量 filter（O(渠道×模型)） */
+/** 渠道 → 模型列表的预分组：供目录 tab 展示融合后的渠道来源。 */
 const modelsByChannel = computed<Record<string, ProxyModel[]>>(() => {
   const map: Record<string, ProxyModel[]> = {};
   for (const c of channels.value) map[c.id] = [];
@@ -223,8 +222,12 @@ const modelsByChannel = computed<Record<string, ProxyModel[]>>(() => {
   }
   return map;
 });
-function channelModels(chId: string) {
-  return modelsByChannel.value[chId] || [];
+/** 反向映射目标必须来自适配器原始目录。融合目录会把统一名也注入 sources，不能作为目标候选。
+ *  类型跟随后端契约：channelModelIds 是 Partial<Record<渠道, 模型名[]>>（上游把它挂在首条响应上），
+ *  缺键就是「该渠道没有原始目录」，取值处一律 || [] 兜底，所以这里不能声明成全量 Record。 */
+const reverseTargetsByChannel = computed<Partial<Record<string, string[]>>>(() => models.value[0]?.channelModelIds || {});
+function channelTargetModels(chId: string) {
+  return reverseTargetsByChannel.value[chId] || [];
 }
 
 async function addReverseAlias() {
@@ -236,6 +239,11 @@ async function addReverseAlias() {
   }
   if (!Object.keys(targetMap).length) {
     err.value = "至少为一个渠道选择目标模型";
+    return;
+  }
+  const selfMappedChannel = Object.entries(targetMap).find(([, target]) => target.toLowerCase() === name.toLowerCase());
+  if (selfMappedChannel) {
+    err.value = `${channelName(selfMappedChannel[0])} 的实际模型不能与统一请求名相同`;
     return;
   }
   const rev = { ...(app.config.proxy.modelReverseAliases || {}) };
@@ -877,7 +885,7 @@ onMounted(refresh);
                 @update:model-value="(v: string) => reverseTargets[c.id] = v"
               >
                 <el-option value="" label="（不映射此渠道）" />
-                <el-option v-for="cm in channelModels(c.id)" :key="cm.id" :value="cm.id" :label="cm.id" />
+                <el-option v-for="modelId in channelTargetModels(c.id)" :key="modelId" :value="modelId" :label="modelId" />
               </el-select>
             </div>
           </div>

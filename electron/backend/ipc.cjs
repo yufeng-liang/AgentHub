@@ -90,7 +90,10 @@ function register(ctx) {
   ipcMain.handle("save_config", handle(({ config: next }) => {
     if (!next || typeof next !== "object" || Array.isArray(next)) return fail("配置格式不正确");
     const merged = unmaskPassword(JSON.parse(JSON.stringify(next)));
-    const r = config.saveConfig(merged);
+    // 设置页整份提交：out-of-band 字段（channelEnabled/checkinAutoRules）以磁盘为准，
+    // 否则渲染层的旧快照会把「上游启闭」「按渠道签到」的写入冲掉（issue #90）；
+    // restoreOnLaunch 不在此列——设置页开关自己就是经这里写盘的，磁盘优先会架空它
+    const r = config.saveConfigFromUI(merged);
     // 落盘成功才更新内存快照，写失败时别把脏数据留给 load_config
     cfg = merged;
     applyNativeTheme(nativeTheme, merged);
@@ -157,6 +160,13 @@ function register(ctx) {
       deviceId: c.webdav.deviceId,
       deviceName: c.webdav.deviceName,
     };
+    // S3 兼容存储（issue #89）：带 __s3 标记与桶参数，webdav.cjs 分派到 S3 传输
+    if (shared.type === "s3") {
+      c.webdav.__s3 = true;
+      c.webdav.bucket = shared.s3.bucket;
+      c.webdav.region = shared.s3.region;
+      c.webdav.pathStyle = shared.s3.pathStyle;
+    }
     if (remotesync.isRunning()) return fail("同步已在进行中");
     if (!remotesync.configured(c)) return fail("WebDAV 未配置完整（服务器地址 / 账号 / 密码）");
     remotesync.run(c).catch(() => {}); // 后台跑，进度走事件广播；异常已在 run 内收口
@@ -179,23 +189,51 @@ function register(ctx) {
   // ===== 统一 WebDAV（设置 · 数据存储）：共享服务器 + 三模块根目录 =====
   ipcMain.handle("webdav_shared_get", handle(() => config.maskedSharedWebdav()));
   ipcMain.handle("webdav_shared_save", handle(({ config: form }) => {
+    const before = config.loadSharedWebdav().endpoint;
     const r = config.saveSharedWebdav(form || {});
+    cfg = null; // 内存快照已过期：后续 remove_tool 等若拿旧快照整份写盘会把刚存的服务器配置冲回去（上游 issue #95）
     // WebDAV 密码同时是号池压缩包的加密口令：改动后令历史包标记 keyChange，下次同步重打包。
     // Task 5 起经管道投给子进程（sync-state.json 归子进程独占，主进程不再直接写）；网关没起时
     // 这次标记先跳过——下次同步的上传跳过条件里带口令指纹（remoteKey 含 keyFingerprint），换了
     // 密码指纹必不匹配，历史包照样重打，漏一次标记不产生数据错（poolsync.cjs :414-417）。
     gatewayClient.call("proxy_poolsync_password_changed", {}).catch(() => {});
+    // 首次配置（之前没配服务器，这次配上）自动跑一次号池同步：API Keys 与模型映射随共享配置包
+    // 落到本机，「换台电脑」配好即得，不用去发现「立即同步号池」（上游 issue #92）。
+    // 已配置时改字段不触发；proxy 板块停用也不触发（停用板块的后台不运行）。
+    // 与上面那条同工序走管道：sync-state.json 与号池库归网关子进程独占，主进程再 require 一个
+    // poolsync.run() 就是第二个写者（同 fork 拒收上游 proxy.boot() 的理由）。网关没起时
+    // call 直接 reject，被 catch 吞掉——首轮定时同步会补上。
+    const after = config.loadSharedWebdav().endpoint;
+    const pm = (config.loadConfig().modules || {}).proxy || {};
+    const proxyOn = !pm || pm.enabled !== false;
+    if (!before && after && proxyOn) {
+      gatewayClient.call("proxy_poolsync_run", {}).catch(() => {});
+    }
+    return r;
+  }));
+  ipcMain.handle("webdav_shared_clear", handle(() => {
+    const r = config.clearSharedWebdav();
+    cfg = null;
     return r;
   }));
   ipcMain.handle("webdav_shared_test", handle(({ config: form }) => {
     const cur = config.loadSharedWebdav();
     const f = form && typeof form === "object" ? form : {};
-    return webdav.test({
+    const fs3 = f.s3 && typeof f.s3 === "object" ? f.s3 : {};
+    const cfg = {
       endpoint: String(f.endpoint ?? cur.endpoint),
       username: String(f.username ?? cur.username),
       password: f.password === config.PASSWORD_MASK || f.password == null ? cur.password : String(f.password),
       root: String(f.root ?? cur.roots.skills),
-    });
+    };
+    // S3 模式（issue #89）：注入 __s3 标记与桶参数，webdav.test 分派到 S3 传输
+    if ((f.type ?? cur.type) === "s3") {
+      cfg.__s3 = true;
+      cfg.bucket = String(fs3.bucket ?? cur.s3.bucket);
+      cfg.region = String(fs3.region ?? cur.s3.region);
+      cfg.pathStyle = fs3.pathStyle ?? cur.s3.pathStyle;
+    }
+    return webdav.test(cfg);
   }));
   ipcMain.handle("webdav_logs", handle(() => remotesync.recentLogs()));
   ipcMain.handle("webdav_devices", handle(async () => {
@@ -257,9 +295,11 @@ function register(ctx) {
   }));
   // 电脑扫描发现：只读探测第三方 agent，命中列表给设置页一键添加
   ipcMain.handle("probe_agents", handle(() => adapter.probeAgents(C())));
-  // 删除自定义工具适配器：不带 confirm 只干跑报影响，带 confirm 才摘挂载删配置
+  // 删除自定义工具适配器：不带 confirm 只干跑报影响，带 confirm 才摘挂载删配置。
+  // 传入的必须是磁盘新鲜读：removeCustomTool 会对传入对象整份 saveConfig，
+  // 若传内存快照 C()，快照里过期的 webdavShared 等字段会把磁盘新值冲掉（issue #95）
   ipcMain.handle("remove_tool", handle(({ id, confirm: doIt }) => {
-    const r = syncer.removeCustomTool(C(), String(id || ""), !!doIt);
+    const r = syncer.removeCustomTool(config.loadConfig(), String(id || ""), !!doIt);
     if (r.ok && doIt) cfg = null; // 配置已删条目，内存快照作废
     return r;
   }));

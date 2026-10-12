@@ -7,8 +7,9 @@ import { computed, onMounted, onUnmounted, ref, watch, nextTick } from "vue";
 import * as api from "../../api/ipc";
 import type { ProxyChannelView, ProxyAccount, ProxyChannelId, ProxyBuiltinChannelId, ProxyChannelKind, ProxyPoolStrategy, ProxyCostTier, ProxyScanCandidate, ProxyCheckinRow, ZcodeDeviceRow } from "../../types";
 import { useAppStore } from "../../stores/app";
-import { fmtInt, fmtK, fmtDate, fmtAgo, fmtCredits, ACCOUNT_STATUS, SOURCE_NAMES, channelName, fmtBalance, balanceUnit, isTokenChannel, isQoderChannel, costTierName, pkgFallbackName, checkinLabels, todayStr } from "./format";
+import { fmtInt, fmtK, fmtDate, fmtAgo, fmtCredits, ACCOUNT_STATUS, SOURCE_NAMES, channelName, fmtBalance, balanceUnit, isTokenChannel, isQoderChannel, isClineChannel, costTierName, pkgFallbackName, checkinLabels, todayStr } from "./format";
 import { coalesceAsync } from "../../utils/timing";
+import { solveCaptcha, cancelCaptcha, CaptchaCancelledError } from "../../utils/aliyunCaptcha";
 
 const app = useAppStore();
 const pool = ref<ProxyChannelView[]>([]);
@@ -82,6 +83,9 @@ const CHANNEL_META: Record<ProxyBuiltinChannelId, { icon: string; hint: string }
   lobster: { icon: "ph-bowl-food", hint: "回环登录 · 每日签到 100 积分" },
   zcode: { icon: "ph-lightning", hint: "GLM 编码套餐 · 领奖励 · 切号保远程" },
   zcode_intl: { icon: "ph-lightning", hint: "GLM 编码套餐 · 国际区（薄别名渠道）" },
+  // CatPaw（美团，上游 v1.60）：没有 OAuth、也没有刷新接口——凭据是桌面端会话 Cookie 值，
+  // 过期只能回客户端重新登录，所以主按钮只有「本机导入 / 粘贴 JSON」两件事可说。
+  catpaw: { icon: "ph-cat", hint: "本机导入 · 粘贴登录态（无网页登录与自动续期）" },
 
   // Qoder 双区：登录走官方授权页的设备码（PKCE），本机导入只是可选路径；
   // 两条渠道各管自己的号池与目录（区服由渠道 id 决定，不在弹窗里切）。
@@ -107,6 +111,9 @@ const CHECKIN_CAPABLE: Record<ProxyBuiltinChannelId, boolean> = {
   cline_pass: false,
   autoclaw: false,
   autoclaw_intl: false,
+  // CatPaw（上游 v1.60）：适配器只给了 balance，没有 checkin/checkinStatus——
+  // 官方就没有每日签到活动，摆按钮等于骗人跑一轮空请求。
+  catpaw: false,
   modelscope: true,
   lobster: true,
   qoder: true,
@@ -179,9 +186,9 @@ function putCheckin(channel: ProxyChannelId, rows: ProxyCheckinRow[]) {
   checkinByChannel.value = { ...checkinByChannel.value, [channel]: rows };
 }
 
-// 添加账号弹窗（四方式：oauth 官方登录 / local 从本机软件导入 / file 从 JSON-ZIP 文件 / paste 粘贴 JSON）
+// 添加账号弹窗（五方式：oauth 官方登录 / sms 手机验证码（仅 AutoClaw 国内版）/ local 从本机软件导入 / file 从 JSON-ZIP 文件 / paste 粘贴 JSON）
 // 渠道类型收在内置：提供商的 Key 在「自定义提供商」页管（openAdd 已提前分流），这里的弹窗只服务生态渠道
-type AddMethod = "oauth" | "local" | "file" | "paste";
+type AddMethod = "oauth" | "sms" | "local" | "file" | "paste";
 const addOpen = ref(false);
 const addChannel = ref<ProxyBuiltinChannelId>("trae");
 const addMethod = ref<AddMethod>("oauth");
@@ -219,23 +226,48 @@ const scanImporting = ref("");
 // 账号重命名（点击名称进入编辑）：renamingId 当前编辑行，renameText 输入内容
 const renamingId = ref("");
 const renameText = ref("");
+// AutoClaw 国内版手机验证码：deviceId 由发码返回、登录必须沿用（服务端按它识别设备）
+const smsPhone = ref("");
+const smsCode = ref("");
+const smsDeviceId = ref("");
+const smsBusy = ref(false);
+const smsMsg = ref("");
+const smsErr = ref(false);
+const smsCountdown = ref(0);
+let smsTimer: ReturnType<typeof setTimeout> | undefined;
 
-// 添加方式可用性：oauth 档按渠道门禁（NO_OAUTH_CHANNELS 这道机制位取上游），其余方式按渠道凭据形态收窄。
-// · AutoClaw 国内版：官方只有客户端手机号+验证码登录，没有可代收的网页授权（主进程 beginOAuth 直接拒），
-//   它是当前唯一挡 OAuth 的渠道；
-// · 小浣熊：上游 v1.18.0 起已支持应用内登录（打开官方授权页 → 粘回 office-raccoon:// 深链换码），
+// 添加方式可用性：三张渠道能力表都是「展示层开关」，判定口径在各自适配器/主进程，
+// 这里只负责不把注定失败的按钮摆出来。
+// · CatPaw（美团，上游 v1.60）：上游没有开放授权页流程，凭据是桌面端会话 Cookie 值
+//   ⇒ 只能「从本机客户端导入登录态」或「粘贴 JSON」，故屏蔽 OAuth 页签；
+// · AutoClaw 国内版：官方主登录是手机号+验证码（上游 v1.60 的两跳 IPC 已接通）
+//   ⇒ 用 sms 页签顶替 OAuth；
+// · 小浣熊：上游 v1.18.0 起支持应用内登录（官方授权页 → 粘回 office-raccoon:// 深链换码），
 //   本分支基点（b476f52）时还没有，合并时按上游事实放行（不再挡）；
 // · Qoder：上游 v1.4x 起是 PKCE 设备码轮询（弹官方登录页 → 本机轮询直接取回 dt-/drt- 凭据对，
-//   无需本机装客户端），照上游放行——CHANNEL_META 里"Qoder 无回环 OAuth"那句注释已经过期；
-// · ModelScope（魔搭）：凭据不是 JSON 快照而是 ms- 访问令牌 ⇒ 隐藏不适用的「文件 / 本机导入」两种方式，
-//   「粘贴」页签改成专用令牌输入（见 METHOD_TABS 与粘贴面板）
-const NO_OAUTH_CHANNELS: ProxyBuiltinChannelId[] = ["autoclaw"];
-function addTabAllowed(key: AddMethod): boolean {
-  // 判据用 addChannel（弹窗自己的渠道，openAdd 里已按 kind 把自定义提供商分流去「自定义提供商」页），
-  // 不用 activeChannel——后者是页面级选中态，弹窗打开期间不保证同步
-  if (key === "oauth" && NO_OAUTH_CHANNELS.includes(addChannel.value)) return false;
-  if (addChannel.value === "modelscope" && (key === "file" || key === "local")) return false;
+//   无需本机装客户端），照上游放行；
+// · ModelScope（魔搭）：凭据不是 JSON 快照而是 ms- 访问令牌 ⇒ 隐藏不适用的「文件 / 本机导入」
+//   两种方式，「粘贴」页签改成专用令牌输入（见 tokenPane 与粘贴面板）。
+const NO_OAUTH_CHANNELS: ProxyChannelId[] = ["catpaw"];
+// 仅手机验证码登录的渠道：AutoClaw 国内版（后端 beginOAuth 也已显式挡住网页授权）
+const SMS_ONLY_CHANNELS: ProxyChannelId[] = ["autoclaw"];
+// 无签到 / 奖励活动的渠道：适配器如实回报「不适用」（checkinStatus → unavailable），
+// 前端不渲染签到与自动签到入口——点了一次「一键签到」只得到一条无意义结果，徒增困惑。
+const NO_CHECKIN_CHANNELS: ProxyChannelId[] = ["catpaw", "cline_free", "cline_pass"];
+function addTabAllowed(key: AddMethod, channel: ProxyChannelId = addChannel.value): boolean {
+  // 默认渠道用 addChannel（弹窗自己的渠道，openAdd 里已按 kind 把自定义提供商分流去
+  // 「自定义提供商」页），不用 activeChannel——后者是页面级选中态，弹窗打开期间不保证同步
+  if (key === "oauth" && NO_OAUTH_CHANNELS.includes(channel)) return false;
+  // 手机验证码页签只给 AutoClaw 国内版；它自身也没有 OAuth 页签可放
+  if (key === "sms") return SMS_ONLY_CHANNELS.includes(channel);
+  if (key === "oauth" && SMS_ONLY_CHANNELS.includes(channel)) return false;
+  if (channel === "modelscope" && (key === "file" || key === "local")) return false;
   return true;
+}
+
+/** 渠道允许的添加方式（分段控件与「打开弹窗时的默认页签」共用这一份口径） */
+function allowedMethods(channel: ProxyChannelId): AddMethod[] {
+  return (["oauth", "sms", "local", "file", "paste"] as AddMethod[]).filter((key) => addTabAllowed(key, channel));
 }
 
 // 渠道允许的添加方式（分段控件按渠道过滤）
@@ -243,6 +275,7 @@ const METHOD_TABS = computed(
   () =>
     [
       { key: "oauth" as const, label: "OAuth 登录", icon: "ph-key" },
+      { key: "sms" as const, label: "手机验证码", icon: "ph-device-mobile" },
       { key: "local" as const, label: "从本机软件导入", icon: "ph-desktop-tower" },
       { key: "file" as const, label: "从 JSON/ZIP 文件", icon: "ph-file-arrow-up" },
       { key: "paste" as const, label: "粘贴 JSON", icon: "ph-clipboard-text" },
@@ -282,19 +315,6 @@ const OAUTH_HELP: Record<string, { title: string; desc: string }> = {
     title: "用 Z.ai 官方授权页登录 ZCode（智谱）",
     desc: "跳转 Z.ai 授权页完成登录后，本机按服务端轮询自动完成入池（无需粘贴回调）。<br />登录后后台自动初始化套餐并解析编码套餐 API Key（约几十秒），期间账号已可用于 Start 套餐对话。<br />若浏览器停在 zcode:// 回调页，可把地址栏整段粘到下方兜底。",
   },
-  // ===== fork 新增渠道（autoclaw 国内版无网页登录，不出 OAuth 档，故本表无它的条目） =====
-  cline_free: {
-    title: "用 Cline 账号设备授权登录（免费池）",
-    desc: "跳转 Cline 授权页并自动携带验证码，确认后本机自动轮询完成登录。<br />也可改用「从本机软件导入」（读取 ~/.cline 登录态）或「粘贴 JSON」。",
-  },
-  cline_pass: {
-    title: "用 Cline 账号设备授权登录（订阅池）",
-    desc: "与免费池同一账号同一登录流程，只是模型池不同。<br />确认授权后本机自动轮询完成登录。",
-  },
-  autoclaw_intl: {
-    title: "用 AutoClaw 国际版 OAuth 登录",
-    desc: "先完成滑块验证，再跳转 Zai / Google 授权页；登录后自动回到本应用。<br />没有国际版账号也可「粘贴 JSON」导入 token。",
-  },
   // Qoder 双区（上游 v1.4x 起 OAuth 走 PKCE 设备码轮询，不再依赖本机客户端）：
   // 两条渠道各说各的区服（区服由渠道 id 定），不再有「在弹窗里切区服」这一步
   qoder: {
@@ -308,6 +328,18 @@ const OAUTH_HELP: Record<string, { title: string; desc: string }> = {
   zcode_intl: {
     title: "用 ZCode 智谱（国际 / Z.AI）订阅登录态登录",
     desc: "跳转 ZCode 授权页（Z.AI 账号）登录，本机轮询自动完成并换取编码套餐 API Key 入池。<br />需已在 z.ai 控制台开通编码套餐；也可「粘贴 JSON」导入 coding key。",
+  },
+  autoclaw_intl: {
+    title: "用 Z.ai / Google 账号登录 AutoClaw 国际版",
+    desc: "点「打开登录页」后<b>先弹出官方风控滑块</b>（阿里云验证，拖一次即可），验证通过自动打开官方登录页（默认 Z.ai），登录完成自动入池。<br />每账号独立执行一次，可反复添加多账号；3 分钟无响应即超时。<br />若浏览器停在回调页没自动跳回，可把地址栏内容整段粘到下方。",
+  },
+  cline_free: {
+    title: "用 Cline 官方设备授权登录（免费额度池）",
+    desc: "点「打开登录页」会跳转 WorkOS 设备授权页（已带用户码，直接确认即可）——<b>无需安装 Cline 客户端</b>，也不占用本地回调端口。<br />确认后本机自动轮询完成入池；每账号独立执行一次，可反复添加多账号；5 分钟无响应即超时。<br />同一份 Cline 登录态可分别在 Free / Pass 两个渠道各导入一次（两个池的账号互不相通）。",
+  },
+  cline_pass: {
+    title: "用 Cline 官方设备授权登录（ClinePass 订阅池）",
+    desc: "点「打开登录页」会跳转 WorkOS 设备授权页（已带用户码，直接确认即可）——<b>无需安装 Cline 客户端</b>。<br />确认后本机自动轮询完成入池；每账号独立执行一次，可反复添加多账号；5 分钟无响应即超时。<br />注意：订阅池只对已开通 ClinePass 的账号开放模型（免费账号请求会得到 403 无权限提示）。",
   },
 };
 
@@ -348,6 +380,13 @@ const pasteHint = computed(() => PASTE_HINT[addChannel.value] || "");
 const pastePlaceholder = computed(() => {
   if (addChannel.value === "zcode") {
     return `zcode 支持三种形态：\n① 轻量：{ "zcodeJwtToken": "…", "codingPlanKey": "apiKey.secret（选填）", "provider": "zai" }\n② 快照：{ "credentials": {…}, "config": {…} }（整份凭据，含切号快照）\n③ zcode-account-switcher 导出文件的 accounts 数组条目`;
+  }
+  if (addChannel.value === "catpaw") {
+    // CatPaw 的凭据是桌面端会话 Cookie 里的 X-Passport-Token 值 + 独立 user-uid（不在 token 里）
+    return `{\n  "name": "主账号（选填）",\n  "accessToken": "X-Passport-Token 值（必填，取自 CatPaw 客户端登录态）",\n  "uid": "user-uid（建议填：它不在 token 里，缺省时按账号名解析）"\n}\n也可整段粘贴 Cookie 串（X-Passport-Token=…; …），会自动取出该字段`;
+  }
+  if (isClineChannel(addChannel.value)) {
+    return `{\n  "name": "主账号（选填）",\n  "accessToken": "workos: 开头的凭据（必填；不带 workos: 前缀会自动补上）",\n  "refreshToken": "选填（建议填：access token 只有 1 小时有效期）",\n  "uid": "选填，缺省从 token 的 external_id 声明解析"\n}\n也可直接从 ~/.cline/data/settings/providers.json 的 providers.cline.settings.auth 整段粘贴`;
   }
   const tokenKey = addChannel.value === "trae" ? "jwt" : "accessToken";
   const extra = addChannel.value === "raccoon" ? `\n  "officeIdentity": "选填，团队版组织标识",` : "";
@@ -1074,7 +1113,7 @@ async function doDelete() {
 // ===== 添加账号 =====
 
 function openAdd(ch: ProxyChannelView) {
-  // 提供商的 Key 归「自定义提供商」页管（一把一填，带去重与连通性探测）。这里不复用四方式弹窗：
+  // 提供商的 Key 归「自定义提供商」页管（一把一填，带去重与连通性探测）。这里不复用弹窗：
   // OAuth / 本机软件导入 / 凭据包 JSON 对中转站都不成立，硬塞进去只会摆三个必然失败的按钮
   if (!isBuiltin(ch)) {
     app.setPage("providers");
@@ -1082,9 +1121,9 @@ function openAdd(ch: ProxyChannelView) {
   }
   // 上面已按 kind 分流，走到这里 ch 必是内置渠道
   addChannel.value = ch.id as ProxyBuiltinChannelId;
-  // 没有应用内 OAuth 的渠道（autoclaw 国内版官方无网页登录）默认落到「从本机软件导入」，
-  // 否则会停在一个已被隐藏的标签页上（raccoon 上游已支持 OAuth，走上面的正常分支）
-  addMethod.value = addTabAllowed("oauth") ? "oauth" : "local";
+  // 默认落该渠道**第一个可用**方式：无 OAuth 的渠道（CatPaw）落「从本机软件导入」，
+  // AutoClaw 国内版落「手机验证码」。写死 "oauth" 会让弹窗停在一个已被隐藏的页签上。
+  addMethod.value = allowedMethods(ch.id)[0] || "oauth";
   pasteJson.value = "";
   pasteMsg.value = "";
   pasteErr.value = false;
@@ -1096,6 +1135,11 @@ function openAdd(ch: ProxyChannelView) {
   oauthUserCode.value = "";
   callbackInput.value = "";
   callbackMsg.value = "";
+  smsPhone.value = "";
+  smsCode.value = "";
+  smsDeviceId.value = "";
+  smsMsg.value = "";
+  smsErr.value = false;
   scanMsg.value = "";
   scanErr.value = false;
   addOpen.value = true;
@@ -1106,6 +1150,8 @@ function openAdd(ch: ProxyChannelView) {
 function closeAdd() {
   addOpen.value = false;
   if (oauthWaiting.value || oauthBusy.value) cancelOauth();
+  // AutoClaw 国际版滑块可能在等用户拖动，这里兜底取消滑块等待，不留面板悬挂
+  cancelCaptcha();
 }
 
 function switchMethod(m: AddMethod) {
@@ -1137,14 +1183,15 @@ async function beginOauth() {
   if (oauthWaiting.value || oauthBusy.value) return;
   const run = ++oauthRun; // 发起序号：取消或重开之后，迟到的结果不再往 UI 上写
   const ch = addChannel.value;
+  // AutoClaw 国际版链路是倒的：先在前端跑完阿里云风控滑块拿到验证串，再换授权地址
+  //（滑块实现收在 src/utils/aliyunCaptcha.ts，本文件不再自己注入 SDK）
+  if (ch === "autoclaw_intl") return beginAutoclawOauth();
   oauthBusy.value = true; // 先只标"发起中"：等结果回来确认拿到 url，才谈得上"已在浏览器打开"
   oauthErr.value = false;
   oauthMsg.value = "";
-  oauthUserCode.value = "";
-
   callbackMsg.value = "";
   try {
-    const r = ch === "autoclaw_intl" ? await beginAutoClawIntlLogin() : await api.proxyOauthBegin(ch, oauthOpts(ch));
+    const r = await api.proxyOauthBegin(ch, oauthOpts(ch));
     if (run !== oauthRun) return;
     if (r.ok === false) {
       oauthErr.value = true;
@@ -1170,7 +1217,16 @@ async function beginOauth() {
   }
 }
 
-// ===== AutoClaw 国际版：阿里云滑块前置（官方浏览器端 SDK 动态注入，主进程只管滑块参数的两跳） =====
+/**
+ * AutoClaw 国际版 OAuth：滑块 → 换授权地址 → 开浏览器等回环回调。
+ * 120 秒的验证码超时只包「拖滑块 + 换地址」——等登录回调发生在 solveCaptcha
+ * 返回之后（长流程塞进 request 回调会被验证码超时误杀，三方状态错乱）。
+ */
+// ===== 阿里云滑块 SDK 注入层（无 npm 包：注脚本 + 取全局函数）=====
+// 这一层留在本文件而不是改用 src/utils/aliyunCaptcha.ts，是因为它还服务 zcode 的逐账号过码
+// （solveZcodeCaptcha 挂的是 zcap-captcha-* 两个节点，且那条链有真机核验过的内嵌滑块兜底形态）。
+// AutoClaw 国际版登录已走上游那份共用模块（同一 SDK、另一组挂载点）——两套并存是本批合并的
+// 中间态，统一成一处是后续单独一批的活，别在这里顺手改 zcode 那条已验证的链路。
 const ACLAW_SDK = "https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js";
 const ACLAW_CAPTCHA_TIMEOUT_MS = 120000; // 滑块弹出后的等待上限：与参考项目同值 120s
 
@@ -1209,66 +1265,96 @@ async function loadAliyunCaptcha(region: string, prefix: string): Promise<void> 
   });
 }
 
-/**
- * 第一跳只回滑块配置、没有 url（后端契约），滑块过了之后带 captchaVerifyParam 二次调用才拿到授权地址。
- * 结果从 SDK 的验证回调里才成立，所以整段包成一个 promise 交给 beginOauth 收尾
- */
-async function beginAutoClawIntlLogin(): Promise<OauthBeginResult> {
-  const first = await api.proxyOauthBegin("autoclaw_intl", oauthOpts("autoclaw_intl"));
-  if (!first.needCaptcha) return first; // 上游把滑块关了：这一跳就是最终结果
-  const cfg = first.captcha;
-  if (!cfg) return { ok: false, message: "上游未返回滑块配置，请重新发起或改用「粘贴 JSON」导入" };
-  await loadAliyunCaptcha(cfg.region, cfg.prefix);
-  const w = window as unknown as AliyunCaptchaWindow;
-  if (typeof w.initAliyunCaptcha !== "function") {
-    return { ok: false, message: "滑块组件未就绪（脚本被网络或策略拦下），请检查网络后重试" };
+async function beginAutoclawOauth() {
+  oauthWaiting.value = true;
+  oauthMsg.value = "正在获取风控配置…";
+  callbackMsg.value = "";
+  try {
+    const cfg = await api.proxyAutoclawCaptchaConfig("autoclaw_intl");
+    if (!cfg.ok || !cfg.enabled) throw new Error("上游未启用网页登录（或风控配置不可用），请改用「从本机软件导入」");
+    if (!cfg.prefix || !cfg.sceneId) throw new Error("风控验证配置不完整，请稍后重试");
+    oauthMsg.value = "请在弹出的滑块中完成验证（官方要求的风控步骤）…";
+    const answer = (await solveCaptcha(
+      { region: cfg.region || "ga", prefix: cfg.prefix, sceneId: cfg.sceneId },
+      async (verifyParam) => {
+        const r = await api.proxyOauthBeginWithCaptcha("autoclaw_intl", verifyParam, aclawVendor.value);
+        if (r.ok === false) throw new Error(r.message || "无法启动登录");
+        return { url: r.url, mode: r.mode };
+      },
+    )) as { url?: string; mode?: string };
+    oauthMode.value = answer.mode || "";
+    oauthMsg.value = "已在浏览器打开官方登录页，完成授权后自动加入号池（3 分钟超时）…";
+  } catch (e) {
+    if (e instanceof CaptchaCancelledError) {
+      oauthWaiting.value = false;
+      oauthMsg.value = "";
+      return;
+    }
+    oauthMsg.value = String((e as Error).message || e);
+    oauthWaiting.value = false;
   }
-  oauthMsg.value = CAPTCHA_WAIT_MSG;
-  return new Promise<OauthBeginResult>((resolve) => {
-    let settled = false;
-    let lastErr = ""; // 滑块可原地重拖，失败先记着，等超时或用户放弃再一次性报出来
-    const finish = (r: OauthBeginResult) => {
-      if (settled) return;
-      settled = true;
-      if (aclawCaptchaTimer) { clearTimeout(aclawCaptchaTimer); aclawCaptchaTimer = undefined; }
-      resolve(r);
-    };
-    // 重复发起前清掉上一次的验证码 DOM：同一容器里 init 两次会叠出两层滑块
-    const mount = document.getElementById("aliyun-captcha-element");
-    if (mount) mount.innerHTML = "";
-    w.initAliyunCaptcha!({
-      SceneId: cfg.sceneId,
-      mode: "popup",
-      element: "#aliyun-captcha-element",
-      button: "#aliyun-captcha-trigger", // popup 模式必须有触发按钮，SDK 只认这个元素的点击，漏了滑块弹不出来
-      slideStyle: { width: 360, height: 40 },
-      language: "cn",
-      captchaVerifyCallback: async (param: string) => {
-        try {
-          const second = await api.proxyOauthBegin("autoclaw_intl", { vendor: aclawVendor.value, captchaVerifyParam: param });
-          if (second.ok) finish(second);
-          else lastErr = second.message || "获取授权地址失败";
-          // 两个 result 都为 true SDK 才收起滑块；失败就留着让用户原地再拖一次
-          return { captchaResult: !!second.ok, bizResult: !!second.ok };
-        } catch (e) {
-          lastErr = String((e as Error).message || e);
-          return { captchaResult: false, bizResult: false };
-        }
-      },
-      onBizResultCallback: () => {}, // SDK 要求的收尾回调：业务结果已由上面的 resolve 路径处理，这里不重复做事
-      getInstance: (inst) => { aclawInstance = inst || null; },
-      onError: (err) => {
-        const code = err && typeof err === "object" ? String((err as { code?: unknown }).code ?? "") : String(err ?? "");
-        finish({ ok: false, message: `滑块组件异常${code ? `（${code}）` : ""}，请重试或改用「粘贴 JSON」导入 token` });
-      },
-    });
-    // 初始化后至少等 2.1s 再点触发按钮，弹层才出得来（参考项目实测的 SDK 时序要求）
-    setTimeout(() => (document.getElementById("aliyun-captcha-trigger") as HTMLButtonElement | null)?.click(), 2100);
-    aclawCaptchaTimer = window.setTimeout(
-      () => finish({ ok: false, message: lastErr || "滑块验证未完成（2 分钟超时或已关闭），请重新发起" }),
-      ACLAW_CAPTCHA_TIMEOUT_MS
-    );
-  });
+}
+
+// ===== AutoClaw 国内版：手机验证码两跳 =====
+
+function startSmsCountdown() {
+  smsCountdown.value = 60;
+  if (smsTimer) clearTimeout(smsTimer);
+  smsTimer = setTimeout(function tick() {
+    smsCountdown.value -= 1;
+    if (smsCountdown.value > 0) smsTimer = setTimeout(tick, 1000);
+  }, 1000);
+}
+
+async function sendSms() {
+  if (smsBusy.value || smsCountdown.value > 0) return;
+  const phone = smsPhone.value.trim();
+  if (!/^1[2-9]\d{9}$/.test(phone.replace(/[\s-]/g, ""))) {
+    smsMsg.value = "请输入 11 位国内手机号";
+    smsErr.value = true;
+    return;
+  }
+  smsBusy.value = true;
+  smsMsg.value = "";
+  smsErr.value = false;
+  try {
+    const r = await api.proxyAutoclawSmsSend("autoclaw", phone);
+    if (!r.ok) throw new Error(r.message || "验证码发送失败");
+    smsDeviceId.value = r.deviceId || "";
+    smsMsg.value = "验证码已发送，请查收短信（约 1 分钟内到达）";
+    startSmsCountdown();
+  } catch (e) {
+    smsMsg.value = String((e as Error).message || e);
+    smsErr.value = true;
+  } finally {
+    smsBusy.value = false;
+  }
+}
+
+async function submitSms() {
+  if (smsBusy.value) return;
+  const code = smsCode.value.trim();
+  if (!/^\d{4,8}$/.test(code)) {
+    smsMsg.value = "请输入短信验证码（数字）";
+    smsErr.value = true;
+    return;
+  }
+  smsBusy.value = true;
+  smsMsg.value = "";
+  smsErr.value = false;
+  try {
+    const r = await api.proxyAutoclawSmsLogin("autoclaw", smsPhone.value.trim(), code, smsDeviceId.value);
+    if (!r.ok) throw new Error(r.message || "登录失败");
+    smsMsg.value = "";
+    toast("AutoClaw 登录成功，账号已加入号池");
+    closeAdd();
+    await refresh();
+  } catch (e) {
+    smsMsg.value = String((e as Error).message || e);
+    smsErr.value = true;
+  } finally {
+    smsBusy.value = false;
+  }
 }
 
 async function cancelOauth() {
@@ -1292,7 +1378,19 @@ function reauthAccount(acc: ProxyAccount) {
   addChannel.value = acc.channel as ProxyBuiltinChannelId;
   addMethod.value = "oauth";
   addOpen.value = true;
-  beginOauth();
+  // 无 OAuth 的渠道（CatPaw）：重登 = 重新导入客户端登录态，绝不能弹授权页
+  // （后端 beginOAuth 已显式挡住该渠道，前端也不该把用户带到那个入口上）
+  if (NO_OAUTH_CHANNELS.includes(acc.channel)) {
+    addMethod.value = allowedMethods(acc.channel)[0] || "paste";
+    scanMsg.value = "CatPaw 凭证过期时：先在 CatPaw 客户端重新登录，再点上方「重新扫描」→「导入」覆盖本机登录态";
+    scanErr.value = false;
+    loadScan();
+    return;
+  }
+  // 默认落该渠道第一个可用方式：AutoClaw 国内版落「手机验证码」（短信登录需用户填手机号，
+  // 不适合自动发起），其余渠道落 OAuth 并直接发起
+  addMethod.value = allowedMethods(acc.channel)[0] || "oauth";
+  if (addMethod.value === "oauth") beginOauth();
 }
 
 /** 兜底：把浏览器地址栏内容整段粘回来完成登录（仅回环模式用得上） */
@@ -1546,7 +1644,10 @@ onMounted(() => {
       oauthMode.value = "";
       oauthUserCode.value = "";
       oauthErr.value = !p.ok;
-      oauthMsg.value = p.ok ? "登录成功，已加入号池（已自动签到）" : `登录失败：${p.message || ""}`;
+      // 无签到活动的渠道（Cline 双池 / CatPaw）登录成功后不该提示「已自动签到」：
+      // 优先用事件回传的 channel（异步回流期间用户可能已切换渠道），缺失时退回当前弹窗渠道
+      const noCheckin = NO_CHECKIN_CHANNELS.includes((p.channel || addChannel.value) as ProxyChannelId);
+      oauthMsg.value = p.ok ? `登录成功，已加入号池${noCheckin ? "" : "（已自动签到）"}` : `登录失败：${p.message || ""}`;
       if (p.ok) {
         addOpen.value = false;
         refresh();
@@ -1563,6 +1664,8 @@ onUnmounted(() => {
   if (aclawCaptchaTimer) clearTimeout(aclawCaptchaTimer); // 滑块等待定时器别留到页面销毁之后
   if (zcapTimer) clearTimeout(zcapTimer);
   zcapCancel = null;
+  if (smsTimer) clearTimeout(smsTimer);
+  cancelCaptcha(); // 弹窗外销毁时滑块等待也不该悬挂
 });
 </script>
 
@@ -2048,10 +2151,46 @@ onUnmounted(() => {
                 </button>
               </div>
               <div v-if="callbackMsg" class="add-msg">{{ callbackMsg }}</div>
+              <!-- Cline 设备授权：用户码（授权页已预填；换设备/手动输码时需要这串） -->
+              <div v-if="oauthWaiting && oauthUserCode" class="add-msg">
+                用户码：<b class="mono">{{ oauthUserCode }}</b>（授权页已预填，直接确认即可）
+              </div>
               <div v-if="oauthMsg" class="add-msg" :class="{ err: oauthErr }">{{ oauthMsg }}</div>
               <!-- 粘贴窗口被遮挡时 SDK 会把弹层转成内嵌滑块，就地渲染在这行下面 -->
               <div id="aliyun-captcha-element" class="captcha-mount"></div>
               <button id="aliyun-captcha-trigger" class="captcha-trigger" type="button" aria-hidden="true" tabindex="-1"></button>
+            </div>
+
+            <!-- 手机验证码登录（AutoClaw 国内版专用）：发码 → 输码 → 两跳直调入池 -->
+            <div v-else-if="addMethod === 'sms'" class="add-pane sms-pane">
+              <div class="paste-label">手机号</div>
+              <div class="cb-row">
+                <input
+                  v-model="smsPhone"
+                  class="input"
+                  style="flex: 1"
+                  placeholder="11 位国内手机号"
+                  maxlength="13"
+                  :disabled="smsBusy"
+                />
+                <button class="btn btn-sm" :disabled="smsBusy || smsCountdown > 0 || !smsPhone.trim()" @click="sendSms">
+                  {{ smsBusy ? "发送中…" : smsCountdown > 0 ? `${smsCountdown}s 后重发` : "发送验证码" }}
+                </button>
+              </div>
+              <div class="paste-label" style="margin-top: 12px">短信验证码</div>
+              <input
+                v-model="smsCode"
+                class="input"
+                placeholder="6 位数字验证码"
+                maxlength="8"
+                :disabled="smsBusy || !smsDeviceId"
+                @keyup.enter="submitSms"
+              />
+              <div class="add-pane-desc" style="margin-top: 10px">
+                验证码登录使用官方短信通道（不改绑、不代收）；同一手机号可反复登录添加多个会话。<br />
+                发送验证码后若 60 秒未收到，请确认手机号后重发。
+              </div>
+              <div v-if="smsMsg" class="add-msg" :class="{ err: smsErr }">{{ smsMsg }}</div>
             </div>
 
             <!-- 从本机软件导入：读本机已登录客户端的凭据，零请求入池 -->
@@ -2082,7 +2221,7 @@ onUnmounted(() => {
                   </el-tooltip>
                 </div>
                 <div v-if="!scanRows.length" class="scan-empty">
-                  未在本机发现可导入的登录态 —— 请先在本机登录对应客户端，或改用「OAuth 登录」
+                  未在本机发现可导入的登录态 —— 请先在本机登录对应客户端，或改用「{{ SMS_ONLY_CHANNELS.includes(activeChannel) ? "手机验证码" : NO_OAUTH_CHANNELS.includes(activeChannel) ? "粘贴 JSON" : "OAuth 登录" }}」
                 </div>
               </div>
               <div v-if="scanMsg" class="add-msg" :class="{ err: scanErr }">{{ scanMsg }}</div>
@@ -2136,7 +2275,7 @@ onUnmounted(() => {
           <footer class="add-foot">
             <span class="add-foot-hint">
               <template v-if="addMethod === 'oauth' && (oauthBusy || oauthWaiting)"><i class="ph ph-circle-notch"></i>{{ oauthFootHint }}</template>
-
+              <template v-else-if="addMethod === 'sms'">验证通过后自动入池，余额与签到随后自动刷新</template>
               <template v-else-if="addMethod === 'local'">导入后仍可刷新余额、切到 IDE 或停用</template>
               <template v-else>入池后可在下方列表里刷新余额、切到 IDE 或停用</template>
             </span>
@@ -2148,6 +2287,12 @@ onUnmounted(() => {
               :disabled="oauthWaiting || oauthBusy"
               @click="beginOauth"
             >{{ oauthCtaLabel }}</button>
+            <button
+              v-else-if="addMethod === 'sms'"
+              class="btn btn-cta"
+              :disabled="smsBusy || !smsDeviceId || !smsCode.trim()"
+              @click="submitSms"
+            >{{ smsBusy ? "登录中…" : "验证并加入号池" }}</button>
             <button
               v-else-if="addMethod === 'file'"
               class="btn btn-cta"

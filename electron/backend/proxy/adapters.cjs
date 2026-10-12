@@ -4852,6 +4852,22 @@ zcode_intl.id = "zcode_intl";
 // 的默认归属不变——新家只是多一个来源，不抢既有裸名路由。
 const ADAPTERS = { trae, workbuddy, workbuddy_ai, raccoon, cline_free, cline_pass, autoclaw, autoclaw_intl, modelscope, lobster, qoder, zcode, zcode_intl, ...(qoderIntl ? { qoder_intl: qoderIntl } : {}) };
 
+// ===== CatPaw（美团，上游 v1.60 新渠道）=====
+// 上游是**有状态会话协议**（round → event(running) → turn(SSE) → 工具循环 → event(completed)），
+// 一个客户端请求会变成多个上游请求 + 协议翻译，故声明 stateful() 走 chatSession 扩展点
+// （契约见本文件顶部注释块；本仓 server.cjs 的扩展点在 v1.4x 那批已收，无需再动转发层）。
+// 协议实现整体收在 catpaw/ 子目录，这里只做挂载。
+// 追加在 zcode_intl **之后**：modelOwners 按 ADAPTERS 键序回传，新渠道排在最后等于
+// 「只认领没人抢的裸名」，既有渠道的默认归属逐字不变。
+const { makeCatPaw } = require("./catpaw/adapter.cjs");
+ADAPTERS.catpaw = makeCatPaw();
+
+// ⚠ 上游本批还把 cline / autoclaw / qoder 三族改成了目录实现（cline/、autoclaw/、qoderAdapter.cjs），
+// 挂载语句与本文件上方的 fork 内联实现**逐渠道同名冲突**（同一 id 两侧各一套，第八批 Qoder 的重演）。
+// 本次合并提交只把上游的三个目录作为新文件带进来、不接线，生产路径仍是 fork 实现；
+// 接线连同「契约必需集升回 cfg/models/chat/queryCredits」放在后续移植提交里单独做，
+// 这样这一步能单独回退。上游那三行 `ADAPTERS.xxx = make...()` 因此在此拒收。
+
 // 启动期契约校验：全员必需方法缺失在 require 阶段即抛错（fail-fast），
 // 人为删掉某个适配器的 chat() 后应用启动即崩在明面上，而不是运行期才 404/TypeError
 for (const [channel, ad] of Object.entries(ADAPTERS)) assertAdapterContract(channel, ad);
@@ -4861,6 +4877,61 @@ for (const [channel, ad] of Object.entries(ADAPTERS)) assertAdapterContract(chan
  *  的归属判定完全留给内置渠道（提供商的模型只以 slug/model 出现），见那里的注释。 */
 function get(channel) {
   return ADAPTERS[channel] || compatAdapter(channel) || null;
+}
+
+/** 渠道适配器声明的原始模型 id。
+ * 管理页配置反向映射时必须使用这份清单，不能从 mergedModels.sources 反推：
+ * mergedModels 会把统一请求名注入映射渠道，反推会让统一名自身混入“实际模型”候选。 */
+function channelModelIds(channel) {
+  const ad = get(channel);
+  if (!ad) return [];
+  const out = [];
+  for (const value of ad.models()) {
+    const id = String(value || "").trim();
+    if (id && !out.some((item) => item.toLowerCase() === id.toLowerCase())) out.push(id);
+  }
+  return out;
+}
+
+function reverseAliasEntry(model, cfg) {
+  const rev = (cfg || proxyConfig()).modelReverseAliases || {};
+  const direct = rev[String(model || "")];
+  if (direct && typeof direct === "object") return direct;
+  const lower = String(model || "").toLowerCase();
+  for (const [key, value] of Object.entries(rev)) {
+    if (key.toLowerCase() === lower && value && typeof value === "object") return value;
+  }
+  return null;
+}
+
+/** 反向映射的渠道目标。自映射（统一名 -> 同名）是历史 UI 污染，不构成可转发目标。 */
+function reverseAliasTarget(model, channel, cfg) {
+  const entry = reverseAliasEntry(model, cfg);
+  if (!entry) return null;
+  const raw = entry[channel];
+  if (typeof raw !== "string" || !raw.trim()) return null;
+  const target = raw.trim();
+  return target.toLowerCase() === String(model || "").trim().toLowerCase() ? null : target;
+}
+
+function nativeModel(channel, model) {
+  const ad = get(channel);
+  const lower = String(model || "").trim().toLowerCase();
+  return !!ad && lower !== "" && ad.models().some((item) => String(item).toLowerCase() === lower);
+}
+
+/** 模型在某渠道上的实际可转发名。
+ * 该渠道显式配了反向映射时，只认映射结果；自映射/空映射不得再回退成“原生模型”，
+ * 否则历史脏目录里恰好混入统一名时，仍可能把统一名发给上游。
+ * 未配该渠道映射时，原生模型名可继续作为合法目标（保留 issue #78 的跨渠道备选）。 */
+function resolveModelTarget(model, channel, cfg) {
+  const normalized = String(model || "").trim();
+  if (!normalized || !get(channel)) return null;
+  const entry = reverseAliasEntry(normalized, cfg);
+  if (entry && Object.prototype.hasOwnProperty.call(entry, channel)) {
+    return reverseAliasTarget(normalized, channel, cfg);
+  }
+  return nativeModel(channel, normalized) ? normalized : null;
 }
 
 // ===== 刷新并发互斥（single-flight） =====
@@ -4908,7 +4979,7 @@ function mergedModels(cfg) {
   for (const [unifiedId, chMap] of Object.entries(rev)) {
     if (!unifiedId || !chMap || typeof chMap !== "object") continue;
     const lowerUnified = unifiedId.toLowerCase();
-    const mappedSources = Object.keys(chMap).filter((ch) => ADAPTERS[ch]);
+    const mappedSources = Object.keys(chMap).filter((ch) => ADAPTERS[ch] && reverseAliasTarget(unifiedId, ch, c));
     if (!mappedSources.length) continue;
     const existing = seen.get(lowerUnified);
     if (existing) {
@@ -4942,8 +5013,9 @@ function mergedModels(cfg) {
           if (rk.toLowerCase() === lowerId) { revMap = rv; break; }
         }
       }
-      if (revMap && revMap[channel]) {
-        lookupId = revMap[channel];
+      if (revMap) {
+        const mapped = reverseAliasTarget(entry.id, channel, c);
+        if (mapped) lookupId = mapped;
       }
       const meta = catMaps[channel].get(lookupId.toLowerCase()) || catMaps[channel].get(entry.id.toLowerCase());
       if (!meta) continue;
@@ -5046,23 +5118,13 @@ function mergedModels(cfg) {
  *  「这个渠道上该用哪个模型名」，不该顺手把跨渠道自救的备选集合收窄成映射里写的那几个（上游 v1.50.2，issue #78）。 */
 function modelOwners(model, cfg) {
   const c = cfg || proxyConfig();
-  const rev = c.modelReverseAliases || {};
   const lower = String(model || "").toLowerCase();
   const mapped = [];
-  const directRev = rev[model];
-  // 别名支路同样要过启闭（上游只给了下面的主循环）：别名命中是 owners 的唯一来源时，
-  // 漏判会让关闭渠道经 resolveChannel 的「单源 → 直达」重新拿到请求，等于启闭形同虚设。
-  const aliasOn = (ch) => ADAPTERS[ch] && channelOn(ch, c);
-  if (directRev && typeof directRev === "object") {
-    mapped.push(...Object.keys(directRev).filter(aliasOn));
-  } else {
-    for (const [k, map] of Object.entries(rev)) {
-      if (k.toLowerCase() === lower && map && typeof map === "object") {
-        mapped.push(...Object.keys(map).filter(aliasOn));
-        break;
-      }
-    }
-  }
+  const entry = reverseAliasEntry(model, c);
+  // 别名支路的三重过滤缺一不可：ADAPTERS 有这家（双表一致）+ channelOn 未被关闭
+  // （上游只给主循环加了启闭过滤，别名命中是 owners 唯一来源时漏判等于启闭形同虚设）
+  // + reverseAliasTarget 非自映射（上游 v1.62 新增：统一名→同名的历史 UI 污染不构成可转发目标）。
+  if (entry) mapped.push(...Object.keys(entry).filter((ch) => ADAPTERS[ch] && channelOn(ch, c) && reverseAliasTarget(model, ch, c)));
   const out = [];
   const seen = new Set();
   for (const ch of mapped) {
@@ -5125,7 +5187,13 @@ module.exports = {
   httpJson,
   refreshTokenLocked,
   setModelMetaSource,
-  // 适配器契约（启动期校验 + 自测复验用）；必需集在本分支只钉 models/chat，理由见上方契约注释块
+  // 上游 v1.62 把「模型 → 该用哪个上游名」拆成三个可复用查询，自测与转发层都按名取
+  channelModelIds,
+  reverseAliasEntry,
+  resolveModelTarget,
+  // 适配器契约（启动期校验 + 自测复验用）。必需集在本分支只钉 models/chat，理由见上方契约注释块：
+  // 本批拒收了上游 makeCline/makeAutoClaw 的接线，fork 那四家仍缺 cfg()/queryCredits()，
+  // 照抄四件套会让网关子进程在 require 期即抛。升必需集与接线必须在同一批做。
   REQUIRED_ADAPTER_METHODS,
   assertAdapterContract,
   consistencyReport,

@@ -12,7 +12,7 @@ AgentHub 是一个**本地运行**的中控台（Electron + Vue 3 + TypeScript�
 | --- | --- | --- |
 | **技能仓库** | 把散落在各工具的 Skill 收进中央库，一处维护、一键分发 | 同时用 Codex / Claude Code / ZCode / Cursor 等多个工具的人 |
 | **用量统计** | 汇总 20 个数据源的 token 用量与费用，按天/项目/模型看趋势 | 想知道「这个月到底烧了多少」的人 |
-| **反代网关** | 把已登录的订阅额度包成 OpenAI 兼容 API，给任何客户端用 | 有订阅额度、想让其他软件也能调用的人 |
+| **反代网关** | 把已登录的订阅额度包成 OpenAI 兼容 API，给任何客户端用 | 有 Trae / WorkBuddy / 商汤小浣熊 / ModelScope（魔搭）/ LobsterAI / ZCode / CatPaw / Qoder / AutoClaw / Cline 任一渠道的订阅额度、想让其他软件也能调用的人 |
 | **记忆中枢** | 本地 Markdown 记忆库 + MCP 服务，让 Agent 记住项目与偏好 | 不想每次开新会话都重新交代背景的人 |
 
 ---
@@ -135,12 +135,24 @@ ZCode、商汤小浣熊、Xiaomi MiMo、Codex、DeepSeek Harness、WorkBuddy、W
 | **WorkBuddy CN** | WorkBuddy 国内版 | 官方登录页 + 本机轮询 | 每日签到 |
 | **WorkBuddy AI** | WorkBuddy 国际版 | 官方登录页 + 本机轮询 | 一次性加油包 |
 | **商汤小浣熊** | 商汤小浣熊 | 应用内授权窗截获（不经过系统浏览器） | 每日签到 |
+| **ModelScope（魔搭）** | 魔搭免费推理额度（魔粒） | OAuth 授权页（应用自动注册）+ 粘贴 ms- 令牌兜底（**无需安装客户端**） | 每日任务（登录 / 绑云 / 点赞领魔粒） |
 | **LobsterAI（有道）** | 网易有道龙虾 | 官方登录页 + 本机回环回调（**无需安装客户端**） | 每日签到 100 积分 |
 | **ZCode（智谱）** | Z.ai GLM 编码套餐 | Z.ai 授权页 + 本机轮询 | 领取奖励 |
+| **CatPaw（美团）** | CatPaw 桌面端会话额度 | 从本机 CatPaw 客户端登录态导入（实时读取，无需重新登录） | 无签到活动 |
 | **Qoder CN** | Qoder 国内版 | 官方登录页设备码轮询（无需本机客户端）/ 从本机软件导入 | 每日领 Credits |
 | **Qoder International** | Qoder 国际版 | 同上 | 每日领 Credits |
+| **AutoClaw 国内版** | 智谱 AutoGLM 加速站 | 手机验证码登录 / 从本机 AutoClaw 客户端导入 | 每日签到领积分 |
+| **AutoClaw 国际版** | AutoGLM 国际站 | OAuth 授权登录（含风控验证）/ 从本机导入 | 每日签到领积分 |
+| **Cline Free** | Cline 免费额度池 | WorkOS 设备授权（浏览器确认，**无需安装客户端**）/ 从本机 Cline 客户端导入 / 粘贴凭据 | 无签到活动 |
+| **Cline Pass** | ClinePass 订阅池 | 同上（同一份 Cline 登录态可在两个渠道各导入一次） | 无签到活动 |
 
 各渠道的号池、签到、策略完全独立，互不影响：在号池页顶部切换渠道，下方整块区域只显示当前渠道的账号。
+
+> **Cline 双渠道（Free / Pass）说明**
+>
+> - Cline 是**标准 OpenAI 兼容上游**（`api.cline.bot`），无签名、无桌面端依赖：设备授权登录在浏览器里点一次确认即可，凭据自动续期（access token 每小时轮换）。
+> - **Free 与 Pass 是两个独立渠道**，不是「一个渠道的两种模式」：两个池的账号、模型清单、启停、映射互不影响。免费池有每日免费额度（余额单位 Credits，欠费时显示负值）；订阅池只对开通了 ClinePass 的账号开放模型。
+> - 模型 id 带池前缀（如 `cline-free/deepseek-v4.1-flash`），那是上游的**计费通道选择器**，网关按原样转发；客户端用不带前缀的短名（`deepseek-v4.1-flash`）请求时会自动补上本渠道的池前缀。请求模型无权限时上游返回 403（未订阅该模型/仅官方产品面可用），网关如实透传不重试、不冷却账号——换一个模型或换一个渠道试试即可。
 
 > **Qoder 渠道的两点特别说明**
 >
@@ -186,6 +198,7 @@ http://127.0.0.1:9527/v1
    - ZCode：跳 Z.ai 授权页，登录后自动入池；随后后台会用几十秒初始化套餐并解析编码套餐 API Key
    - Qoder 两个版本：跳官方登录页（qoder.cn / qoder.com）完成登录，本机每秒轮询直接取回设备凭据对，**无需本机安装客户端、也不用粘贴回调**
    - LobsterAI（有道龙虾）：跳官方登录页（lobsterai.youdao.com）登录，回调本机回环地址自动入池，**无需安装客户端**；浏览器没跳回时把地址栏内容整段粘回兜底（3 分钟超时后也仍认这段回调）
+   - Cline 双渠道：跳 WorkOS 设备授权页（已带用户码，点一次确认即可）完成登录，本机自动轮询入池，**无需安装客户端、不占用本地回调端口**
    - 每次登录对应一个账号，想加几个号就重复几次
 2. **从本机软件导入** —— 直接扫描本机已登录客户端的凭据，零请求入池，最省事（Qoder 走的也是这条：从客户端登录态里读出设备令牌）
 3. **从 JSON / ZIP 文件** —— 批量导入别人给你的账号文件
@@ -345,6 +358,12 @@ Qoder 渠道专项自测（离线，默认不联网、不消耗额度；凭据�
 ELECTRON_RUN_AS_NODE=1 node_modules/electron/dist/electron.exe tools/proxy-qoder-adapter-selftest.cjs      # 适配器纯函数 + SSE 信封解包
 ELECTRON_RUN_AS_NODE=1 node_modules/electron/dist/electron.exe tools/proxy-qoder-integration-selftest.cjs  # 每日领取（stub）+ 记忆中枢适配器
 ELECTRON_RUN_AS_NODE=1 node_modules/electron/dist/electron.exe tools/proxy-qoder-selftest.cjs              # 凭据解密 + wasm 签名器
+```
+
+Cline 双渠道专项自测（离线 + 本地假上游，不联网、不消耗额度）：
+
+```bash
+ELECTRON_RUN_AS_NODE=1 node_modules/electron/dist/electron.exe tools/proxy-cline-selftest.cjs   # 协议断言 + 假上游端到端
 ```
 
 记忆中枢验证入口：

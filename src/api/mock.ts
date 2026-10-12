@@ -17,6 +17,7 @@ const TODAY = (() => {
 function defaultConfig(): AppConfig {
   return {
     theme: "dark",
+    modules: { skills: { enabled: true }, sync: { enabled: true }, proxy: { enabled: true }, memory: { enabled: true } },
     fx: true,
     fxParticles: false,
     fxPools: false,
@@ -59,6 +60,7 @@ function defaultConfig(): AppConfig {
       expiringSoonDays: 7,
       usageRetentionDays: 90,
       debugStatus: false,
+      poolsyncSchedule: { hourly: false, hourlyInterval: 6, daily: false, dailyTime: "04:00" },
       modelOverrides: {},
       modelChannelExcludes: {},
       humanizeJitter: true,
@@ -406,6 +408,55 @@ const PROXY_POOL = [
       { id: "a9", channel: "qoder_intl", uid: "qd_2001", name: "Qoder INTL", status: "online", credits: 0.0066, creditsAt: NOW - 30 * 60000, expiresAt: NOW + 30 * 86400000, coolUntil: 0, coolReason: "", source: "oauth", lastUsed: NOW - 30 * 60000, todayReq: 1, todayTokens: 2100, creditsToday: -1, createdAt: NOW - 86400000, hasToken: true, checkin: { day: TODAY, at: NOW - 6000000, action: "checkin", ok: true, unavailable: true, message: "该账号的服务未开放" } },
     ],
   },
+  {
+    // AutoClaw 双区（国内/国际）：积分口径，国内演示今日签到已领、国际演示昨日领取
+    id: "autoclaw", display: "智谱 AutoClaw（国内）", domain: "autoglm-acceleration-api.zhipuai.cn", costTier: "", poolStrategy: "expire_first",
+    health: null as { until: number; reason: string; streak: number } | null,
+    checkinAuto: { enabled: true, time: "09:00", jitterMin: 0 },
+    summary: { channel: "autoclaw", totalCredits: 3200, accountCount: 1, onlineCount: 1, earliestExpire: 0, expiringSoon: false, todayReq: 12, todayTokens: 31800, lastCreditsAt: NOW - 3 * 60000 },
+    accounts: [
+      { id: "a11", channel: "autoclaw", uid: "ac_10086", name: "手机 138****8000", status: "online", credits: 3200, creditsAt: NOW - 3 * 60000, expiresAt: 0, coolUntil: 0, coolReason: "", creditsToday: -1, source: "oauth", lastUsed: NOW - 1 * 60000, todayReq: 12, todayTokens: 31800, createdAt: NOW - 4 * 86400000, hasToken: true, checkin: { day: TODAY, at: NOW - 3600000, action: "checkin", ok: true, already: true, credit: 20, message: "签到成功，获得 20 积分" } },
+    ],
+  },
+  {
+    id: "autoclaw_intl", display: "智谱 AutoClaw（国际）", domain: "autoglm-api.autoglm.ai", costTier: "", poolStrategy: "expire_first",
+    health: null as { until: number; reason: string; streak: number } | null,
+    checkinAuto: { enabled: false, time: "09:00", jitterMin: 0 },
+    summary: { channel: "autoclaw_intl", totalCredits: 1450, accountCount: 1, onlineCount: 1, earliestExpire: 0, expiringSoon: false, todayReq: 3, todayTokens: 8600, lastCreditsAt: NOW - 26 * 60000 },
+    accounts: [
+      { id: "a12", channel: "autoclaw_intl", uid: "ac_9001", name: "tester@example.com", status: "online", credits: 1450, creditsAt: NOW - 26 * 60000, expiresAt: 0, coolUntil: 0, coolReason: "", creditsToday: -1, source: "oauth", lastUsed: NOW - 5 * 60000, todayReq: 3, todayTokens: 8600, createdAt: NOW - 6 * 86400000, hasToken: true },
+    ],
+  },
+  {
+    // CatPaw（美团）：凭据取自桌面端登录态（meta.desktop），演示里给一条导入来源为 scan 的账号
+    id: "catpaw", display: "CatPaw（美团）", domain: "ai.catpaw.meituan.com", costTier: "", poolStrategy: "expire_first",
+    health: null as { until: number; reason: string; streak: number } | null,
+    checkinAuto: { enabled: false, time: "09:00", jitterMin: 0 },
+    summary: { channel: "catpaw", totalCredits: 8600, accountCount: 1, onlineCount: 1, earliestExpire: 0, expiringSoon: false, todayReq: 24, todayTokens: 62400, lastCreditsAt: NOW - 8 * 60000 },
+    accounts: [
+      { id: "a10", channel: "catpaw", uid: "cp_57130", name: "猫爪主号", status: "online", credits: 8600, creditsAt: NOW - 8 * 60000, expiresAt: 0, coolUntil: 0, coolReason: "", creditsToday: -1, source: "scan", lastUsed: NOW - 2 * 60000, todayReq: 24, todayTokens: 62400, createdAt: NOW - 3 * 86400000, hasToken: true },
+    ],
+  },
+  {
+    // Cline 双池：credit 是浮点计量（微 credit ÷1e6），演示免费池正常余量 / 订阅池订阅到期中；
+    // 无签到活动（checkinAuto 恒关，前端也不渲染入口）
+    id: "cline_free", display: "Cline 免费池", domain: "api.cline.bot", costTier: "free", poolStrategy: "expire_first",
+    health: null as { until: number; reason: string; streak: number } | null,
+    checkinAuto: { enabled: false, time: "09:00", jitterMin: 0 },
+    summary: { channel: "cline_free", totalCredits: 12.5, accountCount: 1, onlineCount: 1, earliestExpire: 0, expiringSoon: false, todayReq: 9, todayTokens: 21400, lastCreditsAt: NOW - 4 * 60000 },
+    accounts: [
+      { id: "a13", channel: "cline_free", uid: "usr-01M2VWEDWF", name: "demo@example.com", status: "online", credits: 12.5, creditsAt: NOW - 4 * 60000, expiresAt: NOW + 3600000, coolUntil: 0, coolReason: "", creditsToday: -1, source: "oauth", lastUsed: NOW - 1 * 60000, todayReq: 9, todayTokens: 21400, createdAt: NOW - 2 * 86400000, hasToken: true },
+    ],
+  },
+  {
+    id: "cline_pass", display: "Cline 订阅池", domain: "api.cline.bot", costTier: "", poolStrategy: "expire_first",
+    health: null as { until: number; reason: string; streak: number } | null,
+    checkinAuto: { enabled: false, time: "09:00", jitterMin: 0 },
+    summary: { channel: "cline_pass", totalCredits: 128.75, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 30 * 86400000, expiringSoon: false, todayReq: 15, todayTokens: 46200, lastCreditsAt: NOW - 6 * 60000 },
+    accounts: [
+      { id: "a14", channel: "cline_pass", uid: "usr-01M2VWEDWF", name: "demo@example.com", status: "online", credits: 128.75, creditsAt: NOW - 6 * 60000, expiresAt: NOW + 30 * 86400000, coolUntil: 0, coolReason: "", creditsToday: -1, source: "oauth", lastUsed: NOW - 3 * 60000, todayReq: 15, todayTokens: 46200, createdAt: NOW - 5 * 86400000, hasToken: true },
+    ],
+  },
 ];
 
 /** 提供商列表的预览态：与 PROXY_POOL 里那条 myrelay 是同一个对象，
@@ -443,6 +494,13 @@ const PROXY_MODELS = [
   { id: "gpt-5", object: "model", created: 0, owned_by: "workbuddy", sources: ["workbuddy", "workbuddy_ai"], name: "GPT-5", rate: 0.5, capabilities: { images: true, video: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 48000, reasoning: { supportedEfforts: ["minimal", "low", "medium", "high", "xhigh", "max"], defaultEffort: "high" }, metaOverridden: ["maxOutputTokens"], enabled: true, override: "", fallback: "" },
   { id: "gemini-2.5-pro", object: "model", created: 0, owned_by: "workbuddy_ai", sources: ["workbuddy_ai"], name: "Gemini 2.5 Pro", rate: 0.05, capabilities: { images: true, video: true, tools: true }, contextLength: 1000000, maxOutputTokens: 64000, reasoning: { supportedEfforts: ["low", "high"], defaultEffort: "high" }, enabled: false, override: "", fallback: "" },
   { id: "raccoon-chat-ml-5-5", object: "model", created: 0, owned_by: "raccoon", sources: ["raccoon"], name: "Raccoon Chat ML 5.5", rate: null, capabilities: { reasoning: true, tools: true }, contextLength: 180000, maxOutputTokens: 80000, enabled: true, override: "", fallback: "" },
+  { id: "glm-5.3-flash", object: "model", created: 0, owned_by: "catpaw", sources: ["catpaw"], name: "GLM-5.3-Flash", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1024000, maxOutputTokens: 0, enabled: true, override: "", fallback: "" },
+  { id: "kimi-k3", object: "model", created: 0, owned_by: "catpaw", sources: ["catpaw"], name: "Kimi-K3", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 0, maxOutputTokens: 0, enabled: true, override: "", fallback: "" },
+  // Cline 双池：模型 id 带池前缀（上游的计费通道选择器，原样转发）
+  { id: "cline-free/deepseek-v4.1-flash", object: "model", created: 0, owned_by: "cline_free", sources: ["cline_free"], name: "DeepSeek V4.1 Flash（免费）", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0, enabled: true, override: "", fallback: "" },
+  { id: "z-ai/glm-5.3-flash", object: "model", created: 0, owned_by: "cline_free", sources: ["cline_free"], name: "GLM-5.3-Flash（免费）", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1310720, maxOutputTokens: 0, enabled: true, override: "", fallback: "" },
+  { id: "cline-pass/deepseek-v4.1-flash", object: "model", created: 0, owned_by: "cline_pass", sources: ["cline_pass"], name: "DeepSeek V4.1 Flash（ClinePass）", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0, enabled: true, override: "", fallback: "" },
+  { id: "cline-pass/glm-5.3", object: "model", created: 0, owned_by: "cline_pass", sources: ["cline_pass"], name: "GLM-5.3（ClinePass）", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0, enabled: true, override: "", fallback: "" },
 ];
 
 const PROXY_RULES = [
@@ -1275,6 +1333,8 @@ export const mock = {
         if (ch === "trae") return { ok: true, url: "https://www.trae.cn/authorization?…（预览）", mode: "loopback" };
         // 与小浣熊 / AutoClaw 国内版的真实门禁一致：官方没有可代收的网页登录，预览也要拒得干脆
         if (ch === "raccoon") return { ok: false, message: "小浣熊暂不支持在应用内直接登录：请在客户端登录后用「从本机软件导入」或粘贴 auth.json" };
+        // CatPaw 没有 OAuth：凭据是桌面端会话 Cookie，预览与主进程 beginOAuth 的拒绝同源
+        if (ch === "catpaw") return { ok: false, message: "CatPaw 不支持 OAuth 登录：请在客户端登录后用「从本机软件导入」或粘贴登录态 JSON" };
         if (ch === "autoclaw") return { ok: false, message: "AutoClaw（国内）官方没有网页登录：请用「从本机软件导入」或粘贴 token" };
         return { ok: true, url: "https://copilot.tencent.com/login?…（预览）", mode: "poll" };
       }
@@ -1430,13 +1490,27 @@ export const mock = {
         return { ok: true, models: ["gpt-4o", "gpt-4o-mini", "o3-pro"] };
       case "webdav_shared_get":
         return {
+          type: "webdav",
           endpoint: "https://dav.jianguoyun.com/dav",
           username: "demo@example.com",
           password: "••••••••",
-          roots: { skills: "/agent-skills", usage: "/dosage-sync", proxy: "/agenthub-proxy" },
+          encryptionPassphrase: "",
+          s3: { bucket: "", region: "", pathStyle: false },
+          roots: { skills: "/agent-skills", usage: "/dosage-sync", proxy: "/agenthub-proxy", memory: "/agenthub-memory" },
         };
       case "webdav_shared_save":
         return { ok: true, message: "已保存" };
+      case "proxy_autoclaw_captcha_config":
+        // 与主进程同源的第一跳形态：只回滑块配置，url 要等带 captchaVerifyParam 的二次 proxy_oauth_begin
+        return { ok: true, enabled: true, region: "cn", prefix: "1f0z2a", sceneId: "sq51tr", supplier: "aliyun" };
+      case "proxy_autoclaw_sms_send":
+        return { ok: true, deviceId: "demo-device-0001" };
+      case "proxy_autoclaw_sms_login":
+        return { ok: true, id: "mock-autoclaw-sms", uid: "usr-demo", updated: false };
+      case "webdav_shared_clear":
+        return { ok: true, message: "已清除统一服务器配置" };
+      case "module_toggle":
+        return { ok: true, message: args?.enabled ? "已启用" : "已停用" };
       case "webdav_shared_test":
         return { ok: true, message: "连接成功 · 218ms", latencyMs: 218 };
       case "proxy_poolsync_status":

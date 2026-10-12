@@ -386,6 +386,8 @@ class MemorySync {
     if (!c || !c.endpoint) return { ok: false, message: "未配置统一 WebDAV 服务器（设置 · 数据存储）" };
     const cfg = this.getConfig();
     if (cfg["sync.enabled"] === false) return { ok: false, message: "记忆中枢同步已关闭" };
+    // 远端同步跨模块互斥（issue #92）：技能/用量/号池同步进行中时跳过本轮（自动同步下轮补跑）
+    if (!webdav.tryBeginSync("memory")) return { ok: false, message: "其他模块的远端同步正在进行，本轮已跳过" };
 
     this.running = true;
     this.cancelFlag = false;
@@ -518,6 +520,7 @@ class MemorySync {
       this._log("error", String(e.message || e));
       return { ok: false, message: String(e.message || e), ...result };
     } finally {
+      webdav.endSync();
       this.running = false;
       webdav.setActiveSignal(null);
       this._abort = null;

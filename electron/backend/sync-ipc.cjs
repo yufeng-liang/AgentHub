@@ -373,8 +373,12 @@ function registerSync(ctx) {
   // 模型别名（归并计费）：用量里的变体模型名按目标模型的价格计费，历史费用随视图即时重算
   ipcMain.handle("add_alias", (_e, args) => {
     try {
-      db.addAlias(args.alias, args.targetModelId);
-      return { ok: true, message: `已将 ${args.alias} 归并到 ${args.targetModelId}，历史费用已重算` };
+      const r = db.addAlias(args.alias, args.targetModelId);
+      // 归并生效但目标无可匹配价格行时明说（模型会滞留未配置列表），别让用户以为「点了没反应」
+      let message = `已将 ${args.alias} 归并到 ${args.targetModelId}，历史费用已重算`;
+      if (r.affected === 0) message = `已将 ${args.alias} 归并到 ${args.targetModelId}（该模型暂无用量记录）`;
+      else if (r.unresolved > 0) message = `归并已生效，但仍有 ${r.unresolved} 条记录无价格可套用：目标模型缺少可匹配的价格行，请拉取价格或手动填价`;
+      return { ok: true, message };
     } catch (e) {
       return { ok: false, message: e.message };
     }

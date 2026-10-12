@@ -627,6 +627,9 @@ async function run(cfg, opts = {}) {
   if (state.restoring) throw new Error("正在恢复备份，请稍后再同步");
   if (state.running) throw new Error("同步正在进行中");
   if (localBusy) throw new Error("本地统计进行中");
+  // 远端同步跨模块互斥（issue #92）：本地/备份模式不碰远端，不占锁
+  const remoteRun = webdavReady(cfg) && !((opts && opts.mode) === "backup");
+  if (remoteRun && !webdav.tryBeginSync("usage")) throw new Error("其他模块的远端同步正在进行，本轮已跳过");
   state = { running: true, cancelled: false, stage: "extract", percent: 0, message: "准备抽取", lastSyncAt: state.lastSyncAt || null, localOnly: false, backupOnly: false, restoring: false };
   settledResult = null; // 开启新一轮结算窗口
   currentAbort = new AbortController();
@@ -689,6 +692,7 @@ async function run(cfg, opts = {}) {
     if (onFinish) onFinish(false, msg);
     return { ok: false, error: msg };
   } finally {
+    if (remoteRun) webdav.endSync();
     webdav.setActiveSignal(null);
     currentAbort = null;
   }
@@ -728,6 +732,8 @@ async function runRemote(cfg) {
   if (state.restoring) throw new Error("正在恢复备份，请稍后再同步");
   if (state.running) throw new Error("同步正在进行中");
   if (localBusy) throw new Error("本地统计进行中，远程同步已跳过");
+  // 远端同步跨模块互斥（issue #92）：其他模块同步中时跳过本轮（定时下轮补跑）
+  if (!webdav.tryBeginSync("usage")) throw new Error("其他模块的远端同步正在进行，本轮已跳过");
   state = { running: true, cancelled: false, stage: "upload", percent: 0, message: "准备上传", lastSyncAt: state.lastSyncAt || null, localOnly: false, backupOnly: false, restoring: false };
   settledResult = null; // 开启新一轮结算窗口
   currentAbort = new AbortController();
@@ -754,6 +760,7 @@ async function runRemote(cfg) {
     if (onFinish) onFinish(false, msg);
     return { ok: false, error: msg };
   } finally {
+    webdav.endSync();
     webdav.setActiveSignal(null);
     currentAbort = null;
   }

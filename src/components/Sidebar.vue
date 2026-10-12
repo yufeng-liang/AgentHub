@@ -31,12 +31,21 @@ const scheduleMemoryRefresh = coalesceAsync(refreshMemoryStats, 800);
 
 // 版本号从主进程取（浏览器预览时 mock 返回 0.1.0）
 const version = ref("v0.1.0");
+// 板块启用态（issue #91）：停用板块的统计 IPC 一律不打（后台已停，打了也没意义）
+function modOn(k: string) {
+  const mods = app.config.modules as Partial<Record<string, { enabled: boolean }>> | undefined;
+  const m = mods?.[k];
+  return !m || m.enabled !== false;
+}
+function refreshStatsForEnabled(only?: string) {
+  const want = (k: string) => (only ? only === k : true);
+  if (want("proxy") && modOn("proxy")) { refreshProxyMeta(); refreshChannels(); }
+  if (want("skills") && modOn("skills")) refreshSkillsStats();
+  if (want("memory") && modOn("memory")) refreshMemoryStats();
+  if (want("usage") && modOn("usage")) ensureUsageSummary();
+}
 onMounted(async () => {
-  refreshChannels();
-  refreshSkillsStats();
-  refreshProxyMeta();
-  refreshMemoryStats();
-  ensureUsageSummary();
+  refreshStatsForEnabled();
   try {
     version.value = "v" + (await api.getAppVersion());
   } catch {
@@ -45,7 +54,12 @@ onMounted(async () => {
   // 网关启停/号池同步都经 app:event 广播：侧栏卡片只订阅不轮询。
   // 原来只在切模块时刷一次，本模块内点「启动服务」后卡片会一直停在「网关未启动」
   offProxyEvent = api.onUpdateEvent((e) => {
-    const p = e as { event?: string; type?: string };
+    const p = e as { event?: string; type?: string; module?: string; enabled?: boolean };
+    // 板块开关切换（issue #91）：启用时补一轮该板块统计，停用时不动（卡片由置灰态呈现）
+    if (p.event === "module-toggled") {
+      if (p.enabled) refreshStatsForEnabled(p.module);
+      return;
+    }
     if (p.event === "proxy" && (p.type === "status" || p.type === "poolsync" || p.type === "credits")) {
       scheduleProxyRefresh();
       return;
@@ -361,9 +375,11 @@ const TOOLS = computed<{ name: string; meta: string; label: string; ok: boolean 
           v-for="mod in app.orderedModules"
           :key="mod.key"
           class="module-card"
-          :class="{ active: app.activeModule === mod.key }"
+          :class="{ active: app.activeModule === mod.key, disabled: !mod.enabled }"
+          :aria-disabled="!mod.enabled"
           @click="app.selectModule(mod.key)"
         >
+          <span v-if="!mod.enabled" class="mc-off">已停用</span>
           <span class="mc-state" :class="MODULE_META[mod.key].level === 'warn' ? 'st-warn' : 'st-ok'">
             <i class="mc-dot"></i>{{ MODULE_META[mod.key].state }}
           </span>
@@ -668,6 +684,26 @@ const TOOLS = computed<{ name: string; meta: string; label: string; ok: boolean 
   cursor: pointer;
   position: relative;
   transition: background 0.2s var(--ease), border-color 0.2s, transform 0.15s;
+}
+/* 已停用板块（issue #91）：低对比置灰、禁用指针交互反馈，右上角「已停用」角标 */
+.module-card.disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  filter: grayscale(0.6);
+}
+.module-card.disabled:hover { background: rgba(255, 255, 255, 0.025); }
+.module-card.disabled:active { transform: none; }
+.module-card.disabled::after { display: none; }
+.mc-off {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  font-size: 10px;
+  line-height: 1;
+  color: var(--text-3);
+  background: var(--surface-3);
+  border-radius: 4px;
+  padding: 2px 5px;
 }
 :root[data-theme="light"] .module-card {
   background: rgba(15, 23, 42, 0.02);

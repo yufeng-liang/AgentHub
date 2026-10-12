@@ -132,6 +132,18 @@ export const isQoderChannel = (id?: string): boolean => id === "qoder" || id ===
 // 上游 v1.55.0 同批还带了它自己那套 fmtBalance / balanceUnit（硬编码三档），与上面 fork 的
 // CHANNEL_UNITS 表驱动版本重名。两份真相源里取表驱动那份：它覆盖 zcode_intl / qoder_intl，
 // 且 isTokenChannel 依赖 balanceUnit() === "Token" 这个单数口径，改成上游的 "Tokens" 会静默断掉换算。
+
+/** Cline 双池共用同一套展示口径（添加账号弹窗按池分支、无签到活动），判断收敛到一处。 */
+export const isClineChannel = (id?: string): boolean => id === "cline_free" || id === "cline_pass";
+
+// ⚠ 上游同批还带了它自己那套 fmtBalance / balanceUnit（硬编码三档），本文件下方 fork 的
+//   表驱动版本同名（并列即 TS2451 重复声明），整段拒收。两条口径差异都是真的：
+//   ① 上游 balanceUnit 给 zcode 回 "Tokens"（复数），而 isTokenChannel 判的是 === "Token"，
+//      照抄会把智谱的 Token 换算静默断掉；
+//   ② 上游 fmtBalance 没有 fmtToken 分支，智谱余额会按中文数量级显示。
+//   上游那份把 Cline 记成 "Credits" 是对的（它有 /users/{id}/balance 真余额接口），
+//   fork 那四家仍缺 queryCredits、余额恒空，所以 CHANNEL_UNITS 暂留「额度」，
+//   等 cline 接线那批连同后端的真余额一起改。
 /** 本地时区的今天（YYYY-MM-DD）：与主进程 store.dayStr 同口径，签到记录的跨天判定用 */
 export function todayStr(): string {
   const d = new Date();
@@ -209,6 +221,7 @@ export const CHANNEL_NAMES: Record<string, string> = {
   zcode_intl: "ZCode 智谱（国际）",
   qoder: "Qoder CN",
   qoder_intl: "Qoder 国际",
+  catpaw: "CatPaw（美团）",
 };
 export const channelName = (id: string) => CHANNEL_NAMES[id] || id || "-";
 

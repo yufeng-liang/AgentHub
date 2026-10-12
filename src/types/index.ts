@@ -224,6 +224,9 @@ export interface AppConfig {
       关闭后恢复系统指针，业务逻辑不受影响 */
   fxCursor: boolean;
   moduleOrder: ModuleKey[];
+  /** 四大板块启用开关（issue #91）：关闭后左上角置灰不可点、后台完全不运行；
+      唯一写入口是 module_toggle IPC，这里的值只作展示同步 */
+  modules: Record<ModuleKey, { enabled: boolean }>;
   tools: Record<string, { enabled: boolean; paths: string[]; name?: string; icon?: string }>;
   customDirs: string[];
   mountMode: "junction" | "copy";
@@ -289,6 +292,9 @@ export interface ProxyConfig {
   expiringSoonDays: number;
   /** 请求流水保留期（天，1~3650）：启动 GC 与统计页「清理」共用 */
   usageRetentionDays: number;
+  /** 号池定时同步（poolsyncSchedule）：hourly 每小时档 / daily 每天固定时刻，全关 = 仅手动；
+   *  API Keys 与模型映射随号池同步走，自动同步让新设备开箱即得 */
+  poolsyncSchedule: { hourly: boolean; hourlyInterval: number; daily: boolean; dailyTime: string };
   debugStatus: boolean;
   /** 模型 → 渠道 id 的 per-model 覆盖（渠道可扩充，故为字符串值） */
   modelOverrides: Record<string, string>;
@@ -356,9 +362,9 @@ export interface ProxyCheckinAutoRule {
 // ===== 反代网关：数据结构（跟 electron/backend/proxy/* 返回一一对应） =====
 
 /** 内置生态渠道：有 OAuth / 本机扫描 / 签到 / 号池同步这些"生态"概念（自建提供商没有）
- *  modelscope/lobster/qoder_intl 由上游 v1.47–v1.50 批次并入（qoder 与 qoder_intl 是两套独立号池，
+ *  modelscope/lobster/qoder_intl 由上游 v1.47–v1.50 批次并入，catpaw 由 v1.60 并入（qoder 与 qoder_intl 是两套独立号池，
  *  分别对应 CN 与国际区，见 proxy/rules.cjs 的渠道配置）。 */
-export type ProxyBuiltinChannelId = "trae" | "workbuddy" | "workbuddy_ai" | "raccoon" | "cline_free" | "cline_pass" | "autoclaw" | "autoclaw_intl" | "modelscope" | "lobster" | "qoder" | "qoder_intl" | "zcode" | "zcode_intl";
+export type ProxyBuiltinChannelId = "trae" | "workbuddy" | "workbuddy_ai" | "raccoon" | "cline_free" | "cline_pass" | "autoclaw" | "autoclaw_intl" | "modelscope" | "lobster" | "qoder" | "qoder_intl" | "zcode" | "zcode_intl" | "catpaw";
 /** 渠道 id = 内置渠道 + 用户自建提供商的 slug。
  *  自建 slug 是运行期数据，编译期无从枚举，所以这里放宽成普通字符串（同 ProxyRoute 的既有做法），
  *  保留字面量联合只为了 IDE 补全。**需要"仅内置"约束的地方请用 ProxyBuiltinChannelId。** */
@@ -681,6 +687,8 @@ export interface ProxyModel {
   created: number;
   owned_by: string;
   sources: ProxyChannelId[];
+  /** 各渠道适配器声明的原始模型 id；反向映射目标必须从这里选，不能从融合后的 sources 反推 */
+  channelModelIds?: Partial<Record<ProxyChannelId, string[]>>;
   /** 目录元数据（catalog.json）：显示名 / 倍率（积分倍率，null=未知）/ 能力 / 上下文长度 */
   name?: string;
   rate?: number | null;

@@ -4,6 +4,21 @@ import { MODULES } from "../types";
 import type { AppConfig, SettingsTab, ModuleDef, ModuleKey, PageDef, Overview, ToolRow } from "../types";
 import * as api from "../api/ipc";
 
+/** 递归合并：以 base 为基线补全 patch 缺失的嵌套字段；数组与原始值一律整体取 patch（有则覆盖）。
+ *  用途：后端返回的配置一旦缺某个嵌套字段（旧版后端 / 字段重命名 / mock 未同步），浅合并会让
+ *  模板访问形如 proxy.poolsyncSchedule 时直接抛错白屏——这里保证任何层级都有 defaultConfig 兜底。 */
+function mergeConfigDeep<T>(base: T, patch: unknown): T {
+  if (Array.isArray(base) || Array.isArray(patch)) return (patch === undefined ? base : (patch as T));
+  if (base && typeof base === "object" && patch && typeof patch === "object") {
+    const out: Record<string, unknown> = { ...(base as Record<string, unknown>) };
+    for (const key of Object.keys(patch as Record<string, unknown>)) {
+      out[key] = mergeConfigDeep((base as Record<string, unknown>)[key], (patch as Record<string, unknown>)[key]);
+    }
+    return out as T;
+  }
+  return patch === undefined ? base : (patch as T);
+}
+
 // 浏览器 mock / 后端加载失败时的兜底默认值；后端权威默认值见 electron/backend/config.cjs
 const defaultConfig: AppConfig = {
   theme: "dark",
@@ -14,6 +29,7 @@ const defaultConfig: AppConfig = {
   fxPools: false,
   fxCursor: true,
   moduleOrder: MODULES.map((m) => m.key),
+  modules: { skills: { enabled: true }, sync: { enabled: true }, proxy: { enabled: true }, memory: { enabled: true } },
   tools: {},
   customDirs: [],
   mountMode: "junction",
@@ -36,6 +52,7 @@ const defaultConfig: AppConfig = {
     creditsRefreshMin: 30,
     expiringSoonDays: 7,
     usageRetentionDays: 90,
+    poolsyncSchedule: { hourly: false, hourlyInterval: 6, daily: false, dailyTime: "04:00" },
     debugStatus: false,
     modelOverrides: {},
     modelChannelExcludes: {},
@@ -109,10 +126,12 @@ export const useAppStore = defineStore("app", {
   getters: {
     isDark: (s) => s.config.theme === "dark",
     moduleOf: () => (key: ModuleKey): ModuleDef => MODULES.find((m) => m.key === key) || MODULES[0],
-    /** 左栏模块列表：用户自定义顺序优先，缺失模块按内置默认补尾 */
-    orderedModules(s): ModuleDef[] {
+    /** 左栏模块列表：用户自定义顺序优先，缺失模块按内置默认补尾；
+     *  附 enabled 标志（issue #91）：关闭的板块左上角置灰不可点 */
+    orderedModules(s): (ModuleDef & { enabled: boolean })[] {
       const byKey = new Map(MODULES.map((m) => [m.key, m]));
-      return s.config.moduleOrder.map((k) => byKey.get(k)).filter((m): m is ModuleDef => !!m);
+      return s.config.moduleOrder.map((k) => byKey.get(k)).filter((m): m is ModuleDef => !!m)
+        .map((m) => ({ ...m, enabled: !s.config.modules?.[m.key] || s.config.modules[m.key].enabled !== false }));
     },
     /** 当前模块的子页面：memory 模块按 ui.tabs 白名单过滤（空=默认 5 个核心页；dashboard/browse 保底），其余模块全量返回 */
     pagesOf(s): PageDef[] {
@@ -135,14 +154,27 @@ export const useAppStore = defineStore("app", {
     },
   },
   actions: {
+    /** 板块开关切换（issue #91）：走主进程唯一写入口，成功后同步内存态供 UI 即时置灰。
+     *  必须是 action 不能是 getter——Pinia getter 会被立即求值，函数值会被提前调用炸掉 */
+    async toggleModule(key: string, enabled: boolean) {
+      const r = await api.moduleToggle(key, enabled);
+      if (r && r.ok) {
+        const mods = this.config.modules as Record<string, { enabled: boolean }> | undefined;
+        if (mods && mods[key]) mods[key].enabled = enabled;
+      }
+      return r;
+    },
     async load() {
       try {
-        Object.assign(this.config, await api.loadConfig());
+        // 深合并而非 Object.assign（浅合并会把 proxy 等嵌套对象整体替换，后端一旦缺字段即白屏）
+        const remote = await api.loadConfig();
+        Object.assign(this.config, mergeConfigDeep(structuredClone(defaultConfig), remote));
       } catch {
         this.config = JSON.parse(JSON.stringify(defaultConfig));
       }
-      // 启动默认板块：左栏模块自定义排序的第一个（而非固定技能仓库），页面取其第一个子页
-      const first = this.orderedModules[0];
+      // 启动默认板块：左栏模块自定义排序的第一个【已启用】板块（关闭的板块置灰不可选），
+      // 页面取其第一个子页；全部未启用时回落第一个（后端 module_toggle 有「至少留一个」守卫）
+      const first = this.orderedModules.find((m) => m.enabled) || this.orderedModules[0];
       if (first) {
         this.activeModule = first.key;
         this.activePage = first.pages[0].id;
@@ -263,6 +295,8 @@ export const useAppStore = defineStore("app", {
     selectModule(key: ModuleKey) {
       this.settingsOpen = false;
       this.pageBeforeConfig = "";
+      // 已停用的板块置灰不可点（issue #91）：入口拦在切换处，避免渲染层绕过
+      if (this.config.modules?.[key] && this.config.modules[key].enabled === false) return;
       if (this.activeModule === key) return;
       this.activeModule = key;
       this.activePage = this.moduleOf(key).pages[0].id;

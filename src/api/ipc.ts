@@ -130,10 +130,15 @@ export const webdavDevices = () => call<{ devices: RemoteDevice[]; error?: strin
 
 // ===== 统一 WebDAV（设置 · 数据存储）：一套服务器凭据 + 四模块根目录 =====
 export interface SharedWebdavConfig {
+  /** 存储类型：webdav（默认）| s3（S3 兼容对象存储：OSS/COS/R2/MinIO 等） */
+  type: "webdav" | "s3";
   endpoint: string;
   username: string;
-  /** 渲染层只拿掩码；保存时传精确掩码 = 未修改（同时是号池压缩包加密口令） */
+  /** 渲染层只拿掩码；保存时传精确掩码 = 未修改。S3 模式下即 SecretKey（同时是号池默认加密口令） */
   password: string;
+  /** 号池压缩包加密口令（掩码态；空 = 沿用 password） */
+  encryptionPassphrase: string;
+  s3: { bucket: string; region: string; pathStyle: boolean };
   roots: { skills: string; usage: string; proxy: string; memory: string };
 }
 export const webdavSharedGet = () => call<SharedWebdavConfig>("webdav_shared_get");
@@ -141,6 +146,11 @@ export const webdavSharedSave = (cfg: SharedWebdavConfig) =>
   call<{ ok: boolean; message: string }>("webdav_shared_save", { config: JSON.parse(JSON.stringify(cfg)) });
 export const webdavSharedTest = (cfg: Partial<SharedWebdavConfig>) =>
   call<{ ok: boolean; message: string; latencyMs?: number }>("webdav_shared_test", { config: JSON.parse(JSON.stringify(cfg)) });
+export const webdavSharedClear = () => call<{ ok: boolean; message: string }>("webdav_shared_clear");
+
+// ===== 四大板块启用开关（issue #91）：主进程唯一写入口（落盘 + 运行时启停 + 托盘/事件刷新） =====
+export const moduleToggle = (module: string, enabled: boolean) =>
+  call<{ ok: boolean; message: string }>("module_toggle", { module, enabled });
 
 // ===== 反代网关：号池 WebDAV 同步（统一服务器 + proxy 根目录；channel 可选 = 只同步某渠道） =====
 export interface ProxyPoolSyncStatus {
@@ -302,6 +312,18 @@ export const proxyOauthBegin = (channel: ProxyBuiltinChannelId, opts?: { edition
     captcha?: { region: string; prefix: string; sceneId: string; supplier: string };
     message?: string;
   }>("proxy_oauth_begin", { channel, ...(opts || {}) } as unknown as Record<string, unknown>);
+/** AutoClaw 国际版 OAuth：带上前端跑完阿里云滑块的验证串换授权地址（主进程占白名单端口回环等回调） */
+export const proxyOauthBeginWithCaptcha = (channel: ProxyChannelId, captchaVerifyParam: string, vendor: "zai" | "google" = "zai") =>
+  call<{ ok: boolean; url?: string; mode?: string; port?: number; message?: string }>("proxy_oauth_begin", { channel, captchaVerifyParam, vendor }, 0);
+/** AutoClaw 国际版：风控配置（enabled/prefix/sceneId，前端初始化阿里云滑块用） */
+export const proxyAutoclawCaptchaConfig = (channel: ProxyChannelId) =>
+  call<{ ok: boolean; enabled?: boolean; region?: string; prefix?: string; sceneId?: string; supplier?: string; message?: string }>("proxy_autoclaw_captcha_config", { channel }, 0);
+/** AutoClaw 国内版：发送短信验证码（返回 deviceId，登录时必须沿用） */
+export const proxyAutoclawSmsSend = (channel: ProxyChannelId, phone: string) =>
+  call<{ ok: boolean; deviceId?: string; message?: string }>("proxy_autoclaw_sms_send", { channel, phone }, 0);
+/** AutoClaw 国内版：验证码登录（deviceId 沿用发码返回值；code 传 6 位数字字符串，主进程转 JSON number） */
+export const proxyAutoclawSmsLogin = (channel: ProxyChannelId, phone: string, code: string, deviceId: string) =>
+  call<{ ok: boolean; id?: string; uid?: string; updated?: boolean; message?: string }>("proxy_autoclaw_sms_login", { channel, phone, code, deviceId }, 0);
 export const proxyOauthCancel = () => call<{ ok: boolean; cancelled?: boolean }>("proxy_oauth_cancel");
 /** 兜底：浏览器没跳回回环地址时，把地址栏内容整段粘回来完成登录（串行换 token，可能多次上游请求） */
 export const proxyOauthSubmitCallback = (channel: ProxyBuiltinChannelId, url: string) =>

@@ -128,6 +128,30 @@ function exportNames(file) {
     }
     re.lastIndex = j;
   }
+
+  // 另一种导出形状：`module.exports = SomeClass;` —— 整份导出一个类，可调用成员是它的 static。
+  // 上游 v1.60 的 catpaw/errors.cjs 就是这个形状（调用方写 `const CatPawError = require("./errors.cjs")`
+  // 后用 CatPawError.badRequest()，两处本身是自洽的）。不认这种写法会把一族合法的静态方法
+  // 全报成「未导出」。这跟第十二批 redact 那型要分清：那型是导出侧真的少了成员（产品坏了），
+  // 这型是量具看不见 static（装置有盲区）——所以补认这一形状，而不是放宽整条断言。
+  for (const cm of src.matchAll(/module\.exports\s*=\s*([A-Za-z_$][\w$]*)\s*(?:;|$)/gm)) {
+    const decl = new RegExp(`class\\s+${cm[1]}\\b`).exec(src);
+    if (!decl) continue; // 导出的是普通函数/对象别名：成员仍须显式挂上去，保持原判据严格
+    const open = src.indexOf("{", decl.index);
+    if (open < 0) continue;
+    let depth2 = 0;
+    let close = open;
+    for (; close < src.length; close++) {
+      if (src[close] === "{") depth2++;
+      else if (src[close] === "}") {
+        depth2--;
+        if (depth2 === 0) break;
+      }
+    }
+    for (const sm of src.slice(open + 1, close).matchAll(/^[^\S\n]*static\s+(?:async\s+)?([A-Za-z_$][\w$]*)\s*\(/gm)) {
+      names.add(sm[1]);
+    }
+  }
   return names;
 }
 

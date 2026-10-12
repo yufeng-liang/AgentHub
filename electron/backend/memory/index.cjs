@@ -36,6 +36,7 @@ const profileCache = require("./profile-cache.cjs");
 let service = null;
 let memCfg = null;
 let httpApi = null;
+let booting = false; // boot 重入闸（异步启动期间防连点）
 let access = null;
 let watcher = null;
 let watchTimer = null;
@@ -140,7 +141,9 @@ function flatSettings() {
 
 function init() {
   const framework = configMod.loadConfig();
-  if (framework.memory && framework.memory.enabled === false) {
+  // 启用开关唯一事实源 modules.memory.enabled（issue #91）；旧版 memory.enabled=false
+  // 已由 loadConfig 迁移进 modules，这里不再读旧字段
+  if (framework.modules && framework.modules.memory && framework.modules.memory.enabled === false) {
     return { enabled: false };
   }
   if (memCfg && service) return { enabled: true, root: rootDir };
@@ -246,32 +249,40 @@ function deviceId() {
 }
 
 async function boot() {
-  const r = init();
-  if (!r.enabled) return r;
+  // 重入闸（审查整改）：init 只保证服务对象存在，这里会无条件新建 HTTP API——
+  // 已在运行时再 boot 会旧实例被覆盖、新实例 EADDRINUSE，桥状态显示错乱
+  if (httpApi || booting) return { enabled: true, root: rootDir, booted: true };
+  booting = true;
   try {
-    httpApi = new MemoryHttpApi(service, runtimeFile(), { onEvent: (p) => emit(p) });
-    const started = await httpApi.start();
-    emit({ type: "bridge", running: true, port: started.port });
-  } catch (e) {
-    emit({ type: "bridge", running: false, message: String(e.message || e) });
-  }
-  startWatch();
-  if (scheduler) scheduler.start();
-  // 存量项目元数据自愈：老版本用显式项目名写入时不探测 Git，项目卡因此缺远程/本地路径。
-  // 延后到启动流程之外异步跑，且逐项目最多读少量文件——不能阻塞启动（曾因同步扫描主进程冻结数十秒）。
-  setTimeout(() => {
+    const r = init();
+    if (!r.enabled) return r;
     try {
-      const r = service && service.reconcileProjectMetadata();
-      if (r && r.healed) emit({ type: "projects", healed: r.healed });
+      httpApi = new MemoryHttpApi(service, runtimeFile(), { onEvent: (p) => emit(p) });
+      const started = await httpApi.start();
+      emit({ type: "bridge", running: true, port: started.port });
     } catch (e) {
-      emit({ type: "projects", healed: 0, message: String((e && e.message) || e) });
+      emit({ type: "bridge", running: false, message: String(e.message || e) });
     }
-  }, 6000);
-  if (flatSettings()["agents.autoVerify"] !== false) {
-    // 异步巡检，不阻塞启动
-    setTimeout(() => reconcileAgents().catch(() => {}), 4000);
+    startWatch();
+    if (scheduler) scheduler.start();
+    // 存量项目元数据自愈：老版本用显式项目名写入时不探测 Git，项目卡因此缺远程/本地路径。
+    // 延后到启动流程之外异步跑，且逐项目最多读少量文件——不能阻塞启动（曾因同步扫描主进程冻结数十秒）。
+    setTimeout(() => {
+      try {
+        const r = service && service.reconcileProjectMetadata();
+        if (r && r.healed) emit({ type: "projects", healed: r.healed });
+      } catch (e) {
+        emit({ type: "projects", healed: 0, message: String((e && e.message) || e) });
+      }
+    }, 6000);
+    if (flatSettings()["agents.autoVerify"] !== false) {
+      // 异步巡检，不阻塞启动
+      setTimeout(() => reconcileAgents().catch(() => {}), 4000);
+    }
+    return r;
+  } finally {
+    booting = false;
   }
-  return r;
 }
 
 async function shutdown() {
@@ -779,11 +790,15 @@ function register(ipcMain) {
   ipcMain.handle("memory_status", handle(() => status()));
   ipcMain.handle("memory_toggle", handle(async ({ enabled }) => {
     const framework = configMod.loadConfig();
-    framework.memory = { ...(framework.memory || {}), enabled: enabled !== false };
+    // modules.memory.enabled 是唯一事实源（issue #91）；memory.enabled 旧字段同步写，
+    // 兼容回滚到旧版本时不丢开关状态
+    const on = enabled !== false;
+    framework.memory = { ...(framework.memory || {}), enabled: on };
+    framework.modules = { ...(framework.modules || {}), memory: { ...((framework.modules || {}).memory || {}), enabled: on } };
     configMod.saveConfig(framework);
-    if (framework.memory.enabled) await boot();
+    if (on) await boot();
     else await shutdown();
-    return ok({ enabled: framework.memory.enabled });
+    return ok({ enabled: on });
   }));
 
   // ===== 模型与网关（供应商 / 模型池 / 路由 / 三级测试） =====

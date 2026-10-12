@@ -9,7 +9,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const config = require("../config.cjs");
-const redact = require("./redact.cjs");
+const { redact } = require("./redact.cjs");
 
 let Database = null;
 let driver = "none";
@@ -167,16 +167,24 @@ CREATE INDEX IF NOT EXISTS idx_oplog_ts ON op_logs(ts);
  *  ⚠ 尚未用真国际版账号端到端验过——闸全是假上游，取值出处见那个模块的头注释。 */
 const QODER_INTL_ENABLED = true;
 
+// AutoClaw 双区开关（上游 v1.60 起有消费方，见 store 导出）：两地同协议同签名
+// （appId/appKey 逐字相同），仅域名与登录方式不同（国内手机验证码 / 国际 OAuth）。
+// fork 侧此前把 autoclaw_intl 无条件写进表里，这里改成跟随上游开关、取值保持为 true，
+// 因此渠道集合与合并前逐字等价，只是多了一条上游要求的开关。
+const AUTOCLAW_INTL_ENABLED = true;
+
 const BUILTIN_CHANNELS = [
   { id: "trae", display: "Trae SOLO CN", domain: "api.trae.cn", unit: "积分" },
   { id: "workbuddy", display: "WorkBuddy CN", domain: "copilot.tencent.com", unit: "积分" },
   { id: "workbuddy_ai", display: "WorkBuddy AI", domain: "www.workbuddy.ai", unit: "积分" },
   { id: "raccoon", display: "商汤小浣熊", domain: "xiaohuanxiong.com", unit: "积分" },
-  // 订阅/加速池：官方无余额接口、消耗也从不实报，unit 只落在 402 耗尽文案上，用中性「额度」
-  { id: "cline_free", display: "Cline 免费池", domain: "api.cline.bot", unit: "额度" },
+  // 订阅/加速池：消耗从不实报，unit 只落在 402 耗尽文案上，用中性「额度」。
+  // Cline 双池按上游 v1.64 补 costTier：池是身份不是账号属性——cline_free 标 "free"
+  // 让 cost-first 路由正确优先，cline_pass 刻意不标（付费订阅错标 free 会让 cost-first 烧钱）。
+  { id: "cline_free", display: "Cline 免费池", domain: "api.cline.bot", unit: "额度", costTier: "free" },
   { id: "cline_pass", display: "Cline 订阅池", domain: "api.cline.bot", unit: "额度" },
   { id: "autoclaw", display: "智谱 AutoClaw（国内）", domain: "autoglm-acceleration-api.zhipuai.cn", unit: "额度" },
-  { id: "autoclaw_intl", display: "智谱 AutoClaw（国际）", domain: "autoglm-api.autoglm.ai", unit: "额度" },
+  ...(AUTOCLAW_INTL_ENABLED ? [{ id: "autoclaw_intl", display: "智谱 AutoClaw（国际）", domain: "autoglm-api.autoglm.ai", unit: "额度" }] : []),
   // ModelScope（魔搭 · 阿里）：官方 OpenAI 兼容网关 + 魔粒每日任务，无客户端、无签名、无逆向
   { id: "modelscope", display: "ModelScope（魔搭）", domain: "api-inference.modelscope.cn", unit: "额度", costTier: "free" },
   // LobsterAI（网易有道龙虾）：原生 OpenAI 兼容 + 每日签到 100 积分，登录走应用内回环 OAuth
@@ -184,7 +192,13 @@ const BUILTIN_CHANNELS = [
   // ZCode（智谱编码套餐；上游 v1.30 起单渠道双 provider：meta.provider=zai|bigmodel，见 adapters.makeZcode）
   // 智谱套餐不是积分，是 Token 包：billing/balance 返回 remaining_units/total_units
   { id: "zcode", display: "ZCode（智谱）", domain: "zcode.z.ai", unit: "Token" },
+  // zcode_intl 只在本仓有（上游的渠道表没有这一条）：它是国际站的写回/切换别名渠道，
+  // ideswitch 的 switchIdeAccount 与 ideSwitchStatus 都按它分支，摘掉即两条链路静默少一支。
   { id: "zcode_intl", display: "ZCode 智谱（国际）", domain: "api.z.ai", unit: "Token" },
+  // CatPaw（美团，上游 v1.60 新渠道）：上游是**有状态会话协议**（round → event → turn → event），
+  // 适配器声明 stateful 走会话式转发；凭据是桌面端会话 Cookie 值（X-Passport-Token）+ user-uid
+  // 独立头，无签到、无刷新接口（过期只能在客户端重新登录）。成本档上游未标注（套餐口径未实测）。
+  { id: "catpaw", display: "CatPaw（美团）", domain: "ai.catpaw.meituan.com", unit: "额度" },
   // 显示名带 CN，与「Qoder 国际」成对：号池两行并排时「Qoder / Qoder 国际」看不出哪行是国内版。
   // 区服一律由渠道 id 决定（EP.regionOf），显示名不参与任何路由或域名拼接。
   { id: "qoder", display: "Qoder CN", domain: "gateway.qoder.com.cn", unit: "Credits" },
@@ -239,6 +253,12 @@ function open() {
   ]) {
     try { db.exec(`ALTER TABLE usage_requests ADD COLUMN ${c}`); } catch { /* 已存在 */ }
   }
+  // 在线迁移（上游 v1.62 issue #92 新增）：keys.updated_at = Key 最后更新时间戳，
+  // 多机同步 LWW 仲裁用它传播「修改/删除」。这条挂在 keys 表上，与账号改名的仲裁无关
+  // ——账号侧的单一时钟仍是 poolsync.accountStamp()，别把它换成 keys.updated_at 的口径。
+  try { db.exec("ALTER TABLE keys ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0"); } catch { /* 已存在 */ }
+  // 老版本只增不改不删，存量行更新时间按迁移时刻起算（此后任何修改都会盖出更新的时间戳）
+  db.prepare("UPDATE keys SET updated_at = ? WHERE updated_at = 0").run(Date.now());
   // 在线迁移（上游 v1.45/v1.50 新增）：keys.route_order = per-key 路由策略覆盖（''=跟随全局）；
   // agents.cost_tier = 渠道成本档（''=未标注，运行时按 normal 解释）
   try { db.exec("ALTER TABLE keys ADD COLUMN route_order TEXT NOT NULL DEFAULT ''"); } catch { /* 已存在 */ }
@@ -324,7 +344,7 @@ function createKey({ name, route, routeOrder, dailyQuota, rateLimit }) {
   const secret = "sk-" + crypto.randomBytes(24).toString("hex"); // 48 hex
   const id = crypto.randomUUID();
   db.prepare(
-    "INSERT INTO keys (id, name, key_hash, key_enc, key_prefix, key_suffix, route, route_order, daily_quota, rate_limit, enabled, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,1,?)"
+    "INSERT INTO keys (id, name, key_hash, key_enc, key_prefix, key_suffix, route, route_order, daily_quota, rate_limit, enabled, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?)"
   ).run(
     id,
     String(name || "").slice(0, 64) || "未命名 Key",
@@ -336,6 +356,7 @@ function createKey({ name, route, routeOrder, dailyQuota, rateLimit }) {
     routeOrderOk(routeOrder) ? routeOrder : "",
     Math.max(0, Number(dailyQuota) || 0),
     Math.max(0, Number(rateLimit) || 0),
+    Date.now(),
     Date.now()
   );
   return { id, secret };
@@ -360,32 +381,53 @@ function listKeys() {
     rateLimit: r.rate_limit,
     enabled: !!r.enabled,
     createdAt: r.created_at,
+    updatedAt: r.updated_at || 0,
     todayReq: (umap.get(r.id) || {}).req || 0,
     todayTokens: (umap.get(r.id) || {}).tokens || 0,
   }));
 }
 
 /**
- * 从别的设备导入一把 API Key（号池 WebDAV 同步用）。
+ * 从别的设备导入/更新一把 API Key（号池 WebDAV 同步用）。
  *
  * 与 createKey 的区别：createKey 自己生成密钥，这里用**给定的明文密钥**入库——
  * 跨设备同步要求同一个 sk- 在各设备都能用，所以只能沿用原密钥。
  * 落库时按本机能力重新加密（Windows 走 DPAPI、无 safeStorage 的环境走明文降级），
  * 所以不直接搬运对端的 key_enc（跨平台解不开）。
  *
- * 幂等：同 id 或同 key_hash 已存在则跳过，返回 {ok:false, reason}。
+ * 幂等 + LWW（issue #92）：同 id 已存在时按 updatedAt 新者胜——远端改过（改名/改配额/
+ * 启停）就同步过来；老版本对端不带 updatedAt（按 0）永远本机为准，与旧版「只补缺」一致。
+ * 同 key_hash 但不同 id（同一把 Key 换了 id）视为已存在跳过，密文本就相同。
  */
-function importKey({ id, name, secret, route, routeOrder, dailyQuota, rateLimit, enabled, createdAt }) {
+function importKey({ id, name, secret, route, routeOrder, dailyQuota, rateLimit, enabled, createdAt, updatedAt }) {
   open();
   const s = String(secret || "").trim();
   if (!s) return { ok: false, reason: "empty-secret" };
   const hash = hashKey(s);
-  const dup = db.prepare("SELECT id FROM keys WHERE key_hash = ? OR id = ?").get(hash, String(id || ""));
-  if (dup) return { ok: false, reason: "exists" };
+  const rid = String(id || "");
+  const remoteAt = Math.max(0, Number(updatedAt) || 0);
+  const dup = db.prepare("SELECT * FROM keys WHERE key_hash = ? OR id = ?").get(hash, rid);
+  if (dup) {
+    if (dup.id === rid && remoteAt > (dup.updated_at || 0)) {
+      db.prepare("UPDATE keys SET name=?, route=?, route_order=?, daily_quota=?, rate_limit=?, enabled=?, updated_at=? WHERE id=?")
+        .run(
+          String(name || "").slice(0, 64) || dup.name,
+          routeOk(route) ? route : dup.route,
+          routeOrderOk(routeOrder) ? routeOrder : dup.route_order,
+          patchNum(dailyQuota, dup.daily_quota),
+          patchNum(rateLimit, dup.rate_limit),
+          enabled === false ? 0 : enabled === true ? 1 : dup.enabled,
+          remoteAt,
+          rid
+        );
+      return { ok: true, updated: true };
+    }
+    return { ok: false, reason: "exists" };
+  }
   db.prepare(
-    "INSERT INTO keys (id, name, key_hash, key_enc, key_prefix, key_suffix, route, route_order, daily_quota, rate_limit, enabled, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
+    "INSERT INTO keys (id, name, key_hash, key_enc, key_prefix, key_suffix, route, route_order, daily_quota, rate_limit, enabled, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
   ).run(
-    String(id || crypto.randomUUID()),
+    rid || crypto.randomUUID(),
     String(name || "").slice(0, 64) || "未命名 Key",
     hash,
     config.encryptSecret(s),
@@ -396,9 +438,15 @@ function importKey({ id, name, secret, route, routeOrder, dailyQuota, rateLimit,
     Math.max(0, Number(dailyQuota) || 0),
     Math.max(0, Number(rateLimit) || 0),
     enabled === false ? 0 : 1,
-    Number(createdAt) || Date.now()
+    Number(createdAt) || Date.now(),
+    remoteAt || Date.now()
   );
   return { ok: true };
+}
+
+/** 数值补丁：远端没带（null/undefined）时保留本机现值；带了（含 0）取合法化后的值 */
+function patchNum(v, cur) {
+  return v == null ? cur : Math.max(0, Number(v) || 0);
 }
 
 function dayStartMs(day) {
@@ -428,8 +476,9 @@ function updateKey(id, patch) {
   const quota = patch.dailyQuota != null ? Math.max(0, Number(patch.dailyQuota) || 0) : cur.daily_quota;
   const rate = patch.rateLimit != null ? Math.max(0, Number(patch.rateLimit) || 0) : cur.rate_limit;
   const enabled = patch.enabled != null ? (patch.enabled ? 1 : 0) : cur.enabled;
-  db.prepare("UPDATE keys SET name=?, route=?, route_order=?, daily_quota=?, rate_limit=?, enabled=? WHERE id=?")
-    .run(name, route, routeOrder, quota, rate, enabled, cur.id);
+  // updated_at 推进：号池同步按它做 LWW，把改名/改配额/启停传播到其他设备（issue #92）
+  db.prepare("UPDATE keys SET name=?, route=?, route_order=?, daily_quota=?, rate_limit=?, enabled=?, updated_at=? WHERE id=?")
+    .run(name, route, routeOrder, quota, rate, enabled, Date.now(), cur.id);
   return true;
 }
 
@@ -1444,6 +1493,7 @@ module.exports = {
   // 不是第二份真相源；本分支的新代码一律用 BUILTIN_CHANNELS / channelList()。
   CHANNELS: BUILTIN_CHANNELS,
   QODER_INTL_ENABLED,
+  AUTOCLAW_INTL_ENABLED,
   isBuiltinChannel,
   channelList, invalidateChannels,
   channelDisplay, channelUnit,

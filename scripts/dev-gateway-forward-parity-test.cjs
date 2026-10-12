@@ -107,7 +107,10 @@ try {
 const newSubCmds = ["proxy_account_import_blob", "proxy_poolsync_password_changed",
   // 上游 v1.57.0 操作日志导出的子进程半边：查询 + 生成 xlsx 字节在这里，落盘在主进程
   // （UI_LOCAL proxy_oplog_export 用 app.getPath("downloads")，子进程 ELECTRON_RUN_AS_NODE 拿不到）
-  "proxy_oplog_export_rows"];
+  "proxy_oplog_export_rows",
+  // 上游 v1.62 板块开关（issue #91）的内部半边：上游那版由主进程直调 proxy.setRuntime()，
+  // 本 fork 的 proxy 域只活在子进程，故改成主进程经管道发这条。渲染层看不见它 ⇒ 不过 preload。
+  "proxy_runtime_set"];
 // 一期基线之外的「用户面」新命令：渲染层真会调用它们 ⇒ 必须同时进 preload 白名单（①）、
 // 主进程转发面（③）与子进程实现体（④）。与 newSubCmds 的分工：那些是子进程内部辅助半段
 // （不过 preload，渲染层看不见，只进 ④ 的白名单），这里每一条则是完整的一条命令面。
@@ -156,6 +159,13 @@ const extraUserCmds = [
   { name: "proxy_oplog_export", why: "操作日志导出：子进程只留占位名，字节半边 proxy_oplog_export_rows，落盘归主进程 UI_LOCAL（上游 v1.57）" },
   { name: "proxy_channel_list", why: "渠道启闭弹窗数据源：读号池视图（含 config 的 channelEnabled），上游 v1.58" },
   { name: "proxy_channel_toggle", why: "渠道启闭开关：写 cfg.proxy.channelEnabled（上游 v1.58，与 poolsync.applyShared 同一条子进程写 cfg.proxy 的路径）" },
+  // 上游 v1.60 的 AutoClaw 登录三条：滑块风控配置读 headers.json、发码拿 deviceId、
+  // 验证码登录直接 store.addAccount 写号池——三条实现体全在子进程 index.cjs，主进程只转发。
+  // 其中 sms_login 与 oauth 那条不同源：它不建 oauthSession，是 IPC 两跳直调，
+  // 因此 beginOAuth 里「国内版没有网页登录」那条拒收仍然成立（拒的是网页授权，不是验证码登录）。
+  { name: "proxy_autoclaw_captcha_config", why: "AutoClaw 国际版滑块风控配置：读 headers.json 的 autoclaw*（上游 v1.60）" },
+  { name: "proxy_autoclaw_sms_send", why: "AutoClaw 国内版发验证码：打 agent-send-code 并回报 deviceId（上游 v1.60）" },
+  { name: "proxy_autoclaw_sms_login", why: "AutoClaw 国内版验证码登录：换 token 后 store.addAccount 写号池（上游 v1.60）" },
 ];
 const upstreamUserNames = extraUserCmds.map((c) => c.name);
 check("④ 子进程表含 proxy_account_import_blob（import_file 拆两段的子进程半段）",
