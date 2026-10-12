@@ -22,6 +22,12 @@ const SDK_LOAD_TIMEOUT_MS = 15000;
 /** 总体看门狗（主进程）：从开窗到收参的最大时长，覆盖用户手动过码的操作时间 */
 const SOLVE_WATCHDOG_MS = 120000;
 
+/** 内联 <script> 插值用：JSON.stringify 不转义 /，上游 captcha 配置若含 </script>
+ *  会终止脚本元素在页内执行任意 JS——`<` 统一转 \u003c（值语义不变） */
+function jsStr(v) {
+  return JSON.stringify(v == null ? "" : v).replace(/</g, "\\u003c");
+}
+
 /** 验证窗页面（内联 HTML：加载阿里云官方 SDK，无感优先、超时或失败转交互式） */
 function captchaHtml(sceneId, region, prefix) {
   return `<!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"><title>ZCode 人机校验</title>
@@ -91,10 +97,10 @@ function captchaHtml(sceneId, region, prefix) {
     });
   }
   loadSdk().then(function(){
-    window.AliyunCaptchaConfig = { region: ${JSON.stringify(region || "")}, prefix: ${JSON.stringify(prefix || "")} };
+    window.AliyunCaptchaConfig = { region: ${jsStr(region || "")}, prefix: ${jsStr(prefix || "")} };
     status("正在进行人机校验…");
     window.initAliyunCaptcha({
-      SceneId: ${JSON.stringify(sceneId || "")},
+      SceneId: ${jsStr(sceneId || "")},
       mode: "popup",
       language: "zh-CN",
       showErrorTip: false,

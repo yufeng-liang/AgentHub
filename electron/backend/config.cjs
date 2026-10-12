@@ -33,6 +33,11 @@ function encryptSecret(plain) { return secretbox.encrypt(plain); }
 
 function decryptSecret(stored) { return secretbox.decrypt(stored); }
 
+// 密文信封前缀：定义仍只有 secretbox 一份（上游 config.cjs 里是同值的第二份，本分支已收口）。
+// 导出它是给 store.stripSensitiveMeta 用——那里要按「值是否已加密」决定敏感键名的去留，
+// 判定必须和加密方同一个尺子，否则前缀一改就静默把会话凭据剥光。
+const ENC_PREFIX = secretbox.ENC_PREFIX;
+
 /** 配置读取专用的宽容版：解不开就是「密码为空」，让用户重填（旧语义）。
  *  loadConfig 是全站入口级的公共路径（网关 settings() 每次请求都读），
  *  那里冒未捕获抛错会让整个配置读取炸掉，比空号池严重得多，故只在这两处降级。 */
@@ -701,7 +706,7 @@ function applyAutoStart(cfg) {
 }
 
 module.exports = {
-  dataDir, configPath, hubDir, ensureHub, loadConfig, saveConfig, defaultConfig,
+  dataDir, configPath, hubDir, ensureHub, loadConfig, saveConfig, defaultConfig, ENC_PREFIX,
   getUpdateNotified, setUpdateNotified, isPortable, encryptSecret, decryptSecret, applyAutoStart,
   RUN_KEY, RUN_VALUE, regExePath, regExec, addGatewayRunItem, removeGatewayRunItem,
   loadSharedWebdav, saveSharedWebdav, clearSharedWebdav, maskedSharedWebdav, moduleWebdav, sharedEncryptionPassphrase, PASSWORD_MASK,

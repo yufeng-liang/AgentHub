@@ -366,7 +366,9 @@ function scanTrae() {
   const seenPaths = new Set();
   for (const [channel, dirs] of Object.entries(channels)) {
     // mtime 比较器里的 statSync 在登录文件被并发删除（升级/退出登录）时会抛错炸掉整轮扫描：
-    // 先逐个预取 mtime（取不到的丢弃），排序只比预取值，比较器不再碰盘
+    // 先逐个预取 mtime（取不到的丢弃），排序只比预取值，比较器不再碰盘（也不再重复 syscall）。
+    // 上游 v1.65.0 独立撞到同一个缺陷，用的是 statSync(p, {throwIfNoEntry:false}) + 缺失排后：
+    // 那仍会把已消失的路径留给下游去读，故本分支保留「预取 + 丢弃」这版更强的口径。
     const paths = traeStoragePaths(dirs)
       .map((p) => {
         try { return { p, mtime: fs.statSync(p).mtimeMs }; } catch { return null; }
@@ -652,7 +654,10 @@ function scanCatpaw() {
   }
   out.push({
     channel: "catpaw",
-    uid: String(login.uid || ""),
+    // uid 兜底 loginName（与 readDesktopLogin 的 uid: uid || loginName 同口径）：
+    // auth.json 只有 loginName 时落库 uid 为空，token 路径与桌面路径的凭证身份
+    // 口径不一致会让 reconcileIdentity 误判 identity-changed 作废全部会话
+    uid: String(login.uid || login.loginName || ""),
     name: String(login.loginName || (login.uid ? `账号 ${login.uid}` : "")),
     token: login.token,
     refreshToken: "",
@@ -1208,6 +1213,9 @@ async function saveTraeAccount(accessToken, refreshToken, channel, extra) {
     ? { uid: cbUid, name: cbName }
     : await adapter.userInfo(accessToken).catch(() => ({ uid: util.jwtDecode(accessToken).uid, name: "" }));
   const uid = String(info.uid || util.jwtDecode(accessToken).uid || cbUid || "");
+  // uid 缺失一律拒绝落库（与 Lobster/ModelScope 同款防线）：空 uid 让去重查找恒不命中，
+  // 同账号重复登录反复新增行，credit_first 排序也会把它当独立号
+  if (!uid) throw new Error("未能解析账号身份（uid），已拒绝入池");
   const existing = uid ? store.listAccounts(channel).find((a) => a.uid === uid) : null;
   if (existing) {
     store.updateAccount(existing.id, { token: accessToken, refreshToken, status: "online", coolUntil: 0, coolReason: "" });
@@ -2122,6 +2130,11 @@ async function beginClineOAuth(channel, onDone) {
   const deviceCode = d.device_code, userCode = d.user_code;
   if (!r.ok || !deviceCode) return { ok: false, message: `设备授权发起失败（HTTP ${r.status}）${d.error || ""}` };
   const url = String(d.verification_uri_complete || d.verification_uri || CLINE_DEVICE_FALLBACK_URL);
+  // 占位守卫：上面的设备授权请求是网络 await，在途期间用户可能已另发登录并把 oauthSession
+  // 占上（beginOAuth 入口的判空挡不住这扇窗口——本流程直到这里才占位）。不守就是拿新会话
+  // 覆盖旧对象：新会话的 timer 孤儿化（首拍 userCode 不匹配即退出、deadline 兜底永不生效）、
+  // onDone 永不触发，前端该渠道卡死在「登录中」。（上游 v1.65.0 同一修复）
+  if (oauthSession) return { ok: false, message: "已有进行中的登录，请先完成或取消" };
   oauthSession = {
     mode: "device", channel, url, userCode, server: null, onDone,
     interval: Math.max(1, Number(d.interval) || 5), slow: 0,
@@ -2148,6 +2161,10 @@ async function beginClineOAuth(channel, onDone) {
           headers: { "content-type": "application/json", accept: "application/json", "x-client-type": "cline-sdk" },
           body: JSON.stringify({ accessToken: pr.data.access_token, refreshToken: pr.data.refresh_token }),
         });
+        // 会话一致性守卫（上游 v1.65.0 的 P0 同款）：这次网络 await 在途期间用户可能已取消并
+        // 另发登录（oauthSession 被替换）。finishOAuth 取的是**当前全局**会话，不守就会把新登录
+        // 连同它的 timer 一起终结，并把旧结果经新会话的 onDone 回给前端（单会话机制被破坏）。
+        if (!oauthSession || oauthSession.userCode !== userCode) return;
         const rd = reg.data && reg.data.data;
         if (!reg.ok || !rd || !rd.accessToken) throw new Error(`换会话令牌失败（HTTP ${reg.status}）`);
         const token = clineAuth.ensureTokenPrefix(rd.accessToken);
@@ -2163,7 +2180,10 @@ async function beginClineOAuth(channel, onDone) {
           meta: {}, source: "oauth",
         });
         finishOAuth({ ok: true, id, uid, pool });
-      } catch (e) { finishOAuth({ ok: false, message: String((e && e.message) || e) }); }
+      } catch (e) {
+        // 失败上报同样要守会话：会话已被取消/替换时把这个 error 回给**新**登录的 onDone 是串结果
+        if (oauthSession && oauthSession.userCode === userCode) finishOAuth({ ok: false, message: String((e && e.message) || e) });
+      }
       return;
     }
     if (verdict === "expired") { finishOAuth({ ok: false, message: "设备码已过期，请重新发起登录" }); return; }
@@ -2237,8 +2257,15 @@ async function beginQoderOAuth(channel, edition, onDone) {
             meta: qoderOauthMeta(machineId, region, email, userId),
             source: "oauth",
           });
+          // 会话一致性守卫（上游 v1.65.0 的 P0 同款）：userinfo 那次网络 await 在途期间，这次登录
+          // 可能已被取消或换成另一次（oauthSession 被替换）。finishOAuth 取的是**当前全局**会话，
+          // 不守就会把新登录连同它的 timer 一起终结，并把旧结果经新会话的 onDone 回给前端。
+          // 账号已落库不回滚——凭据本身有效，只是不再向新会话播报。
+          if (!oauthSession || oauthSession.nonce !== nonce) return;
           finishOAuth({ ok: true, id, uid: userId });
-        } catch (e) { finishOAuth({ ok: false, message: String((e && e.message) || e) }); }
+        } catch (e) {
+          if (oauthSession && oauthSession.nonce === nonce) finishOAuth({ ok: false, message: String((e && e.message) || e) });
+        }
         return;
       }
     }
@@ -2667,9 +2694,10 @@ async function beginLobsterOAuth(channel, onDone) {
       // 兑换成功即作废该 state（配合授权码一次性语义，双重防重放）
       if (gotState) lobsterIssuedStates.delete(String(gotState));
       if (res) res.end(OK_PAGE("登录成功，已加入 LobsterAI 号池，可关闭本页"));
-      // 晚到的回调（会话已关）不再有 onDone 消费者，直接落库即可
+      // 晚到的回调（宽限表命中 = 原会话已超时/结束）：onDone 消费者已不存在，
+      // 只落库不再通知——入口捕获的全局 oauthSession 可能是**另一渠道正在进行中**
+      // 的新登录，把旧回调的成功结果经它回给前端会串结果
       if (resolved.live) finishOAuth({ ok: true, id: r.id, uid: r.uid });
-      else if (session && session.onDone) session.onDone({ ok: true, id: r.id, uid: r.uid });
     } catch (e) {
       const msg = String((e && e.message) || e);
       if (res) res.end(ERR_PAGE(`登录失败：${msg}`));
@@ -2855,7 +2883,11 @@ function saveModelScopeAccount(ex, sess, source) {
   if (!token) return { ok: false, message: "凭据为空，已拒绝入池" };
   const cookie = String((ex && ex.cookie) || "").trim();
   const meta = {
-    ...(sess && sess.clientId ? { oauthClientId: sess.clientId, oauthClientSecret: sess.clientSecret } : {}),
+    // clientSecret 走 DPAPI 加密（msCookie 同款）：updateAccount 的 stripSensitiveMeta
+    // 会剥明文 secret 键，重复登录走更新路径时续期链会静默断裂
+    ...(sess && sess.clientId
+      ? { oauthClientId: sess.clientId, oauthClientSecret: sess.clientSecret ? config.encryptSecret(sess.clientSecret) : "" }
+      : {}),
     tokenKind: token.startsWith("ms_oauth") ? "oauth" : "token",
     scope: String((ex && ex.scope) || ""),
     savedAt: Date.now(),
@@ -3232,6 +3264,9 @@ async function beginAutoClawOauth(channel, onDone, opts) {
     const code = q.get("code");
     if (!code) { writeRes(() => res.end(PENDING_PAGE)); return { ok: false, message: "回调地址缺少 code 参数（授权码）" }; } // 官方页登录前可能空参探测回调可达性
     const state = q.get("state") || "";
+    // ⚠ 本渠道无本机 state 锚点：授权地址（oauth_url）由上游生成，oauthStart 不下发
+    // state、回调也无法与本机比对（Trae/ModelScope/Lobster 是本机生成 state 才能强校验）。
+    // CSRF 面靠「回环端口 + 一次性授权码」兜底，与原型一致，勿仿照其他渠道强校验。
     try {
       const ex = await autoclawLogin.oauthExchange({ cfg: c, httpJson: adapters.httpJson, vendor, deviceId, code, state, navigateUri });
       if (!ex.ok) throw new Error(ex.message);

@@ -189,4 +189,4 @@ function assertUsable() {
 
 // 仅供测试自证「确实是从预期路径（asar 内那份拷贝 / 不含 node_modules/electron 的那份拷贝）require 进来的」；
 // 不参与任何生产判断。
-module.exports = { backend, packaged, encrypt, decrypt, assertUsable, __selfCheck: __dirname };
+module.exports = { backend, packaged, encrypt, decrypt, assertUsable, ENC_PREFIX, __selfCheck: __dirname };

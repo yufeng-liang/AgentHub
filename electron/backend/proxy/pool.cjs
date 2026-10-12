@@ -109,10 +109,23 @@ function fallbackPick(channel, exclude, now) {
   return best;
 }
 
+/** 渠道是否声明「余额 0 不是硬门禁」（Cline：上游允许余额记负——实测欠费 -0.02 仍可用，
+ *  真实门禁是每日额度的 429（带重置时间）与订阅 403，都已由错误分类按账号处置）。
+ *  对这类渠道，「余额 0 → exhausted」会把免费池账号锁死：store 入库层把两位小数舍入后的
+ *  0 与 < -1 的负值都归 0，复活条件 credits > 0 在余额恒 0 时永不满足。
+ *  惰性 require：adapters.cjs 装配重，避免顶层 require 改变加载顺序（本仓反代依赖惯例） */
+function zeroBalanceUsable(channel) {
+  try {
+    const ad = require("./adapters.cjs").get(channel);
+    return !!(ad && ad.zeroBalanceUsable);
+  } catch { return false; }
+}
+
 /**
  * 池内选号：expire_first（默认，积分先到期先用）/ credit_first / round_robin
  * 两种自动切换（不发请求、调度期前置生效）：
- *  ① 余额不足自动切换——已查到余额为 0 的账号直接标记耗尽并跳过，不再浪费一次上游 402；
+ *  ① 余额不足自动切换——已查到余额为 0 的账号直接标记耗尽并跳过，不再浪费一次上游 402
+ *     （声明 zeroBalanceUsable 的渠道豁免——余额 0 不是它的硬门禁，判定见上）；
  *  ② 余额到期自动切换——到期时间已过的账号余额视为失效，标记并跳过；
  *     搭配默认 expire_first 策略：快到期账号永远排在最前优先消耗（到期前榨干），过期即自动切走。
  * 被跳过的账号等下次额度刷新拿到新余额/新到期时间后自动复活（credits.cjs）。
@@ -125,8 +138,10 @@ function pickAccount(channel, strategy, excludeIds, maxInFlight) {
   const candidates = [];
   for (const a of poolAccounts(channel)) {
     if (a.status !== "online" || !a.hasToken || exclude.has(a.id)) continue;
-    // credits === -1 = 企业版无限额度哨兵，不参与耗尽判定
-    if (a.creditsAt > 0 && a.credits === 0) {
+    // credits === -1 = 企业版无限额度哨兵，不参与耗尽判定；
+    // 声明 zeroBalanceUsable 的渠道（Cline）同样豁免——余额 0 不是它的硬门禁，
+    // 真实门禁（每日额度 429）由错误分类落冷却处置，这里误标只会把账号锁死在调度外
+    if (a.creditsAt > 0 && a.credits === 0 && !zeroBalanceUsable(channel)) {
       // ① 已知余额不足：标记耗尽（次日 04:00 给复活机会），自动切换下一账号
       store.updateAccount(a.id, { status: "exhausted", coolUntil: nextDay4AM(), coolReason: "余额不足，已自动切换" });
       continue;
@@ -418,5 +433,5 @@ module.exports = {
   effectiveStatus, poolAccounts, pickAccount, coolAccount, coolAccountMs,
   coolAccountModel, isModelCooled, accountModelCool, poolSummary, nextDay4AM,
   acquireAccount, releaseAccount, softBackoffMs, noteSessionDead, noteServerError, noteSuccess,
-  releaseCool, setExpiringSoonDays, deriveAccountCredits, inFlightCount,
+  releaseCool, zeroBalanceUsable, setExpiringSoonDays, deriveAccountCredits, inFlightCount,
 };

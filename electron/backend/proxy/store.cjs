@@ -315,6 +315,9 @@ function gc() {
   const logCut = Date.now() - 30 * 86400000;
   db.prepare("DELETE FROM op_logs WHERE ts < ?").run(logCut);
   db.prepare("DELETE FROM op_logs WHERE id NOT IN (SELECT id FROM op_logs ORDER BY id DESC LIMIT 50000)").run();
+  // 流水行数上限：未认证请求也写流水（401 早退处记账），仅 90 天裁剪挡不住
+  // 失控进程刷 401 撑大 stats.db——超限删最老，口径对齐 op_logs 的双上限
+  db.prepare("DELETE FROM usage_requests WHERE id NOT IN (SELECT id FROM usage_requests ORDER BY id DESC LIMIT 200000)").run();
 }
 
 function dayStr(ts) {
@@ -880,21 +883,32 @@ function addAccount({ channel, uid, name, token, refreshToken, source, expiresAt
 /** meta 白名单（凭据不走 meta 明文）：token/refreshToken 等凭据一律走独立加密列
  *  （token_enc/refresh_enc），msCookie 在写入前已过 encryptSecret 加密。
  *  这里剥离敏感形态的键（历史版本或外部同步可能带进明文凭据），正常业务键
- *  （lastError/checkin/onboardingGrants/domain/enterpriseId/provider/email 等）不受影响 */
+ *  （lastError/checkin/onboardingGrants/domain/enterpriseId/provider/email 等）不受影响；
+ *  值已是 DPAPI 密文（enc:v1: 信封）的键保留——落库方已加密，剥掉会把
+ *  oauthClientSecret/msCookie 这类加密会话凭据一并清空，续期链随之断裂 */
 const META_SENSITIVE_RE = /token|secret|password|apikey|api[-_]key|jwt|credential/i;
 /** 上游按「键名子串」判敏感，会误杀本分支里名字撞上的**业务键**（都是既有实现，不是本批引入）：
  *  · tokenType —— WorkBuddy/CodeBuddy 的令牌类型，ideswitch.cjs:877 经 metaOf(acc).tokenType 读它拼
  *    本地配置；剥掉即切号时丢类型。
- *  · tokenKind —— ModelScope 凭据是 oauth 还是裸 token（discovery.cjs:2774 写，目前无人读，
+ *  · tokenKind —— ModelScope 凭据是 oauth 还是裸 token（discovery.cjs:3169 写，目前无人读，
  *    留着当排障线索）。
- *  · oauthClientSecret —— ModelScope OAuth 续期的客户端密钥，discovery.cjs:2773 写、adapters.cjs:2915 读；
- *    剥掉即每次续期报「缺少 OAuth 客户端信息」，号在池里但永久不可用。它确实是一把密钥躺在明文
- *    meta 里，那是入池方案落地时就有的取舍（改成走加密列要连着改采集与续期两处），不属于合并批次顺手改的范围。 */
+ *  · oauthClientSecret —— 上游 v1.65.0 起写入即密文（discovery.cjs:3167 encryptSecret，
+ *    读侧 adapters.cjs:2983 decryptSecret；无信封的存量明文由 secretbox.decrypt:161 原样返回），
+ *    新行靠上面的值侧规则就留得住。**这条键侧豁免现在只兜合并前落的明文行**——剥掉即每次续期报
+ *    「缺少 OAuth 客户端信息」，号在池里但永久不可用；明文行重新授权一遍就能转密文，届时可摘掉。 */
 const META_SENSITIVE_KEEP = new Set(["tokenType", "tokenKind", "oauthClientSecret"]);
 function stripSensitiveMeta(meta) {
   const out = {};
   for (const [k, v] of Object.entries(meta)) {
-    if (!META_SENSITIVE_KEEP.has(k) && META_SENSITIVE_RE.test(k)) continue;
+    if (META_SENSITIVE_RE.test(k)) {
+      // 上游 v1.65.0 的值侧规则：已是 DPAPI 信封（enc:v1:）就保留——落库方已经加密，
+      // 按键名剥掉等于把 msCookie 这类会话凭据清空、续期链随之断裂。
+      // 键侧豁免（META_SENSITIVE_KEEP）仍要留着：tokenType/tokenKind 是名字撞车的业务键，
+      // 值不是密文，走不到上面这条。
+      if (typeof v === "string" && v.startsWith(config.ENC_PREFIX)) out[k] = v;
+      else if (META_SENSITIVE_KEEP.has(k)) out[k] = v;
+      continue;
+    }
     out[k] = v;
   }
   return out;

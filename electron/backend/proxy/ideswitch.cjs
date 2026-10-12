@@ -789,9 +789,10 @@ function switchWorkbuddyAccount(acc, opts) {
   let relaunchExe = "";
   if (run.running) {
     if (!opts.confirmAck) {
-      // 兜底（正常路径下入口已拦并弹过确认框）
+      // 兜底（正常路径下入口已拦并弹过确认框）。needConfirm 必须 ok:true（本文件头协议：
+      // 前端 call() 对 ok:false 直接抛错，确认框永远弹不出来；对齐 raccoon 同路径）
       return {
-        ok: false,
+        ok: true,
         channel: acc.channel,
         needConfirm: true,
         message: `${CLIENT_LABELS[acc.channel] || acc.channel} 正在运行，切换需要先关闭它。确认关闭客户端并切换吗？`,

@@ -260,6 +260,7 @@ async function e2e() {
     const pass = adapters.get("cline_pass");
     assert(free && pass, "双池适配器已注册");
     assert(free.refreshWindowSec === 600, "临期窗口 600s（access 1 小时的 1/6）");
+    assert(free.zeroBalanceUsable === true && pass.zeroBalanceUsable === true, "余额 0 非硬门禁旗标（免费池余额恒 0 时仍可被调度，不误标 exhausted）");
 
     // —— 1. 对话：头/路径/body 断言 + model 回写 + reasoning 帧透传
     const accId = storeMod.addAccount({ channel: "cline_free", uid: "usr-01M2VW", name: "自测号", token: "eyJx", refreshToken: "rv-old", source: "paste" });

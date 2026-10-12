@@ -179,7 +179,9 @@ function routeUsable(channel, settings) {
   const now = Date.now();
   return pool.poolAccounts(channel).some((a) =>
     a.status === "online" && a.hasToken &&
-    !(a.creditsAt > 0 && a.credits === 0) &&
+    // 与 pickAccount 同口径（issue #86 教训）：余额 0 的排除对声明 zeroBalanceUsable 的
+    // 渠道（Cline）同样豁免——余额 0 不是它的硬门禁，两处判据必须一起改
+    !((a.creditsAt > 0 && a.credits === 0) && !pool.zeroBalanceUsable(channel)) &&
     !(a.expiresAt > 0 && a.expiresAt <= now));
 }
 
@@ -306,7 +308,11 @@ function classifyUpstream(e, planLimit, channel) {
     return { kind: "model_config", switchable: true, status: 502 }; // 模型/配置问题：不罚号
   }
   if (code === 4008 || /\b4008\b/.test(msg)) return { kind: "rate", switchable: true, status: 429 };
-  if (/\b6004\b/.test(msg)) return { kind: "model_rate", switchable: true, status: 429, resetMs: parseRateResetMs(msg) };
+  // 6004 模型级限流：code 字段与消息文本双通道判定——WB 流内 6004 的文案
+  // （「您的使用量已超出频率限制，将在 XXX 重置」）不含数字码，只测文本会漏
+  if (code === 6004 || /\b6004\b/.test(msg)) {
+    return { kind: "model_rate", switchable: true, status: 429, resetMs: parseRateResetMs(msg) };
+  }
   if (/\b11102\b/.test(msg) || /service info not found/i.test(msg)) return { kind: "model_blocked", switchable: true, status: 404 };
   if (/\b11115\b/.test(msg) || /prompt is too long|prompt_too_long/i.test(msg)) {
     return { kind: "prompt_too_long", switchable: false, status: 400 }; // 请求本身超限：零动作透传
@@ -333,7 +339,10 @@ function isWafBlock(e) {
 }
 
 function isChannelBlock(e) {
-  return isWafBlock(e) || /\b11128\b/.test(String((e && e.message) || ""));
+  // 11128 双通道判定：HTTP 400 路径靠 body 文本命中 isClientGate；流内 error 事件的
+  // message（"Illegal API invocation from an unapproved channel"）不含数字码，
+  // 只测文本会漏 code 字段——渠道级拦截被误记账号错误并计熔断
+  return isWafBlock(e) || Number(e && e.code) === 11128 || /\b11128\b/.test(String((e && e.message) || ""));
 }
 
 /** 上游按「客户端/渠道资格」在渠道校验阶段拒绝（渠道级，与账号、提问内容都无关）：issue #78。
@@ -482,6 +491,7 @@ function applyCool(accId, model, cls, message) {
   }
   switch (cls.kind) {
     case "model_config": // 4001 模型配置为空：模型问题不是账号问题，不罚号
+    case "fatal": // HTTP 400 参数类：同一 body 换任何号都同错，冷却账号毫无意义（classifyUpstream 已置 switchable:false，链在调用侧终止）
     case "bad_params": // 11101：参数问题不罚号（换号仍会发生，由外层轮转决定）
     case "prompt_too_long": // 11115：同一 body 换任何号都超限，零动作
     case "slow": // 首字节超时：请求/上游侧的慢，账号本身没问题，零冷却（外层仍会换号重试）
@@ -612,8 +622,9 @@ async function handleChat(req, res, settings, surface) {
   // raccoon 拒 function），而 400 会触发渠道回退，导致同一条请求能否成功取决于命中
   // 哪个渠道。入口处统一收敛到所有渠道都接受的交集角色，避免逐渠道维护白名单表。
   util.normalizeRoles(body.messages);
-  // 上游并发上限（默认 8）
-  if (runtime.active >= settings.concurrency) {
+  // 上游并发上限（默认 8）：手配 0/负数/非法值时按默认放行，防止 0>=0 恒真把网关整体锁死
+  const maxConc = Number(settings.concurrency) > 0 ? Math.floor(Number(settings.concurrency)) : 8;
+  if (runtime.active >= maxConc) {
     record({ status: 429, error: "concurrency limit" });
     return sink.endErr(429, "上游并发已满，请稍后重试", "rate_limit_exceeded", "concurrency_limited");
   }
@@ -624,7 +635,10 @@ async function handleChat(req, res, settings, surface) {
   // 客户端响应的 model 字段保持请求值（契约不变），记账备注标 alias→actual
   const aliased = (settings.modelAliases || {})[requestedModel];
   const actualModel = aliased && aliased !== requestedModel ? String(aliased) : requestedModel;
-  if ((settings.disabledModels || []).includes(actualModel)) {
+  // 禁用判定与 /v1/models 出口同口径（大小写不敏感）：出口过滤用 toLowerCase，
+  // 入口若用大小写敏感的 includes，目录页登记小写名、客户端用变体大小写请求时会绕过入口直通上游
+  const disabledSet = new Set((settings.disabledModels || []).map((s) => String(s).toLowerCase()));
+  if (disabledSet.has(actualModel.toLowerCase())) {
     record({ status: 400, error: "model disabled" });
     return sink.endErr(400, `模型 "${actualModel}" 已被禁用（模型目录页可恢复）`, "invalid_request_error", "model_disabled");
   }
@@ -644,8 +658,8 @@ async function handleChat(req, res, settings, surface) {
   const perModel = (settings.modelFallback || {})[actualModel];
   const globalFb = settings.autoFallbackEnabled === false ? "" : String(settings.fallbackModel || "");
   const fallback = perModel || globalFb;
-  // 回退模型自身被禁用时不入链（切过去也是 400，白费一跳）
-  if (fallback && fallback !== actualModel && fallback !== requestedModel && !(settings.disabledModels || []).includes(fallback)) {
+  // 回退模型自身被禁用时不入链（切过去也是 400，白费一跳），口径同上（大小写不敏感）
+  if (fallback && fallback !== actualModel && fallback !== requestedModel && !disabledSet.has(fallback.toLowerCase())) {
     modelChain.push(fallback);
   }
 
@@ -962,7 +976,16 @@ async function handleChat(req, res, settings, surface) {
                 code: streamErr.code || 0,
                 body: streamErr.body, data: streamErr.data, // 带给 errBodyOf：流中错误的响应体也要能落库
               });
-              applyCool(acc.id, targetModel, classifyUpstream(lastErr, false, chan), lastErr.message);
+              // 与 catch 路径（下方 classifyUpstream 后的 switchable 检查）同口径：
+              // 确定性拒绝（prompt_too_long / fatal / model_denied）换号必白撞，
+              // 流中路径也必须终止，否则客户端参数错误会逐个冷却全池账号
+              const cls = classifyUpstream(lastErr, false, chan);
+              applyCool(acc.id, targetModel, cls, lastErr.message);
+              if (!cls.switchable) {
+                fatalErr = lastErr;
+                streamErr = null;
+                break;
+              }
               streamErr = null;
               continue;
             }

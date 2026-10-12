@@ -1282,8 +1282,14 @@ function makeWorkBuddy(channelId) {
         if (Number.isFinite(mct) && mct > 0 && out.max_tokens == null) out.max_tokens = mct;
         delete out.max_completion_tokens;
       }
-      // tool_choice 归一（对象报 400 code 11101）：{type:function} → name；none→none；any/required→required；其余→auto
-      if (out.tool_choice && typeof out.tool_choice === "object") {
+      // tool_choice 归一（对象报 400 code 11101）：{type:function} → name；none→none；any/required→required；其余→auto。
+      // 字符串 "none" 也要撤 tools/functions（对齐 trae rewriteBody 与参考 normalize 实测：
+      // 上游语义是不调用工具时连声明一起撤，保留 tools 会报参数错误）
+      if (out.tool_choice === "none") {
+        delete out.tools;
+        delete out.functions;
+        delete out.tool_choice;
+      } else if (out.tool_choice && typeof out.tool_choice === "object") {
         const tc = out.tool_choice;
         if (tc.function && tc.function.name) out.tool_choice = tc.function.name;
         else if (tc.type === "none") out.tool_choice = "none";
@@ -2973,7 +2979,8 @@ const modelscope = {
     }
     const meta = (account && account.meta) || {};
     const clientId = String(meta.oauthClientId || "");
-    const clientSecret = String(meta.oauthClientSecret || "");
+    // clientSecret 落库时经 DPAPI 加密（msCookie 同款），此处解回明文（兼容存量明文）
+    const clientSecret = config.decryptSecret(String(meta.oauthClientSecret || ""));
     if (!clientId || !clientSecret) {
       return { ok: false, terminal: true, message: "缺少 OAuth 客户端信息（meta.oauthClientId/Secret），无法续期，请重新执行 OAuth 登录" };
     }
@@ -4878,7 +4885,8 @@ function modelOwners(model, cfg) {
   const mapped = [];
   const entry = reverseAliasEntry(model, c);
   // 别名支路的三重过滤缺一不可：ADAPTERS 有这家（双表一致）+ channelOn 未被关闭
-  // （上游只给主循环加了启闭过滤，别名命中是 owners 唯一来源时漏判等于启闭形同虚设）
+  // （上游只给主循环加了启闭过滤，别名命中是 owners 唯一来源时漏判等于启闭形同虚设——
+  // 统一请求名的唯一归属/固定策略会把请求强制打进已关闭渠道）
   // + reverseAliasTarget 非自映射（上游 v1.62 新增：统一名→同名的历史 UI 污染不构成可转发目标）。
   if (entry) mapped.push(...Object.keys(entry).filter((ch) => ADAPTERS[ch] && channelOn(ch, c) && reverseAliasTarget(model, ch, c)));
   const out = [];

@@ -408,27 +408,36 @@ function mergeSnapshot(snap, channel) {
       patch.expiresAt = ra.expiresAt || 0;
       // meta 合并而非整体替换（远端 restoreMetaForLocal 结果为底）：
       // - 设备指纹类键保留本机现值——repairDeviceMid 刚在本机重派的随机指纹、扫描/OAuth 绑定的
-      //   deviceId/officeIdentity 不能被远端快照里的旧值滚回去（指纹冲突是出在远端那台机器上的事，
-      //   本机刚修复过反而更新）；
+      //   deviceId/officeIdentity/machineId 不能被远端快照里的旧值滚回去（指纹冲突是出在远端那台
+      //   机器上的事，本机刚修复过反而更新；上游 v1.65.0 也把「丢本机 machineId ⇒ Qoder 签名失败」
+      //   列为跨机同步缺陷，故本分支的本地优先集合一并覆盖 qoder 的双写两键）；
       // - lastError 是本机诊断态：远端快照里的旧错误不采纳，本机没有就保持干净。
       // 其余键（sw/provider/画像等）与凭据是一对，随凭据一起采纳远端。
       const remoteMeta = restoreMetaForLocal(ra.meta, ra.channel);
       delete remoteMeta.lastError;
+      // qoder 的 machine_id/machineId 是**同值双写**（discovery.cjs:2492）：各自取本地优先会把
+      // 一对键拆成两个值，等于换回「读哪侧看运气」的老口径，所以先合成一个值再双写。
+      const machineId = String(local.meta.machineId || local.meta.machine_id
+        || remoteMeta.machineId || remoteMeta.machine_id || "");
       patch.meta = {
         ...remoteMeta,
         deviceMid: local.meta.deviceMid || remoteMeta.deviceMid,
         deviceId: local.meta.deviceId || remoteMeta.deviceId,
         officeIdentity: local.meta.officeIdentity || remoteMeta.officeIdentity,
+        ...(machineId ? { machineId, machine_id: machineId } : {}),
         ...(local.meta.lastError ? { lastError: local.meta.lastError } : {}),
       };
       patch.updatedAt = raUpdatedAt || now;
-      // 只要采纳了远端较新且有效的凭据，重置冷却与解除上游错误，自愈恢复调度
-      patch.coolUntil = 0;
-      patch.coolReason = "";
-      if (local.status === "relogin" || local.status === "cooling") {
-        patch.status = "online";
+      // 自愈（重置冷却与解除上游错误）以远端凭据有效为前提：两端均失效时采纳
+      // 过期远端凭据不能把死号「自愈」成 online 进调度（必然 401 的请求）
+      if (remoteValid) {
+        patch.coolUntil = 0;
+        patch.coolReason = "";
+        if (local.status === "relogin" || local.status === "cooling") {
+          patch.status = "online";
+        }
+        store.clearError(local.id);
       }
-      store.clearError(local.id);
     } else {
       // 不换凭据时，若本机切号快照缺失（如纯 token 导入）而远端带有快照，补充切号快照
       if (ra.channel === "zcode" && ra.meta && ra.meta.sw) {
@@ -474,8 +483,12 @@ function applyTombstones(remote, channel) {
     const local = accounts.find((a) => accountKeyOf(a) === key);
     if (!local) continue;
     // 本机账号比墓碑新（删完后又重新添加了同身份账号）：不删，并视为复活（下面合并墓碑时本机包会盖过它）
-    // 阈值用意图戳（不含 creditsAt/lastUsed）：两者都被后台自动推进（额度定时刷新/请求记账），
-    // 拿它们比墓碑，从未被用户碰过的账号也能顶掉他机的显式删除——与 mergeSnapshot 里的墓碑比较同一把尺
+    // 阈值用意图戳（不含 creditsAt/lastUsed/updatedAt）：creditsAt 与 lastUsed 都被后台自动推进
+    // （额度定时刷新/请求记账），拿它们比墓碑，从未被用户碰过的账号也能顶掉他机的显式删除；
+    // 反过来并入 updatedAt 也有同一后果——「A 删除、B 后台 token 刷新顶新 updated_at」让账号永远
+    // 存活、删除永远无法传播。删除是显式操作理当生效，这条尺子不许与 mergeSnapshot 的 LWW 混用，
+    // 但两处**墓碑比较必须同一把尺**。判据覆盖要如实：dev-poolsync-rename-test 钉的是
+    // mergeSnapshot 侧的 accountStamp/改名，墓碑这一侧的 accountIntentStamp 目前无门禁覆盖。
     if (accountIntentStamp(local) > Number(at)) continue;
     if (store.removeAccount(local.id)) removed++;
   }

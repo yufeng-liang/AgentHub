@@ -39,6 +39,22 @@ const headersMod = require("./headers.cjs");
 /** 默认思考档位（参考实现 cline-proxy 同值；官方 CLI 未显式给档时的默认形态） */
 const DEFAULT_REASONING_EFFORT = "high";
 
+/** 家族启发式（参考实现 context_window_for / reasoning_for 的回退口径）：
+ *  目录里查不到的全新模型按 id 家族给窗口与思考开关，不写死一个数 */
+function contextWindowHeuristic(id) {
+  const name = String(id || "").toLowerCase();
+  if (name.includes("deepseek-v4.1") || name.includes("1m") || name.includes("minimax") || name.includes("mimo")) return 1000000;
+  if (name.includes("kimi") || name.includes("qwen3.8") || name.includes("glm-5")) return 256000;
+  if (name.includes("claude") || name.includes("gpt-6") || name.includes("grok")) return 200000;
+  return 128000;
+}
+
+/** 少数小模型没有 reasoning 输出（参考实现 reasoning_for 同口径） */
+function reasoningHeuristic(id) {
+  const name = String(id || "").toLowerCase();
+  return !(name.includes("solar-pro4") || name.includes("flash-lite"));
+}
+
 /** 429 文案里的人话时长解析（参考实现 parseHumanDuration 移植）：
  *  "Try again in 17h 59m" / "1d 2h 30m" / "30s" 任意组合 → 毫秒；解析不出返回 0。
  *  免费额度撞限的真实冷却可达小时级，只按通用层的短退避会反复打无效请求。 */
@@ -125,6 +141,12 @@ function makeCline(channel, deps) {
      *  与其它渠道同口径写死（qoder 86400 / raccoon 300），配置层不再放一份防双源漂移 */
     refreshWindowSec: 600,
 
+    /** 余额 0 不是硬门禁：上游允许余额记负（实测欠费 -0.02 仍可用），真实门禁是
+     *  每日额度的 429（带重置时间）与订阅 403，都已由错误分类按账号处置。号池调度
+     *  的「余额 0 → exhausted」与 routeUsable 同口径据此跳过本渠道——否则余额恒 0 的
+     *  账号（store 入库层把舍入后的 0 与 < -1 负值都归 0）会被锁死在调度外且永不复活 */
+    zeroBalanceUsable: true,
+
     /** 模型 id 清单（带池前缀的完整上游 id；目录未就绪时为空数组——rules 默认值已含静态兜底） */
     models() {
       return catalogEntries().map((m) => String(m.id));
@@ -137,19 +159,23 @@ function makeCline(channel, deps) {
       const base = String(c.apiBase || "https://api.cline.bot/api/v1").replace(/\/+$/, "");
       const r = await httpJson(`${base}${c.modelsPath || "/ai/cline/recommended-models"}`, {
         method: "GET",
-        headers: { accept: "application/json", "x-client-type": "cline-sdk" },
+        // 伪装头走唯一实现（headers.json upstreamHeaders 覆盖层），与对话/登录/续期同一口径
+        headers: headersMod.buildUpstreamHeaders(c, { accept: "application/json" }),
       }).catch((e) => ({ status: 0, ok: false, data: null, message: String((e && e.message) || e) }));
       if (!r.ok || !r.data) return { ok: false, message: `模型目录 HTTP ${r.status}${r.message ? `：${r.message}` : ""}` };
       const parsed = modelsMod.filterByPool(modelsMod.parseRecommended(r.data), pool);
       if (!parsed.length) return { ok: false, message: "模型目录为空（响应里没有本池可用模型）" };
-      const models = parsed.map((m) => ({
-        id: m.id,
-        name: m.name,
-        rate: null,
-        capabilities: { images: true, reasoning: true, tools: true },
-        contextLength: 0,
-        maxOutputTokens: 0,
-      }));
+      const models = parsed.map((m) => {
+        // 元数据继承（先查表再启发式，与参考实现同款两段式）：上游目录不回传元数据，
+        // 硬编码 capabilities/0 会让「远程与静态两条路径给出不同的数」——同步后
+        // solar-pro4 的思考开关从 false 跳 true、全部上下文长度归 0（刷新前后跳变）
+        const hit = catalogEntries().find((e) => String(e.id || "").toLowerCase() === m.id.toLowerCase());
+        const caps = hit && hit.capabilities && typeof hit.capabilities === "object"
+          ? { images: hit.capabilities.images !== false, reasoning: hit.capabilities.reasoning !== false, tools: hit.capabilities.tools !== false }
+          : { images: true, reasoning: reasoningHeuristic(m.id), tools: true };
+        const ctx = hit && Number(hit.contextLength) > 0 ? Number(hit.contextLength) : contextWindowHeuristic(m.id);
+        return { id: m.id, name: m.name, rate: null, capabilities: caps, contextLength: ctx, maxOutputTokens: 0 };
+      });
       return { ok: true, models };
     },
 
@@ -176,6 +202,9 @@ function makeCline(channel, deps) {
         .find((v) => v) || DEFAULT_REASONING_EFFORT;
       out.reasoning_effort = effort;
       delete out.reasoningEffort;
+      // max_tokens ≤ 0 按缺失处理（对齐参考 adapter.rs：0/负数不算显式小值，对上游只会是
+      // 参数错误）；保留「缺失时透传缺失」的既有取舍（本适配器刻意不注入默认值）
+      if (Number(out.max_tokens) <= 0) delete out.max_tokens;
       return { body: out, sessionId };
     },
 
@@ -274,7 +303,7 @@ function makeCline(channel, deps) {
           httpJson,
           // uid 已在导入/登录时解析为 usr-...（外部 id）；没有时从 JWT 兜底
           userId: String((account && account.uid) || ""),
-          jwtAccountId: credentials.accountIdFromJwt(secrets.token),
+          jwtAccountId: credentials.accountIdFromJwt(secrets && secrets.token),
           parseExpiresAt: credentials.parseExpiresAt,
         });
       } catch (e) {
@@ -343,7 +372,9 @@ function makeCline(channel, deps) {
       }
       if (status === 429) {
         const ms = parseTryAgainMs(`${e.body || ""} ${e.message || ""}`);
-        return { kind: "rate", switchable: true, status: 429, resetMs: ms > 0 ? Date.now() + ms : 0 };
+        // 文案解析不出时接住 fetchStream 已解析的 Retry-After 三头族（通用层同款兜底）：
+        // 不接住的话 resetMs=0 会先白打一次 1s 就地重试，再落 softBackoff 短冷却，墙钟对齐失效
+        return { kind: "rate", switchable: true, status: 429, resetMs: ms > 0 ? Date.now() + ms : (Number(e.retryAfterMs) > 0 ? Date.now() + Number(e.retryAfterMs) : 0) };
       }
       return null;
     },

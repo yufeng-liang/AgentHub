@@ -11,6 +11,7 @@
 //
 // 刻度换算只此一处（CREDITS_PER_MICRO），将来上游改刻度改这里即可。
 "use strict";
+const headersMod = require("./headers.cjs");
 
 /** 上游 balance 的刻度：1 credit = 1e6 微 credit（官方前端 format(e/1e6)，实测核对） */
 const CREDITS_PER_MICRO = 1e6;
@@ -23,22 +24,20 @@ async function resolveUserId(env, token) {
   const fromJwt = env.jwtAccountId || "";
   if (fromJwt.startsWith("usr-")) return fromJwt;
   // 前两级都取不到才打 /users/me（多一个往返，必须留着兜底）
-  const r = await httpJson(`${base}/users/me`, { method: "GET", headers: authHeaders(token) }).catch(() => null);
+  const r = await httpJson(`${base}/users/me`, { method: "GET", headers: authHeaders(env.cfg, token) }).catch(() => null);
   const id = String((r && r.data && r.data.data && r.data.data.id) || "").trim();
   return id;
 }
 
-function authHeaders(token) {
-  return {
-    accept: "application/json",
-    authorization: `Bearer ${token}`,
-    "x-client-type": "cline-sdk",
-  };
+function authHeaders(cfg, token) {
+  // 伪装头走唯一实现（headers.json upstreamHeaders 覆盖层；空串=不发；协议必需头拒绝覆盖），
+  // 与对话/登录/续期同一口径——不再硬编码 x-client-type（方案 §3 单一来源契约）
+  return { ...headersMod.buildUpstreamHeaders(cfg, { accept: "application/json" }), authorization: `Bearer ${token}` };
 }
 
 /** GET 并解包 {"data":..,"success":true} 信封；allowed 状态码返回 null（调用方按语义处理） */
-async function getJson(base, path, token, httpJson, allowed) {
-  const r = await httpJson(`${base}${path}`, { method: "GET", headers: authHeaders(token) }).catch((e) => {
+async function getJson(base, path, token, httpJson, cfg, allowed) {
+  const r = await httpJson(`${base}${path}`, { method: "GET", headers: authHeaders(cfg, token) }).catch((e) => {
     throw new Error(`Cline 接口请求失败：${String((e && e.message) || e).slice(0, 120)}`);
   });
   if (allowed && allowed.includes(r.status)) return null;
@@ -91,7 +90,7 @@ async function queryBalance(env) {
   const base = String(cfg.apiBase || "https://api.cline.bot/api/v1").replace(/\/+$/, "");
   const userId = await resolveUserId(env, token);
   if (!userId) throw new Error("Cline 余额查询失败：拿不到账号 id（上游 /users/me 未返回 id）");
-  const balancePayload = await getJson(base, `/users/${encodeURIComponent(userId)}/balance`, token, httpJson);
+  const balancePayload = await getJson(base, `/users/${encodeURIComponent(userId)}/balance`, token, httpJson, cfg);
   const data = (balancePayload && balancePayload.data) || balancePayload || {};
   const rawBalance = Number(data.balance);
   // 上游 200 但缺 balance（字段改名/结构变化）：**如实报错**，不返回 0——0 会落库后被
@@ -109,7 +108,7 @@ async function queryBalance(env) {
   let subscription = null;
   let subscriptionError = "";
   try {
-    const planPayload = await getJson(base, "/users/me/plan", token, httpJson, [404]);
+    const planPayload = await getJson(base, "/users/me/plan", token, httpJson, cfg, [404]);
     subscription = planPayload ? normalizeSubscription(planPayload.data, env.parseExpiresAt) : null;
   } catch (e) {
     subscriptionError = String((e && e.message) || e).slice(0, 120);

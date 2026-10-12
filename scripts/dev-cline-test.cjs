@@ -170,10 +170,24 @@ globalThis.fetch = async (url, opts) => { lastReq = { url, opts }; return { ok: 
     const ids = fmP.models.map((m) => m.id);
     return fmP.ok === true && ids.join(",") === "cline-pass/kimi-k3,whatever/not-in-catalog,openai/gpt-x";
   })(), fmP);
-  ok("目录条目只给 id/name 与能力声明，元数据不由这次拉取回填（rate 恒 null、contextLength 恒 0）", (() => {
+  // 上游 v1.65.0 起，目录元数据走「先查 catalog 表、查不到按 id 家族启发式」的两段式继承。
+  // 这条断言原先钉的是「远程拉取不回填元数据（rate 恒 null、contextLength 恒 0）」——那正是
+  // 同步前后跳变的根源（静态表给 solar-pro4 reasoning:false，拉取后归 0/默认 true）。
+  const catalogFree = (require("../electron/backend/proxy/rules.cjs").get("catalog.json").cline_free || {}).models || [];
+  ok("表命中的条目继承 catalog 元数据（不从这次拉取现造，也不写死 0）", (() => {
+    const hit = catalogFree.find((e) => e.id === "z-ai/glm-5.3-flash");
     const one = fmFree.models.find((m) => m.id === "z-ai/glm-5.3-flash");
-    return one.rate === null && one.contextLength === 0 && one.maxOutputTokens === 0 && one.capabilities.images === true && one.capabilities.reasoning === true && one.capabilities.tools === true;
-  })(), fmFree.models);
+    return !!hit && one.contextLength === hit.contextLength && one.contextLength > 0
+      && one.capabilities.images === (hit.capabilities.images !== false)
+      && one.capabilities.reasoning === (hit.capabilities.reasoning !== false)
+      // rate / maxOutputTokens 仍不由这次拉取回填：计价走余额侧，目录没给输出上限就留 0
+      && one.rate === null && one.maxOutputTokens === 0;
+  })(), fmFree.models.find((m) => m.id === "z-ai/glm-5.3-flash"));
+  ok("表未命中的新模型走家族启发式兜底（不归 0；该 id 不含家族关键字 ⇒ 兜底档 128000）", (() => {
+    const one = fmP.models.find((m) => m.id === "whatever/not-in-catalog");
+    return one.contextLength === 128000 && one.capabilities.images === true
+      && one.capabilities.tools === true && one.capabilities.reasoning === true;
+  })(), fmP.models.find((m) => m.id === "whatever/not-in-catalog"));
 
   globalThis.fetch = async () => ({ ok: false, status: 500, text: async () => "boom" });
   const fm500 = await free.fetchModels();

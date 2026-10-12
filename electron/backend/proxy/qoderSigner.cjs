@@ -160,6 +160,13 @@ async function loadGlue(product) {
     await mod.initGlue();
     return { glue: mod.glue(), version: loc.version, resources: loc.resources, sdk: loc.sdk };
   })();
+  // 成功才缓存（对齐 qoderInstall「不缓存失败」的设计声明）：失败/null 钉死在缓存里
+  // 会让签名器一次性故障（结构变更/临时 IO 错/用户装完客户端）直到重启才能恢复
+  p.then((v) => {
+    if (!v) signerCache.delete(product);
+  }).catch(() => {
+    signerCache.delete(product);
+  });
   signerCache.set(product, p);
   return p;
 }

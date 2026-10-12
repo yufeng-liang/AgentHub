@@ -33,20 +33,39 @@ const FOREIGN_IDENTITIES = [
   ["You are Codex", "You are a coding agent"],
 ];
 
-/** ASCII 大小写不敏感的子串替换：命中全部替换，每轮从匹配处之后继续（替换产物不再被检查，无死循环） */
+/** ASCII 折叠（单字符）：只折叠 A-Z，非 ASCII 字符原样返回——
+ *  Unicode 折叠（toLowerCase）会改变串长（如 İ U+0130 折叠成 2 字符），导致下标错位 */
+function asciiFoldChar(c) {
+  return c >= "A" && c <= "Z" ? String.fromCharCode(c.charCodeAt(0) + 32) : c;
+}
+
+function asciiFold(s) {
+  let r = "";
+  for (let i = 0; i < s.length; i++) r += asciiFoldChar(s[i]);
+  return r;
+}
+
+/** ASCII 大小写不敏感的子串替换：命中全部替换，替换产物不再被检查（从匹配处之后继续，无死循环）。
+ *  逐字符滑窗 + ASCII 折叠比较（对齐注释纪律与参照实现 eq_ignore_ascii_case）：
+ *  needle 是纯 ASCII（长度稳定），haystack 含 Unicode 扩展字符时下标仍与原文对齐 */
 function replaceIgnoringCase(text, needle, replacement) {
-  const lower = text.toLowerCase();
-  const target = needle.toLowerCase();
+  const n = needle.length;
+  if (!n || n > text.length) return text;
+  const target = asciiFold(needle);
+  const first = target[0];
   let out = "";
   let i = 0;
   while (i < text.length) {
-    const hit = lower.indexOf(target, i);
-    if (hit < 0) {
-      out += text.slice(i);
-      break;
+    if (asciiFoldChar(text[i]) === first) {
+      const slice = text.slice(i, i + n);
+      if (slice.length === n && asciiFold(slice) === target) {
+        out += replacement;
+        i += n;
+        continue;
+      }
     }
-    out += text.slice(i, hit) + replacement;
-    i = hit + target.length;
+    out += text[i];
+    i++;
   }
   return out;
 }

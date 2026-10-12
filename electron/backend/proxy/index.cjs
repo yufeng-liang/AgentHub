@@ -4,6 +4,7 @@
 "use strict";
 const fs = require("node:fs");
 const path = require("node:path");
+const crypto = require("node:crypto"); // JSON 导入账号的 uid 派生用（Node 22 全局 crypto 是 WebCrypto，无 createHash）
 const config = require("../config.cjs");
 const store = require("./store.cjs");
 const rules = require("./rules.cjs");
@@ -852,6 +853,9 @@ function register(ipcMain) {
     // 先写墓碑再删本机：删除要经 WebDAV 传播到其他设备（号池同步拉取时按墓碑移除）
     poolsync.noteRemoved(poolsync.accountKeyOf(acc));
     if (!store.removeAccount(id)) return fail("账号不存在");
+    // CatPaw 会话注册表挂点（对齐参照实现 W5 接线要求）：账号删除后其会话记录残留
+    // （2h TTL），工具续接窗口内其他账号的请求可把 tool 结果提交到已消失账号的 conversation
+    try { require("./catpaw/registry.cjs").registry.clearAccount(id); } catch { /* 无会话不影响删除 */ }
     oplog.log("info", "号池账号", `移除 ${store.channelDisplay(acc.channel)} 账号「${acc.name}」`, { channel: acc.channel, target: acc.name });
     return ok({});
   }));
@@ -861,6 +865,10 @@ function register(ipcMain) {
     store.updateAccount(id, enabled
       ? { status: "online", coolUntil: 0, coolReason: "" }
       : { status: "disabled" });
+    // 停用同样作废该账号名下的 CatPaw 会话（不再参与调度但记录残留，同上）
+    if (!enabled) {
+      try { require("./catpaw/registry.cjs").registry.clearAccount(id); } catch { /* 无会话不影响停用 */ }
+    }
     oplog.log("info", "号池账号", `${enabled ? "启用" : "停用"} ${store.channelDisplay(acc.channel)} 账号「${acc.name}」`, { channel: acc.channel, target: acc.name });
     return ok({});
   }));

@@ -39,13 +39,17 @@ function makeAutoClaw(channel, deps) {
   // 避免「缓存遮蔽新登录态」。key 用账号 id。
   const credCache = new Map(); // accountId -> { token, refreshToken, expiresAt, baseToken }
 
-  /** 取当前生效凭证：缓存命中且库内 token 未变 → 缓存值；否则库值 */
+  /** 取当前生效凭证：缓存命中且库内 token 未变 → 缓存值；否则库值。
+   *  命中判据 = token 命中 baseToken（库未变）或 hit.token（401 重试链拿着上一次刷新的
+   *  结果再来问，server.cjs 的 send 传的正是 r.token）——只认 baseToken 会把后者误判成
+   *  「库已更换」删掉刚建立的缓存，后续请求又拿库内旧 token 再 401、再拿旧 rt 刷新
+   *  （轮换制下旧 rt 可能已作废 → 掉登录）。二者都不命中才是真正的库更换（重登/手改）。 */
   function credentialsOf(account, secrets) {
     const hit = account && account.id ? credCache.get(account.id) : null;
-    if (hit && hit.token && secrets.token === hit.baseToken) {
+    if (hit && hit.token && (secrets.token === hit.baseToken || secrets.token === hit.token)) {
       return { token: hit.token, refreshToken: hit.refreshToken || secrets.refreshToken || "" };
     }
-    if (hit && secrets.token !== hit.baseToken) credCache.delete(account.id);
+    if (hit && secrets.token !== hit.baseToken && secrets.token !== hit.token) credCache.delete(account.id);
     return { token: secrets.token || "", refreshToken: secrets.refreshToken || "" };
   }
 
@@ -119,6 +123,12 @@ function makeAutoClaw(channel, deps) {
         headers: headersMod.signedAuthHeaders(c, token),
       }).catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
       if (r.status === 401) return { ok: false, authError: true, message: "登录态已失效，请重新登录或刷新凭证" };
+      // 目录端点登录态失效也可能以 HTTP 200 + body 码表达（balance/checkin 同口径）：
+      // 不认的话失效被报成「结构可能已变更」误导排障，且不触发 authError 链（不换号/不提示重登）
+      const authCode = Number(r.data && (r.data.code ?? r.data.errorCode)) || 0;
+      if (authCode === 410000 || authCode === 400000) {
+        return { ok: false, authError: true, message: "登录态已失效，请重新登录或刷新凭证" };
+      }
       const list = r.data && Array.isArray(r.data.models) ? r.data.models : null;
       if (!list) {
         return { ok: false, message: `模型目录 HTTP ${r.status}${r.data && r.data.message ? `：${r.data.message}` : "（无 models 数组，结构可能已变更）"}` };
