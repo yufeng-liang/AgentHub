@@ -402,31 +402,69 @@ async function T(name, fn) {
     assert.strictEqual(c.cookieMetaKey, "msCookie");
   });
 
-  // ===== T25 Cookie 采集与落库（授权窗采集 → 加密 → accountSecrets 透传） =====
-  await T("T25 Cookie 采集链路：授权窗采集 + DPAPI 加密落库 + accountSecrets 解密透传", () => {
-    // ① 授权窗提供 collectCookie（整组拼接，不是只取一个）
-    const idx = fs.readFileSync(path.join(__dirname, "..", "electron", "backend", "proxy", "index.cjs"), "utf8");
-    assert.ok(/collectCookie/.test(idx), "授权窗应提供 collectCookie");
-    assert.ok(/sess\.cookies\.get/.test(idx), "collectCookie 应读 partition 的 cookie jar");
-    assert.ok(/join\("; "\)/.test(idx), "应整组拼接 Cookie（魔搭登录态由多个 cookie 共同构成）");
-
-    // ② discovery 在回调时采集，并写进账号
+  // ===== T25 Cookie 采集链路（采集端注入 → 加密落库 → accountSecrets 透传） =====
+  // 上游这版探针的 ① 组按**上游形态**立据：它的网关跑在主进程，授权窗与该 partition 的 cookie
+  // jar 都在 proxy/index.cjs 手里，于是直接 grep「index.cjs 里有 collectCookie /
+  // sess.cookies.get / join("; ")」。本 fork 的 proxy/ 域跑在 ELECTRON_RUN_AS_NODE 子进程
+  // （网关与主进程分离是二期的既定架构），require("electron") 只给路径字符串 ⇒ 开窗与读
+  // cookie jar 只能留在主进程，采集端得以 helpers.openAuthWindow **注入**给子进程。
+  // 现状（如实记录，别把这条探针变绿当成「能力已经齐了」）：**fork 没有注入方**，
+  // proxy_oauth_begin 建会话时不传 helpers ⇒ openWindow 恒 undefined ⇒ 一律降级为系统浏览器 +
+  // 回环回调：OAuth 令牌与推理链路照常，只是采不到 Web 会话 Cookie，于是「点赞 / 每日登录
+  // (daily_active)」两类魔粒任务在 OAuth 登录进来的账号上不可用（粘贴 ms- 令牌同样没有 Cookie）。
+  // ⇒ ① 改钉「注入 + 能力守卫 + 降级可见」：这三件在将来真接上采集端后**仍然成立**，
+  //   不会反过来惩罚修复；② 从 grep 换成**行为断言**——沙箱里连跑三次落库，可执行地证明
+  //   「密文入库 / 解密整组透传 / 本次没采到时不清空已有会话」，那半条链才是 fork 真正拥有的。
+  // 补齐采集要在主进程做授权窗并把采到的 Cookie 回传子进程（新增一条子进程命令 + preload 白名单
+  // /主进程基线/子进程 dispatch/对账闸四处同步登记），属独立改动，不塞进合并里顺手做。
+  await T("T25 Cookie 采集链路：采集端注入 + 降级可见 + DPAPI 加密落库 + accountSecrets 解密透传", async () => {
     const disc = fs.readFileSync(path.join(__dirname, "..", "electron", "backend", "proxy", "discovery.cjs"), "utf8");
-    assert.ok(/collectCookie/.test(disc), "discovery 应调用 collectCookie");
-    assert.ok(/beginModelScopeOAuth\(ch, onDone, helpers\)/.test(disc), "beginOAuth 应把 helpers 传给 modelscope");
-    assert.ok(/mode: "window"/.test(disc), "modelscope 应优先用应用内窗口（才能采 Cookie）");
+    const i0 = disc.indexOf("async function beginModelScopeOAuth");
+    const win = disc.slice(i0, disc.indexOf("\n// ===== AutoClaw 登录", i0));
+    assert.ok(i0 > 0 && win.length > 800, "应能定位 beginModelScopeOAuth 函数体（切片落空则下面全是空判据）");
 
-    // ③ 落库加密 + 不动旧值
-    const save = disc.slice(disc.indexOf("function saveModelScopeAccount"), disc.indexOf("async function importModelScopeToken"));
-    assert.ok(/config\.encryptSecret\(cookie\)/.test(save), "Cookie 应经 encryptSecret 加密落库");
-    assert.ok(/msCookie/.test(save), "应存到 meta.msCookie");
-    assert.ok(/nextMeta\.msCookie = existing\.meta\.msCookie/.test(save), "未采到新 Cookie 时应保留旧值（不清空可用会话）");
+    // ① 采集端是注入的；缺提供方时不抛错、也不静默吞掉代价
+    assert.ok(/function beginModelScopeOAuth\(channel, onDone, helpers\)/.test(win), "采集端经 helpers 参数注入（不是从主进程模块直接取）");
+    assert.ok(/const openWindow = helpers && helpers\.openAuthWindow/.test(win), "helpers 缺失时按 undefined 处理（子进程场景），不是抛错");
+    assert.ok(/typeof openWindow === "function"/.test(win), "只有真的拿到采集端才开应用内窗口");
+    assert.ok(/let capturedCookie = ""/.test(win), "无窗口时 Cookie 起点是空串（不是 undefined）");
+    assert.ok(/authWin && typeof authWin\.collectCookie === "function"/.test(win), "调用采集前做能力守卫");
+    assert.ok(/collectCookie\(c\.cookieDomains/.test(win), "按配置的 cookieDomains 整组采集（魔搭登录态由多个 cookie 共同构成）");
+    assert.ok(/未取得 Web 会话[^\n]*点赞与每日登录奖励不可用/.test(win), "采不到时成功页如实说明代价（不得静默入池）");
+    assert.ok(/hasCookie: !!capturedCookie/.test(win), "登录结果回传 hasCookie（UI 据此显示能力状态）");
+    assert.ok(/beginModelScopeOAuth\(ch, cb, helpers\)/.test(disc), "beginOAuth 应把 helpers 一路透传给 modelscope");
+    assert.ok(/mode: "window"/.test(win) && /mode: "loopback", port/.test(win), "有采集端走应用内窗口、无采集端降级回环，两条返回都得在");
 
-    // ④ accountSecrets 解密透传
-    const st = fs.readFileSync(path.join(__dirname, "..", "electron", "backend", "proxy", "store.cjs"), "utf8");
-    const secFn = st.slice(st.indexOf("function accountSecrets"), st.indexOf("function addAccount"));
-    assert.ok(/meta/.test(secFn), "accountSecrets 应带出 meta（适配器据此取 Cookie）");
-    assert.ok(/config\.decryptSecret\(meta\.msCookie\)/.test(secFn), "msCookie 应解密后透传");
+    // ② 行为断言：同一 uid 连跑三次落库（采到 → 没采到 → 采到新值）
+    const discovery = require("../electron/backend/proxy/discovery.cjs");
+    const uid = "t25-cookie-preserve";
+    const cookieA = "ms_session=aaaa; ms_token=bbbb";
+    const cookieB = "ms_session=cccc; ms_token=dddd";
+    const r1 = discovery.saveModelScopeAccount({ uid, token: "ms_oauth_t25_a", name: "T25", cookie: cookieA }, null, "oauth");
+    assert.ok(r1.ok && r1.updated === false && r1.hasCookie === true, "首次带 Cookie 登录：新增账号并报告已有 Web 会话");
+    const row1 = store.getAccount(r1.id);
+    const meta1 = JSON.parse(row1.meta);
+    assert.ok(meta1.msCookie && meta1.msCookie !== cookieA, "Cookie 必须加密后落库（明文入库即凭据泄漏）");
+    assert.strictEqual(store.accountSecrets(row1).meta.msCookie, cookieA, "accountSecrets 应解密并把整组 Cookie 透传给适配器");
+    const at1 = Number(meta1.cookieAt);
+    assert.ok(at1 > 0, "带 Cookie 保存应记下次刻（Cookie 失效判定按采集时刻算）");
+
+    await new Promise((r) => setTimeout(r, 5)); // 让后一次的 Date.now() 可辨，cookieAt 的两条断言才有意义
+    // 一次失败的采集绝不能抹掉已在用的会话
+    const r2 = discovery.saveModelScopeAccount({ uid, token: "ms_oauth_t25_b", name: "T25" }, null, "oauth");
+    assert.ok(r2.ok && r2.updated === true && r2.hasCookie === true, "未采到 Cookie 仍算登录成功，hasCookie 报告的是保留下来的旧会话");
+    const meta2 = JSON.parse(store.getAccount(r2.id).meta);
+    assert.strictEqual(meta2.msCookie, meta1.msCookie, "旧 Cookie 密文原样保留（不清空可用会话）");
+    assert.strictEqual(meta2.cookieAt, at1, "保留旧值时不刷新 cookieAt（否则失效判定会跟着续期一次假寿命）");
+
+    const r3 = discovery.saveModelScopeAccount({ uid, token: "ms_oauth_t25_c", name: "T25", cookie: cookieB }, null, "oauth");
+    const row3 = store.getAccount(r3.id);
+    const meta3 = JSON.parse(row3.meta);
+    assert.ok(meta3.msCookie !== meta1.msCookie, "采到新 Cookie 时覆盖旧值");
+    assert.strictEqual(store.accountSecrets(row3).meta.msCookie, cookieB, "覆盖后透传的应是新会话");
+    assert.ok(Number(meta3.cookieAt) > at1, "覆盖后刷新 cookieAt");
+
+    store.removeAccount(r3.id); // 沙箱库自净：本探针后续项不依赖这条测试账号
   });
 
   // ===== T26 非流式响应必须单独处理（真实根因：Content-Type 不是 SSE） =====
