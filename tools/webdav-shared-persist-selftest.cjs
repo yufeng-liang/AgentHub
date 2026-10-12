@@ -41,8 +41,12 @@ console.log("  配置路径 = " + cfgPath);
 ok("配置路径在沙箱内（绝不写真实配置）", inSandbox);
 if (!inSandbox) { console.error("拒绝运行：配置路径不在沙箱内"); process.exit(2); }
 
-// 自测环境无 electron/safeStorage：encryptSecret 透传明文，decryptSecret 对 enc:v1: 返回 ""，
-// 正好用来模拟「换机后解不开密文」的真实场景
+// 本 fork 的 config 加密与 Electron safeStorage 无关：secretbox 走 Chromium os_crypt 的 v10 形态
+// （DPAPI + Local State 主密钥），纯 node 沙箱里 encryptSecret 也产 enc:v1: 密文、decryptSecret 也解得开。
+// 所以「磁盘上一定是明文」在上游那版的前提在这里不成立；而 secretbox 对**非打包态**留了 plain-dev
+// 明文降级（无 DPAPI 的机器上自测不该莫名变红），所以判据按 backend() 分两型各钉死一个形状，
+// 两型都是精确判据、不存在「凑巧绿」。解不开密文的场景由 B 组直接塞假密文制造，不依赖环境缺能力。
+const secretbox = require("../electron/backend/proxy/secretbox.cjs");
 function diskShared() {
   try {
     const raw = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
@@ -56,7 +60,15 @@ const saved = config.saveSharedWebdav({ endpoint: "https://dav.example.com/dav",
 ok("保存成功", saved && saved.ok);
 let d = diskShared();
 ok("endpoint/username 落盘", d.endpoint === "https://dav.example.com/dav" && d.username === "alice", JSON.stringify(d));
-ok("密码落盘（无 safeStorage 时明文透传）", d.password === "pw-123", JSON.stringify(d));
+// 落盘形态按本机加密能力分两型：能加密就必须是 enc:v1: 密文（明文落盘即缺陷），
+// 只有非打包态的 plain-dev 降级才允许明文。A 组再判「这份落盘的值提交一轮之后还解得回原密码吗」。
+const SB_BACKEND = secretbox.backend();
+const WANT_CIPHER = SB_BACKEND !== "plain-dev";
+ok(`密码落盘形态（secretbox.backend()=${SB_BACKEND}）`,
+  WANT_CIPHER ? String(d.password).startsWith("enc:v1:") : d.password === "pw-123", JSON.stringify(d));
+/** 盘上那份解回明文（解不开即 ""）。A 组用它比「密码还在不在」，而不是比字节：
+ *  密文每次封装都换 nonce，比字节会把「重新封了一次但密码没丢」误判成回归 */
+const diskPw = () => { try { return secretbox.decrypt(diskShared().password || ""); } catch { return ""; } };
 const loaded = config.loadConfig();
 ok("loadConfig 解出明文密码", loaded.webdavShared.password === "pw-123", loaded.webdavShared.password);
 
@@ -75,13 +87,13 @@ ok("保存成功", r1 && r1.ok);
 d = diskShared();
 ok("整份提交后 endpoint 保留", d.endpoint === "https://dav.example.com/dav", JSON.stringify(d));
 ok("整份提交后 username 保留", d.username === "alice", JSON.stringify(d));
-ok("整份提交后密码保留", d.password === "pw-123", JSON.stringify(d));
+ok("整份提交后密码保留", diskPw() === "pw-123", JSON.stringify(d));
 // 主题等设置页自有字段仍按提交值落盘（磁盘优先不得架空设置页）
 ok("设置页自有字段按提交值落盘", config.loadConfig().theme === "light");
 // 快照缺 webdavShared 键时同样兜底
 const r2 = config.saveConfigFromUI({ theme: "dark", proxy: {}, webdav: { endpoint: "", username: "", password: "", root: "", deviceId: "d0", deviceName: "测试机" } });
 d = diskShared();
-ok("快照缺段时整段回填", r2.ok && d.endpoint === "https://dav.example.com/dav" && d.password === "pw-123", JSON.stringify(d));
+ok("快照缺段时整段回填", r2.ok && d.endpoint === "https://dav.example.com/dav" && diskPw() === "pw-123", JSON.stringify(d));
 
 console.log("");
 console.log("=== B：解密失败保护——空密码不覆盖密文，换服务器正常写 ====");
